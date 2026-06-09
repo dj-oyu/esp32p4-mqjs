@@ -118,7 +118,7 @@ static bool s_isr_service_installed;
 
 static int js_interrupt_handler(JSContext *ctx, void *opaque)
 {
-    return time_ms() > s_run_deadline;
+    return s_stop_req || time_ms() > s_run_deadline;
 }
 
 static void arm_watchdog(void)
@@ -478,12 +478,20 @@ void mqjs_runtime_stop(void)
     s_stop_req = true;
 }
 
+void mqjs_runtime_clear_stop(void)
+{
+    s_stop_req = false;
+}
+
 int mqjs_run_script(const char *src, size_t src_len, const char *name,
                     void *mem_buf, size_t mem_size)
 {
     int ret_code = 0;
 
-    s_stop_req = false;
+    /* note: s_stop_req is NOT cleared here. A stop posted between the
+       host's decision to (re)start and this point must still win,
+       otherwise a freshly delivered script could be missed. The host
+       calls mqjs_runtime_clear_stop() when it wants a fresh run. */
     memset(s_timers, 0, sizeof(s_timers));
     memset(s_gpio_cb, 0, sizeof(s_gpio_cb));
 

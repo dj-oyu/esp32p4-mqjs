@@ -1,0 +1,35 @@
+menu "mqjs script distribution (WiFi / MQTT)"
+
+config MQJS_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        SSID of the access point. Leave empty to disable networking
+        (the device then only runs the stored / built-in script).
+
+config MQJS_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+
+config MQJS_MQTT_BROKER_URI
+    string "MQTT broker URI"
+    default "mqtt://192.168.1.10:1883"
+    help
+        e.g. mqtt://host:1883 or mqtts://host:8883
+
+config MQJS_MQTT_USERNAME
+    string "MQTT username (empty = anonymous)"
+    default ""
+
+config MQJS_MQTT_PASSWORD
+    string "MQTT password"
+    default ""
+
+config MQJS_TOPIC_PREFIX
+    string "MQTT topic prefix"
+    default "mqjs"
+    help
+        Topics become <prefix>/<device-id>/{script,cmd,status} where
+        <device-id> is the efuse MAC as 12 hex digits (printed at boot).
+
+endmenu

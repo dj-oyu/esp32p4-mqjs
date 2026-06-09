@@ -9,6 +9,10 @@ compile_commands.json
 sdkconfig
 sdkconfig.old
 
+# IDF component manager (esp_wifi_remote / esp_hosted are fetched at build)
+managed_components/
+dependencies.lock
+
 # VS Code local workspace settings
 .vscode/
 

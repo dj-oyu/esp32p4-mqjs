@@ -1,0 +1,7 @@
+# The ESP32-P4 has no radio. WiFi is provided by the Stamp-AddOn C6
+# running the esp-hosted slave firmware; esp_wifi_remote transparently
+# forwards the esp_wifi API over that link.
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_wifi_remote: "*"
+  espressif/esp_hosted: "*"

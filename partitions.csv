@@ -1,0 +1,6 @@
+# 16MB flash. NVS is enlarged to 256K so distributed JS scripts
+# (<= 64K, see MQJS_SCRIPT_MAX) can be persisted alongside WiFi data.
+# Name,    Type, SubType, Offset,  Size
+nvs,       data, nvs,     0x9000,  256K
+phy_init,  data, phy,     0x49000, 4K
+factory,   app,  factory, 0x50000, 4M
