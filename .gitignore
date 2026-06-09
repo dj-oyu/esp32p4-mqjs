@@ -1,0 +1,19 @@
+# ESP-IDF / CMake build outputs
+build/
+**/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# SDK config local artifacts
+sdkconfig
+sdkconfig.old
+
+# VS Code local workspace settings
+.vscode/
+
+# OS/editor artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
