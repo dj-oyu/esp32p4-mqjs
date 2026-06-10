@@ -6,6 +6,7 @@
  * stock IDF station example. SDIO pins live in sdkconfig.defaults,
  * credentials in menuconfig -> "mqjs platform".
  */
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -15,6 +16,7 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
+#include "ui_status.h"
 #include "wifi.h"
 
 static const char *TAG = "wifi";
@@ -36,10 +38,14 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_evt, GOT_IP_BIT);
         ESP_LOGW(TAG, "disconnected, reconnecting");
+        ui_status_set_net(false, NULL);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         ESP_LOGI(TAG, "got ip " IPSTR, IP2STR(&e->ip_info.ip));
+        char ip[16];
+        snprintf(ip, sizeof ip, IPSTR, IP2STR(&e->ip_info.ip));
+        ui_status_set_net(true, ip);
         xEventGroupSetBits(s_evt, GOT_IP_BIT);
     }
 }

@@ -156,6 +156,6 @@ direct_dependencies:
 - espressif/mqtt
 - joltwallet/littlefs
 - lvgl/lvgl
-manifest_hash: 4a7160df9a5bae0859770389c1bdd984b4a2bcc4cad7954727ac1a3aad14537f
+manifest_hash: b138491d15f630c2a577b102854ca97179c61bedc3a1224fd672603d0070f1bb
 target: esp32p4
 version: 3.0.0

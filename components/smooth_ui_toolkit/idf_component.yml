@@ -1,0 +1,4 @@
+# Added for esp32p4-mqjs: the lvgl_cpp/widget layers include <lvgl.h>.
+# (Upstream relies on the project to provide LVGL.)
+dependencies:
+  lvgl/lvgl: "^9"

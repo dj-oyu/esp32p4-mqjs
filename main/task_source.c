@@ -21,6 +21,7 @@
 #include "task_pubkey.h"
 #include "task_source.h"
 #include "tweetnacl.h"
+#include "ui_status.h"
 
 #define SIG_LEN        64
 #define MAX_SCRIPT_LEN (64 * 1024)
@@ -48,6 +49,11 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "ready, listening on %s", CONFIG_MQJS_TASK_TOPIC);
         esp_mqtt_client_subscribe(s_cli, CONFIG_MQJS_TASK_TOPIC, 1);
         publish_status("ready");
+        ui_status_set_mqtt(true);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ui_status_set_mqtt(false);
         break;
 
     case MQTT_EVENT_DATA: {
@@ -55,11 +61,13 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGW(TAG, "payload does not fit the rx buffer (%d bytes), ignored",
                      e->total_data_len);
             publish_status("error: too large");
+            ui_status_set_event("rejected: too large");
             break;
         }
         size_t n = (size_t)e->data_len;
         if (n <= SIG_LEN || n > MAX_SCRIPT_LEN) {
             publish_status("error: bad length");
+            ui_status_set_event("rejected: bad length");
             break;
         }
 
@@ -77,6 +85,7 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
             free(m);
             ESP_LOGW(TAG, "signature verification failed, rejected");
             publish_status("error: bad signature");
+            ui_status_set_event("rejected: bad signature");
             break;
         }
         m[mlen] = '\0';
@@ -92,6 +101,9 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "verified task accepted (%llu bytes), stopping current script",
                  mlen);
         publish_status("accepted");
+        char ev[48];
+        snprintf(ev, sizeof ev, "accepted (%uB)", (unsigned)mlen);
+        ui_status_set_event(ev);
         mqjs_runtime_stop();
         break;
     }

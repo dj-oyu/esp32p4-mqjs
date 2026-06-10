@@ -81,9 +81,60 @@ static int64_t date_ms(void)
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+/* print sink: tee of all JS-visible output, assembled into lines so the
+   UI console can store fixed-size records (see mqjs_set_print_sink) */
+static void (*s_print_sink)(const char *, size_t);
+static char s_sink_line[96];
+static size_t s_sink_len;
+
+void mqjs_set_print_sink(void (*fn)(const char *, size_t))
+{
+    s_print_sink = fn;
+}
+
+static void sink_flush(void)
+{
+    if (s_print_sink && s_sink_len)
+        s_print_sink(s_sink_line, s_sink_len);
+    s_sink_len = 0;
+}
+
+static void out_write(const void *buf, size_t len)
+{
+    fwrite(buf, 1, len, stdout);
+    if (!s_print_sink)
+        return;
+    const char *p = buf;
+    for (size_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (c == '\n') {
+            sink_flush();
+            continue;
+        }
+        if (s_sink_len == sizeof(s_sink_line)) {
+            /* split overlong lines at a UTF-8 sequence boundary */
+            size_t cut = s_sink_len;
+            while (cut > 0 && (s_sink_line[cut - 1] & 0xC0) == 0x80)
+                cut--;
+            if (cut > 0 && (s_sink_line[cut - 1] & 0x80))
+                cut--; /* drop the lead byte of the split sequence too */
+            if (cut == 0)
+                cut = s_sink_len;
+            size_t rest = s_sink_len - cut;
+            char carry[4];
+            memcpy(carry, s_sink_line + cut, rest);
+            s_sink_len = cut;
+            sink_flush();
+            memcpy(s_sink_line, carry, rest);
+            s_sink_len = rest;
+        }
+        s_sink_line[s_sink_len++] = c;
+    }
+}
+
 static void js_log_func(void *opaque, const void *buf, size_t buf_len)
 {
-    fwrite(buf, 1, buf_len, stdout);
+    out_write(buf, buf_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -159,9 +210,10 @@ static void arm_watchdog(void)
 static void dump_error(JSContext *ctx)
 {
     JSValue e = JS_GetException(ctx);
-    printf("mqjs: uncaught exception: ");
-    JS_PrintValueF(ctx, e, JS_DUMP_LONG);
-    printf("\n");
+    static const char pfx[] = "mqjs: uncaught exception: ";
+    out_write(pfx, sizeof(pfx) - 1);
+    JS_PrintValueF(ctx, e, JS_DUMP_LONG); /* goes through js_log_func */
+    out_write("\n", 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -172,18 +224,18 @@ JSValue js_print(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     for (int i = 0; i < argc; i++) {
         if (i != 0)
-            putchar(' ');
+            out_write(" ", 1);
         JSValue v = argv[i];
         if (JS_IsString(ctx, v)) {
             JSCStringBuf buf;
             size_t len;
             const char *str = JS_ToCStringLen(ctx, &len, v, &buf);
-            fwrite(str, 1, len, stdout);
+            out_write(str, len);
         } else {
             JS_PrintValueF(ctx, v, JS_DUMP_LONG);
         }
     }
-    putchar('\n');
+    out_write("\n", 1);
     return JS_UNDEFINED;
 }
 

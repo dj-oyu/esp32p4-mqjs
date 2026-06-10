@@ -18,6 +18,7 @@
 #include "mqjs_runtime.h"
 #include "storage.h"
 #include "task_source.h"
+#include "ui_status.h"
 #include "ui_tab5.h"
 #include "wifi.h"
 
@@ -44,14 +45,15 @@ static void js_task(void *arg)
        lengths are tracked explicitly: bytecode tasks contain NULs */
     size_t net_len = 0;
     char *net_script = storage_load_task(&net_len);
+    const char *origin = net_script ? "persisted" : "embedded";
 
     for (;;) {
         const char *src = net_script ? net_script : _binary_task_js_start;
         size_t src_len = net_script ? net_len : strlen(_binary_task_js_start);
+        const char *name = net_script ? "mqtt-task" : "task";
+        ui_status_set_task(name, origin);
         /* fresh context per run: no leaked state between executions */
-        int rc = mqjs_run_script(src, src_len,
-                                 net_script ? "mqtt-task" : "task",
-                                 mem, JS_MEM_SIZE);
+        int rc = mqjs_run_script(src, src_len, name, mem, JS_MEM_SIZE);
 
         size_t next_len = 0;
         char *next = task_source_take(&next_len);
@@ -66,6 +68,7 @@ static void js_task(void *arg)
             free(net_script);
             net_script = next;
             net_len = next_len;
+            origin = "mqtt";
             ESP_LOGI(TAG, "switching to task received over MQTT (%u bytes)",
                      (unsigned)next_len);
         }
@@ -76,6 +79,7 @@ void app_main(void)
 {
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
+    mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     storage_init();            /* mount LittleFS for persisted tasks */
 
     /* network first: blocks up to 30s for an IP, JS runs either way */
@@ -83,6 +87,7 @@ void app_main(void)
         task_source_start();   /* accept replacement tasks over MQTT */
 
     /* the mquickjs VM does not use the C stack for JS frames, but the
-       parser + bindings still need headroom */
-    xTaskCreate(js_task, "mqjs", 16384, NULL, 5, NULL);
+       parser + bindings still need headroom. Pinned to Core 0: the LVGL
+       task lives on Core 1 (see ui_tab5) */
+    xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
 }

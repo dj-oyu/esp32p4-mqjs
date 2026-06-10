@@ -129,7 +129,13 @@ Stamp ビルドには一切影響しない。
   fw 1=ST7121, 3=ST7123)。手元の個体は **ST7123**。ST712x ドライバは
   M5Tab5-UserDemo から vendoring (`components/ui_tab5/vendor/`)
 - 日本語フォント: Noto Sans CJK JP サブセット (`components/ui_tab5/fonts/`,
-  OFL 1.1, 約 1.5MB)。StackChan-dazo と同レシピ (lv_font_conv size20 bpp4)
+  OFL 1.1, 約 1.5MB)。StackChan-dazo と同レシピ (lv_font_conv size20 bpp4)。
+  元 TTF に U+0020 スペースのグリフが無いため、実行時に
+  `fallback = lv_font_montserrat_20` を付けたコピーを使う (ui_font())
+- vendoring: `components/mooncake` (Forairaaaaa/mooncake 572a7e48),
+  `components/smooth_ui_toolkit` (StackChan-dazo 4f4022bb 由来,
+  idf_component.yml で lvgl 依存を追加)、ST712x ドライバ +
+  パネル init テーブル (M5Tab5-UserDemo)
 - アプリが 3MB を超えるため partitions.csv の factory を 6MB に拡張済み。
   **旧レイアウトの実機は一度 `idf.py erase-flash` が必要** (永続化タスクと
   NVS が消える。WiFi 認証情報は sdkconfig 由来なので無傷)

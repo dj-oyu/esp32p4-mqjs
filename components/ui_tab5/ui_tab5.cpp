@@ -42,9 +42,22 @@
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
 
-/* Noto Sans CJK JP subset, fonts/font_noto_jp_20_4.c (compiled as C) */
+/* Noto Sans CJK JP subset, fonts/font_noto_jp_20_4.c (compiled as C).
+ * The hiz8 min TTF it was generated from has no glyph for U+0020 space
+ * (or U+0022) — they render as tofu. ui_font() returns a mutable copy
+ * with Montserrat 20 as fallback to fill the ASCII gaps. */
 extern "C" {
 LV_FONT_DECLARE(font_noto_jp_20_4);
+}
+
+static const lv_font_t *ui_font(void)
+{
+    static lv_font_t jp;
+    if (!jp.line_height) {
+        jp = font_noto_jp_20_4;
+        jp.fallback = &lv_font_montserrat_20;
+    }
+    return &jp;
 }
 
 static const char *TAG = "ui_tab5";
@@ -393,8 +406,8 @@ extern "C" void ui_tab5_start(void)
     lv_obj_t *scr = lv_display_get_screen_active(disp);
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), 0);
     lv_obj_t *label = lv_label_create(scr);
-    lv_obj_set_style_text_font(label, &font_noto_jp_20_4, 0);
-    lv_label_set_text(label, "こんにちは世界 — mqjs Tab5 UI Phase 0");
+    lv_obj_set_style_text_font(label, ui_font(), 0);
+    lv_label_set_text(label, "こんにちは世界 - mqjs Tab5 UI Phase 0");
     lv_obj_set_style_text_color(label, lv_color_hex(0xE0E6EA), 0);
     lv_obj_center(label);
     lvgl_port_unlock();
