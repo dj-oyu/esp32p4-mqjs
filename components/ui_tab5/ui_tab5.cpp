@@ -206,8 +206,8 @@ extern "C" void ui_tab5_log(const char *line, size_t n)
             continue;
         }
         if (c == '\t') {
-            slot[o++] = ' ';
-            if (o < UI_LOG_LINE_STORE)
+            /* 4 spaces: 2 was too easy to mistake for a single space */
+            for (int t = 0; t < 4 && o < UI_LOG_LINE_STORE; t++)
                 slot[o++] = ' ';
             continue;
         }

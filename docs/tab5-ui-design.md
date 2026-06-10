@@ -125,7 +125,7 @@ typedef struct {
   固定長、mutex 保護、古い行から破棄)
 - producer: print sink (js_task 上で呼ばれる → コピーのみで即 return)。
   コピー時に変換: **ANSI SGR カラー → LVGL recolor マークアップ**
-  (16 色パレット、色状態は行を跨いで持続)、\t → スペース 2 個、
+  (16 色パレット、色状態は行を跨いで持続)、\t → スペース 4 個、
   その他の CSI シーケンス/制御文字は除去、'#' はエスケープ
 - consumer: ConsoleApp がフレーム毎に新着行を recolor 付き lv_label へ反映
 - スクロールはタッチでフリック (LVGL 標準のスクロール)、最下部付近に

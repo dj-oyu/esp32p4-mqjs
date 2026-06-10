@@ -23,3 +23,8 @@ CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=46
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=47
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=48
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=42
+
+# Tab5 UI console: break long words anywhere so console lines use the
+# full panel width (default 0 moves whole unbreakable words to the next
+# line, leaving big right-side gaps). Harmless on Stamp (LVGL unlinked).
+CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=6

@@ -5,7 +5,7 @@
 var ESC = "\x1b[";
 var n = 0;
 print(ESC + "33m== コンソール表示テスト ==" + ESC + "0m");
-print("タブ:\tA\tB\tC (2 スペースに展開)");
+print("タブ:\tA\tB\tC (4 スペースに展開)");
 print("記号: # ## %% & @ ! ? ()[]{} ハイフン- スラッシュ/");
 print(ESC + "31m赤 " + ESC + "32m緑 " + ESC + "33m黄 " + ESC + "34m青 " +
       ESC + "35mマゼンタ " + ESC + "36mシアン" + ESC + "0m 標準");
