@@ -560,11 +560,18 @@ static esp_err_t backlight_init(void)
 
 static void backlight_set(int percent)
 {
-    /* at 100% drive the pin constantly high (LEDC: duty == 2^res):
-       even a 4095/4096 PWM beats against the panel refresh and shows
-       as a faint fluorescent-like shimmer (user-reported) */
-    uint32_t duty = (percent >= 100) ? 4096u : (4095u * percent) / 100;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+    /* at 100% park the LEDC output at constant high - no PWM at all:
+       even a 4095/4096 duty beats against the panel refresh and shows
+       as a faint fluorescent-like shimmer (user-reported). NB: writing
+       duty 4096 instead blanks the screen (masked to 0 in the 12-bit
+       register); ledc_stop() with idle_level=1 is the supported way. */
+    if (percent >= 100) {
+        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 1);
+        return;
+    }
+    /* dimming below 100% resumes PWM */
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1,
+                  (4095u * percent) / 100);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
 
