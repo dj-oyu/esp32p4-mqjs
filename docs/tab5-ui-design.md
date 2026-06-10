@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **Phase 0 完了** (2026-06-10)
+Status: **Phase 1 完了** (2026-06-10)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
@@ -186,7 +186,7 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 | Phase | 内容 | 受け入れ基準 |
 |---|---|---|
 | **0. スパイク ✅** (2026-06-10) | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
-| **1. コンソール** | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
+| **1. コンソール ✅** (2026-06-10) | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
 | **2. ui.\* 描画** | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
 | **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
 | **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ | — |
@@ -247,6 +247,34 @@ font_noto_jp_20_4.c (サイズ 20 / bpp4 / 約 1.5MB, OFL) をそのまま
 消えた。WiFi は sdkconfig 由来なので無傷)。画面は横持ちではなく
 **ネイティブ縦 720x1280 のまま** (回転は Phase 1 のレイアウト時に判断、
 §8 のとおり)。
+
+## 9b. Phase 1 実装メモ (2026-06-10 完了)
+
+計画どおり 2 コミットに分割:
+part 1 (`7e7ecb9`) = print sink / 状態フィード / vendoring、
+part 2 = ui_tab5.cpp の画面実装。設計からの逸脱なし。要点:
+
+- **画面の向きはネイティブ縦 720x1280 で確定** (§8 の未決事項)。
+  回転コストゼロで、コンソールには縦が向いている。esp_lvgl_port が
+  起動時に swap_xy 非対応エラーを 1 行出すが無害。
+- レイアウト: ステータスバー 88px (上段 44px = WiFi/MQTT ドット +
+  タスク名、下段 = last_event)、残り全面がコンソール。
+- mooncake は計画どおり抑制的利用: StatusBar (UIAbility, extension
+  manager 側) + ConsoleApp (AppAbility)。`Mooncake::update()` は
+  16ms 周期の lv_timer から呼ぶので、全 LVGL 操作が esp_lvgl_port の
+  ロック内で完結する。
+- smooth_ui_toolkit は AnimateValue を 1 箇所 (新イベント受信時の
+  ハイライトのスプリング減衰) のみ。デフォルトの chrono ティックで
+  そのまま動く。
+- producer 側の不変条件: ui_tab5_log は 20ms タイムアウト付き mutex +
+  memcpy のみ (取れなければ行を捨てる)。js_task が UI に待たされる
+  経路は存在しない。consumer はフレーム毎に最大 16 行をコピーして
+  ロック外で描画。リングに 200 行超溜まったら古い方へ追い付く。
+- コンソールは行毎 lv_label の flex column (上限 200 子、古い行から
+  削除)。最下部 ±24px にいるときだけ追従スクロール。
+- 実機 E2E 確認済み: mqjs_push.py で署名付き push → status トピックに
+  "accepted"、print 出力 (日本語込み) がシリアルに tee され、画面側
+  リングにも流れる (examples/ui_console_test.js)。
 
 ## 10. 次セッションの着手手順 (Phase 0 当時のメモ)
 

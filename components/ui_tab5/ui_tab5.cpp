@@ -1,26 +1,26 @@
 /*
- * Tab5 on-device UI, Phase 0: panel bring-up + LVGL Hello World.
+ * Tab5 on-device UI, Phase 1: status bar + JS console on LVGL.
  *
  * Hardware values mirror the M5Tab5-UserDemo BSP (m5stack_tab5.c):
- *  - 5" 720x1280 MIPI-DSI panel, ILI9881C controller, 2 lanes @730Mbps,
- *    DPI 60MHz RGB565, DPHY powered from on-chip LDO channel 3 @2.5V
+ *  - 5" 720x1280 MIPI-DSI panel, ILI9881C/ST7121/ST7123 controller
+ *    depending on the production lot (detected at boot via the touch
+ *    controller: GT911 -> ILI9881C, 0x55 -> ST712x)
  *  - LCD_RST (P4) and TP_RST (P5) sit on a PI4IOE5V6408 IO expander at
  *    0x43 on the internal I2C bus (SDA=G31 SCL=G32) — the 0x44 expander
  *    (C6 power) is handled separately by main/board_tab5.c
  *  - backlight is LEDC PWM on GPIO22 (12bit @5kHz)
  *
- * Newer Tab5 units ship an ST7123/ST7121 panel instead; the variant is
- * identified by which touch controller answers on I2C (GT911 -> ILI9881C,
- * 0x55 -> ST712x). Only ILI9881C is implemented; ST712x units log an
- * error and the UI stays off (firmware keeps running headless).
- *
- * The LVGL tick/timer task is owned by esp_lvgl_port, pinned to Core 1
- * at low priority so it never starves js_task (Core 0, Phase 1 will pin
- * that side explicitly).
+ * Threading (design doc §2): js_task (Core 0) and the other writers only
+ * touch the mutex-guarded data plane below (line ring + status
+ * snapshot). All LVGL work happens in the esp_lvgl_port task (Core 1,
+ * low priority); an lv_timer drives Mooncake::update(), which runs the
+ * StatusBar/ConsoleApp abilities. Mooncake is lifecycle glue only —
+ * widgets and state live in this file.
  */
 #include "sdkconfig.h"
 #if CONFIG_MQJS_TAB5_UI
 
+#include <memory>
 #include <string.h>
 
 #include "driver/i2c_master.h"
@@ -32,7 +32,11 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+
+#include "core/animation/animate_value/animate_value.hpp"
+#include "mooncake.h"
 
 #include "ui_tab5.h"
 
@@ -61,6 +65,55 @@ static const lv_font_t *ui_font(void)
 }
 
 static const char *TAG = "ui_tab5";
+
+/* ------------------------------------------------------------------ */
+/* Data plane: console line ring + status snapshot                     */
+/* Writers run on js_task (print sink) / wifi / mqtt tasks; the only   */
+/* reader is the LVGL task. No LVGL calls on the writer side, ever.    */
+/* ------------------------------------------------------------------ */
+
+#define UI_LOG_LINES      200
+#define UI_LOG_LINE_BYTES 96 /* the print sink splits lines at 96 bytes */
+
+typedef struct {
+    char text[UI_LOG_LINE_BYTES + 1]; /* NUL-terminated for LVGL */
+} ui_log_line_t;
+
+static ui_log_line_t s_log[UI_LOG_LINES];
+static uint32_t s_log_head; /* total lines ever written (monotonic) */
+static SemaphoreHandle_t s_log_mtx;
+
+static ui_status_t s_status;
+static uint32_t s_status_gen; /* bumped on every snapshot */
+static SemaphoreHandle_t s_status_mtx;
+
+/* print sink, called on js_task: copy into the ring and return. The
+   short timeout (instead of portMAX_DELAY) means a stuck UI task can
+   never stall JS execution; worst case the line is dropped. */
+extern "C" void ui_tab5_log(const char *line, size_t n)
+{
+    if (!s_log_mtx || !line || !n)
+        return;
+    if (n > UI_LOG_LINE_BYTES)
+        n = UI_LOG_LINE_BYTES;
+    if (xSemaphoreTake(s_log_mtx, pdMS_TO_TICKS(20)) != pdTRUE)
+        return;
+    char *slot = s_log[s_log_head % UI_LOG_LINES].text;
+    memcpy(slot, line, n);
+    slot[n] = '\0';
+    s_log_head++;
+    xSemaphoreGive(s_log_mtx);
+}
+
+extern "C" void ui_tab5_set_status(const ui_status_t *st)
+{
+    if (!s_status_mtx || !st)
+        return;
+    xSemaphoreTake(s_status_mtx, portMAX_DELAY);
+    s_status = *st;
+    s_status_gen++;
+    xSemaphoreGive(s_status_mtx);
+}
 
 /*
  * esp-hosted 2.x runs its full transport init from a pre-scheduler C
@@ -359,8 +412,213 @@ static esp_err_t display_init(ui_panel_variant_t variant,
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* UI: StatusBar (UIAbility) + ConsoleApp (AppAbility)                 */
+/* Both run from Mooncake::update() inside the LVGL task, so plain     */
+/* LVGL calls are safe here (the port holds its lock around timers).   */
+/* ------------------------------------------------------------------ */
+
+#define UI_STATUSBAR_H 88
+#define UI_PAD         16
+
+#define UI_COL_BG    0x0B0E11 /* console background */
+#define UI_COL_BAR   0x1A222C /* status bar background */
+#define UI_COL_TEXT  0xC9D1D9
+#define UI_COL_DIM   0x8B98A5 /* task name (secondary info) */
+#define UI_COL_OK    0x2ECC71 /* link-up indicator dots */
+#define UI_COL_DOWN  0x55606B
+#define UI_COL_EVENT 0xFFD479 /* last_event text */
+#define UI_COL_FLASH 0x2E6BD6 /* highlight behind a fresh event */
+
+static lv_obj_t *make_dot(lv_obj_t *parent)
+{
+    lv_obj_t *dot = lv_obj_create(parent);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 14, 14);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(UI_COL_DOWN), 0);
+    return dot;
+}
+
+static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_obj_set_style_text_font(lbl, ui_font(), 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(color), 0);
+    return lbl;
+}
+
+/* Top bar: WiFi/MQTT link dots, current task, last platform event.
+   Reads the status snapshot every frame and only touches widgets when
+   the generation counter moved. */
+class StatusBar : public mooncake::UIAbility {
+public:
+    void onCreate() override
+    {
+        lv_obj_t *bar = lv_obj_create(lv_screen_active());
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_pos(bar, 0, 0);
+        lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(UI_COL_BAR), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *row = lv_obj_create(bar);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_pos(row, 0, 0);
+        lv_obj_set_size(row, UI_LCD_H_RES, 44);
+        lv_obj_set_style_pad_hor(row, UI_PAD, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        _net_dot = make_dot(row);
+        _net_lbl = make_label(row, UI_COL_TEXT);
+        lv_label_set_text(_net_lbl, "WiFi 未接続");
+
+        _mqtt_dot = make_dot(row);
+        _mqtt_lbl = make_label(row, UI_COL_TEXT);
+        lv_label_set_text(_mqtt_lbl, "MQTT");
+
+        lv_obj_t *spacer = lv_obj_create(row);
+        lv_obj_remove_style_all(spacer);
+        lv_obj_set_height(spacer, 1);
+        lv_obj_set_flex_grow(spacer, 1);
+
+        _task_lbl = make_label(row, UI_COL_DIM);
+        lv_label_set_text(_task_lbl, "");
+
+        _event_lbl = make_label(bar, UI_COL_EVENT);
+        lv_obj_set_pos(_event_lbl, UI_PAD, 48);
+        lv_obj_set_width(_event_lbl, UI_LCD_H_RES - 2 * UI_PAD);
+        lv_obj_set_style_pad_hor(_event_lbl, 6, 0);
+        lv_obj_set_style_radius(_event_lbl, 4, 0);
+        lv_obj_set_style_bg_color(_event_lbl, lv_color_hex(UI_COL_FLASH), 0);
+        lv_obj_set_style_bg_opa(_event_lbl, LV_OPA_TRANSP, 0);
+        lv_label_set_text(_event_lbl, "");
+    }
+
+    void onForeground() override
+    {
+        ui_status_t st;
+        xSemaphoreTake(s_status_mtx, portMAX_DELAY);
+        uint32_t gen = s_status_gen;
+        st = s_status;
+        xSemaphoreGive(s_status_mtx);
+
+        if (gen != _seen_gen) {
+            _seen_gen = gen;
+            apply(st);
+        }
+
+        /* fade out the highlight behind a fresh event (spring to 0) */
+        int opa = (int)(float)_flash;
+        if (opa != _flash_opa) {
+            _flash_opa = opa;
+            lv_obj_set_style_bg_opa(_event_lbl, (lv_opa_t)opa, 0);
+        }
+    }
+
+private:
+    void apply(const ui_status_t &st)
+    {
+        lv_obj_set_style_bg_color(
+            _net_dot, lv_color_hex(st.wifi_up ? UI_COL_OK : UI_COL_DOWN), 0);
+        lv_label_set_text_fmt(_net_lbl, "WiFi %s",
+                              st.wifi_up ? (st.ip[0] ? st.ip : "接続中")
+                                         : "未接続");
+        lv_obj_set_style_bg_color(
+            _mqtt_dot, lv_color_hex(st.mqtt_up ? UI_COL_OK : UI_COL_DOWN), 0);
+        if (st.task_name[0])
+            lv_label_set_text_fmt(_task_lbl, "%s (%s)", st.task_name,
+                                  st.task_origin);
+        if (strcmp(_last_event, st.last_event) != 0) {
+            strlcpy(_last_event, st.last_event, sizeof _last_event);
+            lv_label_set_text(_event_lbl, st.last_event);
+            _flash.teleport(LV_OPA_60);
+            _flash.move(0);
+        }
+    }
+
+    lv_obj_t *_net_dot = nullptr, *_net_lbl = nullptr;
+    lv_obj_t *_mqtt_dot = nullptr, *_mqtt_lbl = nullptr;
+    lv_obj_t *_task_lbl = nullptr, *_event_lbl = nullptr;
+    uint32_t _seen_gen = 0;
+    int _flash_opa = -1;
+    char _last_event[sizeof(ui_status_t::last_event)] = "";
+    smooth_ui_toolkit::AnimateValue _flash{0};
+};
+
+/* Scrolling console below the bar: one label per ring line, capped at
+   UI_LOG_LINES children, flick-scrollable. Follows the tail unless the
+   user scrolled up to read history. */
+class ConsoleApp : public mooncake::AppAbility {
+public:
+    ConsoleApp() { setAppInfo().name = "console"; }
+
+    void onCreate() override
+    {
+        _panel = lv_obj_create(lv_screen_active());
+        lv_obj_remove_style_all(_panel);
+        lv_obj_set_pos(_panel, 0, UI_STATUSBAR_H);
+        lv_obj_set_size(_panel, UI_LCD_H_RES, UI_LCD_V_RES - UI_STATUSBAR_H);
+        lv_obj_set_style_bg_color(_panel, lv_color_hex(UI_COL_BG), 0);
+        lv_obj_set_style_bg_opa(_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all(_panel, UI_PAD, 0);
+        lv_obj_set_style_pad_row(_panel, 4, 0);
+        lv_obj_set_flex_flow(_panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_scroll_dir(_panel, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(_panel, LV_SCROLLBAR_MODE_AUTO);
+    }
+
+    void onRunning() override
+    {
+        /* copy under the mutex, draw outside it; the batch bound keeps
+           the producer's worst-case wait tiny. Static: LVGL task only. */
+        static ui_log_line_t batch[16];
+        size_t got = 0;
+        xSemaphoreTake(s_log_mtx, portMAX_DELAY);
+        if (s_log_head - _tail > UI_LOG_LINES)
+            _tail = s_log_head - UI_LOG_LINES; /* ring lapped the reader */
+        while (_tail != s_log_head && got < sizeof batch / sizeof batch[0]) {
+            batch[got++] = s_log[_tail % UI_LOG_LINES];
+            _tail++;
+        }
+        xSemaphoreGive(s_log_mtx);
+        if (!got)
+            return;
+
+        bool follow = lv_obj_get_scroll_bottom(_panel) <= 24;
+        for (size_t i = 0; i < got; i++) {
+            lv_obj_t *lbl = make_label(_panel, UI_COL_TEXT);
+            lv_obj_set_width(lbl, LV_PCT(100));
+            lv_label_set_text(lbl, batch[i].text);
+        }
+        while (lv_obj_get_child_count(_panel) > UI_LOG_LINES)
+            lv_obj_delete(lv_obj_get_child(_panel, 0));
+        if (follow) {
+            lv_obj_update_layout(_panel);
+            lv_obj_scroll_to_y(
+                _panel,
+                lv_obj_get_scroll_y(_panel) + lv_obj_get_scroll_bottom(_panel),
+                LV_ANIM_ON);
+        }
+    }
+
+private:
+    lv_obj_t *_panel = nullptr;
+    uint32_t _tail = 0;
+};
+
 extern "C" void ui_tab5_start(void)
 {
+    /* the data plane must exist before app_main registers the print
+       sink, and must stay usable even if the panel init below fails
+       (ui_tab5_log/set_status no-op while these are NULL) */
+    s_log_mtx = xSemaphoreCreateMutex();
+    s_status_mtx = xSemaphoreCreateMutex();
+
     ui_panel_variant_t variant = panel_reset_and_detect();
     if (variant == UI_PANEL_NONE)
         return;
@@ -401,31 +659,23 @@ extern "C" void ui_tab5_start(void)
         return;
     }
 
-    /* Phase 0 acceptance: a Japanese label on screen */
+    /* Phase 1: status bar + console, driven by mooncake from an
+       lv_timer (i.e. inside the LVGL task, under the port lock) */
     lvgl_port_lock(0);
-    lv_obj_t *scr = lv_display_get_screen_active(disp);
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), 0);
-    lv_obj_t *label = lv_label_create(scr);
-    lv_obj_set_style_text_font(label, ui_font(), 0);
-    lv_label_set_text(label, "こんにちは世界 - mqjs Tab5 UI Phase 0");
-    lv_obj_set_style_text_color(label, lv_color_hex(0xE0E6EA), 0);
-    lv_obj_center(label);
+    lv_obj_set_style_bg_color(lv_display_get_screen_active(disp),
+                              lv_color_hex(UI_COL_BG), 0);
+    auto &mc = mooncake::GetMooncake();
+    mc.createExtension(std::make_unique<StatusBar>());
+    mc.openApp(mc.installApp(std::make_unique<ConsoleApp>()));
+    lv_timer_create([](lv_timer_t *) { mooncake::GetMooncake().update(); },
+                    16, nullptr);
     lvgl_port_unlock();
 
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
-}
 
-/* Phase 1 will route these into the console ring / status snapshot */
-extern "C" void ui_tab5_log(const char *line, size_t n)
-{
-    (void)line;
-    (void)n;
-}
-
-extern "C" void ui_tab5_set_status(const ui_status_t *st)
-{
-    (void)st;
+    static const char greet[] = "mqjs コンソール — JS の print がここに流れます";
+    ui_tab5_log(greet, sizeof greet - 1);
 }
 
 #endif /* CONFIG_MQJS_TAB5_UI */
