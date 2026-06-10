@@ -199,3 +199,63 @@ per-cell `ui.text` は重すぎた (グリフ毎に `lv_draw_label` レイヤを
 - パスワードは ssh.connect の引数として JS ソースに書く想定。タスクは署名付きで
   push される (Ed25519 ゲート) ので配送経路は保護されるが、LittleFS 上の
   task.js は平文。本番運用では公開鍵認証 (T3) に移行すべき。
+
+## 7. 入力・クリップボード・システムパネル設計 (T3a-c + P4、2026-06-11 合意)
+
+ユーザーと詰めた次フェーズの設計。**方針: キーボード/パネルは汎用キートークン源 +
+システム UI(C)、端末や app の意味付けは JS(push 可能)。**
+
+### キートークン規約 (キーボード → JS `ui.onKey`)
+- 印字キー → そのままのバイト ("a", "あ")
+- 特殊キー → `"\x00name"` センチネル (NUL 始まり)。
+  `esc tab ctrl alt fn f1..f12 up down left right home end pgup pgdn del ins copy paste`
+- C 側は「ボタン → トークン」対応を持つだけ。端末の意味は全部 JS で解釈。
+
+### T3a: コントロールバー + 特殊/修飾キー (価値最大、Tab 補完解禁)
+- テキストキーボードの上に端末専用 control bar (`lv_buttonmatrix`):
+  `[Esc][Tab][Ctrl][Alt][Fn][←][↓][↑][→][Copy][Paste]`、Fn で数字↔F1-F12。
+- **修飾キーは one-shot sticky** (押した次の 1 キーだけ効く)。JS の `ui.onKey`
+  状態機械で変換: Ctrl → `c & 0x1F`、Alt → `"\x1b" + c`。Fn キーは xterm
+  シーケンス表を JS が持つ。
+- **Tab 補完はこれだけで使える** (Tab=`\t` をサーバへ送るだけ、補完はサーバ側
+  readline、結果は既存 VT パーサが描画)。受信 `\t` のタブストップ8展開を
+  `feed()` に足すかは任意。
+
+### T3b: コピー&ペースト (ほぼ JS のみ)
+- **クリップボードは型付き・システム共有の C プリミティブ** (層1):
+  `clipboard.set(data, type)` / `clipboard.get()` → `{data, type}` /
+  `clipboard.onChange(fn)`。JS コンテキスト外の C バッファなのでタスク切替を
+  跨いで生存、将来のマルチタスクで全 app が共有 = **アプリ間 IPC の最初の一手**。
+  型 (`text/plain` `text/csv` `application/json` `number` …) で受け手が判別。
+- 選択: `ui.onTouch` に選択モード (ロングプレスでドラッグ開始)。ドラッグ →
+  セル座標、選択セルをハイライト、離したらグリッドモデルから抽出 → clipboard。
+- Paste = `ssh.write(clipboard.get().data)` (対応サーバはブラケットペースト
+  `\x1b[200~`…`\x1b[201~` で囲む)。
+- **MQTT ミラー (層2) は API に焼き込まず外付け** (`clipboard.onChange→mqtt.publish`
+  と `mqtt.subscribe→clipboard.set` を橋渡しする小 app/ランチャー)。retained
+  トピックで永続化 + クロスデバイス共有。echo は sender ID で無視。Phase 4。
+
+### T3c: システム制御/stats パネル (キーボード非表示時に出る、C 所有)
+- ステータスバーと同じシステム UI 層。明るさ/音量はデバイス機能なので C 所有の
+  LVGL パネルが直接ハードを叩く。アプリ (端末) はその上で走る。
+- 内容:
+  - **stats**: `sys.setAppName()` 自己申告のアプリ名 (MQTT トピック = 一意 ID、
+    appName = 人間向け表示名)、`sys.heap()` `sys.psram()` `sys.ssid()`
+    `sys.rssi()` `sys.uptime()` (uptime は performance.now で代用可)。
+  - **クリップボードプレビュー** (型付き、ペースト前確認)。
+  - **明るさダイヤル**: `lv_arc` + 中央 % 表示 + 5% スナップ + `[−][+]` nudge →
+    `backlight_set()` 直結。**実装可** (backlight_set 既存)。
+  - **音量ダイヤル**: 同じ `lv_arc`。ただしオーディオコーデック未駆動なので枠だけ
+    先行、駆動は後続。
+- タッチ精度: 相対ドラッグ + ステップ吸着 + 中央数値 + ± nudge (バーの絶対位置
+  ジャンプを回避)。ダイヤルスタイルは `lv_arc` で確定。
+
+### Phase 4: マルチタスク + ランチャー + app-store (別スコープ・大改修)
+ビジョン: MQTT broker を app-store 化し、複数 mquickjs app をマルチタスク
+(例: SSH + 関数電卓 + CSV 可視化 を同時起動、電卓の結果を SSH 編集に使い、
+SSH で取った CSV を可視化に渡す)。要素:
+- 複数 JS コンテキスト/タスクの同時実行 (今は 1 タスクずつ。メモリ予算 256KB×1
+  を分割 or 動的)。
+- mooncake ランチャーで画面スロット切替 (設計書 §6 の構想)。
+- MQTT トピック = アプリ ID。app-store 化したら topic → manifest(name/icon/権限)。
+- IPC バス = 型付きクリップボード (層2 ミラー) を皮切りにローカル MQTT トピック。
