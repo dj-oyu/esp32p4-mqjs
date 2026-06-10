@@ -199,11 +199,30 @@ python3 tools/mqjs_push.py <ブローカー> <タスクトピック> x.js --raw 
 
 ## Web UI でのタスク配信 (ローカル専用)
 
-```bash
-# WSL で (要 python3-cryptography + gcc)
-python3 tools/mqjs_webui.py            # → http://localhost:8765
-python3 tools/mqjs_webui.py --port 8799 --broker 192.168.1.2 --topic <トピック>
+起動 (Windows のターミナルから WSL 経由で):
+
+```powershell
+wsl python3 tools/mqjs_webui.py --port 8799
+# → ブラウザで http://localhost:8799 (WSL の localhost は Windows に自動転送される)
 ```
+
+WSL 内のシェルからなら `python3 tools/mqjs_webui.py --port 8799`。
+`--broker` / `--topic` で配信先を変更できる (デフォルト:
+broker `192.168.1.2`, トピックは menuconfig のデフォルトと同じ)。
+ポートは衝突しなければ何でもよい (`--port` 省略時 8765)。
+
+前提 (WSL 側): `python3-cryptography` (署名) と `gcc`
+(PC テスト用 run_pc / バイトコードコンパイラを初回起動時に
+`/tmp/mqjs_webui_tools/` へ自動ビルドする)。署名鍵
+`tools/task_signing_key.pem` が無い場合は先に
+`python3 tools/mqjs_keygen.py` を実行しておくこと。
+
+> **なぜ WSL か**: ① run_pc / compile_task のビルドに gcc が必要だが
+> Windows ネイティブには無い (ROM 化 stdlib の PC 用ヘッダ生成も
+> Linux 前提、本 README の「Windows での注意」参照)。② 署名に使う
+> Python の cryptography パッケージがこのマシンでは WSL 側にだけ
+> 入っている。署名+push だけなら Windows でも動くが、PC テストと
+> バイトコード化が WSL 依存なので一本化している。
 
 ブラウザから: examples の読み込み / エディタ / **PC テスト実行**
 (run_pc で 5 秒スモーク) / **バイトコードにコンパイルして送信**
