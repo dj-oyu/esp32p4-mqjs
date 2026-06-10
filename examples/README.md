@@ -23,6 +23,8 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `ui_demo.js` | 不要 (Tab5 画面で確認) | ui.* 描画 API のデモ: アナログ時計 + サイン波の掃引。Stamp では no-op |
 | `touch_demo.js` | 不要 (Tab5 画面で操作) | ui.onTouch のお絵かきデモ: なぞって描く、指を上げると色替え、右上 □ でクリア |
 | `kbd_demo.js` | 不要 (Tab5 画面で操作) | ui.keyboard + ui.onKey + ui.textSize の行エディタ (JS ターミナルの種)。Enter で履歴に確定、タップでキーボード再表示 |
+| `ssh_term.js` | 要 WiFi + sshd (Tab5 画面で操作) | SSH 接続の最小端末 (Phase T1)。印字+改行+BS のみ。HOST/USER/PASS を自分の環境に書き換える |
+| `ssh_vt.js` | 要 WiFi + sshd (Tab5 画面で操作) | SSH ターミナルエミュレータ (Phase T2)。VT100 パーサ + 80x24 グリッド + 16 色。ls --color / vi / top 対応。`SELFTEST=true` で PC パーサ検証 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。
