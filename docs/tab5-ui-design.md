@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **Phase 4a 実装完了** (2026-06-10、ターミナル布石: textSize/keyboard/onKey。実機確認はユーザー操作待ち)
+Status: **Phase 4a 完了・実機確認済み** (2026-06-10、ターミナル布石: textSize/keyboard/onKey。キーボード動作をユーザー確認済み)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
