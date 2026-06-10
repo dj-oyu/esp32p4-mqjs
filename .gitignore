@@ -20,3 +20,6 @@ sdkconfig.old
 *.tmp
 .DS_Store
 Thumbs.db
+
+# IDF component manager downloads (regenerated from main/idf_component.yml)
+managed_components/

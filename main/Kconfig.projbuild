@@ -1,0 +1,14 @@
+menu "mqjs platform"
+
+    config MQJS_WIFI_SSID
+        string "WiFi SSID (empty = WiFi disabled)"
+        default ""
+        help
+            SSID of the access point the Stamp-AddOn C6 should join.
+            Leave empty to skip WiFi bring-up entirely.
+
+    config MQJS_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+
+endmenu

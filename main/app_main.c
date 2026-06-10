@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mqjs_runtime.h"
+#include "wifi.h"
 
 static const char *TAG = "app";
 
@@ -47,6 +48,9 @@ static void js_task(void *arg)
 
 void app_main(void)
 {
+    /* network first: blocks up to 30s for an IP, JS runs either way */
+    wifi_start_and_wait(30000);
+
     /* the mquickjs VM does not use the C stack for JS frames, but the
        parser + bindings still need headroom */
     xTaskCreate(js_task, "mqjs", 16384, NULL, 5, NULL);

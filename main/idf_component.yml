@@ -1,0 +1,4 @@
+dependencies:
+  # WiFi via the Stamp-AddOn C6 (SDIO coprocessor running esp-hosted slave).
+  # esp_wifi_remote forwards the standard esp_wifi_* API to the C6.
+  espressif/esp_wifi_remote: "*"
