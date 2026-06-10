@@ -544,6 +544,13 @@ if (SELFTEST) {
             ssh.write(k);
     });
 
+    /* キーボードの ⌨ アイコン (LVGL の「閉じる」キー) で消えても、画面を
+       タップすれば呼び戻せるようにする (常時表示の保険)。 */
+    ui.onTouch(function (x, y, kind) {
+        if (kind === 0)
+            ui.keyboard(1);
+    });
+
     setInterval(flush, 25); /* ~40fps でダーティ行を消化 */
     ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
 }
