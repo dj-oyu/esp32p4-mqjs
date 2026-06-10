@@ -13,6 +13,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -83,6 +84,11 @@ bool wifi_start_and_wait(uint32_t timeout_ms)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* wall clock for JS Date (and the Tab5 clock demo): background SNTP,
+       syncs whenever the link is up and re-syncs periodically */
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_cfg));
 
     ESP_LOGI(TAG, "connecting to \"%s\"...", CONFIG_MQJS_WIFI_SSID);
     EventBits_t bits = xEventGroupWaitBits(s_evt, GOT_IP_BIT, pdFALSE, pdFALSE,

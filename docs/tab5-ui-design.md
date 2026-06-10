@@ -121,10 +121,15 @@ typedef struct {
 
 ### コンソール
 
-- 行リングバッファ: 200 行 × 96 バイト (固定長、mutex 保護、古い行から破棄)
-- producer: print sink (js_task 上で呼ばれる → memcpy のみで即 return)
-- consumer: ConsoleApp がフレーム毎に新着行を LVGL の textarea/label 群へ反映
-- スクロールはタッチでフリック (LVGL 標準のスクロール)
+- 行リングバッファ: 200 行 × 96 バイト入力 (+recolor マークアップ余白、
+  固定長、mutex 保護、古い行から破棄)
+- producer: print sink (js_task 上で呼ばれる → コピーのみで即 return)。
+  コピー時に変換: **ANSI SGR カラー → LVGL recolor マークアップ**
+  (16 色パレット、色状態は行を跨いで持続)、\t → スペース 2 個、
+  その他の CSI シーケンス/制御文字は除去、'#' はエスケープ
+- consumer: ConsoleApp がフレーム毎に新着行を recolor 付き lv_label へ反映
+- スクロールはタッチでフリック (LVGL 標準のスクロール)、最下部付近に
+  いるときだけ tail-follow
 
 ### 描画コマンドキュー (Phase 2)
 
@@ -189,7 +194,7 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 | **1. コンソール ✅** (2026-06-10) | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
 | **2. ui.\* 描画 ✅** (2026-06-10) | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
 | **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
-| **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ | — |
+| **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ。**JS によるターミナルエミュレータ実装** (ユーザー目標 2026-06-10: ANSI カラー対応はその布石) | — |
 
 各 Phase 完了ごとにコミット。Phase 0/1 は JS API 変更なしなので
 ヘッダ再生成不要。

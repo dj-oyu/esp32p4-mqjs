@@ -21,6 +21,7 @@
 #if CONFIG_MQJS_TAB5_UI
 
 #include <memory>
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
@@ -74,10 +75,11 @@ static const char *TAG = "ui_tab5";
 /* ------------------------------------------------------------------ */
 
 #define UI_LOG_LINES      200
-#define UI_LOG_LINE_BYTES 96 /* the print sink splits lines at 96 bytes */
+#define UI_LOG_LINE_BYTES 96  /* the print sink splits lines at 96 bytes */
+#define UI_LOG_LINE_STORE 168 /* + headroom for LVGL recolor markup     */
 
 typedef struct {
-    char text[UI_LOG_LINE_BYTES + 1]; /* NUL-terminated for LVGL */
+    char text[UI_LOG_LINE_STORE + 2]; /* +closing '#' +NUL */
 } ui_log_line_t;
 
 static ui_log_line_t s_log[UI_LOG_LINES];
@@ -88,21 +90,152 @@ static ui_status_t s_status;
 static uint32_t s_status_gen; /* bumped on every snapshot */
 static SemaphoreHandle_t s_status_mtx;
 
+/* ANSI 16-color palette tuned for the dark console background */
+static const uint32_t ansi_palette[16] = {
+    0x55606B, 0xE05A4E, 0x2ECC71, 0xFFD479, /* 30-33 blk red grn yel */
+    0x4FC3F7, 0xC678DD, 0x56B6C2, 0xC9D1D9, /* 34-37 blu mag cyn wht */
+    0x8B98A5, 0xFF6B5E, 0x4AE38A, 0xFFE08A, /* 90-93 bright          */
+    0x6FD3FF, 0xD898E8, 0x7FD8E0, 0xFFFFFF, /* 94-97                 */
+};
+
+/* SGR parameter list ("31", "0;92", "38;5;196", ...) -> color state.
+   Only foreground colors are mapped (label recolor has no bg);
+   38;5;N / 38;2;r;g;b arguments are consumed but approximated/ignored
+   beyond the 16-color palette. */
+static void sgr_apply(const char *p, uint32_t *color, bool *has_color)
+{
+    int skip = 0;
+    while (*p) {
+        int v = 0;
+        bool any = false;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (*p++ - '0');
+            any = true;
+        }
+        if (*p == ';')
+            p++;
+        if (!any)
+            v = 0;
+        if (skip > 0) {
+            skip--;
+            continue;
+        }
+        if (v == 0 || v == 39)
+            *has_color = false;
+        else if (v >= 30 && v <= 37) {
+            *color = ansi_palette[v - 30];
+            *has_color = true;
+        } else if (v >= 90 && v <= 97) {
+            *color = ansi_palette[v - 90 + 8];
+            *has_color = true;
+        } else if (v == 38 || v == 48) {
+            /* extended color: "5;N" or "2;r;g;b" follows */
+            int mode = 0;
+            while (*p >= '0' && *p <= '9')
+                mode = mode * 10 + (*p++ - '0');
+            if (*p == ';')
+                p++;
+            skip = (mode == 2) ? 3 : 1;
+        }
+        /* bold/underline/bg etc.: ignored */
+    }
+}
+
 /* print sink, called on js_task: copy into the ring and return. The
    short timeout (instead of portMAX_DELAY) means a stuck UI task can
-   never stall JS execution; worst case the line is dropped. */
+   never stall JS execution; worst case the line is dropped.
+
+   Sanitizing/translation on the way in:
+   - ANSI SGR color sequences become LVGL recolor markup
+     ("#RRGGBB text#"); color state persists across lines like a
+     terminal. Other CSI sequences (cursor movement etc.) are skipped.
+   - \t becomes two spaces (no tab glyph, LVGL doesn't expand tabs),
+     other C0 controls are dropped, literal '#' is escaped for recolor.
+   The CSI state survives across calls because the sink may split one
+   logical line at 96 bytes mid-sequence. */
 extern "C" void ui_tab5_log(const char *line, size_t n)
 {
+    /* js_task is the only producer; states are static on purpose */
+    static bool in_csi;
+    static char csi[24];
+    static size_t csi_len;
+    static uint32_t cur_color;
+    static bool has_color;
+
     if (!s_log_mtx || !line || !n)
         return;
-    if (n > UI_LOG_LINE_BYTES)
-        n = UI_LOG_LINE_BYTES;
     if (xSemaphoreTake(s_log_mtx, pdMS_TO_TICKS(20)) != pdTRUE)
         return;
     char *slot = s_log[s_log_head % UI_LOG_LINES].text;
-    memcpy(slot, line, n);
-    slot[n] = '\0';
-    s_log_head++;
+    size_t o = 0;
+    bool span_open = false;
+    if (has_color) { /* color carried over from the previous line */
+        o += snprintf(slot, 12, "#%06X ", (unsigned)cur_color);
+        span_open = true;
+    }
+    for (size_t i = 0; i < n && o < UI_LOG_LINE_STORE; i++) {
+        unsigned char c = (unsigned char)line[i];
+        if (in_csi) {
+            if (c >= 0x40 && c <= 0x7E) { /* final byte */
+                in_csi = false;
+                if (c == 'm') {
+                    csi[csi_len] = '\0';
+                    sgr_apply(csi, &cur_color, &has_color);
+                    if (span_open) {
+                        slot[o++] = '#';
+                        span_open = false;
+                    }
+                    if (has_color && o + 9 <= UI_LOG_LINE_STORE) {
+                        o += snprintf(slot + o, 10, "#%06X ",
+                                      (unsigned)cur_color);
+                        span_open = true;
+                    }
+                }
+            } else if (csi_len < sizeof csi - 1) {
+                csi[csi_len++] = (char)c;
+            }
+            continue;
+        }
+        if (c == 0x1B) {
+            /* ESC [ ... <final>; a lone ESC X just drops both bytes */
+            if (i + 1 < n && line[i + 1] == '[') {
+                in_csi = true;
+                csi_len = 0;
+            }
+            i++;
+            continue;
+        }
+        if (c == '\t') {
+            slot[o++] = ' ';
+            if (o < UI_LOG_LINE_STORE)
+                slot[o++] = ' ';
+            continue;
+        }
+        if (c < 0x20)
+            continue; /* other control chars: no glyph, drop */
+        if (c == '#') { /* recolor is on: escape literal '#' */
+            slot[o++] = '#';
+            if (o < UI_LOG_LINE_STORE)
+                slot[o++] = '#';
+            continue;
+        }
+        slot[o++] = (char)c;
+    }
+    /* expansion can overflow the slot: trim a torn UTF-8 tail */
+    size_t k = o;
+    while (k > 0 && ((unsigned char)slot[k - 1] & 0xC0) == 0x80)
+        k--;
+    if (k > 0 && ((unsigned char)slot[k - 1] & 0x80)) {
+        unsigned char lead = (unsigned char)slot[k - 1];
+        size_t need = (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : 4;
+        if (o - (k - 1) < need)
+            o = k - 1;
+    }
+    if (span_open)
+        slot[o++] = '#'; /* the slot reserves 2 bytes for this + NUL */
+    slot[o] = '\0';
+    if (o)
+        s_log_head++;
     xSemaphoreGive(s_log_mtx);
 }
 
@@ -637,6 +770,8 @@ public:
         for (size_t i = 0; i < got; i++) {
             lv_obj_t *lbl = make_label(_panel, UI_COL_TEXT);
             lv_obj_set_width(lbl, LV_PCT(100));
+            /* the producer translated ANSI SGR into recolor markup */
+            lv_label_set_recolor(lbl, true);
             lv_label_set_text(lbl, batch[i].text);
         }
         while (lv_obj_get_child_count(_panel) > UI_LOG_LINES)
