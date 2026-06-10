@@ -40,6 +40,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
@@ -461,6 +462,170 @@ static void dispatch_gpio_event(JSContext *ctx, const MqjsEvent *ev)
             dump_error(ctx);
         return;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* i2c (synchronous; transactions are sub-ms so they run inline)       */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_I2C_PORTS    2
+#define MQJS_I2C_MAX_READ 32
+
+#ifdef ESP_PLATFORM
+static i2c_master_bus_handle_t s_i2c_bus[MQJS_I2C_PORTS];
+static uint32_t s_i2c_hz[MQJS_I2C_PORTS];
+
+/* buses survive script restarts (like gpio pin config); setup()
+   tears down and recreates the port it is given */
+static int i2c_arg_port(JSContext *ctx, JSValue v, JSValue *err)
+{
+    int port;
+    if (JS_ToInt32(ctx, &port, v)) {
+        *err = JS_EXCEPTION;
+        return -1;
+    }
+    if (port < 0 || port >= MQJS_I2C_PORTS || !s_i2c_bus[port]) {
+        *err = JS_ThrowTypeError(ctx, "i2c port not set up");
+        return -1;
+    }
+    return port;
+}
+#endif
+
+JSValue js_i2c_setup(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int port, sda, scl, hz = 400000;
+    if (JS_ToInt32(ctx, &port, argv[0]) || JS_ToInt32(ctx, &sda, argv[1]) ||
+        JS_ToInt32(ctx, &scl, argv[2]))
+        return JS_EXCEPTION;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && JS_ToInt32(ctx, &hz, argv[3]))
+        return JS_EXCEPTION;
+#ifdef ESP_PLATFORM
+    if (port < 0 || port >= MQJS_I2C_PORTS)
+        return JS_ThrowTypeError(ctx, "bad i2c port");
+    if (s_i2c_bus[port]) {
+        i2c_del_master_bus(s_i2c_bus[port]);
+        s_i2c_bus[port] = NULL;
+    }
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = port,
+        .sda_io_num = sda,
+        .scl_io_num = scl,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    if (i2c_new_master_bus(&cfg, &s_i2c_bus[port]) != ESP_OK)
+        return JS_ThrowInternalError(ctx, "i2c bus init failed");
+    s_i2c_hz[port] = (uint32_t)hz;
+#else
+    printf("[i2c] setup(port=%d, sda=%d, scl=%d, hz=%d) (stub)\n",
+           port, sda, scl, hz);
+#endif
+    return JS_UNDEFINED;
+}
+
+JSValue js_i2c_scan(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSValue arr = JS_NewArray(ctx, 0);
+#ifdef ESP_PLATFORM
+    JSValue err;
+    int port = i2c_arg_port(ctx, argv[0], &err);
+    if (port < 0)
+        return err;
+    int n = 0;
+    for (int addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(s_i2c_bus[port], addr, 20) == ESP_OK)
+            JS_SetPropertyUint32(ctx, arr, n++, JS_NewInt32(ctx, addr));
+    }
+#else
+    printf("[i2c] scan (stub: empty)\n");
+#endif
+    return arr;
+}
+
+#ifdef ESP_PLATFORM
+/* one-shot device handle around a register transaction */
+static esp_err_t i2c_reg_xfer(int port, int addr,
+                              const uint8_t *wr, size_t wrlen,
+                              uint8_t *rd, size_t rdlen)
+{
+    i2c_device_config_t dc = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = (uint16_t)addr,
+        .scl_speed_hz = s_i2c_hz[port],
+    };
+    i2c_master_dev_handle_t dev;
+    esp_err_t e = i2c_master_bus_add_device(s_i2c_bus[port], &dc, &dev);
+    if (e != ESP_OK)
+        return e;
+    if (rdlen)
+        e = i2c_master_transmit_receive(dev, wr, wrlen, rd, rdlen, 100);
+    else
+        e = i2c_master_transmit(dev, wr, wrlen, 100);
+    i2c_master_bus_rm_device(dev);
+    return e;
+}
+#endif
+
+JSValue js_i2c_readReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int addr, reg, n;
+    if (JS_ToInt32(ctx, &addr, argv[1]) || JS_ToInt32(ctx, &reg, argv[2]) ||
+        JS_ToInt32(ctx, &n, argv[3]))
+        return JS_EXCEPTION;
+    if (n < 1 || n > MQJS_I2C_MAX_READ)
+        return JS_ThrowTypeError(ctx, "read length 1..32");
+
+    uint8_t buf[MQJS_I2C_MAX_READ] = { 0 };
+#ifdef ESP_PLATFORM
+    JSValue err;
+    int port = i2c_arg_port(ctx, argv[0], &err);
+    if (port < 0)
+        return err;
+    uint8_t r = (uint8_t)reg;
+    if (i2c_reg_xfer(port, addr, &r, 1, buf, (size_t)n) != ESP_OK)
+        return JS_ThrowInternalError(ctx, "i2c read failed");
+#else
+    printf("[i2c] readReg(addr=0x%02x, reg=0x%02x, n=%d) (stub: zeros)\n",
+           addr, reg, n);
+#endif
+    JSValue arr = JS_NewArray(ctx, 0);
+    for (int i = 0; i < n; i++)
+        JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, buf[i]));
+    return arr;
+}
+
+JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int addr, reg;
+    if (JS_ToInt32(ctx, &addr, argv[1]) || JS_ToInt32(ctx, &reg, argv[2]))
+        return JS_EXCEPTION;
+
+    /* up to 8 data bytes, passed variadically after reg */
+    uint8_t wr[1 + 8];
+    wr[0] = (uint8_t)reg;
+    int nd = 0;
+    for (int i = 3; i < argc && nd < 8; i++, nd++) {
+        int b;
+        if (JS_IsUndefined(argv[i]))
+            break;
+        if (JS_ToInt32(ctx, &b, argv[i]))
+            return JS_EXCEPTION;
+        wr[1 + nd] = (uint8_t)b;
+    }
+#ifdef ESP_PLATFORM
+    JSValue err;
+    int port = i2c_arg_port(ctx, argv[0], &err);
+    if (port < 0)
+        return err;
+    if (i2c_reg_xfer(port, addr, wr, (size_t)(1 + nd), NULL, 0) != ESP_OK)
+        return JS_ThrowInternalError(ctx, "i2c write failed");
+#else
+    printf("[i2c] writeReg(addr=0x%02x, reg=0x%02x, %d data bytes) (stub)\n",
+           addr, reg, nd);
+#endif
+    return JS_UNDEFINED;
 }
 
 /* ------------------------------------------------------------------ */

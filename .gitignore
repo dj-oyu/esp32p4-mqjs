@@ -26,3 +26,4 @@ managed_components/
 
 # Ed25519 task-signing private key (NEVER commit; public key is in main/task_pubkey.h)
 tools/task_signing_key.pem
+sdkconfig.tab5*

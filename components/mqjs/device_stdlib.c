@@ -349,6 +349,18 @@ static const JSPropDef js_gpio[] = {
 static const JSClassDef js_gpio_obj =
     JS_OBJECT_DEF("GPIO", js_gpio);
 
+/* ---- device API: i2c object (synchronous master) ---- */
+static const JSPropDef js_i2c[] = {
+    JS_CFUNC_DEF("setup", 4, js_i2c_setup),
+    JS_CFUNC_DEF("scan", 1, js_i2c_scan),
+    JS_CFUNC_DEF("readReg", 4, js_i2c_readReg),
+    JS_CFUNC_DEF("writeReg", 11, js_i2c_writeReg),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_i2c_obj =
+    JS_OBJECT_DEF("I2C", js_i2c);
+
 /* ---- device API: mqtt object (via esp-mqtt over WiFi) ---- */
 static const JSPropDef js_mqtt[] = {
     JS_CFUNC_DEF("connect", 1, js_mqtt_connect),
@@ -412,6 +424,7 @@ static const JSPropDef js_global_object[] = {
     JS_CFUNC_DEF("print", 1, js_print),
     /* ---- device API (Stamp-P4) ---- */
     JS_PROP_CLASS_DEF("gpio", &js_gpio_obj),
+    JS_PROP_CLASS_DEF("i2c", &js_i2c_obj),
     JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
     JS_CFUNC_DEF("setTimeout", 2, js_setTimeout),
     JS_CFUNC_DEF("setInterval", 2, js_setInterval),

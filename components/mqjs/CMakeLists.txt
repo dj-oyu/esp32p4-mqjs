@@ -14,14 +14,14 @@ set(PREGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
 
 idf_component_register(
-    SRCS "mqjs_runtime.c"
+    SRCS "device_stdlib.c" "mqjs_runtime.c"
          "${MQJS_DIR}/mquickjs.c"
          "${MQJS_DIR}/cutils.c"
          "${MQJS_DIR}/dtoa.c"
          "${MQJS_DIR}/libm.c"
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS "${MQJS_DIR}" "${GEN_DIR}"
-    PRIV_REQUIRES driver esp_driver_gpio esp_timer
+    PRIV_REQUIRES driver esp_driver_gpio esp_driver_i2c esp_timer
 )
 
 # Vendored engine: uint32_t is 'long unsigned int' on riscv32, so the
@@ -30,6 +30,14 @@ idf_component_register(
 set_source_files_properties(
     ${MQJS_DIR}/mquickjs.c ${MQJS_DIR}/cutils.c ${MQJS_DIR}/dtoa.c ${MQJS_DIR}/libm.c
     PROPERTIES COMPILE_OPTIONS "-Wno-format;-Wno-type-limits"
+)
+
+# device_stdlib.c is primarily the HOST generator source (its main() is
+# discarded by --gc-sections in the firmware link); it is in SRCS so the
+# IDE/clangd indexes it. The build-mode macros leave fields uninitialized.
+set_source_files_properties(
+    device_stdlib.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers"
 )
 
 if(CMAKE_HOST_WIN32)

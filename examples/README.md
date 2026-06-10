@@ -18,6 +18,7 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `reaction.js` | LED G2 / ボタン G5 | 反射神経ゲーム。デバウンス・clearTimeout・ステートマシンの実例 |
 | `bench.js` | 不要 | マイクロベンチマーク 7 種 (再帰 / 篩 / 文字列 / Array 高階関数 / libm / JSON / RegExp) |
 | `mqtt_demo.js` | 不要 (要 WiFi) | test.mosquitto.org へ接続し publish→subscribe ループバック。mqtt.* API の実例 |
+| `i2c_scan.js` | I2C デバイス (Tab5 は内蔵) | バススキャン + BMI270 の chip_id 読み出し。i2c.* API の実例 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。
