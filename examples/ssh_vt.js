@@ -5,11 +5,14 @@
  * グリッドに描画する。これで ls --color / vi / top がそれなりに見える。
  *
  * 接続先は下の HOST/USER/PASS を自分の環境に書き換える。
- * pty は組込み wolfSSH の都合で 80x24 固定。画面に入り切らない右端の
- * 桁はクリップされる (横画面化・小フォントは将来)。
+ * pty は組込み wolfSSH の都合で 80x24 固定。Tab5 実機のフォントは
+ * 1 桁 16px なので 720px に約 45 桁しか入らず、右側 (46-80 桁) は
+ * クリップされる。80 桁フルに見せるには横画面化か小フォントが要る (T3)。
  *
- * PC では SELFTEST=true にすると ssh 無しでパーサを検証できる
- * (ui.* は print スタブ、grid をテキストでダンプ)。 */
+ * 検証モード (どちらも committed 版は false):
+ *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
+ *                   (実機なら print は COM8 シリアルに出る → 客観検証)
+ *   REPORT=true   … 実機で色付きデモを画面に流し続ける (SSH 不要・目視用) */
 "use strict";
 
 var HOST = "192.168.1.10";
@@ -17,7 +20,22 @@ var PORT = 22;
 var USER = "user";
 var PASS = "password";
 
-var SELFTEST = false; /* PC でパーサ単体検証するとき true */
+/* 検証フラグ。コメントは必ず 1 行に収める (フラグを sed で書き換えて
+   push するため、複数行コメントだと注入で構文が壊れる)。 */
+var SELFTEST = false; /* PC: DEMO_SCRIPT を流して grid を print ダンプ */
+var REPORT = false;   /* 実機: DEMO_SCRIPT を画面描画し続ける SSH 無しデモ (目視確認用) */
+
+/* パーサ/描画を一通り叩く台本 (clear/home, SGR色, bold, カーソル前進,
+   絶対位置, inverse, autowrap, tab)。SELFTEST と REPORT で共有する。 */
+var DEMO_SCRIPT =
+    "\x1b[2J\x1b[H" +
+    "\x1b[1;34mTab5 VT100\x1b[0m emulator\r\n" +
+    "\x1b[32m$ ls --color\x1b[0m\r\n" +
+    "\x1b[34mdir1\x1b[0m \x1b[1;32mexec\x1b[0m file.txt\r\n" +
+    "move:\x1b[10Cgap10\r\n" +
+    "\x1b[7;1Habs7-1\r\n" +
+    "\x1b[7minverse\x1b[0m bar\r\n" +
+    "tab\there";
 
 /* ---- 画面メトリクス ---- */
 var COLS = 80, ROWS = 24;          /* pty サイズ (固定) */
@@ -385,13 +403,14 @@ function resetTerm() {
     markAll();
 }
 
-/* ---- 描画 (レート制限つきで行ダーティを消化) ---- */
-var MAX_ROWS_PER_TICK = 4;
+/* ---- 描画 (コマンド予算でダーティ行を消化) ---- */
+/* 1 行を描画し、発行した ui コマンド数を返す (flush の予算管理用) */
 function drawRow(r) {
     var y = r * LH;
     var row = rows[r];
     ui.rect(0, y, W, LH, BG);
-    /* 背景ラン */
+    var cmds = 1;
+    /* 背景ラン (デフォルト以外をまとめて矩形) */
     var c = 0;
     while (c < COLS_VIS) {
         var b = row.bg[c];
@@ -399,26 +418,33 @@ function drawRow(r) {
             var c2 = c;
             while (c2 < COLS_VIS && row.bg[c2] === b) c2++;
             ui.rect(c * CW, y, (c2 - c) * CW, LH, colorOf(b, BG));
+            cmds++;
             c = c2;
         } else {
             c++;
         }
     }
-    /* 文字 (空白以外) */
+    /* 文字 (空白以外を 1 セルずつ — 等幅グリッドのため) */
     for (c = 0; c < COLS_VIS; c++) {
         var g = row.ch[c];
-        if (g !== " ")
+        if (g !== " ") {
             ui.text(c * CW, y, g, colorOf(row.fg[c], FG));
+            cmds++;
+        }
     }
+    return cmds;
 }
 
+/* ui コマンドキューは深さ 128。1 tick の発行をその手前で止めれば
+   ドロップ (画面の乱れ) が起きない。行数ではなくコマンド数で律速する
+   ので、文字の少ない行はまとめて、密な行は分割して描ける。 */
+var FLUSH_BUDGET = 110;
 function flush() {
-    var drawn = 0;
-    for (var r = 0; r < ROWS && drawn < MAX_ROWS_PER_TICK; r++) {
+    var budget = FLUSH_BUDGET;
+    for (var r = 0; r < ROWS && budget > 0; r++) {
         if (dirty[r]) {
-            drawRow(r);
+            budget -= drawRow(r);
             dirty[r] = false;
-            drawn++;
         }
     }
     /* カーソル (アンダーライン) */
@@ -439,14 +465,40 @@ function dumpGrid() {
           " rows_vis=" + ROWS_VIS + " cw=" + CW + " lh=" + LH);
 }
 
+/* グリッドを "rN|text" 行の配列に (末尾空白を除く非空行のみ) */
+function gridLines() {
+    var out = [];
+    for (var r = 0; r < ROWS; r++) {
+        var line = rows[r].ch;
+        var e = line.length;
+        while (e > 0 && line[e - 1] === " ") e--;
+        if (e > 0)
+            out.push(("0" + r).slice(-2) + "|" + line.slice(0, e));
+    }
+    return out;
+}
+
 if (SELFTEST) {
-    /* 色 + カーソル移動 + 消去のサンプル */
-    feed("\x1b[2J\x1b[H");
-    feed("hello \x1b[31mred\x1b[0m \x1b[1;32mboldgreen\x1b[0m\r\n");
-    feed("line2\x1b[5Cgap\r\n");
-    feed("\x1b[3;1Hrow3 absolute\r\n");
-    feed("\x1b[7minverse\x1b[0m done");
-    dumpGrid();
+    feed(DEMO_SCRIPT);
+    var lines = gridLines();
+    for (var li = 0; li < lines.length; li++)
+        print(lines[li]);
+    print("END cursor=" + cx + "," + cy + " cols_vis=" + COLS_VIS +
+          " rows_vis=" + ROWS_VIS + " cw=" + CW + " lh=" + LH);
+} else if (REPORT) {
+    /* 実機デモ (SSH/MQTT 不要): 台本を描画し、その後ずっと色付きの行を
+       流してスクロール・カーソル・SGR が画面で動くのを見せる。 */
+    ui.clear(BG);
+    feed(DEMO_SCRIPT);
+    feed("\r\n");
+    setInterval(flush, 25);
+    var tick = 0;
+    setInterval(function () {
+        tick++;
+        var col = 31 + (tick % 7);       /* 色を巡回 */
+        feed("\x1b[" + col + "mline " + tick +
+             "\x1b[0m  scroll/cursor/SGR ok\r\n");
+    }, 500);
 } else {
     ui.clear(BG);
     ui.keyboard(1);
@@ -466,6 +518,6 @@ if (SELFTEST) {
             ssh.write(k);
     });
 
-    setInterval(flush, 33); /* ~30fps でダーティ行を消化 */
+    setInterval(flush, 25); /* ~40fps でダーティ行を消化 */
     ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
 }
