@@ -50,6 +50,7 @@
 /* mqjs public API (extern decl instead of REQUIRES: mqjs already
    depends on this component for ui_tab5.h, same trick as wifi.c) */
 extern "C" void mqjs_post_touch(int x, int y, int kind);
+extern "C" void mqjs_post_key(const char *utf8, size_t len);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -280,6 +281,25 @@ extern "C" void ui_tab5_canvas_size(int *w, int *h)
 {
     *w = s_canvas_w;
     *h = s_canvas_h;
+}
+
+/* Synchronous metric query for the JS terminal-emulator work (Phase 4):
+   ui.textSize() needs an answer, not a queued command. Called on
+   js_task while the LVGL task renders with the same font — fine,
+   because glyph dsc lookup in fmt_txt fonts only reads const tables
+   (no cache in LVGL 9; bitmap decoding, which does touch caches, is
+   never reached by lv_text_get_size). */
+extern "C" void ui_tab5_text_size(const char *utf8, int *w, int *h)
+{
+    *w = 0;
+    *h = 0;
+    if (!s_canvas_w || !utf8)
+        return;
+    lv_point_t size;
+    lv_text_get_size(&size, utf8, ui_font(), 0, 0, LV_COORD_MAX,
+                     LV_TEXT_FLAG_NONE);
+    *w = size.x;
+    *h = size.y;
 }
 
 /*
@@ -915,6 +935,73 @@ private:
     uint32_t _tail = 0;
 };
 
+/* ------------------------------------------------------------------ */
+/* Phase 4: on-screen keyboard (JS terminal groundwork).               */
+/* lv_keyboard overlay on the bottom of the screen, hidden until JS    */
+/* calls ui.keyboard(1). Keys are forwarded to JS as small strings     */
+/* through mqjs_post_key: printable keys verbatim, Enter/OK = "\n",    */
+/* backspace = "\b", arrows = ANSI cursor sequences (terminal food).   */
+/* All of this runs in the LVGL task (queue drain / event callback).   */
+/* ------------------------------------------------------------------ */
+
+#define UI_KB_H 400 /* 4 rows x 100px: comfortable on the 5" panel */
+
+static lv_obj_t *s_kb;
+
+static void kb_show(bool show)
+{
+    if (!show) {
+        if (s_kb)
+            lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (s_kb) {
+        lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_kb);
+        return;
+    }
+    s_kb = lv_keyboard_create(lv_screen_active());
+    /* the default VALUE_CHANGED handler is built for a textarea and
+       switches maps before our callback could read the key, so replace
+       it wholesale: mode switching is redone below via set_mode */
+    lv_obj_remove_event_cb(s_kb, lv_keyboard_def_event_cb);
+    lv_obj_set_size(s_kb, UI_LCD_H_RES, UI_KB_H);
+    lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_text_font(s_kb, ui_font(), 0);
+    lv_obj_add_event_cb(
+        s_kb,
+        [](lv_event_t *e) {
+            lv_obj_t *kb = (lv_obj_t *)lv_event_get_current_target(e);
+            uint32_t id = lv_buttonmatrix_get_selected_button(kb);
+            if (id == LV_BUTTONMATRIX_BUTTON_NONE)
+                return;
+            const char *txt = lv_buttonmatrix_get_button_text(kb, id);
+            if (!txt)
+                return;
+            if (!strcmp(txt, "abc"))
+                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+            else if (!strcmp(txt, "ABC"))
+                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+            else if (!strcmp(txt, "1#"))
+                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_SPECIAL);
+            else if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
+                     !strcmp(txt, LV_SYMBOL_KEYBOARD))
+                kb_show(false);
+            else if (!strcmp(txt, LV_SYMBOL_BACKSPACE))
+                mqjs_post_key("\b", 1);
+            else if (!strcmp(txt, LV_SYMBOL_NEW_LINE) ||
+                     !strcmp(txt, LV_SYMBOL_OK))
+                mqjs_post_key("\n", 1);
+            else if (!strcmp(txt, LV_SYMBOL_LEFT))
+                mqjs_post_key("\x1b[D", 3);
+            else if (!strcmp(txt, LV_SYMBOL_RIGHT))
+                mqjs_post_key("\x1b[C", 3);
+            else
+                mqjs_post_key(txt, strlen(txt));
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 /* Phase 2: JS-drawable canvas over the console area. Hidden until the
    running script issues its first ui.* command; hides again (and
    clears) when a different task takes over, so console-only tasks get
@@ -951,6 +1038,11 @@ public:
         ui_cmd_t cmd;
         bool drew = false;
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+            if (cmd.op == UI_CMD_KEYBOARD) {
+                /* not a drawing op: must not unhide the canvas */
+                kb_show(cmd.x != 0);
+                continue;
+            }
             apply(cmd);
             free(cmd.text);
             drew = true;
@@ -982,6 +1074,7 @@ private:
             memcpy(_origin, to, sizeof _origin);
             fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
             lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+            kb_show(false); /* a new task should not inherit the kb */
         }
     }
 

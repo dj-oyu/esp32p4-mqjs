@@ -162,7 +162,7 @@ typedef struct {
 /* one queue feeds the JS loop; producers are the GPIO ISR and the
    esp-mqtt event task. mqtt strings are heap copies owned by the
    event: the dispatcher (or the drain in reset_slots) frees them. */
-typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH } MqjsEventType;
+typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -170,6 +170,7 @@ typedef struct {
         struct { uint8_t pin; uint8_t level; } gpio;
         struct { char *topic; char *payload; uint32_t len; } mqtt;
         struct { int16_t x, y; uint8_t kind; } touch;
+        struct { char text[8]; uint8_t len; } key; /* one key as UTF-8 */
     } u;
 } MqjsEvent;
 
@@ -186,6 +187,8 @@ static bool      s_mqtt_onconn_used;
 static JSGCRef   s_mqtt_onconn;
 static volatile bool s_touch_used; /* read by the UI task (poster) */
 static JSGCRef   s_touch_cb;
+static volatile bool s_key_used;   /* read by the UI task (poster) */
+static JSGCRef   s_key_cb;
 static volatile bool s_stop_req;
 static int64_t s_run_deadline;          /* JS watchdog */
 
@@ -696,7 +699,7 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 /* mirror of ui_cmd_op_t in ui_tab5.h (not includable on PC) */
 typedef enum {
     UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
-    UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL,
+    UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL, UI_CMD_KEYBOARD,
 } ui_cmd_op_t;
 #endif
 
@@ -717,7 +720,7 @@ static void ui_post(uint8_t op, int x, int y, int w, int h,
         free(text);
 #else
     static const char *names[] =
-        { "clear", "fill", "rect", "line", "text", "pixel" };
+        { "clear", "fill", "rect", "line", "text", "pixel", "keyboard" };
     printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, c=0x%06x%s%s) (stub)\n",
            names[op], x, y, w, h, (unsigned)color,
            text ? ", " : "", text ? text : "");
@@ -733,6 +736,36 @@ JSValue js_ui_size(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #else
     w = 720; /* Tab5 canvas dimensions, so PC runs exercise real code paths */
     h = 1192;
+#endif
+    JSValue arr = JS_NewArray(ctx, 0);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, h));
+    return arr;
+}
+
+/* Pixel size of a string in the canvas font: [w, h]. Synchronous query
+   (not a queued command); [0, 0] without a screen, like ui.size(). The
+   JS terminal uses this to derive its character grid. */
+JSValue js_ui_textSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!str)
+        return JS_EXCEPTION;
+    int w = 0, h = 0;
+#ifdef ESP_PLATFORM
+    ui_tab5_text_size(str, &w, &h);
+#else
+    /* stub: roughly the device font (Noto 20px), halfwidth 10px,
+       fullwidth 20px, one 25px line — keeps grid math exercisable */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if ((c & 0xC0) == 0x80)
+            continue; /* UTF-8 continuation */
+        w += (c < 0x80) ? 10 : 20;
+    }
+    h = 25;
 #endif
     JSValue arr = JS_NewArray(ctx, 0);
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
@@ -864,6 +897,69 @@ static void dispatch_touch_event(JSContext *ctx, const MqjsEvent *ev)
     JS_PushArg(ctx, JS_NULL);                            /* this */
     arm_watchdog();
     JSValue ret = JS_Call(ctx, 3);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+}
+
+/* on-screen keyboard (Phase 4): ui.keyboard(show) toggles the LVGL
+   keyboard overlay; keys arrive via mqjs_post_key as short UTF-8
+   strings ("\n" enter, "\b" backspace, "\x1b[C"/"\x1b[D" arrows) */
+JSValue js_ui_keyboard(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int show = 1;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) &&
+        JS_ToInt32(ctx, &show, argv[0]))
+        return JS_EXCEPTION;
+    ui_post(UI_CMD_KEYBOARD, show ? 1 : 0, 0, 0, 0, 0, NULL);
+    return JS_UNDEFINED;
+}
+
+JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    if (!JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    if (s_key_used)
+        JS_DeleteGCRef(ctx, &s_key_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_key_cb);
+    *pf = argv[0];
+    s_key_used = true;
+#ifndef ESP_PLATFORM
+    printf("[ui] onKey registered (stub: never fires on PC)\n");
+#endif
+    return JS_UNDEFINED;
+}
+
+void mqjs_post_key(const char *utf8, size_t len)
+{
+#ifdef ESP_PLATFORM
+    MqjsEvent ev = { .type = EV_KEY };
+    if (!s_event_queue || !s_key_used || !utf8)
+        return;
+    if (len == 0 || len > sizeof(ev.u.key.text))
+        return;
+    memcpy(ev.u.key.text, utf8, len);
+    ev.u.key.len = (uint8_t)len;
+    xQueueSend(s_event_queue, &ev, 0); /* full queue: drop, never block */
+#else
+    (void)utf8;
+    (void)len;
+#endif
+}
+
+static void dispatch_key_event(JSContext *ctx, const MqjsEvent *ev)
+{
+    if (!s_key_used)
+        return;
+    if (JS_StackCheck(ctx, 3)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.key.text,
+                                    ev->u.key.len));     /* arg0 */
+    JS_PushArg(ctx, s_key_cb.val);                       /* func */
+    JS_PushArg(ctx, JS_NULL);                            /* this */
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 1);
     if (JS_IsException(ret))
         dump_error(ctx);
 }
@@ -1152,6 +1248,8 @@ static bool anything_pending(void)
             return true;
     if (s_touch_used) /* a touch handler keeps the loop alive */
         return true;
+    if (s_key_used)   /* so does a key handler */
+        return true;
 #ifdef ESP_PLATFORM
     if (s_mqtt)   /* active mqtt session keeps the loop alive */
         return true;
@@ -1208,6 +1306,10 @@ static void reset_slots(JSContext *ctx)
         s_touch_used = false; /* before the GCRef dies: gates the poster */
         JS_DeleteGCRef(ctx, &s_touch_cb);
     }
+    if (s_key_used) {
+        s_key_used = false;   /* ditto */
+        JS_DeleteGCRef(ctx, &s_key_cb);
+    }
 }
 
 void mqjs_runtime_stop(void)
@@ -1226,6 +1328,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     memset(s_mqtt_subs, 0, sizeof(s_mqtt_subs));
     s_mqtt_onconn_used = false;
     s_touch_used = false;
+    s_key_used = false;
 
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
@@ -1275,6 +1378,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
             case EV_MQTT_CONNECTED: dispatch_mqtt_connected(ctx);     break;
             case EV_MQTT_DATA:      dispatch_mqtt_data(ctx, &ev);     break;
             case EV_TOUCH:          dispatch_touch_event(ctx, &ev);   break;
+            case EV_KEY:            dispatch_key_event(ctx, &ev);     break;
             }
         }
 #else
@@ -1282,6 +1386,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
         (void)dispatch_mqtt_connected;
         (void)dispatch_mqtt_data;
         (void)dispatch_touch_event;
+        (void)dispatch_key_event;
         if (idle > 0)
             usleep((useconds_t)idle * 1000);
 #endif

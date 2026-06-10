@@ -22,6 +22,7 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `ui_console_test.js` | 不要 (Tab5 画面で確認) | コンソール表示試験: 日本語/長行/タブ/記号/**ANSI カラー** (SGR 16 色、行跨ぎの色持続) |
 | `ui_demo.js` | 不要 (Tab5 画面で確認) | ui.* 描画 API のデモ: アナログ時計 + サイン波の掃引。Stamp では no-op |
 | `touch_demo.js` | 不要 (Tab5 画面で操作) | ui.onTouch のお絵かきデモ: なぞって描く、指を上げると色替え、右上 □ でクリア |
+| `kbd_demo.js` | 不要 (Tab5 画面で操作) | ui.keyboard + ui.onKey + ui.textSize の行エディタ (JS ターミナルの種)。Enter で履歴に確定、タップでキーボード再表示 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。

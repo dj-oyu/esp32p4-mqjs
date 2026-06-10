@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **Phase 3 実装完了** (2026-06-10、タッチ実機確認はユーザー操作待ち)
+Status: **Phase 4a 実装完了** (2026-06-10、ターミナル布石: textSize/keyboard/onKey。実機確認はユーザー操作待ち)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
@@ -196,7 +196,8 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 | **1. コンソール ✅** (2026-06-10) | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
 | **2. ui.\* 描画 ✅** (2026-06-10) | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
 | **3. タッチ ✅** (2026-06-10) | ST7123/GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
-| **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ。**JS によるターミナルエミュレータ実装** (ユーザー目標 2026-06-10: ANSI カラー対応はその布石) | — |
+| **4a. ターミナル布石 ✅** (2026-06-10) | `ui.textSize` (同期メトリクス)、`ui.keyboard` + `ui.onKey` (LVGL オンスクリーンキーボード → EV_KEY)、examples/kbd_demo.js | JS だけで行エディタ (入力・BS・Enter・履歴) が動く |
+| **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ。**JS によるターミナルエミュレータ実装** (ユーザー目標 2026-06-10: ANSI カラー対応・4a の keyboard/metrics はその布石) | — |
 
 各 Phase 完了ごとにコミット。Phase 0/1 は JS API 変更なしなので
 ヘッダ再生成不要。
@@ -338,6 +339,33 @@ part 2 = ui_tab5.cpp の画面実装。設計からの逸脱なし。要点:
   REQUIRES だと循環。wifi.c の esp_hosted_init と同じ流儀)。
 - E2E: touch_demo.js (お絵かき + クリアボタン) を署名 push →
   "accepted"。PC では onTouch は登録のみ (発火しないスタブ)。
+
+## 9e. Phase 4a 実装メモ (2026-06-10)
+
+ターミナルエミュレータ (Phase 4 のユーザー目標) の布石 3 点:
+
+- **`ui.textSize(str)` は同期クエリ** (キュー経由ではない)。js_task から
+  `lv_text_get_size` を直接呼ぶが、fmt_txt フォントのグリフ dsc 参照は
+  const テーブルの読みだけ (LVGL 9 にキャッシュなし、ビットマップ
+  デコードまで到達しない) なので LVGL タスクと競合しない。改行を含むと
+  複数行サイズになる。画面なしは `[0,0]` (ui.size と同じ作法)、PC は
+  近似スタブ (半角 10px/全角 20px/行高 25px)。
+- **オンスクリーンキーボードは lv_keyboard** をそのまま画面下 400px に
+  オーバーレイ (4 段 × 100px)。デフォルトの VALUE_CHANGED ハンドラは
+  textarea 前提でモード切替がこちらのコールバックより先にマップを
+  差し替えてしまう (切替後のマップでボタンテキストを読むと誤キーを
+  拾う) ため、`lv_obj_remove_event_cb` で外して自前ハンドラに置換。
+  モード切替 (abc/ABC/1#) は `lv_keyboard_set_mode` で再実装。
+  ×/⌨ キーは JS に通知せず非表示にするだけ (kbd_demo はタップで再表示)。
+- **キーは EV_KEY (8 バイト UTF-8 値型) で既存キューへ**。
+  `mqjs_post_key()` は touch と同型 (ハンドラ未登録なら投函しない、
+  満杯なら捨てる)。JS への引数は文字列 1 個: 通常キーはそのまま、
+  Enter/OK = "\n"、BS = "\b"、←/→ = "\x1b[D"/"\x1b[C" (ターミナルの
+  カーソルシーケンスをそのまま流せるようにする意図)。`ui.onKey` 登録は
+  onTouch 同様イベントループを生かし続ける。
+- ui.keyboard は UI_CMD_KEYBOARD として描画キューに相乗り (描画 op では
+  ないので CanvasApp を unhide しない)。タスク切替検知でキーボードも
+  自動的に閉じる。ヘッダ再生成 (gen/ + gen_pc/) は WSL で実施済み。
 
 ## 10. 次セッションの着手手順 (Phase 0 当時のメモ)
 

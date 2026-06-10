@@ -42,6 +42,15 @@ void mqjs_set_print_sink(void (*fn)(const char *line, size_t len));
  */
 void mqjs_post_touch(int x, int y, int kind);
 
+/*
+ * Post one on-screen-keyboard key to the JS event loop (callable from
+ * another task, not from an ISR). `utf8` is the key as a short string
+ * (1..8 bytes): printable keys verbatim, "\n" enter, "\b" backspace,
+ * "\x1b[D" / "\x1b[C" cursor left/right. Dropped silently when no
+ * ui.onKey handler is registered or the queue is full.
+ */
+void mqjs_post_key(const char *utf8, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

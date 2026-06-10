@@ -38,6 +38,7 @@ typedef enum {
     UI_CMD_LINE,      /* line from x,y to w,h (endpoint, not size) */
     UI_CMD_TEXT,      /* UTF-8 text at x,y */
     UI_CMD_PIXEL,     /* single pixel at x,y */
+    UI_CMD_KEYBOARD,  /* show (x!=0) / hide (x==0) the on-screen keyboard */
 } ui_cmd_op_t;
 
 typedef struct {
@@ -64,6 +65,10 @@ void ui_tab5_set_status(const ui_status_t *st);
 bool ui_tab5_cmd(const ui_cmd_t *cmd);
 /* Logical canvas resolution; 0x0 when the UI is off or init failed. */
 void ui_tab5_canvas_size(int *w, int *h);
+/* Pixel size of a UTF-8 string in the canvas font (no wrapping; \n makes
+ * it multi-line). 0x0 when the UI is off or init failed. Safe from any
+ * task: only reads const font tables. */
+void ui_tab5_text_size(const char *utf8, int *w, int *h);
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
@@ -81,6 +86,12 @@ static inline bool ui_tab5_cmd(const ui_cmd_t *cmd)
 }
 static inline void ui_tab5_canvas_size(int *w, int *h)
 {
+    *w = 0;
+    *h = 0;
+}
+static inline void ui_tab5_text_size(const char *utf8, int *w, int *h)
+{
+    (void)utf8;
     *w = 0;
     *h = 0;
 }
