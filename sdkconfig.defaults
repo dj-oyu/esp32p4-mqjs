@@ -28,3 +28,8 @@ CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=42
 # full panel width (default 0 moves whole unbreakable words to the next
 # line, leaving big right-side gaps). Harmless on Stamp (LVGL unlinked).
 CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=6
+
+# LVGL allocations from the ESP heap instead of the 64KB builtin pool:
+# 200 console labels (up to 320B text each) exhausted the pool and froze
+# the UI (~line 141 of the console test on hardware).
+CONFIG_LV_USE_CLIB_MALLOC=y

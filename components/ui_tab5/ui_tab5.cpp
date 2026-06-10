@@ -888,7 +888,10 @@ public:
         if (!got)
             return;
 
-        bool follow = lv_obj_get_scroll_bottom(_panel) <= 24;
+        /* tail-follow re-engages within ~4 lines of the bottom: flick
+           momentum usually stops a few dozen px short of the edge, so
+           a tight threshold (24px) never recovered (user-reported) */
+        bool follow = lv_obj_get_scroll_bottom(_panel) <= 100;
         for (size_t i = 0; i < got; i++) {
             lv_obj_t *lbl = make_label(_panel, UI_COL_TEXT);
             lv_obj_set_width(lbl, LV_PCT(100));
