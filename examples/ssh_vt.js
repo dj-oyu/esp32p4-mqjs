@@ -37,15 +37,17 @@ var DEMO_SCRIPT =
     "\x1b[7minverse\x1b[0m bar\r\n" +
     "tab\there";
 
-/* ---- 画面メトリクス ---- */
+/* ---- 画面メトリクス (等幅セルグリッド) ---- */
 var COLS = 80, ROWS = 24;          /* pty サイズ (固定) */
 var sz = ui.size();
 var W = sz[0] || 720, H = sz[1] || 1192;
 var KB_H = 400;
 var VIEW_H = H - KB_H;
-var cell = ui.textSize("M");
-var CW = cell[0] || 10;
-var LH = (cell[1] || 22) + 1;
+/* ui.cells が使う等幅フォントのセル寸法。HackGen 9x24 なので 720/9 = 80 桁
+   ぴったり収まる (もうクリップしない)。 */
+var cell = ui.cellSize();
+var CW = cell[0] || 9;
+var LH = cell[1] || 24;
 var COLS_VIS = Math.min(COLS, (W / CW) | 0);
 var ROWS_VIS = Math.min(ROWS, (VIEW_H / LH) | 0);
 
@@ -129,30 +131,40 @@ function blankCell(r, c) {
     markDirty(r);
 }
 
-/* スクロール領域 [scrollTop, scrollBot] を 1 行上へ */
+/* スクロール領域 [scrollTop, scrollBot] を 1 行上へ。
+   モデル(rows)と表示バッファ(ui.scroll)を同じ向きにずらし、ダーティ
+   フラグも一緒にずらす。これでスクロールは「ui.scroll 1 発 + 空行 1 行」
+   だけになり、全画面再描画が消える (これが重さの主因だった)。 */
 function scrollUp() {
     var first = rows[scrollTop];
-    for (var r = scrollTop; r < scrollBot; r++)
+    for (var r = scrollTop; r < scrollBot; r++) {
         rows[r] = rows[r + 1];
-    /* 使い回しでクリアして最下段へ */
+        dirty[r] = dirty[r + 1];
+        dirtySeq[r] = dirtySeq[r + 1];
+    }
     first.ch = SP;
     first.fg = new Uint8Array(COLS);
     first.bg = new Uint8Array(COLS);
     rows[scrollBot] = first;
-    for (var r2 = scrollTop; r2 <= scrollBot; r2++)
-        markDirty(r2);
+    dirty[scrollBot] = false; /* 空行: バッファも ui.scroll が BG で埋める */
+    dirtySeq[scrollBot] = ++seq;
+    ui.scroll(scrollTop, scrollBot, 1, BG);
 }
 
 function scrollDown() {
     var last = rows[scrollBot];
-    for (var r = scrollBot; r > scrollTop; r--)
+    for (var r = scrollBot; r > scrollTop; r--) {
         rows[r] = rows[r - 1];
+        dirty[r] = dirty[r - 1];
+        dirtySeq[r] = dirtySeq[r - 1];
+    }
     last.ch = SP;
     last.fg = new Uint8Array(COLS);
     last.bg = new Uint8Array(COLS);
     rows[scrollTop] = last;
-    for (var r2 = scrollTop; r2 <= scrollBot; r2++)
-        markDirty(r2);
+    dirty[scrollTop] = false;
+    dirtySeq[scrollTop] = ++seq;
+    ui.scroll(scrollTop, scrollBot, -1, BG);
 }
 
 function lineFeed() {
@@ -413,49 +425,33 @@ function resetTerm() {
     markAll();
 }
 
-/* ---- 描画 (コマンド予算でダーティ行を消化) ---- */
-/* 1 行を描画し、発行した ui コマンド数を返す (flush の予算管理用) */
+/* ---- 描画 (1 行を同色ランに分けて ui.cells で出す) ---- */
+/* 1 行を描画し、発行した ui コマンド数を返す。等幅セルは C 側が
+   グリフを直接ブリットする (lv_draw_label を通さない)。同じ (fg,bg) の
+   連続を 1 回の ui.cells にまとめるので、白文字の行なら 1 行 = 1 コマンド。 */
 function drawRow(r) {
-    var y = r * LH;
     var row = rows[r];
-    ui.rect(0, y, W, LH, BG);
-    var cmds = 1;
-    /* 背景ラン (デフォルト以外をまとめて矩形) */
+    var cmds = 0;
     var c = 0;
     while (c < COLS_VIS) {
-        var b = row.bg[c];
-        if (b !== 0) {
-            var c2 = c;
-            while (c2 < COLS_VIS && row.bg[c2] === b) c2++;
-            ui.rect(c * CW, y, (c2 - c) * CW, LH, colorOf(b, BG));
-            cmds++;
-            c = c2;
-        } else {
-            c++;
-        }
-    }
-    /* 文字 (空白以外を 1 セルずつ — 等幅グリッドのため) */
-    for (c = 0; c < COLS_VIS; c++) {
-        var g = row.ch[c];
-        if (g !== " ") {
-            ui.text(c * CW, y, g, colorOf(row.fg[c], FG));
-            cmds++;
-        }
+        var f = row.fg[c], b = row.bg[c];
+        var c2 = c + 1;
+        while (c2 < COLS_VIS && row.fg[c2] === f && row.bg[c2] === b)
+            c2++;
+        ui.cells(c, r, row.ch.slice(c, c2), colorOf(f, FG), colorOf(b, BG));
+        cmds++;
+        c = c2;
     }
     return cmds;
 }
 
-/* ui コマンドキューは深さ 128。1 tick の発行をその手前で止めれば
-   ドロップ (画面の乱れ) が起きない。スクロールは全行をダーティにする
-   ので 1 tick では描き切れない (全面 ~1100 コマンド / 予算 110)。
-   描き切れない分は「最後にダーティ化した行 = 最新」から優先して描く。
-   下スクロール中は新しい行 (画面下部) が先に最新化され、上の (まもなく
-   流れて消える) 行が遅れる — 古い内容が下部に残る不整合を避けられる。 */
-var FLUSH_BUDGET = 110;
+/* バッファスクロールでスクロールが O(1) になったので、ダーティ行は
+   常に少数。それでも一度に出し過ぎてキュー(128)を溢れさせないよう
+   コマンド予算で律速しつつ、最新ダーティ行 (dirtySeq 最大) から描く。 */
+var FLUSH_BUDGET = 90;
 function flush() {
     var budget = FLUSH_BUDGET;
     while (budget > 0) {
-        /* ダーティ行のうち dirtySeq 最大 (最新) を選ぶ */
         var best = -1, bestSeq = -1;
         for (var r = 0; r < ROWS; r++) {
             if (dirty[r] && dirtySeq[r] > bestSeq) {
@@ -468,7 +464,7 @@ function flush() {
         budget -= drawRow(best);
         dirty[best] = false;
     }
-    /* カーソル (アンダーライン) */
+    /* カーソル (アンダーライン) — 行描画の上に重ねる */
     if (cy < ROWS_VIS && cx < COLS_VIS)
         ui.rect(cx * CW, cy * LH + LH - 3, CW, 2, CURSOR);
 }

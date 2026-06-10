@@ -1,14 +1,20 @@
-This component embeds an LVGL bitmap font generated from Noto Sans CJK JP.
+This component embeds LVGL bitmap fonts generated from open fonts.
 
-Font: Noto Sans CJK JP (subset distribution: hiz8 "Noto-Sans-CJK-JP.min" 3.1.0,
-Regular weight). Noto Sans CJK is licensed under the SIL Open Font License,
-Version 1.1.
+1. font_noto_jp_20_4.c — Noto Sans CJK JP (subset distribution: hiz8
+   "Noto-Sans-CJK-JP.min" 3.1.0, Regular weight). Noto Sans CJK is licensed
+   under the SIL Open Font License, Version 1.1.
+   Copyright 2014-2021 Adobe (https://www.adobe.com/), with Reserved Font Name
+   "Source". Noto is a trademark of Google LLC.
 
-Copyright 2014-2021 Adobe (https://www.adobe.com/), with Reserved Font Name
-"Source". Noto is a trademark of Google LLC.
+2. font_term_mono.c — HackGen Console (yuru7/HackGen v2.10.0, Regular), the
+   monospace terminal-grid font used by ui.cells. HackGen combines Hack
+   (ASCII) and GenJyuuGothic (源柔ゴシック, CJK) and is distributed under the
+   SIL Open Font License, Version 1.1.
+   Copyright the HackGen authors (https://github.com/yuru7/HackGen), Hack
+   (https://github.com/source-foundry/Hack) and the GenJyuuGothic authors.
 
-The generated font_noto_jp_20_4.c is a derivative work (rasterized glyph data)
-of the above font and is therefore also covered by the SIL Open Font License 1.1,
+Both generated .c files are derivative works (rasterized glyph data) of the
+above fonts and are therefore also covered by the SIL Open Font License 1.1,
 reproduced below.
 
 -----------------------------------------------------------

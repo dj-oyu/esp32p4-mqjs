@@ -73,6 +73,28 @@ static const lv_font_t *ui_font(void)
     return &jp;
 }
 
+/* Monospace terminal font (HackGen Console, fonts/font_term_mono.c).
+ * Fixed cell grid for ui.cells/UI_CMD_CELLS: 9px advance (720/9 = 80 cols),
+ * 24px line height. Glyphs are blitted directly (no lv_draw_label) and
+ * clipped to the cell, so the box-drawing overhang (box_w up to 11) tiles
+ * cleanly across cell edges. */
+extern "C" {
+LV_FONT_DECLARE(font_term_mono);
+}
+#define UI_CELL_W 9
+#define UI_CELL_H 24
+
+/* blend fg over bg on RGB565 by a 4-bit alpha (0=bg .. 15=fg) */
+static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
+{
+    int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+    int fr = (fg >> 11) & 0x1F, fgc = (fg >> 5) & 0x3F, fb = fg & 0x1F;
+    int r = br + ((fr - br) * a) / 15;
+    int g = bgc + ((fgc - bgc) * a) / 15;
+    int b = bb + ((fb - bb) * a) / 15;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 static const char *TAG = "ui_tab5";
 
 /* ------------------------------------------------------------------ */
@@ -281,6 +303,12 @@ extern "C" void ui_tab5_canvas_size(int *w, int *h)
 {
     *w = s_canvas_w;
     *h = s_canvas_h;
+}
+
+extern "C" void ui_tab5_cell_size(int *w, int *h)
+{
+    *w = s_canvas_w ? UI_CELL_W : 0;
+    *h = s_canvas_w ? UI_CELL_H : 0;
 }
 
 /* Synchronous metric query for the JS terminal-emulator work (Phase 4):
@@ -1143,6 +1171,122 @@ private:
         lv_canvas_finish_layer(_canvas, &layer);
     }
 
+    /* Blit one monospace glyph, fg blended over whatever bg is already in
+       the cell, clipped to the cell box (no lv_draw_label, no layer). */
+    void blit_glyph(int cx0, int cy0, uint32_t cp, uint16_t fg)
+    {
+        const lv_font_t *font = &font_term_mono;
+        lv_font_glyph_dsc_t g;
+        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
+            return;
+        if (g.box_w == 0 || g.box_h == 0) /* space etc. */
+            return;
+        /* Get the raw A4 bitmap and decode it ourselves. NOTE: the public
+           lv_font_get_glyph_bitmap() force-resets req_raw_bitmap to 0
+           (decoding to A8 into a draw_buf we don't pass -> NULL deref
+           crash). Call the font's method directly so req_raw_bitmap=1
+           sticks and we get the raw glyph_bitmap pointer. Packing is a
+           continuous 4bpp bitstream, MSB nibble first (host-verified in
+           fonts/decode_test.py). */
+        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
+        if (!rf->get_glyph_bitmap)
+            return;
+        g.req_raw_bitmap = 1;
+        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
+        if (!bmp)
+            return;
+        /* fmt_txt 4bpp: rows are padded to `stride` bytes if stride>0, else
+           the glyph is a continuous bitstream (no per-row padding). */
+        const int bpp = 4;
+        int baseline = cy0 + (UI_CELL_H - font->base_line);
+        int gx0 = cx0 + g.ofs_x;
+        int gy0 = baseline - g.ofs_y - g.box_h;
+        int clipR = cx0 + UI_CELL_W, clipB = cy0 + UI_CELL_H;
+        for (int py = 0; py < g.box_h; py++) {
+            int y = gy0 + py;
+            if (y < cy0 || y >= clipB || y < 0 || y >= s_canvas_h)
+                continue;
+            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
+            for (int px = 0; px < g.box_w; px++) {
+                int x = gx0 + px;
+                if (x < cx0 || x >= clipR || x < 0 || x >= s_canvas_w)
+                    continue;
+                int bitpos = rowbit + px * bpp;
+                uint8_t byte = bmp[bitpos >> 3];
+                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
+                if (!a)
+                    continue;
+                size_t idx = (size_t)y * s_canvas_w + x;
+                _buf[idx] = a == 15 ? fg : ui_blend565(_buf[idx], fg, a);
+            }
+        }
+    }
+
+    /* Draw a run of cells (one fg/bg) starting at (col,row) using the
+       monospace grid font. UTF-8 decoded to codepoints. */
+    void cells(const ui_cmd_t &cmd)
+    {
+        if (!cmd.text)
+            return;
+        int col = cmd.x, row = cmd.y;
+        uint16_t fg = lv_color_to_u16(lv_color_hex(cmd.color));
+        uint16_t bg = lv_color_to_u16(lv_color_hex(cmd.bg));
+        const uint8_t *s = (const uint8_t *)cmd.text;
+        int c = col;
+        while (*s) {
+            /* minimal UTF-8 decode */
+            uint32_t cp = *s++;
+            if (cp >= 0xF0 && (s[0] & 0xC0) == 0x80) {
+                cp = ((cp & 0x07) << 18) | ((s[0] & 0x3F) << 12) |
+                     ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+                s += 3;
+            } else if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80) {
+                cp = ((cp & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F);
+                s += 2;
+            } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
+                cp = ((cp & 0x1F) << 6) | (s[0] & 0x3F);
+                s += 1;
+            }
+            int cx0 = c * UI_CELL_W, cy0 = row * UI_CELL_H;
+            fill_rect(cx0, cy0, UI_CELL_W, UI_CELL_H, bg);
+            blit_glyph(cx0, cy0, cp, fg);
+            c++;
+        }
+    }
+
+    /* Scroll cell-rows [top,bot] by n (n>0 up, n<0 down) in the buffer
+       (memmove), filling the vacated rows with `fill`. */
+    void scroll(int top, int bot, int n, uint16_t fill)
+    {
+        if (top < 0) top = 0;
+        if (bot > s_canvas_h / UI_CELL_H - 1) bot = s_canvas_h / UI_CELL_H - 1;
+        if (bot <= top || n == 0)
+            return;
+        int rows = bot - top + 1;
+        int an = n < 0 ? -n : n;
+        if (an >= rows)
+            an = rows; /* whole region cleared */
+        int y_top = top * UI_CELL_H;
+        int move_rows = (rows - an) * UI_CELL_H; /* pixel rows to move */
+        size_t rowbytes = (size_t)s_canvas_w * 2;
+        if (move_rows > 0) {
+            if (n > 0) { /* up: pull lower content toward the top */
+                memmove(_buf + (size_t)y_top * s_canvas_w,
+                        _buf + (size_t)(y_top + an * UI_CELL_H) * s_canvas_w,
+                        (size_t)move_rows * rowbytes);
+            } else { /* down: push content toward the bottom */
+                memmove(_buf + (size_t)(y_top + an * UI_CELL_H) * s_canvas_w,
+                        _buf + (size_t)y_top * s_canvas_w,
+                        (size_t)move_rows * rowbytes);
+            }
+        }
+        /* clear the vacated `an` cell-rows */
+        if (n > 0)
+            fill_rect(0, (bot + 1 - an) * UI_CELL_H, s_canvas_w, an * UI_CELL_H, fill);
+        else
+            fill_rect(0, y_top, s_canvas_w, an * UI_CELL_H, fill);
+    }
+
     void apply(const ui_cmd_t &cmd)
     {
         uint16_t px = lv_color_to_u16(lv_color_hex(cmd.color));
@@ -1162,6 +1306,12 @@ private:
             break;
         case UI_CMD_PIXEL:
             put_pixel(cmd.x, cmd.y, px);
+            break;
+        case UI_CMD_CELLS:
+            cells(cmd);
+            break;
+        case UI_CMD_SCROLL:
+            scroll(cmd.x, cmd.y, cmd.w, px);
             break;
         default:
             break;

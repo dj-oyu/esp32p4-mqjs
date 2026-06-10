@@ -39,14 +39,20 @@ typedef enum {
     UI_CMD_TEXT,      /* UTF-8 text at x,y */
     UI_CMD_PIXEL,     /* single pixel at x,y */
     UI_CMD_KEYBOARD,  /* show (x!=0) / hide (x==0) the on-screen keyboard */
+    UI_CMD_CELLS,     /* monospace run: text at cell (x=col, y=row), color=fg,
+                         bg=bg. Drawn with the terminal grid font (ui.cells). */
+    UI_CMD_SCROLL,    /* scroll cell-rows [x=top, y=bot] by w lines
+                         (w>0 up, w<0 down); vacated rows filled with color */
 } ui_cmd_op_t;
 
 typedef struct {
     uint8_t op;     /* ui_cmd_op_t */
     int16_t x, y;
-    int16_t w, h;   /* RECT: size; LINE: end point; others: unused */
-    uint32_t color; /* 0xRRGGBB */
-    char *text;     /* TEXT only: heap copy. Consumed (freed) by the UI
+    int16_t w, h;   /* RECT: size; LINE: end point; CELLS: unused;
+                       SCROLL: w=lines (signed); others: unused */
+    uint32_t color; /* 0xRRGGBB (CELLS: fg; SCROLL: fill) */
+    uint32_t bg;    /* CELLS: background 0xRRGGBB; others: unused */
+    char *text;     /* TEXT/CELLS only: heap copy. Consumed (freed) by the UI
                        on success; stays owned by the caller when
                        ui_tab5_cmd() returns false. */
 } ui_cmd_t;
@@ -69,6 +75,9 @@ void ui_tab5_canvas_size(int *w, int *h);
  * it multi-line). 0x0 when the UI is off or init failed. Safe from any
  * task: only reads const font tables. */
 void ui_tab5_text_size(const char *utf8, int *w, int *h);
+/* Cell size (advance width, line height) of the monospace terminal font
+ * used by ui.cells/UI_CMD_CELLS. 0x0 when the UI is off. Const tables only. */
+void ui_tab5_cell_size(int *w, int *h);
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
@@ -92,6 +101,11 @@ static inline void ui_tab5_canvas_size(int *w, int *h)
 static inline void ui_tab5_text_size(const char *utf8, int *w, int *h)
 {
     (void)utf8;
+    *w = 0;
+    *h = 0;
+}
+static inline void ui_tab5_cell_size(int *w, int *h)
+{
     *w = 0;
     *h = 0;
 }

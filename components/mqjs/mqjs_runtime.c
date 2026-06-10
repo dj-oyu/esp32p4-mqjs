@@ -708,13 +708,15 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 typedef enum {
     UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
     UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL, UI_CMD_KEYBOARD,
+    UI_CMD_CELLS, UI_CMD_SCROLL,
 } ui_cmd_op_t;
 #endif
 
 /* Post one drawing command. Takes ownership of `text` (heap copy) in
-   every outcome; drops are counted on-screen by the UI itself. */
-static void ui_post(uint8_t op, int x, int y, int w, int h,
-                    uint32_t color, char *text)
+   every outcome; drops are counted on-screen by the UI itself. `bg` is
+   only used by UI_CMD_CELLS (cell background). */
+static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
+                       uint32_t color, uint32_t bg, char *text)
 {
 #ifdef ESP_PLATFORM
     ui_cmd_t c = {
@@ -722,18 +724,26 @@ static void ui_post(uint8_t op, int x, int y, int w, int h,
         .x = (int16_t)x, .y = (int16_t)y,
         .w = (int16_t)w, .h = (int16_t)h,
         .color = color,
+        .bg = bg,
         .text = text,
     };
     if (!ui_tab5_cmd(&c))
         free(text);
 #else
     static const char *names[] =
-        { "clear", "fill", "rect", "line", "text", "pixel", "keyboard" };
-    printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, c=0x%06x%s%s) (stub)\n",
-           names[op], x, y, w, h, (unsigned)color,
+        { "clear", "fill", "rect", "line", "text", "pixel", "keyboard",
+          "cells", "scroll" };
+    printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, fg=0x%06x, bg=0x%06x%s%s) (stub)\n",
+           names[op], x, y, w, h, (unsigned)color, (unsigned)bg,
            text ? ", " : "", text ? text : "");
     free(text);
 #endif
+}
+
+static void ui_post(uint8_t op, int x, int y, int w, int h,
+                    uint32_t color, char *text)
+{
+    ui_post_bg(op, x, y, w, h, color, 0, text);
 }
 
 JSValue js_ui_size(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -779,6 +789,62 @@ JSValue js_ui_textSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
     JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, h));
     return arr;
+}
+
+/* Cell size [w, h] of the monospace terminal-grid font (ui.cells).
+   [0,0] without a screen. The JS terminal derives cols/rows from this. */
+JSValue js_ui_cellSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int w = 0, h = 0;
+#ifdef ESP_PLATFORM
+    ui_tab5_cell_size(&w, &h);
+#else
+    w = 9; /* matches font_term_mono (HackGen size17): 9x24, 80 cols on 720 */
+    h = 24;
+#endif
+    JSValue arr = JS_NewArray(ctx, 0);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, h));
+    return arr;
+}
+
+/* ui.cells(col, row, str, fg, bg): draw a monospace run of cells with a
+   single fg/bg (the JS terminal splits each row into same-color runs). */
+JSValue js_ui_cells(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int col, row, fg = 0xFFFFFF, bg = 0;
+    if (JS_ToInt32(ctx, &col, argv[0]) || JS_ToInt32(ctx, &row, argv[1]))
+        return JS_EXCEPTION;
+    JSCStringBuf buf;
+    size_t len;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[2], &buf);
+    if (!str)
+        return JS_EXCEPTION;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && JS_ToInt32(ctx, &fg, argv[3]))
+        return JS_EXCEPTION;
+    if (argc >= 5 && !JS_IsUndefined(argv[4]) && JS_ToInt32(ctx, &bg, argv[4]))
+        return JS_EXCEPTION;
+    char *copy = malloc(len + 1);
+    if (!copy)
+        return JS_ThrowInternalError(ctx, "out of memory");
+    memcpy(copy, str, len);
+    copy[len] = '\0';
+    ui_post_bg(UI_CMD_CELLS, col, row, 0, 0, (uint32_t)fg, (uint32_t)bg, copy);
+    return JS_UNDEFINED;
+}
+
+/* ui.scroll(top, bot, n[, bg]): scroll cell-rows [top,bot] by n
+   (n>0 up, n<0 down) in the canvas buffer; vacated rows filled with bg. */
+JSValue js_ui_scroll(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int top, bot, n, bg = 0;
+    if (JS_ToInt32(ctx, &top, argv[0]) || JS_ToInt32(ctx, &bot, argv[1]) ||
+        JS_ToInt32(ctx, &n, argv[2]))
+        return JS_EXCEPTION;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && JS_ToInt32(ctx, &bg, argv[3]))
+        return JS_EXCEPTION;
+    ui_post(UI_CMD_SCROLL, top, bot, n, 0, (uint32_t)bg, NULL);
+    return JS_UNDEFINED;
 }
 
 static JSValue ui_fill_op(JSContext *ctx, int argc, JSValue *argv, uint8_t op)
