@@ -11,4 +11,19 @@ menu "mqjs platform"
         string "WiFi password"
         default ""
 
+    config MQJS_TASK_BROKER
+        string "Task source MQTT broker URI"
+        default "mqtt://test.mosquitto.org"
+        help
+            Broker the task-source client connects to for receiving
+            replacement JS tasks.
+
+    config MQJS_TASK_TOPIC
+        string "Task source topic (empty = disabled)"
+        default "esp32p4-mqjs/task/u7q3x9f2"
+        help
+            JS source published to this topic replaces the running task.
+            No signature verification yet: on a public broker the topic
+            name is the only secret, pick a non-guessable one.
+
 endmenu

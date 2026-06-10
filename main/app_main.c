@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mqjs_runtime.h"
+#include "task_source.h"
 #include "wifi.h"
 
 static const char *TAG = "app";
@@ -36,20 +37,38 @@ static void js_task(void *arg)
         vTaskDelete(NULL);
     }
 
+    /* NULL = run the script embedded at build time */
+    char *net_script = NULL;
+
     for (;;) {
+        const char *src = net_script ? net_script : _binary_task_js_start;
         /* fresh context per run: no leaked state between executions */
-        int rc = mqjs_run_script(_binary_task_js_start,
-                                 strlen(_binary_task_js_start),
-                                 "task", mem, JS_MEM_SIZE);
-        ESP_LOGI(TAG, "script ended rc=%d, restarting in 1s", rc);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        int rc = mqjs_run_script(src, strlen(src),
+                                 net_script ? "mqtt-task" : "task",
+                                 mem, JS_MEM_SIZE);
+
+        char *next = task_source_take();
+        if (!next) {
+            ESP_LOGI(TAG, "script ended rc=%d, restarting in 1s", rc);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            /* re-check: a task that arrived during the pause would
+               otherwise wait until the next run stops */
+            next = task_source_take();
+        }
+        if (next) {
+            free(net_script);
+            net_script = next;
+            ESP_LOGI(TAG, "switching to task received over MQTT (%u bytes)",
+                     (unsigned)strlen(next));
+        }
     }
 }
 
 void app_main(void)
 {
     /* network first: blocks up to 30s for an IP, JS runs either way */
-    wifi_start_and_wait(30000);
+    if (wifi_start_and_wait(30000))
+        task_source_start();   /* accept replacement tasks over MQTT */
 
     /* the mquickjs VM does not use the C stack for JS frames, but the
        parser + bindings still need headroom */
