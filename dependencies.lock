@@ -53,6 +53,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.1
+  espressif/mqtt:
+    component_hash: ffdad5659706b4dc14bc63f8eb73ef765efa015bf7e9adf71c813d52a2dc9342
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.0
   espressif/wifi_remote_over_eppp:
     component_hash: 06d8bc15348bbd21f1390daace36ed5adcf6026c93c5b69decc55fa04df2711a
     dependencies:
@@ -73,6 +83,7 @@ dependencies:
     version: 6.0.1
 direct_dependencies:
 - espressif/esp_wifi_remote
-manifest_hash: ab2aa6ae493944fbe6a94aee3217927ca7c15a95b544a6a9f72a613d6b6e3e19
+- espressif/mqtt
+manifest_hash: 3440c69da3349a902a65a06cd7c4def786abdf75418a6041b1d3a77daaeac8c4
 target: esp32p4
 version: 3.0.0

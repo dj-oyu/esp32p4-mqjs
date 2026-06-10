@@ -17,6 +17,7 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `mandelbrot.js` | 不要 | マンデルブロ集合へ 40 フレームの ASCII ズーム。終了後イベントループが自然終了 → タスク再起動でリプレイ |
 | `reaction.js` | LED G2 / ボタン G5 | 反射神経ゲーム。デバウンス・clearTimeout・ステートマシンの実例 |
 | `bench.js` | 不要 | マイクロベンチマーク 7 種 (再帰 / 篩 / 文字列 / Array 高階関数 / libm / JSON / RegExp) |
+| `mqtt_demo.js` | 不要 (要 WiFi) | test.mosquitto.org へ接続し publish→subscribe ループバック。mqtt.* API の実例 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。
@@ -51,7 +52,13 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 - **ウォッチドッグ 5 秒**: トップレベル実行も各コールバックも、1 回の
   JS 実行が 5 秒を超えると `InternalError: interrupted` で中断される。
   重い処理はフレーム分割して setTimeout でつなぐ (mandelbrot.js 方式)。
-- **タイマーは最大 16 本**、GPIO ハンドラは最大 8 本 (1 ピンにつき 1 個)。
+- **タイマーは最大 16 本**、GPIO ハンドラは最大 8 本 (1 ピンにつき 1 個)、
+  MQTT 購読は最大 8 本 (トピックフィルタ 95 文字、ペイロード 4KB まで。
+  フィルタ重複は TypeError)。
+- **mqtt.connect() するとセッションが生きている間イベントループは
+  終了しない** (mqtt.disconnect() で破棄すれば終了要因が消える)。
+  subscribe コールバックは esp-mqtt タスクからキュー経由で JS イベント
+  ループに渡るので、他のコールバックと同じスレッドで直列に走る。
 - **時間粒度は 10 ms** (FreeRTOS 100 Hz tick)。`setInterval(fn, 2)` は
   実質 10 ms になる。ソフト PWM のような µs/ms 精度の用途には使えない
   (そういうものは C 側で RMT 等を使って高レベル API として公開する)。

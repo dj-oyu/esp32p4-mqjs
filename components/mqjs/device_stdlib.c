@@ -349,6 +349,20 @@ static const JSPropDef js_gpio[] = {
 static const JSClassDef js_gpio_obj =
     JS_OBJECT_DEF("GPIO", js_gpio);
 
+/* ---- device API: mqtt object (via esp-mqtt over WiFi) ---- */
+static const JSPropDef js_mqtt[] = {
+    JS_CFUNC_DEF("connect", 1, js_mqtt_connect),
+    JS_CFUNC_DEF("disconnect", 0, js_mqtt_disconnect),
+    JS_CFUNC_DEF("connected", 0, js_mqtt_connected),
+    JS_CFUNC_DEF("onConnect", 1, js_mqtt_onConnect),
+    JS_CFUNC_DEF("publish", 4, js_mqtt_publish),
+    JS_CFUNC_DEF("subscribe", 2, js_mqtt_subscribe),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_mqtt_obj =
+    JS_OBJECT_DEF("MQTT", js_mqtt);
+
 static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("Object", &js_object_class),
     JS_PROP_CLASS_DEF("Function", &js_function_class),
@@ -398,6 +412,7 @@ static const JSPropDef js_global_object[] = {
     JS_CFUNC_DEF("print", 1, js_print),
     /* ---- device API (Stamp-P4) ---- */
     JS_PROP_CLASS_DEF("gpio", &js_gpio_obj),
+    JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
     JS_CFUNC_DEF("setTimeout", 2, js_setTimeout),
     JS_CFUNC_DEF("setInterval", 2, js_setInterval),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),

@@ -24,6 +24,7 @@
  * stdout, onChange registers but never fires).
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -34,22 +35,27 @@
 #include "mqjs_runtime.h"
 
 #ifdef ESP_PLATFORM
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "mqtt_client.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
 #include <unistd.h>
 #endif
 
-#define MQJS_MAX_TIMERS    16
-#define MQJS_MAX_GPIO_CB   8
-#define MQJS_MAX_RUN_MS    5000  /* per JS_Eval / callback watchdog */
-#define MQJS_QUEUE_LEN     32
+#define MQJS_MAX_TIMERS       16
+#define MQJS_MAX_GPIO_CB      8
+#define MQJS_MAX_MQTT_SUB     8
+#define MQJS_MQTT_TOPIC_MAX   96
+#define MQJS_MQTT_PAYLOAD_MAX 4096
+#define MQJS_MAX_RUN_MS       5000  /* per JS_Eval / callback watchdog */
+#define MQJS_QUEUE_LEN        32
 
 /* ------------------------------------------------------------------ */
 /* time / log                                                          */
@@ -97,19 +103,38 @@ typedef struct {
     JSGCRef fn;
 } GpioSlot;
 
+/* one queue feeds the JS loop; producers are the GPIO ISR and the
+   esp-mqtt event task. mqtt strings are heap copies owned by the
+   event: the dispatcher (or the drain in reset_slots) frees them. */
+typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA } MqjsEventType;
+
 typedef struct {
-    uint8_t pin;
-    uint8_t level;
-} GpioEvent;
+    uint8_t type;
+    union {
+        struct { uint8_t pin; uint8_t level; } gpio;
+        struct { char *topic; char *payload; uint32_t len; } mqtt;
+    } u;
+} MqjsEvent;
+
+typedef struct {
+    bool used;
+    char topic[MQJS_MQTT_TOPIC_MAX];
+    JSGCRef fn;
+} MqttSub;
 
 static TimerSlot s_timers[MQJS_MAX_TIMERS];
 static GpioSlot  s_gpio_cb[MQJS_MAX_GPIO_CB];
+static MqttSub   s_mqtt_subs[MQJS_MAX_MQTT_SUB];
+static bool      s_mqtt_onconn_used;
+static JSGCRef   s_mqtt_onconn;
 static volatile bool s_stop_req;
 static int64_t s_run_deadline;          /* JS watchdog */
 
 #ifdef ESP_PLATFORM
-static QueueHandle_t s_gpio_queue;
+static QueueHandle_t s_event_queue;
 static bool s_isr_service_installed;
+static esp_mqtt_client_handle_t s_mqtt;
+static volatile bool s_mqtt_up;         /* broker session established */
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -367,12 +392,15 @@ JSValue js_gpio_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 /* ISR: post to queue only. NEVER call into JS from here. */
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
-    GpioEvent ev = {
-        .pin = (uint8_t)(intptr_t)arg,
-        .level = (uint8_t)gpio_get_level((gpio_num_t)(intptr_t)arg),
+    MqjsEvent ev = {
+        .type = EV_GPIO,
+        .u.gpio = {
+            .pin = (uint8_t)(intptr_t)arg,
+            .level = (uint8_t)gpio_get_level((gpio_num_t)(intptr_t)arg),
+        },
     };
     BaseType_t hp = pdFALSE;
-    xQueueSendFromISR(s_gpio_queue, &ev, &hp);
+    xQueueSendFromISR(s_event_queue, &ev, &hp);
     if (hp)
         portYIELD_FROM_ISR();
 }
@@ -414,25 +442,291 @@ JSValue js_gpio_onChange(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return JS_ThrowInternalError(ctx, "too many gpio handlers");
 }
 
-static void dispatch_gpio_event(JSContext *ctx, const GpioEvent *ev)
+static void dispatch_gpio_event(JSContext *ctx, const MqjsEvent *ev)
 {
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
         GpioSlot *g = &s_gpio_cb[i];
-        if (!g->used || g->pin != ev->pin)
+        if (!g->used || g->pin != ev->u.gpio.pin)
             continue;
         if (JS_StackCheck(ctx, 3)) {
             dump_error(ctx);
             return;
         }
-        JS_PushArg(ctx, JS_NewInt32(ctx, ev->level)); /* arg0 */
-        JS_PushArg(ctx, g->fn.val);                   /* func */
-        JS_PushArg(ctx, JS_NULL);                     /* this */
+        JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.gpio.level)); /* arg0 */
+        JS_PushArg(ctx, g->fn.val);                          /* func */
+        JS_PushArg(ctx, JS_NULL);                            /* this */
         arm_watchdog();
         JSValue ret = JS_Call(ctx, 1);
         if (JS_IsException(ret))
             dump_error(ctx);
         return;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* mqtt (esp-mqtt; PC build = print-only stubs)                        */
+/* ------------------------------------------------------------------ */
+
+/* MQTT topic filter match incl. '+' and '#' wildcards */
+static bool mqtt_topic_match(const char *filter, const char *topic)
+{
+    while (*filter && *topic) {
+        if (*filter == '+') {
+            filter++;
+            while (*topic && *topic != '/')
+                topic++;
+        } else if (*filter == '#') {
+            return true;
+        } else {
+            if (*filter != *topic)
+                return false;
+            filter++;
+            topic++;
+        }
+    }
+    if (*filter == '\0' && *topic == '\0')
+        return true;
+    /* "a/#" also matches "a"; lone trailing '+' matches the empty level */
+    if (filter[0] == '/' && filter[1] == '#' && filter[2] == '\0')
+        return *topic == '\0';
+    if (filter[0] == '#' && filter[1] == '\0')
+        return true;
+    if (filter[0] == '+' && filter[1] == '\0')
+        return *topic == '\0';
+    return false;
+}
+
+#ifdef ESP_PLATFORM
+/* runs in the esp-mqtt task: copy + enqueue only, never touch JS */
+static void mqtt_event_cb(void *arg, esp_event_base_t base,
+                          int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t e = event_data;
+    MqjsEvent ev = { 0 };
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        s_mqtt_up = true;
+        ev.type = EV_MQTT_CONNECTED;
+        xQueueSend(s_event_queue, &ev, 0);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        s_mqtt_up = false;   /* esp-mqtt auto-reconnects */
+        break;
+    case MQTT_EVENT_DATA: {
+        /* fragmented payloads (> internal rx buffer) are not supported */
+        if (e->current_data_offset != 0 || e->data_len != e->total_data_len)
+            break;
+        if (e->topic_len == 0 || e->data_len > MQJS_MQTT_PAYLOAD_MAX)
+            break;
+        char *topic = malloc((size_t)e->topic_len + 1);
+        char *payload = malloc((size_t)e->data_len + 1);
+        if (!topic || !payload) {
+            free(topic);
+            free(payload);
+            break;
+        }
+        memcpy(topic, e->topic, e->topic_len);
+        topic[e->topic_len] = '\0';
+        memcpy(payload, e->data, e->data_len);
+        payload[e->data_len] = '\0';
+        ev.type = EV_MQTT_DATA;
+        ev.u.mqtt.topic = topic;
+        ev.u.mqtt.payload = payload;
+        ev.u.mqtt.len = (uint32_t)e->data_len;
+        if (xQueueSend(s_event_queue, &ev, 0) != pdTRUE) {
+            free(topic);
+            free(payload);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+#endif
+
+JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *uri = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!uri)
+        return JS_EXCEPTION;
+
+#ifdef ESP_PLATFORM
+    if (s_mqtt)
+        return JS_ThrowTypeError(ctx, "mqtt already started");
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = uri,   /* copied by esp_mqtt_client_init */
+    };
+    s_mqtt = esp_mqtt_client_init(&cfg);
+    if (!s_mqtt)
+        return JS_ThrowInternalError(ctx, "mqtt init failed (bad uri?)");
+    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_cb, NULL);
+    if (esp_mqtt_client_start(s_mqtt) != ESP_OK) {
+        esp_mqtt_client_destroy(s_mqtt);
+        s_mqtt = NULL;
+        return JS_ThrowInternalError(ctx, "mqtt start failed");
+    }
+#else
+    printf("[mqtt] connect(%s) (stub)\n", uri);
+#endif
+    return JS_UNDEFINED;
+}
+
+JSValue js_mqtt_disconnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    if (s_mqtt) {
+        esp_mqtt_client_stop(s_mqtt);
+        esp_mqtt_client_destroy(s_mqtt);
+        s_mqtt = NULL;
+        s_mqtt_up = false;
+    }
+#else
+    printf("[mqtt] disconnect (stub)\n");
+#endif
+    return JS_UNDEFINED;
+}
+
+JSValue js_mqtt_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    return JS_NewInt32(ctx, s_mqtt_up ? 1 : 0);
+#else
+    return JS_NewInt32(ctx, 0);
+#endif
+}
+
+JSValue js_mqtt_onConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    if (!JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    if (s_mqtt_onconn_used)
+        JS_DeleteGCRef(ctx, &s_mqtt_onconn);
+    JSValue *pf = JS_AddGCRef(ctx, &s_mqtt_onconn);
+    *pf = argv[0];
+    s_mqtt_onconn_used = true;
+    return JS_UNDEFINED;
+}
+
+JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf tbuf, pbuf;
+    size_t tlen, plen;
+    int qos = 0, retain = 0;
+
+    const char *topic = JS_ToCStringLen(ctx, &tlen, argv[0], &tbuf);
+    if (!topic)
+        return JS_EXCEPTION;
+    const char *payload = JS_ToCStringLen(ctx, &plen, argv[1], &pbuf);
+    if (!payload)
+        return JS_EXCEPTION;
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &qos, argv[2]))
+        return JS_EXCEPTION;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && JS_ToInt32(ctx, &retain, argv[3]))
+        return JS_EXCEPTION;
+
+#ifdef ESP_PLATFORM
+    if (!s_mqtt)
+        return JS_ThrowTypeError(ctx, "mqtt not connected");
+    int id = esp_mqtt_client_publish(s_mqtt, topic, payload, (int)plen,
+                                     qos, retain);
+    return JS_NewInt32(ctx, id);
+#else
+    printf("[mqtt] publish(%s, %s, qos=%d, retain=%d) (stub)\n",
+           topic, payload, qos, retain);
+    return JS_NewInt32(ctx, 0);
+#endif
+}
+
+JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf tbuf;
+    size_t tlen;
+    const char *topic = JS_ToCStringLen(ctx, &tlen, argv[0], &tbuf);
+    if (!topic)
+        return JS_EXCEPTION;
+    if (tlen == 0 || tlen >= MQJS_MQTT_TOPIC_MAX)
+        return JS_ThrowTypeError(ctx, "bad topic length");
+    if (!JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "not a function");
+
+    for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
+        MqttSub *s = &s_mqtt_subs[i];
+        if (s->used && !strcmp(s->topic, topic))
+            return JS_ThrowTypeError(ctx, "topic already subscribed");
+    }
+    for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
+        MqttSub *s = &s_mqtt_subs[i];
+        if (s->used)
+            continue;
+        memcpy(s->topic, topic, tlen + 1);
+        JSValue *pf = JS_AddGCRef(ctx, &s->fn);
+        *pf = argv[1];
+        s->used = true;
+#ifdef ESP_PLATFORM
+        if (s_mqtt && s_mqtt_up)
+            esp_mqtt_client_subscribe(s_mqtt, s->topic, 0);
+        /* not connected yet: dispatch_mqtt_connected() subscribes later */
+#else
+        printf("[mqtt] subscribe(%s) registered (stub: never fires on PC)\n",
+               s->topic);
+#endif
+        return JS_UNDEFINED;
+    }
+    return JS_ThrowInternalError(ctx, "too many mqtt subscriptions");
+}
+
+static void dispatch_mqtt_connected(JSContext *ctx)
+{
+#ifdef ESP_PLATFORM
+    /* (re)subscribe everything on each broker session; duplicate
+       SUBSCRIBE packets are just a refresh for the broker */
+    for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
+        if (s_mqtt_subs[i].used && s_mqtt)
+            esp_mqtt_client_subscribe(s_mqtt, s_mqtt_subs[i].topic, 0);
+    }
+#endif
+    if (!s_mqtt_onconn_used)
+        return;
+    if (JS_StackCheck(ctx, 2)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, s_mqtt_onconn.val);  /* func */
+    JS_PushArg(ctx, JS_NULL);            /* this */
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 0);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+}
+
+static void dispatch_mqtt_data(JSContext *ctx, MqjsEvent *ev)
+{
+    for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
+        MqttSub *s = &s_mqtt_subs[i];
+        if (!s->used || !mqtt_topic_match(s->topic, ev->u.mqtt.topic))
+            continue;
+        if (JS_StackCheck(ctx, 4)) {
+            dump_error(ctx);
+            break;
+        }
+        /* args are pushed in reverse: the last-pushed one becomes arg0 */
+        JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.mqtt.payload,
+                                        ev->u.mqtt.len));                /* arg1 */
+        JS_PushArg(ctx, JS_NewString(ctx, ev->u.mqtt.topic));            /* arg0 */
+        JS_PushArg(ctx, s->fn.val);                                      /* func */
+        JS_PushArg(ctx, JS_NULL);                                        /* this */
+        arm_watchdog();
+        JSValue ret = JS_Call(ctx, 2);
+        if (JS_IsException(ret))
+            dump_error(ctx);
+        /* no break: several filters may match one topic */
+    }
+    free(ev->u.mqtt.topic);
+    free(ev->u.mqtt.payload);
 }
 
 /* ------------------------------------------------------------------ */
@@ -451,6 +745,10 @@ static bool anything_pending(void)
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++)
         if (s_gpio_cb[i].used)
             return true;
+#ifdef ESP_PLATFORM
+    if (s_mqtt)   /* active mqtt session keeps the loop alive */
+        return true;
+#endif
     return false;
 }
 
@@ -471,6 +769,34 @@ static void reset_slots(JSContext *ctx)
             s_gpio_cb[i].used = false;
         }
     }
+#ifdef ESP_PLATFORM
+    /* stop producers first, then drain the queue and free mqtt copies */
+    if (s_mqtt) {
+        esp_mqtt_client_stop(s_mqtt);
+        esp_mqtt_client_destroy(s_mqtt);
+        s_mqtt = NULL;
+        s_mqtt_up = false;
+    }
+    if (s_event_queue) {
+        MqjsEvent ev;
+        while (xQueueReceive(s_event_queue, &ev, 0) == pdTRUE) {
+            if (ev.type == EV_MQTT_DATA) {
+                free(ev.u.mqtt.topic);
+                free(ev.u.mqtt.payload);
+            }
+        }
+    }
+#endif
+    for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
+        if (s_mqtt_subs[i].used) {
+            JS_DeleteGCRef(ctx, &s_mqtt_subs[i].fn);
+            s_mqtt_subs[i].used = false;
+        }
+    }
+    if (s_mqtt_onconn_used) {
+        JS_DeleteGCRef(ctx, &s_mqtt_onconn);
+        s_mqtt_onconn_used = false;
+    }
 }
 
 void mqjs_runtime_stop(void)
@@ -486,10 +812,12 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     s_stop_req = false;
     memset(s_timers, 0, sizeof(s_timers));
     memset(s_gpio_cb, 0, sizeof(s_gpio_cb));
+    memset(s_mqtt_subs, 0, sizeof(s_mqtt_subs));
+    s_mqtt_onconn_used = false;
 
 #ifdef ESP_PLATFORM
-    if (!s_gpio_queue)
-        s_gpio_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(GpioEvent));
+    if (!s_event_queue)
+        s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
 #endif
 
     JSContext *ctx = JS_NewContext(mem_buf, mem_size, &js_stdlib);
@@ -511,11 +839,18 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     while (!s_stop_req && anything_pending()) {
         int idle = run_timers(ctx, 50 /* ms */);
 #ifdef ESP_PLATFORM
-        GpioEvent ev;
-        if (xQueueReceive(s_gpio_queue, &ev, pdMS_TO_TICKS(idle)))
-            dispatch_gpio_event(ctx, &ev);
+        MqjsEvent ev;
+        if (xQueueReceive(s_event_queue, &ev, pdMS_TO_TICKS(idle))) {
+            switch (ev.type) {
+            case EV_GPIO:           dispatch_gpio_event(ctx, &ev);    break;
+            case EV_MQTT_CONNECTED: dispatch_mqtt_connected(ctx);     break;
+            case EV_MQTT_DATA:      dispatch_mqtt_data(ctx, &ev);     break;
+            }
+        }
 #else
-        (void)dispatch_gpio_event;   /* unused in PC build */
+        (void)dispatch_gpio_event;       /* unused in PC build */
+        (void)dispatch_mqtt_connected;
+        (void)dispatch_mqtt_data;
         if (idle > 0)
             usleep((useconds_t)idle * 1000);
 #endif

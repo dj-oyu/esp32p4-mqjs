@@ -1,0 +1,4 @@
+dependencies:
+  # esp-mqtt left IDF core in v6.0; pulled from the component registry.
+  # Declaring it here auto-adds it to this component's requirements.
+  espressif/mqtt: "*"
