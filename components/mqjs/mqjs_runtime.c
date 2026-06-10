@@ -993,7 +993,24 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
 
     /* 1) compile + run top-level (registers callbacks) */
     arm_watchdog();
-    JSValue val = JS_Eval(ctx, src, src_len, name ? name : "<task>", 0);
+    JSValue val;
+    if (JS_IsBytecode((const uint8_t *)src, src_len)) {
+        /* precompiled task: the buffer is patched in place and stays
+           referenced for the whole context lifetime, so it must live in
+           RAM (heap), never in flash. Trusted-source only: the loader
+           does not validate bytecode (Ed25519 gate in task_source.c).
+           Re-relocating the same buffer on a later run is a no-op. */
+        if (JS_RelocateBytecode(ctx, (uint8_t *)src, (uint32_t)src_len)) {
+            printf("mqjs: bytecode relocation failed\n");
+            ret_code = -1;
+            goto done;
+        }
+        val = JS_LoadBytecode(ctx, (const uint8_t *)src);
+        if (!JS_IsException(val))
+            val = JS_Run(ctx, val);
+    } else {
+        val = JS_Eval(ctx, src, src_len, name ? name : "<task>", 0);
+    }
     if (JS_IsException(val)) {
         dump_error(ctx);
         ret_code = -1;

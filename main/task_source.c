@@ -31,6 +31,7 @@ static const char *TAG = "task_src";
 static esp_mqtt_client_handle_t s_cli;
 static SemaphoreHandle_t s_lock;
 static char *s_pending;
+static size_t s_pending_len;
 
 static void publish_status(const char *msg)
 {
@@ -85,6 +86,7 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         free(s_pending);            /* superseded before it ever ran */
         s_pending = (char *)m;
+        s_pending_len = (size_t)mlen;
         xSemaphoreGive(s_lock);
 
         ESP_LOGI(TAG, "verified task accepted (%llu bytes), stopping current script",
@@ -120,13 +122,17 @@ void task_source_start(void)
     esp_mqtt_client_start(s_cli);
 }
 
-char *task_source_take(void)
+char *task_source_take(size_t *len)
 {
-    if (!s_lock)
+    if (!s_lock) {
+        *len = 0;
         return NULL;
+    }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     char *p = s_pending;
+    *len = s_pending_len;
     s_pending = NULL;
+    s_pending_len = 0;
     xSemaphoreGive(s_lock);
     return p;
 }

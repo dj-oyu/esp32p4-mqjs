@@ -39,29 +39,34 @@ static void js_task(void *arg)
         vTaskDelete(NULL);
     }
 
-    /* a previously verified+persisted task takes over the embedded one */
-    char *net_script = storage_load_task();
+    /* a previously verified+persisted task takes over the embedded one.
+       lengths are tracked explicitly: bytecode tasks contain NULs */
+    size_t net_len = 0;
+    char *net_script = storage_load_task(&net_len);
 
     for (;;) {
         const char *src = net_script ? net_script : _binary_task_js_start;
+        size_t src_len = net_script ? net_len : strlen(_binary_task_js_start);
         /* fresh context per run: no leaked state between executions */
-        int rc = mqjs_run_script(src, strlen(src),
+        int rc = mqjs_run_script(src, src_len,
                                  net_script ? "mqtt-task" : "task",
                                  mem, JS_MEM_SIZE);
 
-        char *next = task_source_take();
+        size_t next_len = 0;
+        char *next = task_source_take(&next_len);
         if (!next) {
             ESP_LOGI(TAG, "script ended rc=%d, restarting in 1s", rc);
             vTaskDelay(pdMS_TO_TICKS(1000));
             /* re-check: a task that arrived during the pause would
                otherwise wait until the next run stops */
-            next = task_source_take();
+            next = task_source_take(&next_len);
         }
         if (next) {
             free(net_script);
             net_script = next;
+            net_len = next_len;
             ESP_LOGI(TAG, "switching to task received over MQTT (%u bytes)",
-                     (unsigned)strlen(next));
+                     (unsigned)next_len);
         }
     }
 }

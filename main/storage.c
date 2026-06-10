@@ -35,8 +35,9 @@ bool storage_init(void)
     return true;
 }
 
-char *storage_load_task(void)
+char *storage_load_task(size_t *len)
 {
+    *len = 0;
     if (!s_mounted)
         return NULL;
     FILE *f = fopen(TASK_PATH, "rb");
@@ -58,6 +59,7 @@ char *storage_load_task(void)
     size_t rd = fread(buf, 1, (size_t)n, f);
     fclose(f);
     buf[rd] = '\0';
+    *len = rd;
     ESP_LOGI(TAG, "loaded persisted task (%zu bytes)", rd);
     return buf;
 }
