@@ -4,3 +4,5 @@ dependencies:
   espressif/esp_wifi_remote: "*"
   # esp-mqtt (out of IDF core since v6.0) for the task-source receiver
   espressif/mqtt: "*"
+  # LittleFS for persisting verified tasks across power cycles
+  joltwallet/littlefs: "*"

@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mqjs_runtime.h"
+#include "storage.h"
 #include "task_source.h"
 #include "wifi.h"
 
@@ -37,8 +38,8 @@ static void js_task(void *arg)
         vTaskDelete(NULL);
     }
 
-    /* NULL = run the script embedded at build time */
-    char *net_script = NULL;
+    /* a previously verified+persisted task takes over the embedded one */
+    char *net_script = storage_load_task();
 
     for (;;) {
         const char *src = net_script ? net_script : _binary_task_js_start;
@@ -66,6 +67,8 @@ static void js_task(void *arg)
 
 void app_main(void)
 {
+    storage_init();            /* mount LittleFS for persisted tasks */
+
     /* network first: blocks up to 30s for an IP, JS runs either way */
     if (wifi_start_and_wait(30000))
         task_source_start();   /* accept replacement tasks over MQTT */

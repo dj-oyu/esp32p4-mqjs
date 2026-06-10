@@ -1,0 +1,7 @@
+# ESP32-P4 / 16MB flash. Custom table to add a LittleFS "storage" data
+# partition for persisting the most recently verified JS task.
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x6000
+phy_init,   data, phy,      0xf000,   0x1000
+factory,    app,  factory,  0x10000,  0x300000
+storage,    data, littlefs, ,         0x100000

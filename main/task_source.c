@@ -1,10 +1,13 @@
 /*
  * Receive replacement JS tasks over MQTT (see task_source.h).
  *
- * SECURITY: there is no signature verification yet (roadmap: Ed25519 +
- * trusted source). Anyone who can publish to the topic runs code on the
- * device, so on a public broker the topic name is the only secret.
- * The JS watchdog still bounds what a hostile script can do per run.
+ * Payload wire format: Ed25519 signature(64 bytes) || JS source. Only
+ * payloads that verify against the firmware's embedded public key
+ * (task_pubkey.h) are accepted; verified tasks are persisted to LittleFS
+ * and replace the running script. The JS watchdog still bounds each run.
+ *
+ * SECURITY: flash is trusted - a persisted task is not re-verified on
+ * boot. Key rotation requires re-flashing (regenerate task_pubkey.h).
  */
 #include <stdlib.h>
 #include <string.h>
@@ -14,10 +17,14 @@
 #include "mqtt_client.h"
 #include "sdkconfig.h"
 #include "mqjs_runtime.h"
+#include "storage.h"
+#include "task_pubkey.h"
 #include "task_source.h"
+#include "tweetnacl.h"
 
+#define SIG_LEN        64
 #define MAX_SCRIPT_LEN (64 * 1024)
-#define RX_BUF_SIZE    (32 * 1024)   /* scripts must fit in one packet */
+#define RX_BUF_SIZE    (32 * 1024)   /* sig+script must fit in one packet */
 
 static const char *TAG = "task_src";
 
@@ -44,28 +51,44 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 
     case MQTT_EVENT_DATA: {
         if (e->current_data_offset != 0 || e->data_len != e->total_data_len) {
-            ESP_LOGW(TAG, "script does not fit the rx buffer (%d bytes), ignored",
+            ESP_LOGW(TAG, "payload does not fit the rx buffer (%d bytes), ignored",
                      e->total_data_len);
             publish_status("error: too large");
             break;
         }
-        if (e->data_len == 0 || e->data_len > MAX_SCRIPT_LEN)
+        size_t n = (size_t)e->data_len;
+        if (n <= SIG_LEN || n > MAX_SCRIPT_LEN) {
+            publish_status("error: bad length");
             break;
-        char *buf = malloc((size_t)e->data_len + 1);
-        if (!buf) {
+        }
+
+        /* crypto_sign_open writes the message into a buffer of size n;
+           the recovered script is its first (n - 64) bytes. */
+        unsigned char *m = malloc(n + 1);
+        if (!m) {
             publish_status("error: no memory");
             break;
         }
-        memcpy(buf, e->data, e->data_len);
-        buf[e->data_len] = '\0';
+        unsigned long long mlen = 0;
+        int rc = crypto_sign_open(m, &mlen, (const unsigned char *)e->data,
+                                  n, MQJS_TASK_PUBKEY);
+        if (rc != 0) {
+            free(m);
+            ESP_LOGW(TAG, "signature verification failed, rejected");
+            publish_status("error: bad signature");
+            break;
+        }
+        m[mlen] = '\0';
+
+        storage_save_task((const char *)m, (size_t)mlen);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
         free(s_pending);            /* superseded before it ever ran */
-        s_pending = buf;
+        s_pending = (char *)m;
         xSemaphoreGive(s_lock);
 
-        ESP_LOGI(TAG, "new task received (%d bytes), stopping current script",
-                 e->data_len);
+        ESP_LOGI(TAG, "verified task accepted (%llu bytes), stopping current script",
+                 mlen);
         publish_status("accepted");
         mqjs_runtime_stop();
         break;
@@ -85,6 +108,8 @@ void task_source_start(void)
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = CONFIG_MQJS_TASK_BROKER,
         .buffer.size = RX_BUF_SIZE,
+        /* Ed25519 verify runs in the mqtt event task; give it headroom */
+        .task.stack_size = 8192,
     };
     s_cli = esp_mqtt_client_init(&cfg);
     if (!s_cli) {

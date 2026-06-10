@@ -12,6 +12,7 @@ endif()
 # the source script changes.
 configure_file(${MQJS_SCRIPT_PATH} ${CMAKE_CURRENT_BINARY_DIR}/task.js COPYONLY)
 
-idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c"
+idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                        PRIV_REQUIRES mqjs nvs_flash esp_wifi esp_netif esp_event
+                                     tweetnacl
                        EMBED_TXTFILES ${CMAKE_CURRENT_BINARY_DIR}/task.js)
