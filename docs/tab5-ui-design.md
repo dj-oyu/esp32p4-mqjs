@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **設計確定・実装前** (2026-06-10)
+Status: **Phase 0 完了** (2026-06-10)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
@@ -185,7 +185,7 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 
 | Phase | 内容 | 受け入れ基準 |
 |---|---|---|
-| **0. スパイク** | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
+| **0. スパイク ✅** (2026-06-10) | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
 | **1. コンソール** | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
 | **2. ui.\* 描画** | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
 | **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
@@ -211,7 +211,44 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 - StatusBar と Console/Canvas の画面分割比率
 - mooncake / smooth_ui_toolkit の固定コミット (vendoring 時に記録)
 
-## 9. 次セッションの着手手順 (Phase 0)
+## 9. Phase 0 実装メモ (2026-06-10 完了)
+
+実装は計画どおり components/ui_tab5 (C++, `CONFIG_MQJS_TAB5_UI`) に封印。
+ハマりどころが 2 つあった:
+
+1. **このリポジトリの Tab5 は ST7123 パネル個体** (新しめのロット)。
+   UserDemo と同じ方法でタッチコントローラから変種判定する:
+   GT911 応答 → ILI9881C、0x55 応答 → fw レジスタ 0x0000 が 1 なら
+   ST7121 / 3 なら ST7123。3 変種とも実装済み (ILI9881C/GT911 個体は
+   未実機検証)。ST7123/ST7121 ドライバは UserDemo から vendoring
+   (`components/ui_tab5/vendor/`, Apache-2.0)。パネル init テーブルは
+   `ili9881_init_data.inc` / `st7123_init_data.inc` (M5Stack MIT)。
+   **Phase 3 への影響: タッチも GT911 ではなく ST7123 (I2C 0x55)。**
+   esp_lcd_touch_gt911 ではなく ST7123 タッチドライバが必要
+   (UserDemo の bsp_touch_new 参照)。
+2. **esp-hosted 2.x は pre-scheduler のコンストラクタで全トランス
+   ポートを初期化する** (`port_esp_hosted_host_init.c` の
+   `__attribute__((constructor))`)。その時点のヒープは PSRAM 登録前・
+   内部 DMA RAM ~110KB しかなく、SDIO mempool 2 本で ~90KB 食う。
+   UI の .bss (~50KB) を足しただけで枯渇し
+   `assert failed: sdio_mempool_create (buf_mp_g)` のブートループに
+   なった。対策: ui_tab5 が `-Wl,--wrap=esp_hosted_init` でコンスト
+   ラクタ時の呼び出しを no-op 化し、wifi.c が起動後に本物を呼ぶ
+   (esp_hosted_init は冪等)。C6 の電源ゲート (board_tab5_power_init)
+   より後に初期化される副次効果もあり、こちらの方が本来正しい順序。
+
+その他: IDF 6 で esp_lcd の DPI 設定が `pixel_format` →
+`in_color_format`/`out_color_format` に、dma2d がフラグ →
+`esp_lcd_dpi_panel_enable_dma2d()` に変わった以外、LVGL9 +
+esp_lvgl_port 2.8 + esp_lcd_ili9881c 1.1 は IDF 6.0.1 でそのまま通った
+(§7 の最大リスクは杞憂だった)。jp_font は StackChan-dazo で生成済みの
+font_noto_jp_20_4.c (サイズ 20 / bpp4 / 約 1.5MB, OFL) をそのまま
+コミット。パーティション拡張 + erase-flash 済み (永続タスクと NVS は
+消えた。WiFi は sdkconfig 由来なので無傷)。画面は横持ちではなく
+**ネイティブ縦 720x1280 のまま** (回転は Phase 1 のレイアウト時に判断、
+§8 のとおり)。
+
+## 10. 次セッションの着手手順 (Phase 0 当時のメモ)
 
 1. `components/ui_tab5` 雛形 + Kconfig (`MQJS_TAB5_UI`) + 空登録の確認 (Stamp ビルドが無傷であること)
 2. ui_tab5/idf_component.yml に lvgl / esp_lvgl_port / esp_lcd_ili9881c / esp_lcd_touch_gt911 を追加 → Tab5 ビルドで取得・コンパイル確認 (**ここが IDF 6 関門**)

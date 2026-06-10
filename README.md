@@ -118,6 +118,28 @@ idf.py -B build_tab5 "-DSDKCONFIG=sdkconfig.tab5" "-DMQJS_SCRIPT=i2c_scan.js" -p
      GPIO15 が常時 Low = C6 が永久リセットになる。2.x では
      `RESET_ACTIVE_HIGH` (= 通常 High・Low パルスでリセット) が正解
 
+### Tab5 オンデバイス UI (Phase 0: 表示スパイク済み)
+
+設計は docs/tab5-ui-design.md。`components/ui_tab5` (C++17, LVGL9 +
+esp_lvgl_port) に封印され、`CONFIG_MQJS_TAB5_UI=y` (sdkconfig.tab5.defaults)
+のときだけコンパイルされる。無効時はヘッダが no-op スタブになるので
+Stamp ビルドには一切影響しない。
+
+- パネルはタッチコントローラで自動判別 (GT911 → ILI9881C / I2C 0x55 →
+  fw 1=ST7121, 3=ST7123)。手元の個体は **ST7123**。ST712x ドライバは
+  M5Tab5-UserDemo から vendoring (`components/ui_tab5/vendor/`)
+- 日本語フォント: Noto Sans CJK JP サブセット (`components/ui_tab5/fonts/`,
+  OFL 1.1, 約 1.5MB)。StackChan-dazo と同レシピ (lv_font_conv size20 bpp4)
+- アプリが 3MB を超えるため partitions.csv の factory を 6MB に拡張済み。
+  **旧レイアウトの実機は一度 `idf.py erase-flash` が必要** (永続化タスクと
+  NVS が消える。WiFi 認証情報は sdkconfig 由来なので無傷)
+- **esp-hosted 2.x の罠**: pre-scheduler コンストラクタで SDIO mempool
+  (~90KB) を確保しようとするが、その時点のヒープは PSRAM 登録前で
+  ~110KB しかない。UI の .bss 増加で枯渇し `sdio_mempool_create` の
+  assert ループになるため、ui_tab5 が `-Wl,--wrap=esp_hosted_init` で
+  コンストラクタ呼び出しを no-op 化し、wifi.c が起動後 (C6 通電後) に
+  本物を呼ぶ (冪等なので Stamp でも害なし)
+
 ### Windows での注意
 
 - プロジェクトパスに非 ASCII 文字 (日本語ディレクトリ名等) が

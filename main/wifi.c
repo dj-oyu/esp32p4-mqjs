@@ -19,6 +19,13 @@
 
 static const char *TAG = "wifi";
 
+/* esp-hosted public API (component header not on main's include path).
+ * Idempotent: with the Tab5 UI build, components/ui_tab5 defers the
+ * constructor-time call (early heap too small for the SDIO mempools, C6
+ * still power-gated), so this is where the transport really comes up.
+ * On Stamp builds the constructor already did the work and this no-ops. */
+int esp_hosted_init(void);
+
 static EventGroupHandle_t s_evt;
 #define GOT_IP_BIT BIT0
 
@@ -51,6 +58,8 @@ bool wifi_start_and_wait(uint32_t timeout_ms)
     } else {
         ESP_ERROR_CHECK(err);
     }
+
+    ESP_ERROR_CHECK(esp_hosted_init());
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

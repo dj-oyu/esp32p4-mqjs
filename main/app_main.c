@@ -18,6 +18,7 @@
 #include "mqjs_runtime.h"
 #include "storage.h"
 #include "task_source.h"
+#include "ui_tab5.h"
 #include "wifi.h"
 
 static const char *TAG = "app";
@@ -74,6 +75,7 @@ static void js_task(void *arg)
 void app_main(void)
 {
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
+    ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     storage_init();            /* mount LittleFS for persisted tasks */
 
     /* network first: blocks up to 30s for an IP, JS runs either way */

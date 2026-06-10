@@ -1,0 +1,13 @@
+menu "Tab5 on-device UI"
+
+    config MQJS_TAB5_UI
+        bool "Enable Tab5 on-device UI (MIPI-DSI + LVGL)"
+        default n
+        depends on IDF_TARGET_ESP32P4
+        help
+            Drive the M5Stack Tab5 5" 1280x720 MIPI-DSI panel (ILI9881C)
+            with LVGL: status bar, JS console, and (later) ui.* drawing
+            bindings. Off by default so Stamp-P4 builds are unaffected;
+            when disabled ui_tab5.h provides no-op inline stubs.
+
+endmenu
