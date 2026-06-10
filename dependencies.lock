@@ -1,4 +1,14 @@
 dependencies:
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
   espressif/eppp_link:
     component_hash: 04f7f31868b8ae6014c96132740a192d09611a6e46aaa7038c865ffc7e26b38f
     dependencies:
@@ -59,6 +69,24 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.2.0~2
+  espressif/esp_lcd_touch_st7123:
+    component_hash: c43fd76fb12b4dd1bf30d60e99e4ec150b16e17cafc942a58e6274d4b68e71fe
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: espressif/esp_lcd_touch
+      registry_url: https://components.espressif.com
+      require: public
+      version: ^1
+    - name: idf
+      require: private
+      version: '>=4.4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.2
   espressif/esp_lvgl_port:
     component_hash: fb6c1fdfe70d4ca39a035d63ca394a35f17ec84ce16ff98ecb13a54155d75da4
     dependencies:
@@ -151,11 +179,12 @@ dependencies:
 direct_dependencies:
 - espressif/esp_lcd_ili9881c
 - espressif/esp_lcd_touch_gt911
+- espressif/esp_lcd_touch_st7123
 - espressif/esp_lvgl_port
 - espressif/esp_wifi_remote
 - espressif/mqtt
 - joltwallet/littlefs
 - lvgl/lvgl
-manifest_hash: b138491d15f630c2a577b102854ca97179c61bedc3a1224fd672603d0070f1bb
+manifest_hash: 17c94649ad34d2c6dcc1909a38a0ed7546f3c8c93d3c39b20e0b486f939518d0
 target: esp32p4
 version: 3.0.0

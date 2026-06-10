@@ -384,6 +384,7 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("line", 5, js_ui_line),
     JS_CFUNC_DEF("text", 4, js_ui_text),
     JS_CFUNC_DEF("pixel", 3, js_ui_pixel),
+    JS_CFUNC_DEF("onTouch", 1, js_ui_onTouch),
     JS_PROP_END,
 };
 

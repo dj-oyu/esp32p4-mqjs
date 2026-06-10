@@ -159,13 +159,14 @@ typedef struct {
 /* one queue feeds the JS loop; producers are the GPIO ISR and the
    esp-mqtt event task. mqtt strings are heap copies owned by the
    event: the dispatcher (or the drain in reset_slots) frees them. */
-typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA } MqjsEventType;
+typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH } MqjsEventType;
 
 typedef struct {
     uint8_t type;
     union {
         struct { uint8_t pin; uint8_t level; } gpio;
         struct { char *topic; char *payload; uint32_t len; } mqtt;
+        struct { int16_t x, y; uint8_t kind; } touch;
     } u;
 } MqjsEvent;
 
@@ -180,6 +181,8 @@ static GpioSlot  s_gpio_cb[MQJS_MAX_GPIO_CB];
 static MqttSub   s_mqtt_subs[MQJS_MAX_MQTT_SUB];
 static bool      s_mqtt_onconn_used;
 static JSGCRef   s_mqtt_onconn;
+static volatile bool s_touch_used; /* read by the UI task (poster) */
+static JSGCRef   s_touch_cb;
 static volatile bool s_stop_req;
 static int64_t s_run_deadline;          /* JS watchdog */
 
@@ -808,6 +811,60 @@ JSValue js_ui_text(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_UNDEFINED;
 }
 
+/* touch: the UI task polls the controller and posts here; JS receives
+   (x, y, kind) with kind 0=down 1=move 2=up in canvas coordinates */
+JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    if (!JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    if (s_touch_used)
+        JS_DeleteGCRef(ctx, &s_touch_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_touch_cb);
+    *pf = argv[0];
+    s_touch_used = true;
+#ifndef ESP_PLATFORM
+    printf("[ui] onTouch registered (stub: never fires on PC)\n");
+#endif
+    return JS_UNDEFINED;
+}
+
+void mqjs_post_touch(int x, int y, int kind)
+{
+#ifdef ESP_PLATFORM
+    if (!s_event_queue || !s_touch_used)
+        return;
+    MqjsEvent ev = {
+        .type = EV_TOUCH,
+        .u.touch = { .x = (int16_t)x, .y = (int16_t)y, .kind = (uint8_t)kind },
+    };
+    xQueueSend(s_event_queue, &ev, 0); /* full queue: drop, never block */
+#else
+    (void)x;
+    (void)y;
+    (void)kind;
+#endif
+}
+
+static void dispatch_touch_event(JSContext *ctx, const MqjsEvent *ev)
+{
+    if (!s_touch_used)
+        return;
+    if (JS_StackCheck(ctx, 5)) {
+        dump_error(ctx);
+        return;
+    }
+    /* args are pushed in reverse: the last-pushed one becomes arg0 */
+    JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.kind)); /* arg2 */
+    JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.y));    /* arg1 */
+    JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.x));    /* arg0 */
+    JS_PushArg(ctx, s_touch_cb.val);                     /* func */
+    JS_PushArg(ctx, JS_NULL);                            /* this */
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 3);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+}
+
 /* ------------------------------------------------------------------ */
 /* mqtt (esp-mqtt; PC build = print-only stubs)                        */
 /* ------------------------------------------------------------------ */
@@ -1090,6 +1147,8 @@ static bool anything_pending(void)
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++)
         if (s_gpio_cb[i].used)
             return true;
+    if (s_touch_used) /* a touch handler keeps the loop alive */
+        return true;
 #ifdef ESP_PLATFORM
     if (s_mqtt)   /* active mqtt session keeps the loop alive */
         return true;
@@ -1142,6 +1201,10 @@ static void reset_slots(JSContext *ctx)
         JS_DeleteGCRef(ctx, &s_mqtt_onconn);
         s_mqtt_onconn_used = false;
     }
+    if (s_touch_used) {
+        s_touch_used = false; /* before the GCRef dies: gates the poster */
+        JS_DeleteGCRef(ctx, &s_touch_cb);
+    }
 }
 
 void mqjs_runtime_stop(void)
@@ -1159,6 +1222,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     memset(s_gpio_cb, 0, sizeof(s_gpio_cb));
     memset(s_mqtt_subs, 0, sizeof(s_mqtt_subs));
     s_mqtt_onconn_used = false;
+    s_touch_used = false;
 
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
@@ -1207,12 +1271,14 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
             case EV_GPIO:           dispatch_gpio_event(ctx, &ev);    break;
             case EV_MQTT_CONNECTED: dispatch_mqtt_connected(ctx);     break;
             case EV_MQTT_DATA:      dispatch_mqtt_data(ctx, &ev);     break;
+            case EV_TOUCH:          dispatch_touch_event(ctx, &ev);   break;
             }
         }
 #else
         (void)dispatch_gpio_event;       /* unused in PC build */
         (void)dispatch_mqtt_connected;
         (void)dispatch_mqtt_data;
+        (void)dispatch_touch_event;
         if (idle > 0)
             usleep((useconds_t)idle * 1000);
 #endif

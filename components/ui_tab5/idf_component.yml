@@ -1,6 +1,8 @@
 dependencies:
   lvgl/lvgl: "^9"
   espressif/esp_lvgl_port: "^2"
-  # Tab5 panel (MIPI-DSI) and touch controller, same parts as M5Tab5-UserDemo
+  # Tab5 panel (MIPI-DSI) and touch controllers, same parts as M5Tab5-UserDemo
+  # (GT911 = ILI9881C panel lots, ST7123 = ST712x lots; detected at boot)
   espressif/esp_lcd_ili9881c: "^1"
   espressif/esp_lcd_touch_gt911: "^1"
+  espressif/esp_lcd_touch_st7123: "^1"

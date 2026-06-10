@@ -21,6 +21,7 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `i2c_scan.js` | I2C デバイス (Tab5 は内蔵) | バススキャン + BMI270 の chip_id 読み出し。i2c.* API の実例 |
 | `ui_console_test.js` | 不要 (Tab5 画面で確認) | コンソール表示試験: 日本語/長行/タブ/記号/**ANSI カラー** (SGR 16 色、行跨ぎの色持続) |
 | `ui_demo.js` | 不要 (Tab5 画面で確認) | ui.* 描画 API のデモ: アナログ時計 + サイン波の掃引。Stamp では no-op |
+| `touch_demo.js` | 不要 (Tab5 画面で操作) | ui.onTouch のお絵かきデモ: なぞって描く、指を上げると色替え、右上 □ でクリア |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。

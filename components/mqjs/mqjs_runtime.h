@@ -34,6 +34,14 @@ void mqjs_runtime_stop(void);
  */
 void mqjs_set_print_sink(void (*fn)(const char *line, size_t len));
 
+/*
+ * Post a touch event to the JS event loop (callable from another task,
+ * not from an ISR). kind: 0 = down, 1 = move, 2 = up. Coordinates are
+ * in the ui canvas space (see ui.size()). Dropped silently when no
+ * ui.onTouch handler is registered or the queue is full.
+ */
+void mqjs_post_touch(int x, int y, int kind);
+
 #ifdef __cplusplus
 }
 #endif

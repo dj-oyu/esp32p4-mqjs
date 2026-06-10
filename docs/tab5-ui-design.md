@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **Phase 2 完了** (2026-06-10)
+Status: **Phase 3 実装完了** (2026-06-10、タッチ実機確認はユーザー操作待ち)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
@@ -193,7 +193,7 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 | **0. スパイク ✅** (2026-06-10) | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
 | **1. コンソール ✅** (2026-06-10) | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
 | **2. ui.\* 描画 ✅** (2026-06-10) | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
-| **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
+| **3. タッチ ✅** (2026-06-10) | ST7123/GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
 | **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ。**JS によるターミナルエミュレータ実装** (ユーザー目標 2026-06-10: ANSI カラー対応はその布石) | — |
 
 各 Phase 完了ごとにコミット。Phase 0/1 は JS API 変更なしなので
@@ -309,6 +309,33 @@ part 2 = ui_tab5.cpp の画面実装。設計からの逸脱なし。要点:
   ui_demo.js が rc=0 で走ることを確認済み。
 - 実機 E2E: ui_demo.js を署名 push → status "accepted"、例外なし。
   (時計+サイン波の見た目の最終確認はユーザー目視)
+
+## 9d. Phase 3 実装メモ (2026-06-10)
+
+設計 (§3 タッチ) からの差分・確定事項:
+
+- このリポジトリの Tab5 はタッチも ST7123 (§9 のとおり)。ドライバは
+  レジストリ部品 **espressif/esp_lcd_touch_st7123**。GT911 個体も
+  esp_lcd_touch_gt911 で実装済み (未実機検証)。両者とも 16bit レジスタ
+  アドレス・I2C 0x55/0x5D(0x14)、INT=GPIO23、RST はパネルと共通の
+  IO エキスパンダ線 (detect で解放済み)。
+- **タッチ用 I2C バスは port 1 で常時保持** (SDA31/SCL32)。port 0 は
+  JS の `i2c.setup(0, ...)` 用に空けたまま。注意: JS が port 0 で
+  ピン 31/32 を claim するとタッチが死ぬ (GPIO マトリクスを奪う)。
+- **ポーリングは esp_lvgl_port に任せた** (lvgl_port_add_touch)。これで
+  LVGL のジェスチャが生きて Phase 1 で約束したコンソールのフリック
+  スクロールが本当に動くようになった。JS への投函は 16ms の mooncake
+  タイマー内で indev の状態 (lv_indev_get_state/point) を観測して
+  down/move/up 遷移を `mqjs_post_touch()` へ — 追加の I2C トラフィック
+  ゼロ、レート上限は実質 60Hz。
+- 座標は **キャンバス座標系** (ステータスバー分 y-88、負は 0 に
+  クランプ)。`ui.onTouch(fn)` → `fn(x, y, kind)`、kind 0=down 1=move
+  2=up。onTouch 登録はイベントループを生かし続ける (タイマー無しの
+  純タッチタスクが書ける)。再登録は置き換え。
+- ui_tab5 → mqjs は extern 宣言 1 本 (mqjs → ui_tab5 が既にあるため
+  REQUIRES だと循環。wifi.c の esp_hosted_init と同じ流儀)。
+- E2E: touch_demo.js (お絵かき + クリアボタン) を署名 push →
+  "accepted"。PC では onTouch は登録のみ (発火しないスタブ)。
 
 ## 10. 次セッションの着手手順 (Phase 0 当時のメモ)
 

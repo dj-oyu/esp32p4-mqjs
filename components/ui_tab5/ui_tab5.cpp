@@ -44,6 +44,12 @@
 
 #include "esp_lcd_st7121.h"
 #include "esp_lcd_st7123.h"
+#include "esp_lcd_touch_gt911.h"
+#include "esp_lcd_touch_st7123.h"
+
+/* mqjs public API (extern decl instead of REQUIRES: mqjs already
+   depends on this component for ui_tab5.h, same trick as wifi.c) */
+extern "C" void mqjs_post_touch(int x, int y, int kind);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -308,6 +314,7 @@ extern "C" int __wrap_esp_hosted_init(void)
 #define UI_DPHY_LDO_MV      2500
 #define UI_BACKLIGHT_GPIO   22
 #define UI_LVGL_BUF_LINES   50
+#define UI_STATUSBAR_H      88 /* canvas/console area starts below this */
 
 /* Tab5 shipped with different panels over time; the variant is identified
  * by which touch controller answers on the internal I2C bus
@@ -327,6 +334,8 @@ typedef enum {
 #define UI_GT911_ADDR       0x5D /* primary GT911 address */
 #define UI_GT911_ADDR_BKP   0x14
 #define UI_ST7123_TP_ADDR   0x55 /* touch of the ST712x panel variant */
+
+static uint8_t s_gt911_addr = UI_GT911_ADDR; /* whichever addr answered */
 
 /* Touch fw version register 0x0000 on the 0x55 controller tells the
  * ST712x flavour apart: 1 = ST7121, 3 (or anything else) = ST7123. */
@@ -407,9 +416,13 @@ static ui_panel_variant_t panel_reset_and_detect(void)
     /* give the touch controller time to boot out of reset, then probe */
     vTaskDelay(pdMS_TO_TICKS(100));
     ui_panel_variant_t variant;
-    if (i2c_master_probe(bus, UI_GT911_ADDR, 50) == ESP_OK ||
-        i2c_master_probe(bus, UI_GT911_ADDR_BKP, 50) == ESP_OK) {
+    if (i2c_master_probe(bus, UI_GT911_ADDR, 50) == ESP_OK) {
         ESP_LOGI(TAG, "GT911 found -> ILI9881C panel variant");
+        s_gt911_addr = UI_GT911_ADDR;
+        variant = UI_PANEL_ILI9881C;
+    } else if (i2c_master_probe(bus, UI_GT911_ADDR_BKP, 50) == ESP_OK) {
+        ESP_LOGI(TAG, "GT911 (backup addr) found -> ILI9881C panel variant");
+        s_gt911_addr = UI_GT911_ADDR_BKP;
         variant = UI_PANEL_ILI9881C;
     } else if (i2c_master_probe(bus, UI_ST7123_TP_ADDR, 50) == ESP_OK) {
         variant = st712x_flavour(bus);
@@ -421,6 +434,106 @@ static ui_panel_variant_t panel_reset_and_detect(void)
     }
     i2c_del_master_bus(bus);
     return variant;
+}
+
+/*
+ * Touch (Phase 3). The controller depends on the panel lot: GT911 on
+ * ILI9881C units, ST7123 on ST712x units (INT on GPIO23, no reset pin
+ * — TP_RST is the expander line released in panel_reset_and_detect).
+ *
+ * The bus is created on I2C port 1 and KEPT (unlike the probe bus):
+ * port 0 stays free for JS i2c.setup(0, ...). Caveat: a JS task that
+ * claims pins 31/32 itself would steal them from the touch controller.
+ */
+static lv_indev_t *s_touch_indev;
+
+static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
+{
+    i2c_master_bus_config_t bus_cfg = {};
+    bus_cfg.i2c_port = 1;
+    bus_cfg.sda_io_num = (gpio_num_t)UI_I2C_SDA;
+    bus_cfg.scl_io_num = (gpio_num_t)UI_I2C_SCL;
+    bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+    bus_cfg.glitch_ignore_cnt = 7;
+    bus_cfg.flags.enable_internal_pullup = true;
+
+    i2c_master_bus_handle_t bus;
+    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
+        ESP_LOGE(TAG, "touch i2c bus failed (no touch)");
+        return;
+    }
+
+    /* both controllers use 16-bit register addresses, no control
+       phase; only the device address differs (the GT911 config macro
+       is not C++-friendly, so the struct is filled by hand) */
+    esp_lcd_panel_io_i2c_config_t io_cfg = {};
+    io_cfg.dev_addr = (variant == UI_PANEL_ILI9881C) ? s_gt911_addr
+                                                     : UI_ST7123_TP_ADDR;
+    io_cfg.control_phase_bytes = 1;
+    io_cfg.dc_bit_offset = 0;
+    io_cfg.lcd_cmd_bits = 16;
+    io_cfg.flags.disable_control_phase = 1;
+    io_cfg.scl_speed_hz = 400000;
+
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_err_t err = esp_lcd_new_panel_io_i2c(bus, &io_cfg, &io);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "touch io failed: %s (no touch)", esp_err_to_name(err));
+        return;
+    }
+
+    esp_lcd_touch_config_t tp_cfg = {};
+    tp_cfg.x_max = UI_LCD_H_RES;
+    tp_cfg.y_max = UI_LCD_V_RES;
+    tp_cfg.rst_gpio_num = GPIO_NUM_NC;
+    tp_cfg.int_gpio_num = (gpio_num_t)23;
+    esp_lcd_touch_handle_t tp = NULL;
+    if (variant == UI_PANEL_ILI9881C)
+        err = esp_lcd_touch_new_i2c_gt911(io, &tp_cfg, &tp);
+    else
+        err = esp_lcd_touch_new_i2c_st7123(io, &tp_cfg, &tp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "touch ctrl failed: %s (no touch)", esp_err_to_name(err));
+        return;
+    }
+
+    /* esp_lvgl_port polls the controller and drives LVGL gestures
+       (console flick scroll); the JS path observes the indev below */
+    lvgl_port_touch_cfg_t touch_cfg = {};
+    touch_cfg.disp = disp;
+    touch_cfg.handle = tp;
+    s_touch_indev = lvgl_port_add_touch(&touch_cfg);
+    if (!s_touch_indev)
+        ESP_LOGE(TAG, "lvgl_port_add_touch failed");
+    else
+        ESP_LOGI(TAG, "touch up (%s)",
+                 variant == UI_PANEL_ILI9881C ? "GT911" : "ST7123");
+}
+
+/* runs in the LVGL task (from the mooncake lv_timer): mirror the indev
+   state LVGL already polled into JS touch events. Coordinates are
+   canvas-relative (status bar clamps to y=0); kind 0=down 1=move 2=up. */
+static void touch_observe(void)
+{
+    static bool was_pressed;
+    static lv_point_t last;
+
+    if (!s_touch_indev)
+        return;
+    bool pressed = lv_indev_get_state(s_touch_indev) == LV_INDEV_STATE_PRESSED;
+    lv_point_t p;
+    lv_indev_get_point(s_touch_indev, &p);
+    p.y -= UI_STATUSBAR_H;
+    if (p.y < 0)
+        p.y = 0;
+    if (pressed && !was_pressed)
+        mqjs_post_touch(p.x, p.y, 0);
+    else if (pressed && (p.x != last.x || p.y != last.y))
+        mqjs_post_touch(p.x, p.y, 1);
+    else if (!pressed && was_pressed)
+        mqjs_post_touch(last.x, last.y, 2);
+    was_pressed = pressed;
+    last = p;
 }
 
 static esp_err_t backlight_init(void)
@@ -579,8 +692,7 @@ static esp_err_t display_init(ui_panel_variant_t variant,
 /* LVGL calls are safe here (the port holds its lock around timers).   */
 /* ------------------------------------------------------------------ */
 
-#define UI_STATUSBAR_H 88
-#define UI_PAD         16
+#define UI_PAD 16
 
 #define UI_COL_BG    0x0B0E11 /* console background */
 #define UI_COL_BAR   0x1A222C /* status bar background */
@@ -1020,9 +1132,15 @@ extern "C" void ui_tab5_start(void)
     mc.createExtension(std::make_unique<StatusBar>());
     mc.openApp(mc.installApp(std::make_unique<ConsoleApp>()));
     mc.openApp(mc.installApp(std::make_unique<CanvasApp>()));
-    lv_timer_create([](lv_timer_t *) { mooncake::GetMooncake().update(); },
-                    16, nullptr);
+    lv_timer_create(
+        [](lv_timer_t *) {
+            mooncake::GetMooncake().update();
+            touch_observe();
+        },
+        16, nullptr);
     lvgl_port_unlock();
+
+    touch_init(variant, disp);
 
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
