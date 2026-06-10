@@ -197,6 +197,22 @@ python3 tools/mqjs_push.py <ブローカー> <タスクトピック> x.js --raw 
 - 開発はローカルの Mosquitto が便利 (Windows: `listener 1883` +
   `allow_anonymous true` を追記し、ファイアウォールで LAN に限定)。
 
+## Web UI でのタスク配信 (ローカル専用)
+
+```bash
+# WSL で (要 python3-cryptography + gcc)
+python3 tools/mqjs_webui.py            # → http://localhost:8765
+python3 tools/mqjs_webui.py --port 8799 --broker 192.168.1.2 --topic <トピック>
+```
+
+ブラウザから: examples の読み込み / エディタ / **PC テスト実行**
+(run_pc で 5 秒スモーク) / **バイトコードにコンパイルして送信**
+チェックボックス / 署名 + push / `<トピック>/status` の購読フィード
+(デバイスの accepted / bad signature がリアルタイムに見える)。
+
+**127.0.0.1 のみにバインド**している。このプロセスは署名鍵
+(tools/task_signing_key.pem) を扱うので、外部公開しないこと。
+
 ## PC でのテスト (実機不要・検証済み)
 
 Linux / WSL 上で (Windows ネイティブには gcc が無い前提):
