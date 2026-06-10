@@ -1,13 +1,17 @@
-/* Tab5 SSH ターミナルエミュレータ (Phase T2): mquickjs 製 VT100。
+/* Tab5 SSH ターミナルエミュレータ (Phase T3): mquickjs 製 VT100。
  *
- * 80x24 のセルグリッドを持ち、サーバから来る ANSI/VT100 エスケープ
- * (カーソル移動・消去・SGR 16 色・スクロール領域) を解釈して固定
- * グリッドに描画する。これで ls --color / vi / top がそれなりに見える。
+ * 等幅セルグリッドを持ち、サーバから来る ANSI/VT100 エスケープ
+ * (カーソル移動・消去・SGR 16 色・スクロール領域) を解釈して、C 側の
+ * ui.cells (グリフ直接ブリット) と ui.scroll (バッファスクロール) で
+ * 高速に描画する。ls --color / vi / top が軽く動く。
+ *
+ * 桁数/行数は画面 (ui.size) とセル寸法 (ui.cellSize) から導出し、
+ * pty も ssh.connect でその値に合わせる (wolfSSH_ChangeTerminalSize)。
+ * ハードコードしないので、向き・解像度・キーボード高が変わっても、また
+ * 将来 横画面化しても自動で追従する。HackGen 9x24 で 720px = 80 桁、
+ * キーボード (常時表示, 400px) の上に 33 行。
  *
  * 接続先は下の HOST/USER/PASS を自分の環境に書き換える。
- * pty は組込み wolfSSH の都合で 80x24 固定。Tab5 実機のフォントは
- * 1 桁 16px なので 720px に約 45 桁しか入らず、右側 (46-80 桁) は
- * クリップされる。80 桁フルに見せるには横画面化か小フォントが要る (T3)。
  *
  * 検証モード (どちらも committed 版は false):
  *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
@@ -37,19 +41,24 @@ var DEMO_SCRIPT =
     "\x1b[7minverse\x1b[0m bar\r\n" +
     "tab\there";
 
-/* ---- 画面メトリクス (等幅セルグリッド) ---- */
-var COLS = 80, ROWS = 24;          /* pty サイズ (固定) */
+/* ---- 画面メトリクス (等幅セルグリッド) ----
+   桁数/行数は画面サイズとセル寸法から導出する (ハードコードしない)。
+   こうしておけば画面の向き・解像度・キーボード高が変わっても、また
+   将来 横画面化しても、グリッドと pty が自動で追従する。
+   キーボードは常時表示なので、その上 (VIEW_H) に収まる行数を端末高にする。 */
 var sz = ui.size();
 var W = sz[0] || 720, H = sz[1] || 1192;
-var KB_H = 400;
+var KB_H = 400;                     /* 常時表示キーボードの高さ */
 var VIEW_H = H - KB_H;
-/* ui.cells が使う等幅フォントのセル寸法。HackGen 9x24 なので 720/9 = 80 桁
-   ぴったり収まる (もうクリップしない)。 */
-var cell = ui.cellSize();
+var cell = ui.cellSize();           /* HackGen 等幅: [9, 24] */
 var CW = cell[0] || 9;
 var LH = cell[1] || 24;
-var COLS_VIS = Math.min(COLS, (W / CW) | 0);
-var ROWS_VIS = Math.min(ROWS, (VIEW_H / LH) | 0);
+var COLS = (W / CW) | 0;            /* 720/9 = 80 (横画面なら 1280/9=142) */
+var ROWS = (VIEW_H / LH) | 0;       /* (1192-400)/24 = 33 */
+if (COLS < 1) COLS = 1;
+if (ROWS < 1) ROWS = 1;
+var COLS_VIS = COLS;                /* 画面ぴったりなので全部見える */
+var ROWS_VIS = ROWS;
 
 /* ---- 配色 (コンソールと同じ 16 色パレット、暗背景向け) ---- */
 var BG = 0x0B0E11;

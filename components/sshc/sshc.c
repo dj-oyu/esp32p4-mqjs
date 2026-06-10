@@ -170,12 +170,13 @@ static void ssh_session(WOLFSSH_CTX *ctx)
         goto done;
     }
 
-    /* wolfSSH's pty-req sends a fixed 80x24 on a no-filesystem embedded
-       build (GetTerminalInfo has no termios to query), and live resize
-       (wolfSSH_ChangeTerminalSize) is only compiled with a filesystem.
-       So the requested cols/rows are advisory on this config — the JS
-       terminal should assume 80x24. Apply the size only where the lib
-       actually provides the call. */
+    /* wolfSSH's pty-req sends a fixed 80x24 (GetTerminalInfo has no local
+       termios to query on the device), so immediately resize the server's
+       pty to the grid the JS terminal actually uses (derived from the
+       screen + cell size, e.g. 80x33). wolfSSH_ChangeTerminalSize is
+       compiled in because the project undefines NO_FILESYSTEM for wolfSSH
+       (see components/sshc/wolfssl_override/user_settings.h); the guard
+       stays so a no-filesystem build still compiles cleanly. */
 #if defined(WOLFSSH_TERM) && !defined(NO_FILESYSTEM)
     if (s_params.cols > 0 && s_params.rows > 0)
         wolfSSH_ChangeTerminalSize(ssh, s_params.cols, s_params.rows, 0, 0);
