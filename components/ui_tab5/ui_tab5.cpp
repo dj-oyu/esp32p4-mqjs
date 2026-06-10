@@ -25,6 +25,7 @@
 
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "esp_heap_caps.h"
 #include "esp_lcd_ili9881c.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
@@ -113,6 +114,33 @@ extern "C" void ui_tab5_set_status(const ui_status_t *st)
     s_status = *st;
     s_status_gen++;
     xSemaphoreGive(s_status_mtx);
+}
+
+/* drawing command queue (Phase 2): js_task posts, CanvasApp drains.
+   Non-blocking by design — a full queue drops the command and bumps a
+   counter that the status bar displays (visible backpressure, JS is
+   never stalled). */
+#define UI_CMD_QUEUE_DEPTH 128 /* 16B each; static scenes burst >64 */
+
+static QueueHandle_t s_cmd_queue;
+static volatile uint32_t s_cmd_drops;
+static int s_canvas_w, s_canvas_h; /* set once the display is up */
+
+extern "C" bool ui_tab5_cmd(const ui_cmd_t *cmd)
+{
+    if (!s_cmd_queue || !cmd)
+        return false;
+    if (xQueueSend(s_cmd_queue, cmd, 0) != pdTRUE) {
+        s_cmd_drops = s_cmd_drops + 1;
+        return false; /* caller keeps ownership of cmd->text */
+    }
+    return true;
+}
+
+extern "C" void ui_tab5_canvas_size(int *w, int *h)
+{
+    *w = s_canvas_w;
+    *h = s_canvas_h;
 }
 
 /*
@@ -429,6 +457,7 @@ static esp_err_t display_init(ui_panel_variant_t variant,
 #define UI_COL_DOWN  0x55606B
 #define UI_COL_EVENT 0xFFD479 /* last_event text */
 #define UI_COL_FLASH 0x2E6BD6 /* highlight behind a fresh event */
+#define UI_COL_DROP  0xE05A4E /* draw-cmd drop counter */
 
 static lv_obj_t *make_dot(lv_obj_t *parent)
 {
@@ -481,6 +510,9 @@ public:
         _mqtt_lbl = make_label(row, UI_COL_TEXT);
         lv_label_set_text(_mqtt_lbl, "MQTT");
 
+        _drop_lbl = make_label(row, UI_COL_DROP);
+        lv_label_set_text(_drop_lbl, "");
+
         lv_obj_t *spacer = lv_obj_create(row);
         lv_obj_remove_style_all(spacer);
         lv_obj_set_height(spacer, 1);
@@ -518,6 +550,13 @@ public:
             _flash_opa = opa;
             lv_obj_set_style_bg_opa(_event_lbl, (lv_opa_t)opa, 0);
         }
+
+        /* draw-command drop counter (visible backpressure, Phase 2) */
+        uint32_t drops = s_cmd_drops;
+        if (drops != _seen_drops) {
+            _seen_drops = drops;
+            lv_label_set_text_fmt(_drop_lbl, "drop %u", (unsigned)drops);
+        }
     }
 
 private:
@@ -544,7 +583,9 @@ private:
     lv_obj_t *_net_dot = nullptr, *_net_lbl = nullptr;
     lv_obj_t *_mqtt_dot = nullptr, *_mqtt_lbl = nullptr;
     lv_obj_t *_task_lbl = nullptr, *_event_lbl = nullptr;
+    lv_obj_t *_drop_lbl = nullptr;
     uint32_t _seen_gen = 0;
+    uint32_t _seen_drops = 0;
     int _flash_opa = -1;
     char _last_event[sizeof(ui_status_t::last_event)] = "";
     smooth_ui_toolkit::AnimateValue _flash{0};
@@ -565,7 +606,10 @@ public:
         lv_obj_set_size(_panel, UI_LCD_H_RES, UI_LCD_V_RES - UI_STATUSBAR_H);
         lv_obj_set_style_bg_color(_panel, lv_color_hex(UI_COL_BG), 0);
         lv_obj_set_style_bg_opa(_panel, LV_OPA_COVER, 0);
-        lv_obj_set_style_pad_all(_panel, UI_PAD, 0);
+        /* slim side padding: console lines should use the full width
+           (user feedback: 16px pads wasted ~3 half-width chars) */
+        lv_obj_set_style_pad_ver(_panel, 8, 0);
+        lv_obj_set_style_pad_hor(_panel, 4, 0);
         lv_obj_set_style_pad_row(_panel, 4, 0);
         lv_obj_set_flex_flow(_panel, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_scroll_dir(_panel, LV_DIR_VER);
@@ -611,13 +655,181 @@ private:
     uint32_t _tail = 0;
 };
 
+/* Phase 2: JS-drawable canvas over the console area. Hidden until the
+   running script issues its first ui.* command; hides again (and
+   clears) when a different task takes over, so console-only tasks get
+   the console back. Primitives are drawn straight into the RGB565
+   buffer (PSRAM); TEXT goes through an LVGL layer for font rendering.
+   One invalidate per drained batch. */
+class CanvasApp : public mooncake::AppAbility {
+public:
+    CanvasApp() { setAppInfo().name = "canvas"; }
+
+    void onCreate() override
+    {
+        size_t bytes = (size_t)s_canvas_w * s_canvas_h * 2;
+        _buf = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        if (!_buf) {
+            ESP_LOGE(TAG, "canvas buffer alloc failed (%u bytes)",
+                     (unsigned)bytes);
+            return;
+        }
+        fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
+        _canvas = lv_canvas_create(lv_screen_active());
+        lv_canvas_set_buffer(_canvas, _buf, s_canvas_w, s_canvas_h,
+                             LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_pos(_canvas, 0, UI_STATUSBAR_H);
+        lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void onRunning() override
+    {
+        if (!_canvas)
+            return;
+        track_task_switch();
+
+        ui_cmd_t cmd;
+        bool drew = false;
+        while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+            apply(cmd);
+            free(cmd.text);
+            drew = true;
+        }
+        if (drew) {
+            if (lv_obj_has_flag(_canvas, LV_OBJ_FLAG_HIDDEN))
+                lv_obj_remove_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(_canvas);
+        }
+    }
+
+private:
+    /* a new task starting means the canvas content is stale: clear it
+       and drop back to the console until the task draws something */
+    void track_task_switch()
+    {
+        char tn[sizeof(ui_status_t::task_name)];
+        char to[sizeof(ui_status_t::task_origin)];
+        xSemaphoreTake(s_status_mtx, portMAX_DELAY);
+        uint32_t gen = s_status_gen;
+        memcpy(tn, s_status.task_name, sizeof tn);
+        memcpy(to, s_status.task_origin, sizeof to);
+        xSemaphoreGive(s_status_mtx);
+        if (gen == _seen_gen)
+            return;
+        _seen_gen = gen;
+        if (strcmp(tn, _task) != 0 || strcmp(to, _origin) != 0) {
+            memcpy(_task, tn, sizeof _task);
+            memcpy(_origin, to, sizeof _origin);
+            fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
+            lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void fill_all(uint16_t px)
+    {
+        size_t n = (size_t)s_canvas_w * s_canvas_h;
+        for (size_t i = 0; i < n; i++)
+            _buf[i] = px;
+    }
+
+    void fill_rect(int x, int y, int w, int h, uint16_t px)
+    {
+        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+        int x1 = x + w, y1 = y + h;
+        if (x1 > s_canvas_w)
+            x1 = s_canvas_w;
+        if (y1 > s_canvas_h)
+            y1 = s_canvas_h;
+        for (int yy = y0; yy < y1; yy++)
+            for (int xx = x0; xx < x1; xx++)
+                _buf[(size_t)yy * s_canvas_w + xx] = px;
+    }
+
+    void put_pixel(int x, int y, uint16_t px)
+    {
+        if (x >= 0 && x < s_canvas_w && y >= 0 && y < s_canvas_h)
+            _buf[(size_t)y * s_canvas_w + x] = px;
+    }
+
+    void line(int x0, int y0, int x1, int y1, uint16_t px)
+    {
+        /* Bresenham */
+        int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+        int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+        int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        int err = dx - dy;
+        for (;;) {
+            put_pixel(x0, y0, px);
+            if (x0 == x1 && y0 == y1)
+                break;
+            int e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                x0 += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    void text(const ui_cmd_t &cmd)
+    {
+        if (!cmd.text)
+            return;
+        lv_layer_t layer;
+        lv_canvas_init_layer(_canvas, &layer);
+        lv_draw_label_dsc_t dsc;
+        lv_draw_label_dsc_init(&dsc);
+        dsc.color = lv_color_hex(cmd.color);
+        dsc.text = cmd.text;
+        dsc.font = ui_font();
+        lv_area_t coords = { cmd.x, cmd.y, s_canvas_w - 1, s_canvas_h - 1 };
+        lv_draw_label(&layer, &dsc, &coords);
+        lv_canvas_finish_layer(_canvas, &layer);
+    }
+
+    void apply(const ui_cmd_t &cmd)
+    {
+        uint16_t px = lv_color_to_u16(lv_color_hex(cmd.color));
+        switch (cmd.op) {
+        case UI_CMD_CLEAR:
+        case UI_CMD_FILL:
+            fill_all(px);
+            break;
+        case UI_CMD_RECT:
+            fill_rect(cmd.x, cmd.y, cmd.w, cmd.h, px);
+            break;
+        case UI_CMD_LINE:
+            line(cmd.x, cmd.y, cmd.w, cmd.h, px);
+            break;
+        case UI_CMD_TEXT:
+            text(cmd);
+            break;
+        case UI_CMD_PIXEL:
+            put_pixel(cmd.x, cmd.y, px);
+            break;
+        default:
+            break;
+        }
+    }
+
+    lv_obj_t *_canvas = nullptr;
+    uint16_t *_buf = nullptr;
+    uint32_t _seen_gen = 0;
+    char _task[sizeof(ui_status_t::task_name)] = "";
+    char _origin[sizeof(ui_status_t::task_origin)] = "";
+};
+
 extern "C" void ui_tab5_start(void)
 {
     /* the data plane must exist before app_main registers the print
        sink, and must stay usable even if the panel init below fails
-       (ui_tab5_log/set_status no-op while these are NULL) */
+       (ui_tab5_log/set_status/cmd no-op while these are NULL) */
     s_log_mtx = xSemaphoreCreateMutex();
     s_status_mtx = xSemaphoreCreateMutex();
+    s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
 
     ui_panel_variant_t variant = panel_reset_and_detect();
     if (variant == UI_PANEL_NONE)
@@ -659,7 +871,12 @@ extern "C" void ui_tab5_start(void)
         return;
     }
 
-    /* Phase 1: status bar + console, driven by mooncake from an
+    /* JS-visible canvas resolution (everything below the status bar);
+       published before js_task starts, so ui.size() is always valid */
+    s_canvas_w = UI_LCD_H_RES;
+    s_canvas_h = UI_LCD_V_RES - UI_STATUSBAR_H;
+
+    /* status bar + console + canvas, driven by mooncake from an
        lv_timer (i.e. inside the LVGL task, under the port lock) */
     lvgl_port_lock(0);
     lv_obj_set_style_bg_color(lv_display_get_screen_active(disp),
@@ -667,6 +884,7 @@ extern "C" void ui_tab5_start(void)
     auto &mc = mooncake::GetMooncake();
     mc.createExtension(std::make_unique<StatusBar>());
     mc.openApp(mc.installApp(std::make_unique<ConsoleApp>()));
+    mc.openApp(mc.installApp(std::make_unique<CanvasApp>()));
     lv_timer_create([](lv_timer_t *) { mooncake::GetMooncake().update(); },
                     16, nullptr);
     lvgl_port_unlock();
@@ -674,7 +892,8 @@ extern "C" void ui_tab5_start(void)
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
 
-    static const char greet[] = "mqjs コンソール — JS の print がここに流れます";
+    /* note: no em-dash etc. here — U+2014 is in neither font (tofu) */
+    static const char greet[] = "mqjs コンソール: JS の print がここに流れます";
     ui_tab5_log(greet, sizeof greet - 1);
 }
 

@@ -20,6 +20,7 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 | `mqtt_demo.js` | 不要 (要 WiFi) | test.mosquitto.org へ接続し publish→subscribe ループバック。mqtt.* API の実例 |
 | `i2c_scan.js` | I2C デバイス (Tab5 は内蔵) | バススキャン + BMI270 の chip_id 読み出し。i2c.* API の実例 |
 | `ui_console_test.js` | 不要 (Tab5 画面で確認) | 日本語+長行を 1 秒毎に print。Tab5 オンデバイスコンソールの動作確認用 |
+| `ui_demo.js` | 不要 (Tab5 画面で確認) | ui.* 描画 API のデモ: アナログ時計 + サイン波の掃引。Stamp では no-op |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。

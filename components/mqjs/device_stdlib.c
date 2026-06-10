@@ -375,6 +375,21 @@ static const JSPropDef js_mqtt[] = {
 static const JSClassDef js_mqtt_obj =
     JS_OBJECT_DEF("MQTT", js_mqtt);
 
+/* ---- device API: ui object (Tab5 on-device canvas; no-op on Stamp) ---- */
+static const JSPropDef js_ui[] = {
+    JS_CFUNC_DEF("size", 0, js_ui_size),
+    JS_CFUNC_DEF("clear", 1, js_ui_clear),
+    JS_CFUNC_DEF("fill", 1, js_ui_fill),
+    JS_CFUNC_DEF("rect", 5, js_ui_rect),
+    JS_CFUNC_DEF("line", 5, js_ui_line),
+    JS_CFUNC_DEF("text", 4, js_ui_text),
+    JS_CFUNC_DEF("pixel", 3, js_ui_pixel),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_ui_obj =
+    JS_OBJECT_DEF("UI", js_ui);
+
 static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("Object", &js_object_class),
     JS_PROP_CLASS_DEF("Function", &js_function_class),
@@ -426,6 +441,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("gpio", &js_gpio_obj),
     JS_PROP_CLASS_DEF("i2c", &js_i2c_obj),
     JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
+    JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_CFUNC_DEF("setTimeout", 2, js_setTimeout),
     JS_CFUNC_DEF("setInterval", 2, js_setInterval),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),

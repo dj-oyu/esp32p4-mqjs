@@ -44,6 +44,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "ui_tab5.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -677,6 +678,133 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
     printf("[i2c] writeReg(addr=0x%02x, reg=0x%02x, %d data bytes) (stub)\n",
            addr, reg, nd);
 #endif
+    return JS_UNDEFINED;
+}
+
+/* ------------------------------------------------------------------ */
+/* ui (Tab5 on-device canvas; silent no-op on UI-less devices so the   */
+/* same script runs on Stamp; PC build = print-only stubs)             */
+/* ------------------------------------------------------------------ */
+
+#ifndef ESP_PLATFORM
+/* mirror of ui_cmd_op_t in ui_tab5.h (not includable on PC) */
+typedef enum {
+    UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
+    UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL,
+} ui_cmd_op_t;
+#endif
+
+/* Post one drawing command. Takes ownership of `text` (heap copy) in
+   every outcome; drops are counted on-screen by the UI itself. */
+static void ui_post(uint8_t op, int x, int y, int w, int h,
+                    uint32_t color, char *text)
+{
+#ifdef ESP_PLATFORM
+    ui_cmd_t c = {
+        .op = op,
+        .x = (int16_t)x, .y = (int16_t)y,
+        .w = (int16_t)w, .h = (int16_t)h,
+        .color = color,
+        .text = text,
+    };
+    if (!ui_tab5_cmd(&c))
+        free(text);
+#else
+    static const char *names[] =
+        { "clear", "fill", "rect", "line", "text", "pixel" };
+    printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, c=0x%06x%s%s) (stub)\n",
+           names[op], x, y, w, h, (unsigned)color,
+           text ? ", " : "", text ? text : "");
+    free(text);
+#endif
+}
+
+JSValue js_ui_size(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int w, h;
+#ifdef ESP_PLATFORM
+    ui_tab5_canvas_size(&w, &h);
+#else
+    w = 720; /* Tab5 canvas dimensions, so PC runs exercise real code paths */
+    h = 1192;
+#endif
+    JSValue arr = JS_NewArray(ctx, 0);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, h));
+    return arr;
+}
+
+static JSValue ui_fill_op(JSContext *ctx, int argc, JSValue *argv, uint8_t op)
+{
+    int color = 0;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) &&
+        JS_ToInt32(ctx, &color, argv[0]))
+        return JS_EXCEPTION;
+    ui_post(op, 0, 0, 0, 0, (uint32_t)color, NULL);
+    return JS_UNDEFINED;
+}
+
+JSValue js_ui_clear(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return ui_fill_op(ctx, argc, argv, UI_CMD_CLEAR);
+}
+
+JSValue js_ui_fill(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return ui_fill_op(ctx, argc, argv, UI_CMD_FILL);
+}
+
+JSValue js_ui_rect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int x, y, w, h, color;
+    if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]) ||
+        JS_ToInt32(ctx, &w, argv[2]) || JS_ToInt32(ctx, &h, argv[3]) ||
+        JS_ToInt32(ctx, &color, argv[4]))
+        return JS_EXCEPTION;
+    ui_post(UI_CMD_RECT, x, y, w, h, (uint32_t)color, NULL);
+    return JS_UNDEFINED;
+}
+
+JSValue js_ui_line(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int x0, y0, x1, y1, color;
+    if (JS_ToInt32(ctx, &x0, argv[0]) || JS_ToInt32(ctx, &y0, argv[1]) ||
+        JS_ToInt32(ctx, &x1, argv[2]) || JS_ToInt32(ctx, &y1, argv[3]) ||
+        JS_ToInt32(ctx, &color, argv[4]))
+        return JS_EXCEPTION;
+    ui_post(UI_CMD_LINE, x0, y0, x1, y1, (uint32_t)color, NULL);
+    return JS_UNDEFINED;
+}
+
+JSValue js_ui_pixel(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int x, y, color;
+    if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]) ||
+        JS_ToInt32(ctx, &color, argv[2]))
+        return JS_EXCEPTION;
+    ui_post(UI_CMD_PIXEL, x, y, 0, 0, (uint32_t)color, NULL);
+    return JS_UNDEFINED;
+}
+
+JSValue js_ui_text(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int x, y, color = 0xFFFFFF;
+    if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]))
+        return JS_EXCEPTION;
+    JSCStringBuf buf;
+    size_t len;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[2], &buf);
+    if (!str)
+        return JS_EXCEPTION;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) &&
+        JS_ToInt32(ctx, &color, argv[3]))
+        return JS_EXCEPTION;
+    char *copy = malloc(len + 1);
+    if (!copy)
+        return JS_ThrowInternalError(ctx, "out of memory");
+    memcpy(copy, str, len);
+    copy[len] = '\0';
+    ui_post(UI_CMD_TEXT, x, y, 0, 0, (uint32_t)color, copy);
     return JS_UNDEFINED;
 }
 

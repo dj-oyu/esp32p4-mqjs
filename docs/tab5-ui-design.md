@@ -1,6 +1,6 @@
 # Tab5 UI 設計書 — mqjs プラットフォームの「顔」
 
-Status: **Phase 1 完了** (2026-06-10)
+Status: **Phase 2 完了** (2026-06-10)
 対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
 
 ## 0. ゴール / 非ゴール
@@ -187,7 +187,7 @@ storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
 |---|---|---|
 | **0. スパイク ✅** (2026-06-10) | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
 | **1. コンソール ✅** (2026-06-10) | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
-| **2. ui.\* 描画** | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
+| **2. ui.\* 描画 ✅** (2026-06-10) | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
 | **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
 | **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ | — |
 
@@ -275,6 +275,35 @@ part 2 = ui_tab5.cpp の画面実装。設計からの逸脱なし。要点:
 - 実機 E2E 確認済み: mqjs_push.py で署名付き push → status トピックに
   "accepted"、print 出力 (日本語込み) がシリアルに tee され、画面側
   リングにも流れる (examples/ui_console_test.js)。
+
+## 9c. Phase 2 実装メモ (2026-06-10 完了)
+
+設計 (§3) からの差分・確定事項:
+
+- **キュー深さは 64 → 128** (16B/件)。静的シーン (時計の文字盤 60 本など)
+  を一括描画すると 1 フレームのドレイン間隔の間に 64 を超えるため。
+  それでも溢れる場合の作法は ui_demo.js のとおり `delay()` で小分けに
+  流す。ドロップはステータスバーに `drop N` (赤) で出る。
+- **論理解像度は 720x1192** (1280 − ステータスバー 88px)。`ui.size()`
+  は js_task 起動前に確定しているので常に有効。画面なし (Stamp /
+  パネル初期化失敗) では `[0, 0]` を返し、描画系は全て silent no-op
+  — 同じスクリプトが両機体で走る。
+- **CanvasApp の表示切替**: 起動時は隠れていて、最初の ui.* コマンドで
+  コンソールの上に現れる。**別タスクへの切替を状態フィードの世代で検知
+  したらクリアして隠す** (print 専用タスクに戻ったときコンソールが
+  復帰する)。タッチでの手動切替は Phase 3/4。
+- 描画は RGB565 バッファ (PSRAM, 1.68MB) へ自前プリミティブ
+  (rect/line/pixel は直書き、Bresenham)。TEXT のみ LVGL の
+  canvas layer (`lv_canvas_init_layer` → `lv_draw_label` →
+  `finish_layer`) で jp_font レンダリング。invalidate はドレイン
+  1 バッチにつき 1 回。
+- TEXT 文字列の所有権: js 側で heap コピー → キュー投函成功で UI 側が
+  free、失敗 (満杯/画面なし) は投函側が即 free。
+- ヘッダ再生成は WSL で実施 (gen/ = -m32, gen_pc/ = -m64、手順は
+  README)。PC スモーク: run_pc で ui.* がスタブ print されること、
+  ui_demo.js が rc=0 で走ることを確認済み。
+- 実機 E2E: ui_demo.js を署名 push → status "accepted"、例外なし。
+  (時計+サイン波の見た目の最終確認はユーザー目視)
 
 ## 10. 次セッションの着手手順 (Phase 0 当時のメモ)
 
