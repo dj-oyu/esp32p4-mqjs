@@ -96,8 +96,27 @@ idf.py -B build_tab5 "-DSDKCONFIG=sdkconfig.tab5" "-DMQJS_SCRIPT=i2c_scan.js" -p
 - チップリビジョンは Stamp と同じ v1.3 (既存の rev 設定がそのまま効く)
 - **USB の DTR/RTS によるリセットが効かない** (ダウンロードモードに
   入るか無反応)。リセットは本体の電源ボタンで行うこと
-- C6 (esp-hosted) の SDIO ピンは Stamp と異なるため WiFi は未設定
-  (sdkconfig.tab5 では SSID 空 = WiFi スキップで運用)
+- **WiFi も動く** (mqtt.* とタスク配信まで実機確認済み)。
+  sdkconfig.tab5.defaults (ローカル・要 WiFi 認証情報) に以下を追加:
+  ```
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=12
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=13
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=11
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=10
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
+  CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
+  CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
+  CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+  CONFIG_MQJS_TAB5_POWER=y
+  ```
+  ハマりどころ 2 つ:
+  1. **C6 は IO エキスパンダ (PI4IOE5V6408 @0x44) の P0 で電源ゲート**
+     されている。`CONFIG_MQJS_TAB5_POWER=y` で main/board_tab5.c が
+     起動時に通電する (これが無いと sdmmc_card_init が永遠に失敗)
+  2. **esp-hosted 2.x はリセット極性設定の意味が 1.x と逆**。M5 公式
+     UserDemo (hosted 1.4) の `RESET_ACTIVE_LOW` をそのまま写すと
+     GPIO15 が常時 Low = C6 が永久リセットになる。2.x では
+     `RESET_ACTIVE_HIGH` (= 通常 High・Low パルスでリセット) が正解
 
 ### Windows での注意
 

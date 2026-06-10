@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "board_tab5.h"
 #include "mqjs_runtime.h"
 #include "storage.h"
 #include "task_source.h"
@@ -67,6 +68,7 @@ static void js_task(void *arg)
 
 void app_main(void)
 {
+    board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     storage_init();            /* mount LittleFS for persisted tasks */
 
     /* network first: blocks up to 30s for an IP, JS runs either way */

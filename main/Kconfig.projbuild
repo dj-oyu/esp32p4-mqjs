@@ -11,6 +11,14 @@ menu "mqjs platform"
         string "WiFi password"
         default ""
 
+    config MQJS_TAB5_POWER
+        bool "M5Stack Tab5: enable C6 WLAN power via PI4IOE expander"
+        default n
+        help
+            On Tab5 the esp-hosted C6 is power-gated by an IO expander
+            (PI4IOE5V6408 @0x44, internal I2C). Enable for Tab5 builds
+            so WiFi works; leave off for Stamp-P4.
+
     config MQJS_TASK_BROKER
         string "Task source MQTT broker URI"
         default "mqtt://test.mosquitto.org"
