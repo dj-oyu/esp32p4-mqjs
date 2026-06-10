@@ -1,0 +1,221 @@
+# Tab5 UI 設計書 — mqjs プラットフォームの「顔」
+
+Status: **設計確定・実装前** (2026-06-10)
+対象: M5Stack Tab5 (ESP32-P4 rev v1.3 + ESP32-C6, 5" 1280x720 MIPI-DSI, GT911 タッチ)
+
+## 0. ゴール / 非ゴール
+
+**ゴール**
+
+- push した JS タスクの挙動が**画面で即見える**こと (print 出力・受理通知・実行状態)
+- 将来、**JS タスク自身が画面とタッチを使える**こと (`ui.*` バインディング)
+- 日本語表示 (コンソール・ラベルとも)
+- Stamp-P4 ビルドへの影響ゼロ (UI は Tab5 専用のオプトイン)
+
+**非ゴール**
+
+- 汎用 GUI ビルダー的なリッチウィジェットを JS に公開すること (v1 は描画プリミティブまで)
+- 動画・カメラ・オーディオ (Tab5 にはあるが本プラットフォームの範囲外)
+- Stamp-P4 での画面対応 (ハードが無い)
+
+## 1. 技術スタック (確定)
+
+```
+mooncake             画面/App ライフサイクル管理のみ (= 抑制的利用)
+smooth_ui_toolkit    アニメーション (AnimateValue/spring) + LVGL C++ ラッパー
+LVGL 9 + esp_lvgl_port   描画・入力。espressif 管理部品
+esp_lcd (DSI/ILI9881C) + esp_lcd_touch_gt911   パネル/タッチ (UserDemo と同部品)
+jp_font              Noto Sans CJK JP サブセット (lv_font_conv 生成、後述)
+─────────── ここまで C++。components/ui_tab5 に完全封印 ───────────
+公開 C API (ui_tab5.h)  ←  main / mqjs ランタイムは C のまま
+```
+
+### 選定理由 (要点のみ)
+
+- **LVGL vs M5GFX**: Tab5 は MIPI-DSI でフレームバッファ常時走査のため、M5GFX の
+  伝統的なメモリ優位が消える。720p では「変わった部分だけ描く」が支配的で、
+  LVGL のダーティ領域差分描画が実効効率で勝つ。smooth_ui_toolkit の
+  ウィジェット層 (lvgl_cpp) と jp_font の前例 (StackChan-dazo) も LVGL 側。
+  Phase 2 の即時描画 API は LVGL canvas バッファへの自前描画で実現する
+  (描画ライブラリの二重搭載はしない)。
+- **mooncake**: ライフサイクル糊 (~500 行・依存ゼロ・MIT)。採用コストほぼゼロで、
+  Phase 4 のマルチタスクスロット+ランチャー構想に構造がそのまま合う。
+  **使い方は抑制的**: 画面遷移管理のみ。描画・状態・キューは本体コードに置き、
+  Ability は「いつ描くか」だけ知る。いつでも剥がせる状態を保つ。
+- **mooncake / smooth_ui_toolkit は vendoring** (mquickjs/TweetNaCl と同じ流儀。
+  コミット ID を README に記録)。LVGL 系はレジストリ部品。
+
+## 2. アーキテクチャ
+
+```
+┌──────────────────────────── Tab5 ────────────────────────────┐
+│ ui_task (Core1, C++, prio 低)        js_task (Core0, 既存)    │
+│  LVGL tick/timer + Mooncake::update() mqjs イベントループ      │
+│   ├─ StatusBar (UIAbility)            │                      │
+│   ├─ ConsoleApp (AppAbility)          │                      │
+│   └─ CanvasApp (AppAbility, Phase2)   │                      │
+│                                       │                      │
+│  [状態] ui_status 構造体 ◄─ mutex ─── wifi.c / task_source.c  │
+│  [ログ] 行リングバッファ ◄─ mutex ─── print sink (js_task から)│
+│  [描画] UiCmd キュー     ◄─ queue ─── JS: ui.* (Phase2)       │
+│  [入力] GT911 ─► mqjs_post_touch() ─► 既存 MqjsEvent キュー    │
+│                                        └► JS: ui.onTouch(fn) │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**不変条件 (これまでと同じ設計原則)**
+
+1. JS コンテキストに触れるのは js_task のみ。UI→JS は既存の MqjsEvent
+   キュー経由 (gpio/mqtt と同型)。JS→UI は専用キュー/リングバッファ経由。
+2. JSValue・JS ヒープへのポインタをタスク間で渡さない。文字列は必ずコピー。
+3. mqjs ランタイムのウォッチドッグ・GC・使い捨てコンテキスト設計に変更なし。
+
+**コア配置**: js_task を Core0、ui_task を Core1 に明示ピン留め
+(現在 affinity 未指定なので、このタイミングで固定する)。
+
+## 3. モジュール境界
+
+### components/ui_tab5 (新規, C++17)
+
+公開ヘッダ `ui_tab5.h` は C リンケージのみ:
+
+```c
+void ui_tab5_start(void);                     // 画面初期化 + ui_task 起動
+void ui_tab5_log(const char *line, size_t n); // コンソール 1 行 (UTF-8)
+void ui_tab5_set_status(const ui_status_t *); // 状態スナップショット更新
+// Phase 2:
+bool ui_tab5_cmd(const ui_cmd_t *);           // 描画コマンド投函 (満杯なら false)
+```
+
+`CONFIG_MQJS_TAB5_UI=n` (デフォルト) のとき: コンポーネントは空登録になり、
+ヘッダはすべて no-op の inline スタブを提供する (board_tab5.h と同じ手法)。
+→ main 側に `#ifdef` を散らさない。Stamp ビルドはフラッシュ 1 バイトも増えない。
+
+### mqjs ランタイムへの変更 (最小)
+
+- `mqjs_set_print_sink(void (*fn)(const char *, size_t))` を追加。
+  js_print / dump_error の出力を stdout と sink の両方に流す (tee)。
+  → ConsoleApp はこれだけで JS の print を取得できる。Phase 1 では
+  ランタイム変更はこの 1 点のみ。
+- Phase 2 で `ui` オブジェクトを device_stdlib.c に追加 (ヘッダ再生成、
+  WSL。手順は README 既出)。
+- Phase 3 で MqjsEvent に EV_TOUCH を追加し、公開 API
+  `mqjs_post_touch(x, y, kind)` を生やす (ISR 不要、GT911 ポーリングは
+  ui_task 側で実施して投函)。
+
+### 状態フィード (キュー不要の設計)
+
+```c
+typedef struct {
+    char task_name[32];      // "task" / "mqtt-task" 等
+    char task_origin[16];    // embedded / mqtt / persisted
+    char ip[16];
+    bool wifi_up, mqtt_up;
+    char last_event[48];     // "accepted (3644B)" / "bad signature" 等
+} ui_status_t;
+```
+
+書き手 (wifi.c / task_source.c / app_main.c) は変化時に
+`ui_tab5_set_status()` を呼ぶだけ。UI 側は mutex 付きスナップショットを
+フレーム毎に読む。イベントの取りこぼしという概念自体を持たない。
+
+### コンソール
+
+- 行リングバッファ: 200 行 × 96 バイト (固定長、mutex 保護、古い行から破棄)
+- producer: print sink (js_task 上で呼ばれる → memcpy のみで即 return)
+- consumer: ConsoleApp がフレーム毎に新着行を LVGL の textarea/label 群へ反映
+- スクロールはタッチでフリック (LVGL 標準のスクロール)
+
+### 描画コマンドキュー (Phase 2)
+
+```c
+typedef struct {
+    uint8_t op;            // CLEAR / FILL / RECT / LINE / TEXT / PIXEL
+    int16_t x, y, w, h;
+    uint32_t color;        // 0xRRGGBB
+    char *text;            // TEXT のみ。heap コピー、消費側が free
+} ui_cmd_t;
+```
+
+- 深さ 64 の FreeRTOS キュー。**満杯時は非ブロッキングで破棄**し、ドロップ
+  カウンタを画面に出す (JS を待たせない・背圧を可視化する)。
+- CanvasApp はフレーム毎に全件消化 → lv_canvas バッファへ自前プリミティブで
+  描画 → invalidate はフレーム 1 回に合体。
+- JS API 案: `ui.size()` → `[w,h]`、`ui.clear(c)` `ui.fill(c)`
+  `ui.rect(x,y,w,h,c)` `ui.line(x0,y0,x1,y1,c)` `ui.text(x,y,str,c)`
+  `ui.pixel(x,y,c)`。色は 0xRRGGBB の整数。
+- 論理解像度はステータスバーを除いた canvas 領域 (実装時に確定し
+  `ui.size()` で照会可能にする)。
+
+### タッチ (Phase 3)
+
+- GT911 を ui_task でポーリング (esp_lcd_touch_gt911)
+- down/move/up を `mqjs_post_touch()` で MqjsEvent キューへ
+- JS: `ui.onTouch(function(x, y, kind) {...})` — gpio.onChange と同じ
+  GCRef 保持パターン。レート制限 (~50Hz) は投函側で行う。
+
+## 4. 日本語フォント
+
+- **レシピ (StackChan-dazo で実証済み)**: hiz8 の `Noto-Sans-CJK-JP.min`
+  (常用漢字サブセット TTF) を `lv_font_conv --size 20 --bpp 4 --no-compress
+  --format lvgl --range 0x20-0xFFFF` で C ソース化し、
+  `components/ui_tab5/fonts/` にコミット。
+- フラッシュ実測見込み ~1.5MB → **v1 はサイズ 20 の 1 本のみ**。見出しは
+  transform 拡大で代用し、必要になってから 2 本目を検討。
+- **mquickjs の UTF-8 パススルーは検証済み** (2026-06-10, run_pc):
+  `print("こんにちは世界")` は無傷で出力され、`"あいう".length === 3`
+  (コードポイント単位)。JS からの日本語コンソール出力は問題なし。
+- LVGL は UTF-8 ネイティブ。ラベルにそのまま渡せる。
+
+## 5. パーティション変更 (要 erase-flash)
+
+フォント+LVGL でアプリが 3MB を超えるため:
+
+```
+# 変更前                          # 変更後
+factory  0x10000  0x300000 (3MB)  factory  0x10000  0x600000 (6MB)
+storage  0x310000 0x100000 (1MB)  storage  0x610000 0x100000 (1MB)
+```
+
+16MB フラッシュなので余裕。partitions.csv は Stamp と共通のまま変更する
+(Stamp 側は空き領域が増えるだけ)。**切替時に一度 erase-flash が必要**で、
+永続化済みタスクと NVS は消える (WiFi 認証情報は sdkconfig 由来なので無傷)。
+
+## 6. フェーズ計画と受け入れ基準
+
+| Phase | 内容 | 受け入れ基準 |
+|---|---|---|
+| **0. スパイク** | IDF 6.0.1 + DSI + esp_lvgl_port + LVGL9 で Hello World、jp_font で日本語ラベル、パーティション拡張 | Tab5 に「こんにちは世界」が表示される |
+| **1. コンソール** | mooncake/smooth_ui_toolkit 導入、StatusBar + ConsoleApp、print sink、状態フィード | Web UI から push → 画面に accepted 通知と print 出力 (日本語込み) が流れる |
+| **2. ui.\* 描画** | UiCmd キュー、CanvasApp、stdlib に `ui` 追加 (ヘッダ再生成)、examples/ui_demo.js | push した JS だけで時計/グラフが画面に描ける。PC 版はスタブ print |
+| **3. タッチ** | GT911 → EV_TOUCH → `ui.onTouch`、examples/touch_demo.js | JS だけでタッチ反応するデモが動く |
+| **4. 構想 (未確定)** | 永続化タスクの複数スロット化 + mooncake ランチャーでタップ切替。Stack-chan (CoreS3) との MQTT 連携デモ | — |
+
+各 Phase 完了ごとにコミット。Phase 0/1 は JS API 変更なしなので
+ヘッダ再生成不要。
+
+## 7. リスクと対策
+
+| リスク | 影響 | 対策 |
+|---|---|---|
+| LVGL/esp_lvgl_port/DSI ドライバの IDF 6.0 非対応 | Phase 0 が進まない | 最初に検証 (だから Phase 0)。ダメなら部品バージョン固定 or 小パッチ (dazo に IDF6 パッチ前例あり)。最終フォールバックは UserDemo の BSP 移植 |
+| smooth_ui_toolkit lvgl_cpp と LVGL 9 最新の API ずれ | ウィジェット層が使えない | コアのアニメーションだけ使い、ウィジェットは素の LVGL で書く (依存を一段弱める) |
+| 720p の sw_rotate (UserDemo は 90° 回転で運用) が重い | フレームレート低下 | まず横持ちネイティブで試す。回転が必要なら PPA 利用 or 縦 UI レイアウトに変更 |
+| ui_task と esp-hosted/SDIO の Core1 競合 | WiFi スループット低下 | ui_task は低優先度・16ms 周期。問題が出たら優先度/コア再配置 |
+| フォント追加でフラッシュ肥大 | ビルド不能 | factory 6MB 化 (§5)。さらに必要なら esp_mmap_assets でフォントを別パーティション化 (dazo 方式) |
+
+## 8. 未決事項 (実装時に決める)
+
+- 画面の向き: 横 (1280x720) を第一候補。パネルがネイティブ縦なら回転コストを Phase 0 で実測してから確定
+- バックライト制御・スクリーンセーバ (IO エキスパンダ P4? UserDemo 参照)
+- StatusBar と Console/Canvas の画面分割比率
+- mooncake / smooth_ui_toolkit の固定コミット (vendoring 時に記録)
+
+## 9. 次セッションの着手手順 (Phase 0)
+
+1. `components/ui_tab5` 雛形 + Kconfig (`MQJS_TAB5_UI`) + 空登録の確認 (Stamp ビルドが無傷であること)
+2. ui_tab5/idf_component.yml に lvgl / esp_lvgl_port / esp_lcd_ili9881c / esp_lcd_touch_gt911 を追加 → Tab5 ビルドで取得・コンパイル確認 (**ここが IDF 6 関門**)
+3. UserDemo の BSP 初期化 (DSI パネル・LDO・バックライト) を参考に最小の表示初期化を書く
+4. partitions.csv 拡張 + erase-flash + Hello World 表示
+5. jp_font 生成・コミット → 日本語ラベル表示
+6. 完了したらこの文書の Phase 0 を ✅ に更新してコミット
