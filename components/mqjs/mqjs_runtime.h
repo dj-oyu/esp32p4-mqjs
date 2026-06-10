@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -50,6 +51,19 @@ void mqjs_post_touch(int x, int y, int kind);
  * ui.onKey handler is registered or the queue is full.
  */
 void mqjs_post_key(const char *utf8, size_t len);
+
+/*
+ * Feed SSH session bytes / termination into the JS event loop (callable
+ * from the sshc session task, not from an ISR).
+ *
+ * mqjs_post_ssh_data takes ownership of `data` (heap) on success and the
+ * dispatcher frees it; on failure (queue stayed full after a bounded
+ * wait) ownership stays with the caller — terminal output must not be
+ * dropped, so the caller should retry or tear the session down.
+ * mqjs_post_ssh_closed delivers a short human reason once.
+ */
+bool mqjs_post_ssh_data(char *data, size_t len);
+void mqjs_post_ssh_closed(const char *reason);
 
 #ifdef __cplusplus
 }

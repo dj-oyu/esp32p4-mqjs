@@ -176,6 +176,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 9.4.0
+  wolfssl/wolfssh:
+    component_hash: 24d623360c07374a90b1ade8d1218b24bb7b661fd51ace9135dccf510a338927
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.4.20
+  wolfssl/wolfssl:
+    component_hash: 4d619e882c19d967bbaa53302e3bd2bdb8c611b5efb13302171aace809fccfdf
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 5.8.2~1
 direct_dependencies:
 - espressif/esp_lcd_ili9881c
 - espressif/esp_lcd_touch_gt911
@@ -185,6 +199,8 @@ direct_dependencies:
 - espressif/mqtt
 - joltwallet/littlefs
 - lvgl/lvgl
-manifest_hash: 17c94649ad34d2c6dcc1909a38a0ed7546f3c8c93d3c39b20e0b486f939518d0
+- wolfssl/wolfssh
+- wolfssl/wolfssl
+manifest_hash: a82ab4321b9e69d7d7b945c482bc7c2f7449fcae38120215434c296efee9d74e
 target: esp32p4
 version: 3.0.0

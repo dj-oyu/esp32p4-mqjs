@@ -394,6 +394,21 @@ static const JSPropDef js_ui[] = {
 static const JSClassDef js_ui_obj =
     JS_OBJECT_DEF("UI", js_ui);
 
+/* ---- device API: ssh object (wolfSSH client; no-op on non-SSH builds) ---- */
+static const JSPropDef js_ssh[] = {
+    JS_CFUNC_DEF("connect", 6, js_ssh_connect),
+    JS_CFUNC_DEF("write", 1, js_ssh_write),
+    JS_CFUNC_DEF("resize", 2, js_ssh_resize),
+    JS_CFUNC_DEF("close", 0, js_ssh_close),
+    JS_CFUNC_DEF("connected", 0, js_ssh_connected),
+    JS_CFUNC_DEF("onData", 1, js_ssh_onData),
+    JS_CFUNC_DEF("onClose", 1, js_ssh_onClose),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_ssh_obj =
+    JS_OBJECT_DEF("SSH", js_ssh);
+
 static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("Object", &js_object_class),
     JS_PROP_CLASS_DEF("Function", &js_function_class),
@@ -446,6 +461,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("i2c", &js_i2c_obj),
     JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
+    JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_CFUNC_DEF("setTimeout", 2, js_setTimeout),
     JS_CFUNC_DEF("setInterval", 2, js_setInterval),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),

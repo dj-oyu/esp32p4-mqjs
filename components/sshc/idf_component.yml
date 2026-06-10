@@ -1,0 +1,14 @@
+dependencies:
+  # SSH client library with its own crypto (wolfCrypt) — deliberately NOT
+  # mbedTLS-based: IDF 6 ships mbedTLS 4 (PSA), which dropped the legacy
+  # crypto API that libssh2's mbedtls backend needs.
+  #
+  # Pulled unconditionally (the component manager can't gate deps on a
+  # Kconfig value — rules only see idf_version/target). Like ui_tab5's
+  # LVGL, wolfSSL is compiled even on Stamp but, with CONFIG_MQJS_SSH=n,
+  # nothing references it so --gc-sections drops it: flash is unaffected.
+  # The clean-compile settings (ESP_ENABLE_WOLFSSH, the RSA stack-warning
+  # suppress) live in the shared sdkconfig.defaults so both builds apply
+  # them.
+  wolfssl/wolfssh: "^1.4.20"
+  wolfssl/wolfssl: "*" # wolfssh REQUIRES the plain component name 'wolfssl'

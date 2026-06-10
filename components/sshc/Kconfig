@@ -1,0 +1,13 @@
+menu "SSH client (mqjs ssh.*)"
+
+    config MQJS_SSH
+        bool "Enable the SSH client bindings (wolfSSH)"
+        default n
+        help
+            Build the wolfSSH-based SSH client task and expose it to JS
+            as ssh.connect / write / resize / close / onData / onClose.
+            Adds wolfSSL+wolfSSH to the image (a few hundred KB). Off by
+            default; when disabled sshc.h provides no-op inline stubs so
+            Stamp builds are unaffected.
+
+endmenu

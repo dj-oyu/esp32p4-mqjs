@@ -33,3 +33,13 @@ CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=6
 # 200 console labels (up to 320B text each) exhausted the pool and froze
 # the UI (~line 141 of the console test on hardware).
 CONFIG_LV_USE_CLIB_MALLOC=y
+
+# wolfSSL/wolfSSH (components/sshc, pulled unconditionally). These make it
+# compile cleanly on BOTH Tab5 and Stamp; the actual SSH client is gated
+# by CONFIG_MQJS_SSH (Tab5 only, in sdkconfig.tab5.defaults) and dropped
+# by --gc-sections when off, so Stamp flash is unaffected.
+#   ENABLE_WOLFSSH: turn on WOLFSSH_TERM etc. in wolfSSL's user_settings.h
+#   NO_STACK_SIZE_BUILD_WARNING: silence the RSA-vs-3.5KB-main-stack
+#     #warning that -Werror=cpp makes fatal (SSH runs on its own 8KB task)
+CONFIG_ESP_ENABLE_WOLFSSH=y
+CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
