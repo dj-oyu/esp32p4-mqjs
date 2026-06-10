@@ -43,6 +43,42 @@ idf.py build flash monitor
 `Too many properties, consider increasing ATOM_ALIGN` 警告は無害です
 (グローバルのハッシュサイズが上限で頭打ちになるだけ)。
 
+### チップリビジョン (重要)
+
+M5Stamp-P4 のチップは **rev v1.3**。一方 ESP-IDF v6.0 のデフォルトは
+最小リビジョン v3.01 (ECO5) なので、そのままビルドすると flash 時に
+`requires chip revision in range [v3.1 - v3.99]` で蹴られる。
+sdkconfig.defaults で以下を固定済み (消さないこと):
+
+```
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+```
+
+### Windows での注意
+
+- プロジェクトパスに非 ASCII 文字 (日本語ディレクトリ名等) が
+  含まれると、コンパイルは通るが **binutils (objdump) がビルド
+  成果物を開けず ldgen で失敗する**。ビルドディレクトリだけ `-B` で
+  ASCII パスに逃がせば回避できる:
+
+  ```powershell
+  . $env:IDF_PATH\export.ps1
+  idf.py -B C:\esp-build\esp32p4-mqjs -p <PORT> build flash monitor
+  ```
+
+  以降の flash / monitor も毎回同じ `-B` を付けること。
+- Stamp-P4 は内蔵 USB-Serial/JTAG (VID 303A / PID 1001) として
+  COM ポートに見える。C6 アドオンは SDIO 接続のコプロセッサなので
+  PC からは P4 だけが見える。
+- `idf.py monitor` は TTY 必須。リダイレクトされたシェルから
+  ログだけ取りたい場合は SerialPort (115200) で COM を開き、
+  RTS を ON→OFF とパルスしてリセット後に読み出せばよい。
+- ROM 化 stdlib のヘッダは Windows では生成せず、コミット済みの
+  `components/mqjs/gen/` のものを使う (CMakeLists が自動で切替)。
+  **device_stdlib.c を変更したら Linux/WSL でヘッダを再生成して
+  コミットし直すこと。**
+
 ## PC でのテスト (実機不要・検証済み)
 
 ```bash

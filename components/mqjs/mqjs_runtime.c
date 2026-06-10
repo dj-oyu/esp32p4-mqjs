@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <sys/time.h>
 
 #include "cutils.h"
 #include "mquickjs.h"
@@ -43,7 +44,6 @@ static const char *TAG = "mqjs";
 #else
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h>
 #endif
 
 #define MQJS_MAX_TIMERS    16
