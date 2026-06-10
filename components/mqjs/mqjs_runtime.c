@@ -83,9 +83,12 @@ static int64_t date_ms(void)
 }
 
 /* print sink: tee of all JS-visible output, assembled into lines so the
-   UI console can store fixed-size records (see mqjs_set_print_sink) */
+   UI console can store fixed-size records (see mqjs_set_print_sink).
+   The split width bounds one on-screen console record: too small and
+   long lines visibly break before the panel edge (256B = 85 CJK or
+   256 ASCII glyphs, comfortably past one 720px row). */
 static void (*s_print_sink)(const char *, size_t);
-static char s_sink_line[96];
+static char s_sink_line[256];
 static size_t s_sink_len;
 
 void mqjs_set_print_sink(void (*fn)(const char *, size_t))

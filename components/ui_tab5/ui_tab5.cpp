@@ -81,8 +81,8 @@ static const char *TAG = "ui_tab5";
 /* ------------------------------------------------------------------ */
 
 #define UI_LOG_LINES      200
-#define UI_LOG_LINE_BYTES 96  /* the print sink splits lines at 96 bytes */
-#define UI_LOG_LINE_STORE 168 /* + headroom for LVGL recolor markup     */
+#define UI_LOG_LINE_BYTES 256 /* the print sink splits lines at 256 bytes */
+#define UI_LOG_LINE_STORE 320 /* + headroom for LVGL recolor markup       */
 
 typedef struct {
     char text[UI_LOG_LINE_STORE + 2]; /* +closing '#' +NUL */
@@ -560,7 +560,10 @@ static esp_err_t backlight_init(void)
 
 static void backlight_set(int percent)
 {
-    uint32_t duty = (4095u * percent) / 100;
+    /* at 100% drive the pin constantly high (LEDC: duty == 2^res):
+       even a 4095/4096 PWM beats against the panel refresh and shows
+       as a faint fluorescent-like shimmer (user-reported) */
+    uint32_t duty = (percent >= 100) ? 4096u : (4095u * percent) / 100;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
 }
