@@ -5,6 +5,9 @@ CMakeCache.txt
 cmake_install.cmake
 compile_commands.json
 
+# PC test artifacts (see README "PC でのテスト")
+components/mqjs/gen_pc/
+
 # SDK config local artifacts
 sdkconfig
 sdkconfig.old

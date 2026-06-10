@@ -27,7 +27,9 @@ components/mqjs/
   mqjs_runtime.c    … バインディング実装 + イベントループ + ウォッチドッグ
   mqjs_runtime.h    … コンポーネント公開 API
   tools/test_pc.c   … PC スモークテスト (実機不要)
-main/app_main.c     … デモ: PSRAM に 256KB のコンテキストを作り JS を実行
+  tools/run_pc.c    … PC で任意の .js を実行するランナー (実機不要)
+examples/           … JS タスクのサンプル集 (examples/README.md 参照)
+main/app_main.c     … PSRAM に 256KB のコンテキストを作り JS タスクを実行
 ```
 
 ## ビルド (実機)
@@ -36,6 +38,17 @@ main/app_main.c     … デモ: PSRAM に 256KB のコンテキストを作り J
 idf.py set-target esp32p4
 idf.py build flash monitor
 ```
+
+実行する JS タスクは `examples/` から 1 本選んでビルド時に埋め込む
+(デフォルトは `blink_button.js`):
+
+```bash
+idf.py -DMQJS_SCRIPT=life.js build flash monitor
+```
+
+ライフゲーム / マンデルブロズーム / モールス信号 / 反射神経ゲーム /
+ベンチマーク等が入っている。一覧と「mquickjs サブセットでスクリプトを
+書くときのルール」は [examples/README.md](examples/README.md) を参照。
 
 ビルド中に device_stdlib.c が **ホスト側 gcc** でコンパイルされ、
 `mquickjs_atom.h` / `device_stdlib.h` (ROM 化 stdlib) が `-m32`
@@ -81,17 +94,24 @@ CONFIG_ESP32P4_REV_MIN_100=y
 
 ## PC でのテスト (実機不要・検証済み)
 
+Linux / WSL 上で (Windows ネイティブには gcc が無い前提):
+
 ```bash
 cd components/mqjs
 gcc -O2 -I mquickjs -o /tmp/stdlib_tool device_stdlib.c mquickjs/mquickjs_build.c
 mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h   # PC は 64bit
 /tmp/stdlib_tool -m64    > gen_pc/device_stdlib.h
-gcc -O2 -I. -Igen_pc -Imquickjs -o /tmp/test_pc tools/test_pc.c \
+gcc -O2 -I. -Igen_pc -Imquickjs -o /tmp/run_pc tools/run_pc.c \
     mqjs_runtime.c mquickjs/mquickjs.c mquickjs/cutils.c \
     mquickjs/dtoa.c mquickjs/libm.c -lm
-/tmp/test_pc
+
+/tmp/run_pc ../../examples/bench.js          # 終わるスクリプトはそのまま
+timeout 3 /tmp/run_pc ../../examples/life.js # 終わらないものは timeout で
 ```
+
+gpio.* はスタブ (print するだけ)、タイマーは実時間で動く。
+`tools/test_pc.c` は固定スクリプトの最小スモークテスト版。
 
 確認済みの動作:
 - setInterval ×4 + clearInterval + setTimeout が実時間どおり発火し、
