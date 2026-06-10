@@ -461,24 +461,37 @@ static ui_panel_variant_t panel_reset_and_detect(void)
         return UI_PANEL_NONE;
     }
 
-    /* give the touch controller time to boot out of reset, then probe */
+    /* give the touch controller time to boot out of reset, then probe.
+       The panel variant is inferred from which touch chip answers, so a
+       transient I2C miss (seen after a watchdog/USB reset that doesn't
+       fully recycle the touch controller) would pick the WRONG panel and
+       init the DSI with wrong timings -> black screen. Retry the probe a
+       few times before giving up, and if nothing answers fall back to
+       ST7123 (this repository's Tab5 lot) rather than ILI9881C — a wrong
+       ILI9881C guess on an ST7123 panel is exactly what blanks it. */
     vTaskDelay(pdMS_TO_TICKS(100));
-    ui_panel_variant_t variant;
-    if (i2c_master_probe(bus, UI_GT911_ADDR, 50) == ESP_OK) {
-        ESP_LOGI(TAG, "GT911 found -> ILI9881C panel variant");
-        s_gt911_addr = UI_GT911_ADDR;
-        variant = UI_PANEL_ILI9881C;
-    } else if (i2c_master_probe(bus, UI_GT911_ADDR_BKP, 50) == ESP_OK) {
-        ESP_LOGI(TAG, "GT911 (backup addr) found -> ILI9881C panel variant");
-        s_gt911_addr = UI_GT911_ADDR_BKP;
-        variant = UI_PANEL_ILI9881C;
-    } else if (i2c_master_probe(bus, UI_ST7123_TP_ADDR, 50) == ESP_OK) {
-        variant = st712x_flavour(bus);
-        ESP_LOGI(TAG, "touch @0x55 -> %s panel variant",
-                 variant == UI_PANEL_ST7121 ? "ST7121" : "ST7123");
-    } else {
-        ESP_LOGW(TAG, "no touch controller answered, assuming ILI9881C");
-        variant = UI_PANEL_ILI9881C;
+    ui_panel_variant_t variant = UI_PANEL_NONE;
+    for (int attempt = 0; attempt < 8 && variant == UI_PANEL_NONE; attempt++) {
+        if (i2c_master_probe(bus, UI_GT911_ADDR, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "GT911 found -> ILI9881C panel variant");
+            s_gt911_addr = UI_GT911_ADDR;
+            variant = UI_PANEL_ILI9881C;
+        } else if (i2c_master_probe(bus, UI_GT911_ADDR_BKP, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "GT911 (backup addr) found -> ILI9881C panel variant");
+            s_gt911_addr = UI_GT911_ADDR_BKP;
+            variant = UI_PANEL_ILI9881C;
+        } else if (i2c_master_probe(bus, UI_ST7123_TP_ADDR, 50) == ESP_OK) {
+            variant = st712x_flavour(bus);
+            ESP_LOGI(TAG, "touch @0x55 -> %s panel variant",
+                     variant == UI_PANEL_ST7121 ? "ST7121" : "ST7123");
+        } else {
+            ESP_LOGW(TAG, "touch probe attempt %d: no answer, retrying", attempt);
+            vTaskDelay(pdMS_TO_TICKS(60));
+        }
+    }
+    if (variant == UI_PANEL_NONE) {
+        ESP_LOGW(TAG, "no touch controller after retries; defaulting to ST7123");
+        variant = UI_PANEL_ST7123;
     }
     i2c_del_master_bus(bus);
     return variant;
