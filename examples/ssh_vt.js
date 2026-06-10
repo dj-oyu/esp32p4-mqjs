@@ -82,16 +82,26 @@ var scrollTop = 0, scrollBot = ROWS - 1;
 var curFg = 0, curBg = 0, bold = false, inverse = false;
 var prevCurRow = 0;
 
+/* dirty[r] = 要再描画。dirtySeq[r] = 最後にダーティ化した順序番号。
+   描画予算が足りないとき、新しくダーティになった行から先に描く
+   (スクロールなら最新の下部行、編集ならカーソル周辺が優先される)。 */
 var dirty = new Array(ROWS);
-for (i = 0; i < ROWS; i++)
+var dirtySeq = new Array(ROWS);
+var seq = 0;
+for (i = 0; i < ROWS; i++) {
     dirty[i] = true;
+    dirtySeq[i] = i; /* 初回は上から下へ */
+}
+seq = ROWS;
 function markDirty(r) {
-    if (r >= 0 && r < ROWS)
+    if (r >= 0 && r < ROWS) {
         dirty[r] = true;
+        dirtySeq[r] = ++seq;
+    }
 }
 function markAll() {
     for (var r = 0; r < ROWS; r++)
-        dirty[r] = true;
+        markDirty(r);
 }
 
 /* 行 r の桁 c に 1 文字を書く (色は SGR 状態を反映) */
@@ -436,16 +446,27 @@ function drawRow(r) {
 }
 
 /* ui コマンドキューは深さ 128。1 tick の発行をその手前で止めれば
-   ドロップ (画面の乱れ) が起きない。行数ではなくコマンド数で律速する
-   ので、文字の少ない行はまとめて、密な行は分割して描ける。 */
+   ドロップ (画面の乱れ) が起きない。スクロールは全行をダーティにする
+   ので 1 tick では描き切れない (全面 ~1100 コマンド / 予算 110)。
+   描き切れない分は「最後にダーティ化した行 = 最新」から優先して描く。
+   下スクロール中は新しい行 (画面下部) が先に最新化され、上の (まもなく
+   流れて消える) 行が遅れる — 古い内容が下部に残る不整合を避けられる。 */
 var FLUSH_BUDGET = 110;
 function flush() {
     var budget = FLUSH_BUDGET;
-    for (var r = 0; r < ROWS && budget > 0; r++) {
-        if (dirty[r]) {
-            budget -= drawRow(r);
-            dirty[r] = false;
+    while (budget > 0) {
+        /* ダーティ行のうち dirtySeq 最大 (最新) を選ぶ */
+        var best = -1, bestSeq = -1;
+        for (var r = 0; r < ROWS; r++) {
+            if (dirty[r] && dirtySeq[r] > bestSeq) {
+                best = r;
+                bestSeq = dirtySeq[r];
+            }
         }
+        if (best < 0)
+            break;
+        budget -= drawRow(best);
+        dirty[best] = false;
     }
     /* カーソル (アンダーライン) */
     if (cy < ROWS_VIS && cx < COLS_VIS)
