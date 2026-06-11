@@ -46,6 +46,8 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "ui_tab5.h"
 #include "sshc.h"
 static const char *TAG = "mqjs";
@@ -1447,6 +1449,165 @@ JSValue js_uiwidget_value(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 }
 
 /* ------------------------------------------------------------------ */
+/* store (W2): tiny local key-value persistence, broker-independent    */
+/* (design §6 local-first). NVS namespace "mqjs"; values are strings   */
+/* (JS does JSON.stringify/parse on top). Keys 1-15 chars (NVS limit), */
+/* values up to ~3.9KB (NVS string limit). Survives task switches and  */
+/* reboots; PC build keeps a session-local table so flows smoke-test.  */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_STORE_VAL_MAX 3900
+
+#ifdef ESP_PLATFORM
+static nvs_handle_t s_store;
+static bool s_store_open;
+
+static bool store_open(void)
+{
+    if (s_store_open)
+        return true;
+    /* wifi.c normally ran nvs_flash_init already; do it lazily for
+       UI-less / WiFi-less configurations (double init is a no-op) */
+    if (nvs_open("mqjs", NVS_READWRITE, &s_store) != ESP_OK) {
+        nvs_flash_init();
+        if (nvs_open("mqjs", NVS_READWRITE, &s_store) != ESP_OK)
+            return false;
+    }
+    s_store_open = true;
+    return true;
+}
+#else
+#define MQJS_PC_STORE 16
+static struct {
+    char key[16];
+    char *val;
+} s_pc_store[MQJS_PC_STORE];
+
+static int pc_store_find(const char *k)
+{
+    for (int i = 0; i < MQJS_PC_STORE; i++)
+        if (s_pc_store[i].val && !strcmp(s_pc_store[i].key, k))
+            return i;
+    return -1;
+}
+#endif
+
+/* copy the key argument onto the stack; NVS keys are at most 15 chars */
+static int store_key(JSContext *ctx, JSValue v, char *dst /*[16]*/)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *s = JS_ToCStringLen(ctx, &len, v, &buf);
+    if (!s)
+        return -1;
+    if (len == 0 || len > 15) {
+        JS_ThrowRangeError(ctx, "store key must be 1-15 chars");
+        return -1;
+    }
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return 0;
+}
+
+/* store.get(key) -> string | undefined */
+JSValue js_store_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char key[16];
+    if (store_key(ctx, argv[0], key))
+        return JS_EXCEPTION;
+#ifdef ESP_PLATFORM
+    if (!store_open())
+        return JS_UNDEFINED;
+    size_t len = 0;
+    if (nvs_get_str(s_store, key, NULL, &len) != ESP_OK || len == 0)
+        return JS_UNDEFINED;
+    char *buf = malloc(len);
+    if (!buf)
+        return JS_ThrowOutOfMemory(ctx);
+    if (nvs_get_str(s_store, key, buf, &len) != ESP_OK) {
+        free(buf);
+        return JS_UNDEFINED;
+    }
+    JSValue v = JS_NewStringLen(ctx, buf, len - 1); /* len includes NUL */
+    free(buf);
+    return v;
+#else
+    int i = pc_store_find(key);
+    return i < 0 ? JS_UNDEFINED : JS_NewString(ctx, s_pc_store[i].val);
+#endif
+}
+
+/* store.set(key, value) -> bool. Strings only; persist immediately. */
+JSValue js_store_set(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char key[16];
+    if (store_key(ctx, argv[0], key))
+        return JS_EXCEPTION;
+    JSCStringBuf vbuf;
+    size_t vlen;
+    /* read the value AFTER the key was copied out: a second ToCString
+       may move the first string in the compacting GC heap */
+    const char *val = JS_ToCStringLen(ctx, &vlen, argv[1], &vbuf);
+    if (!val)
+        return JS_EXCEPTION;
+    if (vlen > MQJS_STORE_VAL_MAX)
+        return JS_ThrowRangeError(ctx, "store value too large (max %d)",
+                                  MQJS_STORE_VAL_MAX);
+#ifdef ESP_PLATFORM
+    if (!store_open())
+        return JS_NewBool(0);
+    /* val points into the JS heap, but nothing below allocates there */
+    bool ok = nvs_set_str(s_store, key, val) == ESP_OK &&
+              nvs_commit(s_store) == ESP_OK;
+    return JS_NewBool(ok);
+#else
+    int i = pc_store_find(key);
+    if (i < 0) {
+        for (int k = 0; k < MQJS_PC_STORE; k++)
+            if (!s_pc_store[k].val) {
+                i = k;
+                break;
+            }
+    }
+    if (i < 0)
+        return JS_NewBool(0);
+    char *copy = malloc(vlen + 1);
+    if (!copy)
+        return JS_ThrowOutOfMemory(ctx);
+    memcpy(copy, val, vlen);
+    copy[vlen] = '\0';
+    free(s_pc_store[i].val);
+    strcpy(s_pc_store[i].key, key);
+    s_pc_store[i].val = copy;
+    printf("[store] set %s (%u bytes) (PC: session-only)\n", key,
+           (unsigned)vlen);
+    return JS_NewBool(1);
+#endif
+}
+
+/* store.del(key) -> bool (true when it existed) */
+JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char key[16];
+    if (store_key(ctx, argv[0], key))
+        return JS_EXCEPTION;
+#ifdef ESP_PLATFORM
+    if (!store_open())
+        return JS_NewBool(0);
+    bool ok = nvs_erase_key(s_store, key) == ESP_OK &&
+              nvs_commit(s_store) == ESP_OK;
+    return JS_NewBool(ok);
+#else
+    int i = pc_store_find(key);
+    if (i < 0)
+        return JS_NewBool(0);
+    free(s_pc_store[i].val);
+    s_pc_store[i].val = NULL;
+    return JS_NewBool(1);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
 /* sys (W1-4): heap telemetry for the navigation-churn measurement     */
 /* ------------------------------------------------------------------ */
 
@@ -1752,6 +1913,12 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_ThrowTypeError(ctx, "mqtt already started");
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = uri,   /* copied by esp_mqtt_client_init */
+        /* distinct client id: the default is derived from the MAC, so a
+           JS task connecting to the same broker as the task-delivery
+           client (task_source.c) made the broker kick whichever
+           connected first — task pushes flapped and the status-bar MQTT
+           dot went gray (found the hard way, 2026-06-11) */
+        .credentials.client_id = "mqjs-js-task",
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     if (!s_mqtt)

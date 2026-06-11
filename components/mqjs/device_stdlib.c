@@ -447,6 +447,17 @@ static const JSPropDef js_ssh[] = {
 static const JSClassDef js_ssh_obj =
     JS_OBJECT_DEF("SSH", js_ssh);
 
+/* ---- device API: store object (NVS-backed key-value, W2) ---- */
+static const JSPropDef js_store[] = {
+    JS_CFUNC_DEF("get", 1, js_store_get),
+    JS_CFUNC_DEF("set", 2, js_store_set),
+    JS_CFUNC_DEF("del", 1, js_store_del),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_store_obj =
+    JS_OBJECT_DEF("Store", js_store);
+
 /* ---- device API: sys object (heap telemetry, W1-4) ---- */
 static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("heap", 0, js_sys_heap),
@@ -510,6 +521,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
+    JS_PROP_CLASS_DEF("store", &js_store_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
        ui.screen(); the names just make the ROM protos reachable). */

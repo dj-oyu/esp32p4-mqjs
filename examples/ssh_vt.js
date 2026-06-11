@@ -529,10 +529,38 @@ if (SELFTEST) {
              "\x1b[0m  scroll/cursor/SGR ok\r\n");
     }, 500);
 } else {
-    /* 端末本体 (キャンバス) は常駐し、接続フォーム (ウィジェット画面) を
-       前面に重ねる。フォーム表示中は inForm でキャンバス側のタッチを遮断
-       (README のハイブリッド標準イディオム)。 */
+    /* ---- SSH クライアントページ (W2) ----
+     * 保存済みホストの一覧 (タップ → 接続/編集/削除) + 新規接続フォーム。
+     * ホストは store("ssh_hosts") に JSON でローカル永続 (設計 §6。
+     * パスワードは現状平文保存 — 公開鍵認証/デバイス鍵暗号化は将来)。
+     * 端末描画はキャンバスのまま (性能バイパス)、ページはウィジェット。
+     * 標準イディオム: ウィジェット画面が前面の間は inForm でキャンバスの
+     * タッチを遮断 / リスト内容を変更したら unwind() でコンソールまで
+     * 巻き戻してページを作り直す (ブロック内 function 宣言は巻き上げ
+     * られないので全部 var の関数式)。 */
     var inForm = false;
+    var HOSTS_KEY = "ssh_hosts";
+
+    var loadHosts = function () {
+        var s = store.get(HOSTS_KEY);
+        if (!s)
+            return [];
+        try {
+            var a = JSON.parse(s);
+            return (a && a.length !== undefined) ? a : [];
+        } catch (e) {
+            return []; /* 壊れた JSON: 空から作り直す */
+        }
+    };
+    var saveHosts = function (hosts) {
+        store.set(HOSTS_KEY, JSON.stringify(hosts));
+    };
+    var unwind = function () { /* ウィジェット画面を全部閉じてコンソールへ */
+        while (ui.back()) {}
+    };
+    var hostLabel = function (e) {
+        return e.user + "@" + e.host + ":" + e.port;
+    };
 
     ssh.onData(function (chunk) {
         feed(chunk);
@@ -540,7 +568,8 @@ if (SELFTEST) {
     ssh.onClose(function (reason) {
         feed("\r\n*** SSH closed: " + reason + " ***\r\n");
         ui.keyboard(0);
-        connectForm("切断: " + reason); /* フォームに戻る (再接続 UX) */
+        unwind();
+        hostsPage("切断: " + reason); /* ホスト一覧に戻る (再接続 UX) */
     });
     ui.onKey(function (k) {
         if (k === "\n")
@@ -552,8 +581,8 @@ if (SELFTEST) {
     });
 
     /* キーボードの ⌨ アイコン (LVGL の「閉じる」キー) で消えても、画面を
-       タップすれば呼び戻せるようにする (常時表示の保険)。フォームが前面の
-       間は何もしない (端末キーボードがフォームに被ってしまう)。 */
+       タップすれば呼び戻せるようにする (常時表示の保険)。ページが前面の
+       間は何もしない (端末キーボードがページに被ってしまう)。 */
     ui.onTouch(function (x, y, kind) {
         if (inForm)
             return;
@@ -563,34 +592,98 @@ if (SELFTEST) {
 
     setInterval(flush, 25); /* ~40fps でダーティ行を消化 */
 
-    /* ブロック内の function 宣言は mquickjs では巻き上げられない:
-       var への関数式代入にする (onClose より先に評価される位置に置く) */
-    var connectForm = function (note) {
+    var startSession = function (e) {
+        inForm = false;
+        unwind();
+        ui.clear(BG);
+        resetTerm();
+        ui.keyboard(1);
+        ssh.connect(e.host, e.port, e.user, e.pass, COLS, ROWS);
+    };
+
+    /* 接続フォーム。preset で初期値、editIdx >= 0 なら既存エントリの編集 */
+    var connectForm = function (preset, editIdx) {
         inForm = true;
-        var s = ui.screen("SSH 接続");
+        var s = ui.screen(editIdx >= 0 ? "ホストを編集" : "新規接続");
+        var fh = s.field("Host");
+        fh.setText(preset.host);
+        var fp = s.field("Port");
+        fp.setText("" + preset.port);
+        var fu = s.field("User");
+        fu.setText(preset.user);
+        var fw = s.field("Password", { secret: true });
+        fw.setText(preset.pass || "");
+        var sv = s.toggle("この接続先を保存", 1);
+        var mk = function () {
+            var p = parseInt(fp.value(), 10);
+            return { host: fh.value(), port: isNaN(p) ? 22 : p,
+                     user: fu.value(), pass: fw.value() };
+        };
+        var put = function (e) {
+            if (!sv.value())
+                return;
+            var hosts = loadHosts();
+            if (editIdx >= 0 && editIdx < hosts.length)
+                hosts[editIdx] = e;
+            else
+                hosts.push(e);
+            saveHosts(hosts);
+        };
+        s.button("接続", function () {
+            var e = mk();
+            put(e);
+            startSession(e);
+        });
+        if (editIdx >= 0) {
+            s.button("保存して一覧へ", function () {
+                put(mk());
+                unwind();
+                hostsPage("保存しました");
+            });
+        }
+        s.button("キャンセル", ui.back);
+    };
+
+    /* 一覧の行をタップ → 接続/編集/削除のアクションページ */
+    var hostActions = function (idx) {
+        var hosts = loadHosts();
+        if (idx >= hosts.length)
+            return;
+        var e = hosts[idx];
+        var s = ui.screen(hostLabel(e));
+        s.button("接続", function () { startSession(e); });
+        s.button("編集", function () { connectForm(e, idx); });
+        s.button("削除", function () {
+            var h2 = loadHosts();
+            h2.splice(idx, 1);
+            saveHosts(h2);
+            unwind();
+            hostsPage("削除: " + hostLabel(e));
+        });
+        s.button("戻る", ui.back);
+    };
+
+    var hostsPage = function (note) {
+        inForm = true;
+        var s = ui.screen("SSH ホスト");
         if (note)
             s.label(note);
-        var fh = s.field("Host");
-        fh.setText(HOST);
-        var fp = s.field("Port");
-        fp.setText("" + PORT);
-        var fu = s.field("User");
-        fu.setText(USER);
-        var fw = s.field("Password", { secret: true });
-        s.button("接続", function () {
-            HOST = fh.value();
-            USER = fu.value();
-            PASS = fw.value();
-            var p = parseInt(fp.value(), 10);
-            if (!isNaN(p))
-                PORT = p;
-            inForm = false;
-            ui.back();          /* キャンバス画面に戻ってから端末開始 */
-            ui.clear(BG);
-            resetTerm();
-            ui.keyboard(1);
-            ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
+        var hosts = loadHosts();
+        if (hosts.length) {
+            var l = s.list();
+            var i;
+            for (i = 0; i < hosts.length; i++) {
+                (function (idx, e) {
+                    l.add(hostLabel(e), function () { hostActions(idx); });
+                })(i, hosts[i]);
+            }
+        } else {
+            s.label("保存済みホストはありません");
+        }
+        s.button("+ 新規接続", function () {
+            connectForm({ host: HOST, port: PORT, user: USER, pass: "" }, -1);
         });
     };
-    connectForm(null);
+
+    hostsPage(null);
 }

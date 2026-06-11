@@ -74,6 +74,13 @@ typedef struct {
 static ui_w_entry_t s_w[UI_W_MAX];
 static uint8_t s_stack[UI_NAV_RETAIN + 4]; /* root + retained + headroom */
 static int s_sp;
+static int s_cur = -1;       /* slot of the ACTIVE widget screen, -1 = console.
+                                Tracked here instead of lv_screen_active():
+                                during a lv_screen_load_anim the display still
+                                reports the OLD screen until the animation
+                                lands, so back-to-back ui.back() calls (the
+                                unwind idiom) raced and stopped after one pop
+                                (user-reported W2 bug). */
 static lv_obj_t *s_root;     /* console screen (bottom of every stack) */
 static lv_obj_t *s_field_kb; /* shared lv_keyboard for FIELD textareas */
 
@@ -227,16 +234,10 @@ extern "C" uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
     }
 
     /* retain the screen we are leaving (console = sentinel) */
-    lv_obj_t *cur = lv_screen_active();
-    uint8_t cur_slot = UI_SLOT_ROOT;
-    if (cur != s_root) {
-        for (int i = 0; i < UI_W_MAX; i++)
-            if (s_w[i].used && s_w[i].kind == UI_WK_SCREEN_SLOT &&
-                s_w[i].obj == cur)
-                cur_slot = (uint8_t)i;
-    }
+    uint8_t cur_slot = s_cur < 0 ? UI_SLOT_ROOT : (uint8_t)s_cur;
     if (s_sp < (int)sizeof(s_stack))
         s_stack[s_sp++] = cur_slot;
+    s_cur = slot;
 
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, UI_NAV_ANIM_MS, 0,
                         false);
@@ -271,27 +272,29 @@ extern "C" uint32_t ui_tab5_w_back(void)
     if (!ui_up() || !s_root)
         return 0;
     lvgl_port_lock(0);
-    lv_obj_t *cur = lv_screen_active();
-    int cur_slot = -1;
-    for (int i = 0; i < UI_W_MAX; i++)
-        if (s_w[i].used && s_w[i].kind == UI_WK_SCREEN_SLOT &&
-            s_w[i].obj == cur)
-            cur_slot = i;
-    if (cur_slot < 0 || s_sp <= 0) { /* console active, or nothing below */
+    int cur_slot = s_cur; /* tracked, NOT lv_screen_active(): see s_cur */
+    if (cur_slot < 0 || !s_w[cur_slot].used || s_sp <= 0) {
         lvgl_port_unlock();
-        return 0;
+        return 0; /* console active (or stale state): nothing to pop */
     }
+    lv_obj_t *cur_obj = s_w[cur_slot].obj;
     uint8_t prev_slot = s_stack[--s_sp];
     lv_obj_t *prev =
         (prev_slot == UI_SLOT_ROOT) ? s_root : s_w[prev_slot].obj;
     if (!prev) { /* retained screen was evicted: fall through to console */
         prev = s_root;
+        prev_slot = UI_SLOT_ROOT;
         s_sp = 0;
     }
+    s_cur = (prev_slot == UI_SLOT_ROOT) ? -1 : (int)prev_slot;
     uint32_t destroyed = w_handle(cur_slot);
     w_orphan_screen(cur_slot);
+    (void)cur_obj;
     /* auto_del=true frees the departing tree after the animation — the
-       design's "アニメ完了後に旧を解放" without any timer bookkeeping */
+       design's "アニメ完了後に旧を解放" without any timer bookkeeping.
+       Rapid chained back() calls are safe: lv_screen_load_anim force-
+       completes an in-flight load (and del_prev-deletes the screen it
+       was leaving) before starting the next one. */
     lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_MOVE_RIGHT, UI_NAV_ANIM_MS, 0,
                         true);
     lvgl_port_unlock();
@@ -318,6 +321,7 @@ extern "C" void ui_tab5_w_reset(void)
         s_w[i].obj = NULL;
     }
     s_sp = 0;
+    s_cur = -1;
     lvgl_port_unlock();
 }
 

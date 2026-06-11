@@ -168,7 +168,7 @@ ssh.write(id, "ls\n");  ssh.onData(id, fn);  ssh.close(id);
 | **W1-2** | ウィジェットバインド基盤: id↔obj 表、コマンドキュー拡張、イベント routing、ハンドル世代管理 | 中 | — |
 | **W1-3** | 初期ウィジェット: screen/navigate/back(リテインスタック N=3)+ button/label/field/list(object_pool)+ 一括解放(④) | 中 | — |
 | **W1-4** | 設定ページ骨子を JS で組み、navigate/back を **heap 計測**してスラッシングしないことを定量化 | 小 | sys.heap() |
-| **W2** | ホスト設定ページ + NVS 永続 + フォーム。既存 ssh_vt を「クライアントページ」に統合 | 小〜中 | — |
+| **W2** | ホスト設定ページ + NVS 永続 + フォーム。既存 ssh_vt を「クライアントページ」に統合 ✅ **済** (§10.6) | 小〜中 | — |
 | **W3** | 複数 SSH セッション(sshc ハンドル化)+ tabview 切替 | 中 | — |
 | **P4** | これを土台にランチャー/マルチアプリ([[tab5-platform-vision]]) | 大 | — |
 
@@ -296,3 +296,46 @@ toggle/slider/list 6 行/Save/Cancel)を 5 枚 push(N=3 超え → evict 発生)
 - examples は全面的に 3 形態(ウィジェット/キャンバス/ハイブリッド)へ
   対応済み(5856abd、examples/README.md に標準イディオム集)。ssh_vt /
   ssh_term は接続フォーム入力になり認証情報がファイルから消えた。
+
+## 11. W2 実装ログ (2026-06-11)
+
+- **`store.get/set/del`**(mqjs_runtime.c / device_stdlib.c): NVS
+  namespace "mqjs"、キー 1〜15 文字(NVS 制限)、値は文字列 ≤3.9KB
+  (JS 側で JSON.stringify/parse)。set/del は即 commit。NVS 初期化は
+  wifi.c 任せ + 遅延フォールバック(WiFi 無し構成でも動く)。PC ビルドは
+  セッション内テーブル(フロー検証用)。mqjs コンポーネントに
+  nvs_flash 依存を追加。§6 のローカルファースト原則どおりブローカー非依存。
+- **ssh_vt クライアントページ**: 起動 → 「SSH ホスト」一覧(store の
+  "ssh_hosts" JSON)。行タップ → 接続/編集/削除のアクションページ。
+  「+ 新規接続」→ フォーム(Host/Port/User/Password + 保存トグル)。
+  切断 → 一覧に復帰。リスト変更後は `while(ui.back()){}` でコンソール
+  まで巻き戻して作り直す(動的リストの標準イディオム)。端末コア
+  (VT100 パーサ/セル描画)は無変更、SELFTEST 出力同一を確認。
+- パスワードは平文で NVS 保存(§6 で宣言済みのトレードオフ。公開鍵認証/
+  デバイス鍵暗号化が将来課題)。
+- 実機確認(自動プローブ): `w2_store_probe.js` で set/get/del とタスク
+  再実行・**ウォッチドッグ再起動跨ぎの永続**を MQTT レポートで実証。
+  UI から保存したホスト(ssh_hosts JSON)も再起動を生き延びた。
+
+### 11.1 実機で踏んだバグ 2 件(修正・実証済み)
+
+1. **unwind 競合**: `while(ui.back()){}` が画面遷移アニメと競合。LVGL は
+   アニメ完了まで `lv_screen_active()` が旧画面を返す(lv_display.c)ため、
+   連続 back の 2 回目が orphan 済み画面を見て 0 を返し巻き戻しが止まる。
+   タイミング依存(LVGL タスクは Core1 並走)で、症状は「接続後に
+   キーボードが効かない/タップ再表示しない」(実は hosts ページが前面の
+   まま)。**修正**: ui_widgets.cpp がアクティブ画面スロットを自前追跡
+   (`s_cur`)し、`lv_screen_active()` への問い合わせを廃止。連続 back の
+   重なりは LVGL 側が in-flight ロードを強制完了 + del_prev で安全。
+   **実機実証**: `w2_unwind_probe.js`(3 画面積んで 1 tick 内で全 unwind)
+   → burst_pops=3 OK / rebuild_pops OK。
+2. **MQTT クライアント ID 衝突**: JS の `mqtt.connect` と task_source.c が
+   両方 esp-mqtt デフォルト ID(MAC 由来で同一)→ 同一ブローカーに繋ぐと
+   蹴り合いになりタスク配信がフラッピング(status バー MQTT グレー、
+   push 喪失)。**修正**: JS 接続に固有 ID `mqjs-js-task` を付与
+   (js_mqtt_connect)。プローブの publish とタスク配信の共存で実証。
+
+教訓: 「MQTT グレー + コンソール初期表示のまま」は C6 wedge とは限らず、
+「画面を描かないタスクが永続化されている + 配信チャネル不調」のことも
+ある。シリアルの `loaded persisted task (NNN bytes)` のサイズでどの
+タスクが走っているか判別できる。
