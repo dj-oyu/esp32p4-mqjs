@@ -6,7 +6,7 @@ RUN=${RUN_PC:-/tmp/run_pc}
 # /tmp is wiped whenever the WSL VM restarts — a missing binary must be a
 # hard error, or every script "passes" (the grep sees no exception text)
 [ -x "$RUN" ] || { echo "FATAL: $RUN not found - build run_pc first (README)"; exit 2; }
-files=${@:-touch_demo ui_demo i2c_scan mqtt_demo blink_button morse reaction bench ssh_term ssh_vt settings_demo}
+files=${@:-launcher touch_demo ui_demo i2c_scan mqtt_demo blink_button morse reaction bench ssh_vt settings_demo}
 rc=0
 for f in $files; do
     out=$(timeout 4 "$RUN" "$f.js" 2>&1)

@@ -497,6 +497,9 @@ static const JSPropDef js_sys[] = {
     /* P4c registry: uninstall + per-app latest notifications */
     JS_CFUNC_DEF("uninstall", 1, js_sys_uninstall),
     JS_CFUNC_DEF("notices", 0, js_sys_notices),
+    /* §11 store catalog: browse the shelf, install on demand */
+    JS_CFUNC_DEF("store", 0, js_sys_store),
+    JS_CFUNC_DEF("install", 1, js_sys_install),
     JS_PROP_END,
 };
 

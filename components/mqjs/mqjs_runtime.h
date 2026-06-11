@@ -138,6 +138,29 @@ bool mqjs_clipboard_peek(char *type, size_t tcap, char *data, size_t dcap);
 void mqjs_set_print_sink(void (*fn)(const char *line, size_t len));
 
 /*
+ * §11 store catalog provider (launcher-multiapp-design): the host
+ * registers the broker-backed catalog here; the PC build leaves it
+ * NULL -> sys.store() returns [] and sys.install() false. get() copies
+ * the entry's name and its leading manifest header (the runtime parses
+ * @title/@icon/@desc/@size out of it). install() requests the async
+ * fetch of the signed body; completion surfaces as the usual
+ * "installed: <name>" status event.
+ */
+typedef struct {
+    int (*count)(void);
+    bool (*get)(int idx, char *name, size_t ncap, char *head, size_t hcap);
+    bool (*install)(const char *name);
+} mqjs_store_api_t;
+void mqjs_set_store_provider(const mqjs_store_api_t *api);
+
+/*
+ * Called on the JS task right after sys.uninstall removes an app file:
+ * the host drops the app's registry subscription so the retained body
+ * does not reinstall it on the next broker sync (§11).
+ */
+void mqjs_set_uninstall_hook(void (*fn)(const char *name));
+
+/*
  * Post a touch event to the JS event loop (callable from another task,
  * not from an ISR). kind: 0 = down, 1 = move, 2 = up. Coordinates are
  * in the ui canvas space (see ui.size()). Touch always belongs to the

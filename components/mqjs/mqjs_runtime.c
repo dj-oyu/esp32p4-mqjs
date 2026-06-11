@@ -366,6 +366,21 @@ void mqjs_set_print_sink(void (*fn)(const char *, size_t))
     s_print_sink = fn;
 }
 
+/* §11 store catalog provider + uninstall unsubscribe hook (both
+   host-registered; NULL on the PC build) */
+static const mqjs_store_api_t *s_store_api;
+static void (*s_uninstall_hook)(const char *name);
+
+void mqjs_set_store_provider(const mqjs_store_api_t *api)
+{
+    s_store_api = api;
+}
+
+void mqjs_set_uninstall_hook(void (*fn)(const char *name))
+{
+    s_uninstall_hook = fn;
+}
+
 /* Flush one assembled line to the sink. Non-dev apps get a "[name] "
    prefix so the shared console stays attributable (§3.5). */
 static void sink_flush(void)
@@ -2639,6 +2654,83 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return arr;
 }
 
+/* sys.store() -> [{name, title, icon, desc, size, installed}] straight
+   from the broker catalog (§11). Catalog-only on purpose: the launcher
+   merges it with sys.installed() itself, and a device-side install
+   shows up here as installed=true on the next call. */
+JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+    JS_PUSH_VALUE(ctx, arr);
+    int n = 0;
+    int cnt = s_store_api ? s_store_api->count() : 0;
+    for (int i = 0; i < cnt; i++) {
+        char name[25], head[224];
+        if (!s_store_api->get(i, name, sizeof name, head, sizeof head))
+            continue;
+        size_t hlen = strlen(head);
+        char title[48], icon[8], desc[120], perm[48], sizes[16];
+        manifest_field(head, hlen, "// @title ", title, sizeof title);
+        manifest_field(head, hlen, "// @icon ", icon, sizeof icon);
+        manifest_field(head, hlen, "// @desc ", desc, sizeof desc);
+        manifest_field(head, hlen, "// @perm ", perm, sizeof perm);
+        manifest_field(head, hlen, "// @size ", sizes, sizeof sizes);
+        long size = atol(sizes);
+        bool inst = false;
+        char path[96];
+        snprintf(path, sizeof path, "/littlefs/apps/%.40s.js", name);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            inst = true;
+            fseek(f, 0, SEEK_END);
+            long fl = ftell(f);
+            if (fl > 0)
+                size = fl; /* the device's copy wins over @size */
+            fclose(f);
+        }
+        JSGCRef obj_ref;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        JSValue v = JS_NewString(ctx, name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", v);
+        v = JS_NewString(ctx, title[0] ? title : name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "title", v);
+        v = JS_NewString(ctx, icon);
+        JS_SetPropertyStr(ctx, obj_ref.val, "icon", v);
+        v = JS_NewString(ctx, desc);
+        JS_SetPropertyStr(ctx, obj_ref.val, "desc", v);
+        v = JS_NewString(ctx, perm);
+        JS_SetPropertyStr(ctx, obj_ref.val, "perm", v);
+        JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                          JS_NewInt32(ctx, (int32_t)size));
+        JS_SetPropertyStr(ctx, obj_ref.val, "installed", JS_NewBool(inst));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)n++, obj);
+    }
+    JS_POP_VALUE(ctx, arr);
+    return arr;
+}
+
+/* sys.install(name) -> bool: request the async fetch of a catalog
+   app's signed body (§11). true = request accepted; completion lands
+   through the registry path ("installed: <name>" status/event). */
+JSValue js_sys_install(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char name[64];
+    if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+        return JS_EXCEPTION;
+    bool ok = s_store_api && name[0] && !strchr(name, '/') &&
+              s_store_api->install(name);
+    return JS_NewBool(ok);
+}
+
 static int app_free_slot(void)
 {
     /* 0 = launcher, 1 = dev: launched apps live in the user slots */
@@ -2894,7 +2986,12 @@ JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     if (!strchr(name, '/'))
         autostart_optin_remove(name); /* uninstall revokes the boot opt-in */
 #endif
-    return JS_NewBool(remove(path) == 0);
+    bool ok = remove(path) == 0;
+    /* §11: drop the registry subscription too, or the retained body
+       would reinstall the app on the next broker sync */
+    if (ok && !strchr(name, '/') && s_uninstall_hook)
+        s_uninstall_hook(name);
+    return JS_NewBool(ok);
 }
 
 /* Status-bar chip / notification tap: ask the resident launcher to

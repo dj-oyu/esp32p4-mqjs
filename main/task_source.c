@@ -9,6 +9,7 @@
  * SECURITY: flash is trusted - a persisted task is not re-verified on
  * boot. Key rotation requires re-flashing (regenerate task_pubkey.h).
  */
+#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -55,25 +56,113 @@ static void publish_status(const char *msg)
  * LAN-only broker — worst case an attacker deletes, never installs. */
 #define APPS_PREFIX CONFIG_MQJS_TASK_TOPIC "/apps/"
 
-static void registry_rx(esp_mqtt_event_handle_t e)
-{
+/* §11 store catalog: <TASK_TOPIC>/store/<name> carries the app's
+ * leading manifest comment block (plus a tool-added "// @size N") as a
+ * small retained message. UNSIGNED on purpose — same reasoning as the
+ * tombstone: a forged catalog row can only lie in a list; installing
+ * the body still requires the Ed25519 envelope on apps/<name>. */
+#define STORE_PREFIX CONFIG_MQJS_TASK_TOPIC "/store/"
+#define STORE_MAX  24
+#define STORE_HEAD 224
+
+typedef struct {
     char name[25];
-    size_t nlen = (size_t)e->topic_len - (sizeof(APPS_PREFIX) - 1);
-    const char *p = e->topic + sizeof(APPS_PREFIX) - 1;
-    if (nlen == 0 || nlen >= sizeof name) {
-        ui_status_set_event("app rejected: bad name");
-        return;
-    }
+    char head[STORE_HEAD];
+} StoreEntry;
+static StoreEntry s_store[STORE_MAX];
+static int s_store_n;
+static SemaphoreHandle_t s_store_lock;
+
+/* copy the <name> suffix of e->topic (after plen bytes of prefix) with
+ * the registry's identifier charset; false = reject */
+static bool topic_name(esp_mqtt_event_handle_t e, size_t plen, char *name,
+                       size_t cap)
+{
+    size_t nlen = (size_t)e->topic_len - plen;
+    const char *p = e->topic + plen;
+    if (nlen == 0 || nlen >= cap)
+        return false;
     for (size_t i = 0; i < nlen; i++) {
         char c = p[i];
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_' || c == '-')) {
-            ui_status_set_event("app rejected: bad name");
-            return;
-        }
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
         name[i] = c;
     }
     name[nlen] = '\0';
+    return true;
+}
+
+/* catalog sync: keep the latest manifest header per shelf entry; an
+ * empty retained payload (catalog tombstone) drops the row. Silent on
+ * junk — an unsigned topic must not be able to spam the status bar. */
+static void store_rx(esp_mqtt_event_handle_t e)
+{
+    char name[25];
+    if (!topic_name(e, sizeof(STORE_PREFIX) - 1, name, sizeof name))
+        return;
+    xSemaphoreTake(s_store_lock, portMAX_DELAY);
+    int idx = -1;
+    for (int i = 0; i < s_store_n; i++)
+        if (!strcmp(s_store[i].name, name)) {
+            idx = i;
+            break;
+        }
+    if (e->data_len == 0) {
+        if (idx >= 0) {
+            s_store[idx] = s_store[--s_store_n];
+            memset(&s_store[s_store_n], 0, sizeof s_store[0]);
+        }
+    } else if (e->data_len < 11 || memcmp(e->data, "// @app ", 8) != 0) {
+        ESP_LOGW(TAG, "store entry '%s' has no manifest, dropped", name);
+    } else {
+        if (idx < 0 && s_store_n < STORE_MAX)
+            idx = s_store_n++;
+        if (idx >= 0) {
+            StoreEntry *se = &s_store[idx];
+            snprintf(se->name, sizeof se->name, "%s", name);
+            size_t n = (size_t)e->data_len;
+            if (n >= sizeof se->head)
+                n = sizeof se->head - 1;
+            memcpy(se->head, e->data, n);
+            se->head[n] = '\0';
+        } else {
+            ESP_LOGW(TAG, "store catalog full, '%s' dropped", name);
+        }
+    }
+    xSemaphoreGive(s_store_lock);
+}
+
+/* §11: payload subscriptions are per-installed-app — the shelf no
+ * longer auto-installs everything; new apps arrive only through
+ * task_source_install(). Updates/tombstones keep flowing for what is
+ * already on the device. */
+static void subscribe_installed(void)
+{
+    DIR *d = opendir("/littlefs/apps");
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (l < 4 || l > 27 || strcmp(e->d_name + l - 3, ".js"))
+            continue;
+        char topic[sizeof(APPS_PREFIX) + 32];
+        snprintf(topic, sizeof topic, APPS_PREFIX "%.*s", (int)(l - 3),
+                 e->d_name);
+        esp_mqtt_client_subscribe(s_cli, topic, 1);
+    }
+    closedir(d);
+}
+
+static void registry_rx(esp_mqtt_event_handle_t e)
+{
+    char name[25];
+    if (!topic_name(e, sizeof(APPS_PREFIX) - 1, name, sizeof name)) {
+        ui_status_set_event("app rejected: bad name");
+        return;
+    }
+    size_t nlen = strlen(name);
 
     if (e->data_len == 0) { /* tombstone */
         if (storage_delete_app(name)) {
@@ -142,9 +231,10 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "ready, listening on %s", CONFIG_MQJS_TASK_TOPIC);
         esp_mqtt_client_subscribe(s_cli, CONFIG_MQJS_TASK_TOPIC, 1);
-        /* P4c registry shelf: retained app payloads replay on every
-           (re)connect = the store sync */
-        esp_mqtt_client_subscribe(s_cli, APPS_PREFIX "+", 1);
+        /* §11: catalog rows for everything on the shelf, payloads only
+           for what this device has installed (selective install) */
+        esp_mqtt_client_subscribe(s_cli, STORE_PREFIX "+", 1);
+        subscribe_installed();
         publish_status("ready");
         ui_status_set_mqtt(true);
         break;
@@ -164,7 +254,12 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
             ui_status_set_event(ev0);
             break;
         }
-        /* route by topic: registry shelf vs the dev task topic */
+        /* route by topic: catalog vs registry shelf vs the dev topic */
+        if (e->topic_len > (int)(sizeof(STORE_PREFIX) - 1) &&
+            memcmp(e->topic, STORE_PREFIX, sizeof(STORE_PREFIX) - 1) == 0) {
+            store_rx(e);
+            break;
+        }
         if (e->topic_len > (int)(sizeof(APPS_PREFIX) - 1) &&
             memcmp(e->topic, APPS_PREFIX, sizeof(APPS_PREFIX) - 1) == 0) {
             registry_rx(e);
@@ -256,6 +351,7 @@ void task_source_start(void)
         return;
     }
     s_lock = xSemaphoreCreateMutex();
+    s_store_lock = xSemaphoreCreateMutex();
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = CONFIG_MQJS_TASK_BROKER,
         .buffer.size = RX_BUF_SIZE,
@@ -286,4 +382,67 @@ char *task_source_take(size_t *len)
     s_pending_len = 0;
     xSemaphoreGive(s_lock);
     return p;
+}
+
+/* ---- §11 store catalog API (callers: mqjs runtime via the store
+   provider; all safe before task_source_start = empty/false) ---- */
+
+static bool name_valid(const char *name)
+{
+    size_t l = strlen(name);
+    if (l == 0 || l > 24)
+        return false;
+    for (const char *p = name; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+            return false;
+    return true;
+}
+
+int task_source_store_count(void)
+{
+    if (!s_store_lock)
+        return 0;
+    xSemaphoreTake(s_store_lock, portMAX_DELAY);
+    int n = s_store_n;
+    xSemaphoreGive(s_store_lock);
+    return n;
+}
+
+bool task_source_store_get(int idx, char *name, size_t ncap, char *head,
+                           size_t hcap)
+{
+    if (!s_store_lock)
+        return false;
+    bool ok = false;
+    xSemaphoreTake(s_store_lock, portMAX_DELAY);
+    if (idx >= 0 && idx < s_store_n) {
+        snprintf(name, ncap, "%s", s_store[idx].name);
+        snprintf(head, hcap, "%s", s_store[idx].head);
+        ok = true;
+    }
+    xSemaphoreGive(s_store_lock);
+    return ok;
+}
+
+bool task_source_install(const char *name)
+{
+    if (!s_cli || !name_valid(name))
+        return false;
+    /* subscribing to the payload topic IS the install: the retained
+       body arrives, registry_rx verifies + saves (then the connect-time
+       littlefs scan keeps the subscription on future sessions) */
+    char topic[sizeof(APPS_PREFIX) + 32];
+    snprintf(topic, sizeof topic, APPS_PREFIX "%s", name);
+    return esp_mqtt_client_subscribe(s_cli, topic, 1) >= 0;
+}
+
+void task_source_app_unsub(const char *name)
+{
+    if (!s_cli || !name_valid(name))
+        return;
+    /* §11: uninstall must not resurrect on the next retained replay */
+    char topic[sizeof(APPS_PREFIX) + 32];
+    snprintf(topic, sizeof topic, APPS_PREFIX "%s", name);
+    esp_mqtt_client_unsubscribe(s_cli, topic);
 }

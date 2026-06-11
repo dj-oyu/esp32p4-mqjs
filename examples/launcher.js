@@ -62,7 +62,49 @@ function storePage() {
             list.add(label, function () { detailPage(it, !!running[it.name]); });
         })(inst[j]);
     }
+    /* §11: 棚にあってこの端末に入っていないアプリ (カタログ由来)。
+       インストールは要求のみ非同期 — 完了は "installed:" 通知で届き、
+       次にこのページを開いたとき済み側に並ぶ。 */
+    var store = sys.store();
+    var have = {};
+    for (var k = 0; k < inst.length; k++)
+        have[inst[k].name] = true;
+    var avail = [];
+    for (var m = 0; m < store.length; m++)
+        if (!store[m].installed && !have[store[m].name])
+            avail.push(store[m]);
+    if (avail.length) {
+        s.label("入手可能 (" + avail.length + ")");
+        var al = s.list();
+        for (var a = 0; a < avail.length; a++) {
+            (function (it) {
+                al.add((it.icon ? it.icon + " " : "") + it.title,
+                       function () { availPage(it); });
+            })(avail[a]);
+        }
+    }
     s.label("行タップで詳細 (説明 / 権限 / 起動)");
+    s.button("戻る", function () { ui.back(); });
+}
+
+/* 未インストール詳細: マニフェスト情報と [インストール]。要求が通ると
+   署名検証済みの本体が registry 経路で入る (自動実行はしない §6)。 */
+function availPage(it) {
+    var s = ui.screen((it.icon ? it.icon + " " : "") + it.title);
+    s.label("name: " + it.name);
+    if (it.desc)
+        s.label(it.desc);
+    if (it.perm)
+        s.label("権限 (宣言のみ): " + it.perm);
+    if (it.size)
+        s.label("サイズ: " + it.size + " B");
+    s.button("インストール", function () {
+        if (sys.install(it.name))
+            sys.notify("インストール要求: " + it.name);
+        else
+            sys.notify("要求できません (ブローカー未接続?)");
+        ui.back(); /* 完了は installed: 通知 → ストアを開き直すと済み側 */
+    });
     s.button("戻る", function () { ui.back(); });
 }
 
@@ -82,9 +124,9 @@ function detailPage(it, isRunning) {
     });
     s.button("アンインストール", function () {
         sys.uninstall(it.name);
-        /* レジストリ配布物は broker に retained が残っていれば次の
-           同期で戻る (恒久削除は tombstone、設計 §4.5) */
-        sys.notify("削除: " + it.name + " (棚に残っていれば次の同期で復帰)");
+        /* §11: 購読も外れるので retained 本体では復活しない。棚に
+           あればストアの「入手可能」に並び直す (再インストール可) */
+        sys.notify("削除: " + it.name + " (ストアから再インストール可)");
         build();
     });
     s.button("戻る", function () { ui.back(); });

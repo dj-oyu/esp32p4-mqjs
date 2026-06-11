@@ -478,7 +478,7 @@ manifest に `// @autostart` の 1 行があるアプリを、**opt-in 済みな
 - 選択インストール (§9 範囲外項目): インデックス topic + 本体の
   オンデマンド取得。棚の「全部入り」をやめるとき。→ **§11 で設計済み**。
 
-## 11. ストアカタログ + 選択インストール (設計 2026-06-12)
+## 11. ストアカタログ + 選択インストール (設計+実装+実機 E2E 済 2026-06-12)
 
 動機 (ユーザー): ランチャーから「インストール前のアプリ」が見えない。
 app store には必須の機能。
@@ -559,6 +559,16 @@ app store には必須の機能。
   installed 側の一覧に出るだけ — 欠落しない。
 - examples のストア掲載は別作業: 各ファイルに `// @app @title @icon
   @desc` を付与して `--shelf` で publish (掲載候補の選定はユーザー)。
+
+### 11.7.1 実機 E2E 結果 (2026-06-12)
+
+全 17 examples を `--shelf` で棚出し (カタログ行 145-276B)。デバイス実測:
+`sys.store()` = 17 行 (title/icon/desc/perm/size/installed 全て正値)、
+`sys.install("life")` → 3 秒以内に署名検証+保存 ("installed: life")、
+カタログの installed フラグ反転、`sys.uninstall` → カタログの入手可能へ
+復帰 (購読解除により retained 再配送でも復活しない)。ssh_vt は dev
+タスクから正式インストールアプリへ移行 (dev スロットは
+tools/dev_idle.js = ブート毎に devreport を 1 行 publish して自己停止)。
 
 ### 11.8 見送り (この弾の範囲外)
 

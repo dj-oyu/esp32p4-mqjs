@@ -62,6 +62,14 @@ static bool dev_next_source(const char **src, size_t *len, const char **name,
     return true;
 }
 
+/* §11 store catalog: the runtime's sys.store()/sys.install() are backed
+   by task_source's broker mirror (all entries safe pre-connect) */
+static const mqjs_store_api_t s_store_api = {
+    .count = task_source_store_count,
+    .get = task_source_store_get,
+    .install = task_source_install,
+};
+
 static void js_task(void *arg)
 {
     mqjs_rt_init(); /* arenas (4 x 256KB PSRAM) + shared event queue */
@@ -92,6 +100,8 @@ void app_main(void)
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
+    mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
+    mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
     storage_init();            /* mount LittleFS for persisted tasks */
 
     /* network first: blocks up to 30s for an IP, JS runs either way */
