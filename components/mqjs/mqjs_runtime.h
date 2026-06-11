@@ -54,7 +54,9 @@ void mqjs_post_key(const char *utf8, size_t len);
 
 /*
  * Feed SSH session bytes / termination into the JS event loop (callable
- * from the sshc session task, not from an ISR).
+ * from an sshc session task, not from an ISR). `id` is the session
+ * handle returned by mqjs_ssh_connect (W3: up to 3 concurrent sessions;
+ * JS routes data to the right terminal by id).
  *
  * mqjs_post_ssh_data takes ownership of `data` (heap) on success and the
  * dispatcher frees it; on failure (queue stayed full after a bounded
@@ -62,8 +64,8 @@ void mqjs_post_key(const char *utf8, size_t len);
  * dropped, so the caller should retry or tear the session down.
  * mqjs_post_ssh_closed delivers a short human reason once.
  */
-bool mqjs_post_ssh_data(char *data, size_t len);
-void mqjs_post_ssh_closed(const char *reason);
+bool mqjs_post_ssh_data(int id, char *data, size_t len);
+void mqjs_post_ssh_closed(int id, const char *reason);
 
 #ifdef __cplusplus
 }

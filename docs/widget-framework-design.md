@@ -1,7 +1,7 @@
 # Tab5 ウィジェットフレームワーク + マルチセッション 設計書
 
-Status: **W1 完了・実機検証済み** (2026-06-11)。W1-1〜W1-4 実装+定量ゲート
-合格(§10 実装ログ・§10.4 実機結果)。残りは目視確認(§10.4-5)と W2。
+Status: **W1〜W3 完了・実機検証済み** (2026-06-11)。実装ログ = §10 (W1) /
+§11 (W2) / §12 (W3)。残りは P4(ランチャー/マルチアプリ)。
 
 関連: `docs/ssh-terminal-design.md`(SSH 端末本体・§7 で入力/クリップボード/
 ダイヤルパネルを設計)、[[tab5-platform-vision]](MQTT app-store + マルチタスク
@@ -169,7 +169,7 @@ ssh.write(id, "ls\n");  ssh.onData(id, fn);  ssh.close(id);
 | **W1-3** | 初期ウィジェット: screen/navigate/back(リテインスタック N=3)+ button/label/field/list(object_pool)+ 一括解放(④) | 中 | — |
 | **W1-4** | 設定ページ骨子を JS で組み、navigate/back を **heap 計測**してスラッシングしないことを定量化 | 小 | sys.heap() |
 | **W2** | ホスト設定ページ + NVS 永続 + フォーム。既存 ssh_vt を「クライアントページ」に統合 ✅ **済** (§10.6) | 小〜中 | — |
-| **W3** | 複数 SSH セッション(sshc ハンドル化)+ tabview 切替 | 中 | — |
+| **W3** | 複数 SSH セッション(sshc ハンドル化)+ tabview 切替 ✅ **済** (§12) | 中 | — |
 | **P4** | これを土台にランチャー/マルチアプリ([[tab5-platform-vision]]) | 大 | — |
 
 着手順は **W1-1(PSRAM ヒープ)→ W1-2(基盤)→ W1-3 → W1-4**。W1-0 は完了。
@@ -339,3 +339,31 @@ toggle/slider/list 6 行/Save/Cancel)を 5 枚 push(N=3 超え → evict 発生)
 「画面を描かないタスクが永続化されている + 配信チャネル不調」のことも
 ある。シリアルの `loaded persisted task (NNN bytes)` のサイズでどの
 タスクが走っているか判別できる。
+
+## 12. W3 実装ログ (2026-06-11) — 複数 SSH セッション + タブ切替
+
+- **sshc ハンドル化**(components/sshc): static 単一セッション →
+  `SSHC_MAX_SESSIONS = 3` のセッション配列。各セッションが独立の
+  task(8KB)/socket/wolfSSH/tx StreamBuffer(2KB) を持つ。id は
+  `(gen<<2 | slot) + 1` で stale な JS ハンドルはどの API でも無害な
+  no-op。`mqjs_ssh_close_all()`(タスク切替クリーンアップ用)を追加。
+  wolfSSH_Init は一度だけ(複数タスクの Init/Cleanup 競合を回避)。
+- **ssh.\* JS API は §7 のとおりハンドル式**: `connect` が id を返し
+  (空きなしは TypeError)、`write/resize/close/connected/onData/onClose`
+  は第1引数に id。コールバックはセッション毎(4 slot、EV_SSH_CLOSED の
+  ディスパッチ後に data/close をまとめて release)。EV_SSH_DATA/CLOSED は
+  id を運び、JS が正しい端末へ振り分ける。
+- **ssh_vt マルチセッション化**: 端末状態+VT100 パーサ+描画を
+  `makeTerm()` ファクトリに分離(パーサロジックは無変更、SELFTEST 出力
+  同一を確認)。グリッド最上段 1 行(TAB_ROWS)がキャンバス直描きの
+  タブバー: タップで切替、緑の `+` で新規接続(ホストページへ)。
+  pty 行数は ROWS-1 に追従。
+- **背景タブのリソース設計**(「ピクセルは捨てる、モデルと回線は保つ」):
+  描画資源はタブ毎に持たない(キャンバスは全タブ共有の 1 枚、背景 Term
+  は `act` ゲートで ui.* を一切発行しない。背景中のスクロールも
+  ui.scroll でなく dirty マークに置換)。保持するのはグリッドモデル
+  (~10KB/本、固定 256KB の JS ヒープ内)と SSH セッション資源
+  (数十 KB 内部 RAM/本 — これが上限 3 本の根拠)。切替時は
+  markAll + 予算付き flush でモデルから全再描画。背景受信は継続
+  (サーバ出力を取りこぼさない)。PSRAM にタブ数比例の確保はない。
+- 実機テスト済み(ユーザー確認): タブ切替、複数セッション同時キープ。

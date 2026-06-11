@@ -178,8 +178,8 @@ typedef struct {
         struct { char *topic; char *payload; uint32_t len; } mqtt;
         struct { int16_t x, y; uint8_t kind; } touch;
         struct { char text[8]; uint8_t len; } key; /* one key as UTF-8 */
-        struct { char *data; uint32_t len; } ssh;  /* heap copy (rx)   */
-        struct { char reason[24]; } ssh_closed;
+        struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
+        struct { char reason[22]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
     } u;
 } MqjsEvent;
@@ -212,10 +212,18 @@ static volatile bool s_touch_used; /* read by the UI task (poster) */
 static JSGCRef   s_touch_cb;
 static volatile bool s_key_used;   /* read by the UI task (poster) */
 static JSGCRef   s_key_cb;
-static bool      s_ssh_data_used;  /* ssh.onData / ssh.onClose */
-static JSGCRef   s_ssh_data_cb;
-static bool      s_ssh_close_used;
-static JSGCRef   s_ssh_close_cb;
+
+/* per-session ssh callbacks (W3 handle-style: ssh.onData(id, fn)).
+   Sized to the sshc session cap + slack; sshc.h is ESP-only so the
+   constant is mirrored here (SSHC_MAX_SESSIONS = 3). */
+#define MQJS_MAX_SSH_CB 4
+typedef struct {
+    bool used;
+    int32_t id;
+    bool data_used, close_used;
+    JSGCRef data_fn, close_fn;
+} SshCb;
+static SshCb s_ssh_cbs[MQJS_MAX_SSH_CB];
 static volatile bool s_stop_req;
 static int64_t s_run_deadline;          /* JS watchdog */
 
@@ -1631,26 +1639,80 @@ JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 /* ------------------------------------------------------------------ */
-/* ssh (wolfSSH session task in components/sshc; PC = print stubs).    */
-/* The session task posts EV_SSH_DATA (heap copies, owned by the       */
-/* event) and one EV_SSH_CLOSED; an active session keeps the JS loop   */
+/* ssh (wolfSSH session tasks in components/sshc; PC = print stubs).   */
+/* W3 handle-style: ssh.connect() returns a session id; write/resize/  */
+/* close/connected/onData/onClose take it as the first argument, so up */
+/* to 3 sessions can be kept concurrently (design §7). Each session    */
+/* task posts EV_SSH_DATA (heap copies, owned by the event) with its   */
+/* id and one EV_SSH_CLOSED; any active session keeps the JS loop      */
 /* alive like an mqtt session does.                                    */
 /* ------------------------------------------------------------------ */
 
+static SshCb *sshcb_find(int32_t id)
+{
+    for (int i = 0; i < MQJS_MAX_SSH_CB; i++)
+        if (s_ssh_cbs[i].used && s_ssh_cbs[i].id == id)
+            return &s_ssh_cbs[i];
+    return NULL;
+}
+
+static SshCb *sshcb_get(int32_t id)
+{
+    SshCb *c = sshcb_find(id);
+    if (c)
+        return c;
+    for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
+        if (!s_ssh_cbs[i].used) {
+            c = &s_ssh_cbs[i];
+            memset(c, 0, sizeof *c);
+            c->used = true;
+            c->id = id;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+static void sshcb_release(JSContext *ctx, SshCb *c)
+{
+    if (c->data_used)
+        JS_DeleteGCRef(ctx, &c->data_fn);
+    if (c->close_used)
+        JS_DeleteGCRef(ctx, &c->close_fn);
+    memset(c, 0, sizeof *c);
+}
+
+#ifndef ESP_PLATFORM
+static int s_pc_ssh_next = 1; /* fake session ids for PC smoke runs */
+#endif
+
+/* ssh.connect(host, port, user, pass, cols, rows) -> session id (> 0).
+   Throws when all session slots are busy. */
 JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSCStringBuf hbuf, ubuf, pbuf;
     size_t hlen, ulen, plen;
     int port = 22, cols = 80, rows = 24;
 
-    const char *host = JS_ToCStringLen(ctx, &hlen, argv[0], &hbuf);
-    if (!host)
+    /* copy host/user out first: each later ToCString may move earlier
+       strings in the compacting GC heap */
+    char host[64], user[32];
+    const char *p = JS_ToCStringLen(ctx, &hlen, argv[0], &hbuf);
+    if (!p)
         return JS_EXCEPTION;
+    if (hlen >= sizeof host)
+        hlen = sizeof host - 1;
+    memcpy(host, p, hlen);
+    host[hlen] = '\0';
     if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &port, argv[1]))
         return JS_EXCEPTION;
-    const char *user = JS_ToCStringLen(ctx, &ulen, argv[2], &ubuf);
-    if (!user)
+    p = JS_ToCStringLen(ctx, &ulen, argv[2], &ubuf);
+    if (!p)
         return JS_EXCEPTION;
+    if (ulen >= sizeof user)
+        ulen = sizeof user - 1;
+    memcpy(user, p, ulen);
+    user[ulen] = '\0';
     const char *pass = JS_ToCStringLen(ctx, &plen, argv[3], &pbuf);
     if (!pass)
         return JS_EXCEPTION;
@@ -1660,136 +1722,156 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
         return JS_EXCEPTION;
 
 #ifdef ESP_PLATFORM
-    if (!mqjs_ssh_connect(host, port, user, pass, cols, rows))
-        return JS_ThrowTypeError(ctx, "ssh session already running (or no mem)");
+    int id = mqjs_ssh_connect(host, port, user, pass, cols, rows);
+    if (!id)
+        return JS_ThrowTypeError(ctx, "no free ssh session (max %d)",
+                                 SSHC_MAX_SESSIONS);
 #else
-    printf("[ssh] connect(%s@%s:%d, pty %dx%d) (stub: never connects on PC)\n",
-           user, host, port, cols, rows);
+    int id = s_pc_ssh_next++;
+    printf("[ssh] connect(%s@%s:%d, pty %dx%d) -> #%d (stub: never connects "
+           "on PC)\n", user, host, port, cols, rows, id);
 #endif
-    return JS_UNDEFINED;
+    return JS_NewInt32(ctx, id);
 }
 
 JSValue js_ssh_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
     JSCStringBuf buf;
     size_t len;
-    const char *str = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    const char *str = JS_ToCStringLen(ctx, &len, argv[1], &buf);
     if (!str)
         return JS_EXCEPTION;
 #ifdef ESP_PLATFORM
-    return JS_NewInt32(ctx, mqjs_ssh_write(str, len) ? 1 : 0);
+    return JS_NewInt32(ctx, mqjs_ssh_write(id, str, len) ? 1 : 0);
 #else
-    printf("[ssh] write(%u bytes) (stub)\n", (unsigned)len);
+    printf("[ssh] write(#%d, %u bytes) (stub)\n", id, (unsigned)len);
     return JS_NewInt32(ctx, 1);
 #endif
 }
 
 JSValue js_ssh_resize(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    int cols, rows;
-    if (JS_ToInt32(ctx, &cols, argv[0]) || JS_ToInt32(ctx, &rows, argv[1]))
+    int id, cols, rows;
+    if (JS_ToInt32(ctx, &id, argv[0]) || JS_ToInt32(ctx, &cols, argv[1]) ||
+        JS_ToInt32(ctx, &rows, argv[2]))
         return JS_EXCEPTION;
 #ifdef ESP_PLATFORM
-    mqjs_ssh_resize(cols, rows);
+    mqjs_ssh_resize(id, cols, rows);
 #else
-    printf("[ssh] resize(%dx%d) (stub)\n", cols, rows);
+    printf("[ssh] resize(#%d, %dx%d) (stub)\n", id, cols, rows);
 #endif
     return JS_UNDEFINED;
 }
 
 JSValue js_ssh_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
 #ifdef ESP_PLATFORM
-    mqjs_ssh_close();
+    mqjs_ssh_close(id);
 #else
-    printf("[ssh] close (stub)\n");
+    printf("[ssh] close(#%d) (stub)\n", id);
 #endif
     return JS_UNDEFINED;
 }
 
 JSValue js_ssh_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
 #ifdef ESP_PLATFORM
-    return JS_NewInt32(ctx, mqjs_ssh_up() ? 1 : 0);
+    return JS_NewInt32(ctx, mqjs_ssh_up(id) ? 1 : 0);
 #else
+    (void)id;
     return JS_NewInt32(ctx, 0);
 #endif
 }
 
+/* ssh.onData(id, fn) / ssh.onClose(id, fn): per-session callbacks.
+   Re-registering for the same id replaces the previous function. */
+static JSValue ssh_register(JSContext *ctx, JSValue *argv, bool close_cb)
+{
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    SshCb *c = sshcb_get(id);
+    if (!c)
+        return JS_ThrowInternalError(ctx, "too many ssh callbacks");
+    JSGCRef *ref = close_cb ? &c->close_fn : &c->data_fn;
+    bool *used = close_cb ? &c->close_used : &c->data_used;
+    if (*used)
+        JS_DeleteGCRef(ctx, ref);
+    JSValue *pf = JS_AddGCRef(ctx, ref);
+    *pf = argv[1];
+    *used = true;
+    return JS_UNDEFINED;
+}
+
 JSValue js_ssh_onData(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    if (!JS_IsFunction(ctx, argv[0]))
-        return JS_ThrowTypeError(ctx, "not a function");
-    if (s_ssh_data_used)
-        JS_DeleteGCRef(ctx, &s_ssh_data_cb);
-    JSValue *pf = JS_AddGCRef(ctx, &s_ssh_data_cb);
-    *pf = argv[0];
-    s_ssh_data_used = true;
-#ifndef ESP_PLATFORM
-    printf("[ssh] onData registered (stub: never fires on PC)\n");
-#endif
-    return JS_UNDEFINED;
+    return ssh_register(ctx, argv, false);
 }
 
 JSValue js_ssh_onClose(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    if (!JS_IsFunction(ctx, argv[0]))
-        return JS_ThrowTypeError(ctx, "not a function");
-    if (s_ssh_close_used)
-        JS_DeleteGCRef(ctx, &s_ssh_close_cb);
-    JSValue *pf = JS_AddGCRef(ctx, &s_ssh_close_cb);
-    *pf = argv[0];
-    s_ssh_close_used = true;
-#ifndef ESP_PLATFORM
-    printf("[ssh] onClose registered (stub: never fires on PC)\n");
-#endif
-    return JS_UNDEFINED;
+    return ssh_register(ctx, argv, true);
 }
 
-/* Called by the sshc session task. Takes ownership of `data` (heap) on
+/* Called by an sshc session task. Takes ownership of `data` (heap) on
    success; returns false when the queue stayed full (caller retries —
    terminal bytes must never be dropped, TCP provides the upstream
    backpressure). */
-bool mqjs_post_ssh_data(char *data, size_t len)
+bool mqjs_post_ssh_data(int id, char *data, size_t len)
 {
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
         return false;
     MqjsEvent ev = {
         .type = EV_SSH_DATA,
-        .u.ssh = { .data = data, .len = (uint32_t)len },
+        .u.ssh = { .data = data, .len = (uint32_t)len, .id = (int16_t)id },
     };
     return xQueueSend(s_event_queue, &ev, pdMS_TO_TICKS(100)) == pdTRUE;
 #else
+    (void)id;
     (void)data;
     (void)len;
     return true;
 #endif
 }
 
-void mqjs_post_ssh_closed(const char *reason)
+void mqjs_post_ssh_closed(int id, const char *reason)
 {
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
         return;
     MqjsEvent ev = { .type = EV_SSH_CLOSED };
+    ev.u.ssh_closed.id = (int16_t)id;
     strlcpy(ev.u.ssh_closed.reason, reason ? reason : "closed",
             sizeof ev.u.ssh_closed.reason);
     xQueueSend(s_event_queue, &ev, pdMS_TO_TICKS(500));
 #else
+    (void)id;
     (void)reason;
 #endif
 }
 
 static void dispatch_ssh_data(JSContext *ctx, MqjsEvent *ev)
 {
-    if (s_ssh_data_used) {
+    SshCb *c = sshcb_find(ev->u.ssh.id);
+    if (c && c->data_used) {
         if (JS_StackCheck(ctx, 3)) {
             dump_error(ctx);
         } else {
             JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.ssh.data,
                                             ev->u.ssh.len));  /* arg0 */
-            JS_PushArg(ctx, s_ssh_data_cb.val);               /* func */
+            JS_PushArg(ctx, c->data_fn.val);                  /* func */
             JS_PushArg(ctx, JS_NULL);                         /* this */
             arm_watchdog();
             JSValue ret = JS_Call(ctx, 1);
@@ -1802,19 +1884,24 @@ static void dispatch_ssh_data(JSContext *ctx, MqjsEvent *ev)
 
 static void dispatch_ssh_closed(JSContext *ctx, const MqjsEvent *ev)
 {
-    if (!s_ssh_close_used)
+    SshCb *c = sshcb_find(ev->u.ssh_closed.id);
+    if (!c)
         return;
-    if (JS_StackCheck(ctx, 3)) {
-        dump_error(ctx);
-        return;
+    if (c->close_used) {
+        if (JS_StackCheck(ctx, 3)) {
+            dump_error(ctx);
+        } else {
+            JS_PushArg(ctx, JS_NewString(ctx, ev->u.ssh_closed.reason));
+            JS_PushArg(ctx, c->close_fn.val);
+            JS_PushArg(ctx, JS_NULL);
+            arm_watchdog();
+            JSValue ret = JS_Call(ctx, 1);
+            if (JS_IsException(ret))
+                dump_error(ctx);
+        }
     }
-    JS_PushArg(ctx, JS_NewString(ctx, ev->u.ssh_closed.reason)); /* arg0 */
-    JS_PushArg(ctx, s_ssh_close_cb.val);                         /* func */
-    JS_PushArg(ctx, JS_NULL);                                    /* this */
-    arm_watchdog();
-    JSValue ret = JS_Call(ctx, 1);
-    if (JS_IsException(ret))
-        dump_error(ctx);
+    /* the session is gone: release both callbacks in one sweep */
+    sshcb_release(ctx, c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2146,7 +2233,7 @@ static void reset_slots(JSContext *ctx)
         s_mqtt = NULL;
         s_mqtt_up = false;
     }
-    mqjs_ssh_close(); /* blocks until the session task died (bounded) */
+    mqjs_ssh_close_all(); /* blocks until session tasks died (bounded) */
     if (s_event_queue) {
         MqjsEvent ev;
         while (xQueueReceive(s_event_queue, &ev, 0) == pdTRUE) {
@@ -2177,13 +2264,9 @@ static void reset_slots(JSContext *ctx)
         s_key_used = false;   /* ditto */
         JS_DeleteGCRef(ctx, &s_key_cb);
     }
-    if (s_ssh_data_used) {
-        s_ssh_data_used = false;
-        JS_DeleteGCRef(ctx, &s_ssh_data_cb);
-    }
-    if (s_ssh_close_used) {
-        s_ssh_close_used = false;
-        JS_DeleteGCRef(ctx, &s_ssh_close_cb);
+    for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
+        if (s_ssh_cbs[i].used)
+            sshcb_release(ctx, &s_ssh_cbs[i]);
     }
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
         if (s_widget_cbs[i].used) {
@@ -2218,8 +2301,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     s_mqtt_onconn_used = false;
     s_touch_used = false;
     s_key_used = false;
-    s_ssh_data_used = false;
-    s_ssh_close_used = false;
+    memset(s_ssh_cbs, 0, sizeof(s_ssh_cbs));
 
 #ifdef ESP_PLATFORM
     if (!s_event_queue)

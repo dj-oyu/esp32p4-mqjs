@@ -65,27 +65,19 @@ function redraw() {
         ui.text(2, (i - start) * LH + 2, lines[i], FG);
 }
 
-ssh.onData(function (chunk) {
-    feed(chunk);
-    redraw();
-});
-
-ssh.onClose(function (reason) {
-    feed("\n*** SSH closed: " + reason + " ***\n");
-    redraw();
-    ui.keyboard(0);
-    running = false;
-    connectForm("切断: " + reason); /* フォームに戻る (再接続 UX) */
-});
+/* W3: ssh.* はハンドル式 — connect が返す id を全呼び出しに渡す */
+var sid = 0;
 
 ui.onKey(function (k) {
+    if (!sid)
+        return;
     /* キーはそのままサーバへ。Enter は CR (端末の慣習) で送る */
     if (k === "\n")
-        ssh.write("\r");
+        ssh.write(sid, "\r");
     else if (k === "\b")
-        ssh.write("\x7f"); /* DEL: bash の行編集が期待するバックスペース */
+        ssh.write(sid, "\x7f"); /* DEL: bash の行編集が期待する */
     else
-        ssh.write(k);
+        ssh.write(sid, k);
 });
 
 function startTerm(host, port, user, pass) {
@@ -95,7 +87,19 @@ function startTerm(host, port, user, pass) {
     dirty = true;
     redraw();
     ui.keyboard(1);
-    ssh.connect(host, port, user, pass, COLS, ROWS);
+    sid = ssh.connect(host, port, user, pass, COLS, ROWS);
+    ssh.onData(sid, function (chunk) {
+        feed(chunk);
+        redraw();
+    });
+    ssh.onClose(sid, function (reason) {
+        sid = 0;
+        feed("\n*** SSH closed: " + reason + " ***\n");
+        redraw();
+        ui.keyboard(0);
+        running = false;
+        connectForm("切断: " + reason); /* フォームに戻る (再接続 UX) */
+    });
 }
 
 /* ---- 接続フォーム (ウィジェットモード) ---- */

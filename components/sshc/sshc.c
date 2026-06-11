@@ -1,10 +1,14 @@
 /*
- * SSH client session task (wolfSSH). One session at a time. Owns the
- * TCP socket and the WOLFSSH object exclusively; the only cross-task
- * surfaces are:
+ * SSH client session tasks (wolfSSH), W3: up to SSHC_MAX_SESSIONS
+ * concurrent sessions, handle-based (design docs/widget-framework-design.md
+ * §7). Each session owns its TCP socket and WOLFSSH object exclusively on
+ * its own task; the only cross-task surfaces per session are:
  *   - a tx StreamBuffer (JS keystrokes -> session task)
- *   - mqjs_post_ssh_data() (server bytes -> JS event loop, heap copies)
+ *   - mqjs_post_ssh_data(id, ...) (server bytes -> JS event loop, heap)
  *   - a few volatile flags (resize request, stop request, state)
+ *
+ * Session ids are (generation << 2 | slot) + 1-based so a stale JS id
+ * never addresses a reused slot. 0 = invalid.
  *
  * Connection flow (blocking, on the session task only): resolve host ->
  * TCP connect -> wolfSSH handshake + password auth -> pty-req + shell
@@ -41,8 +45,8 @@
 /* mqjs sinks (extern decl instead of REQUIRES mqjs: mqjs already
    depends on this component for sshc.h, so a REQUIRES back would be a
    cycle — same trick as ui_tab5.cpp / wifi.c) */
-extern bool mqjs_post_ssh_data(char *data, size_t len);
-extern void mqjs_post_ssh_closed(const char *reason);
+extern bool mqjs_post_ssh_data(int id, char *data, size_t len);
+extern void mqjs_post_ssh_closed(int id, const char *reason);
 
 static const char *TAG = "sshc";
 
@@ -53,7 +57,6 @@ static const char *TAG = "sshc";
 #define SSH_CONNECT_TMO_S 10
 #define SSH_RECV_TMO_MS   50
 
-/* connection parameters, filled by mqjs_ssh_connect before the task runs */
 typedef struct {
     char host[64];
     char user[32];
@@ -62,23 +65,47 @@ typedef struct {
     int  cols, rows;
 } ssh_params_t;
 
-static TaskHandle_t      s_task;
-static StreamBufferHandle_t s_tx;     /* JS -> session bytes */
-static ssh_params_t      s_params;
-static volatile bool     s_stop;      /* close() request */
-static volatile bool     s_up;        /* shell channel established */
-static volatile bool     s_active;    /* task alive (connecting or up) */
-static volatile int      s_resize_cols, s_resize_rows;
-static volatile bool     s_resize_req;
+/* one concurrent session (~8KB task stack + wolfSSH state + crypto
+   buffers of internal RAM each — hence the small cap, design §7) */
+typedef struct {
+    volatile bool active;  /* task alive (connecting or up) */
+    volatile bool up;      /* shell channel established */
+    volatile bool stop;    /* close() request */
+    volatile bool resize_req;
+    volatile int  resize_cols, resize_rows;
+    StreamBufferHandle_t tx;
+    ssh_params_t params;
+    uint16_t gen;          /* bumped per connect; part of the public id */
+    int id;                /* public id while active */
+} ssh_sess_t;
 
-/* wolfSSH password auth callback: hand back s_params.pass for a
-   PASSWORD request, refuse everything else (no pubkey/keyboard yet). */
+static ssh_sess_t s_sess[SSHC_MAX_SESSIONS];
+
+static int sess_id(int slot)
+{
+    return (int)((s_sess[slot].gen << 2) | (unsigned)slot) + 1;
+}
+
+/* public id -> slot, -1 when stale/invalid/inactive */
+static int sess_lookup(int id)
+{
+    if (id <= 0)
+        return -1;
+    int slot = (id - 1) & 3;
+    if (slot >= SSHC_MAX_SESSIONS)
+        return -1;
+    if (!s_sess[slot].active || s_sess[slot].id != id)
+        return -1;
+    return slot;
+}
+
+/* wolfSSH password auth callback; ctx = the session (set per WOLFSSH) */
 static int ssh_userauth_cb(byte authType, WS_UserAuthData *authData, void *ctx)
 {
-    (void)ctx;
-    if (authType == WOLFSSH_USERAUTH_PASSWORD) {
-        authData->sf.password.password = (const byte *)s_params.pass;
-        authData->sf.password.passwordSz = (word32)strlen(s_params.pass);
+    ssh_sess_t *s = ctx;
+    if (authType == WOLFSSH_USERAUTH_PASSWORD && s) {
+        authData->sf.password.password = (const byte *)s->params.pass;
+        authData->sf.password.passwordSz = (word32)strlen(s->params.pass);
         return WOLFSSH_USERAUTH_SUCCESS;
     }
     return WOLFSSH_USERAUTH_FAILURE;
@@ -126,13 +153,13 @@ static int tcp_connect(const char *host, int port)
 
 /* the session: connect, handshake, then read/write loop. Always posts
    exactly one mqjs_post_ssh_closed() before returning. */
-static void ssh_session(WOLFSSH_CTX *ctx)
+static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
 {
     const char *reason = "closed";
     WOLFSSH *ssh = NULL;
     int fd = -1;
 
-    fd = tcp_connect(s_params.host, s_params.port);
+    fd = tcp_connect(s->params.host, s->params.port);
     if (fd < 0) {
         reason = "connect failed";
         goto done;
@@ -143,9 +170,9 @@ static void ssh_session(WOLFSSH_CTX *ctx)
         reason = "no mem";
         goto done;
     }
-    wolfSSH_SetUserAuthCtx(ssh, NULL);
+    wolfSSH_SetUserAuthCtx(ssh, s);
     wolfSSH_SetPublicKeyCheckCtx(ssh, NULL);
-    if (wolfSSH_SetUsername(ssh, s_params.user) != WS_SUCCESS) {
+    if (wolfSSH_SetUsername(ssh, s->params.user) != WS_SUCCESS) {
         reason = "bad username";
         goto done;
     }
@@ -163,7 +190,7 @@ static void ssh_session(WOLFSSH_CTX *ctx)
         rc = wolfSSH_connect(ssh);
     } while (rc != WS_SUCCESS &&
              (wolfSSH_get_error(ssh) == WS_WANT_READ ||
-              wolfSSH_get_error(ssh) == WS_WANT_WRITE) && !s_stop);
+              wolfSSH_get_error(ssh) == WS_WANT_WRITE) && !s->stop);
     if (rc != WS_SUCCESS) {
         ESP_LOGE(TAG, "wolfSSH_connect: %s", wolfSSH_get_error_name(ssh));
         reason = "auth/handshake failed";
@@ -178,13 +205,13 @@ static void ssh_session(WOLFSSH_CTX *ctx)
        (see components/sshc/wolfssl_override/user_settings.h); the guard
        stays so a no-filesystem build still compiles cleanly. */
 #if defined(WOLFSSH_TERM) && !defined(NO_FILESYSTEM)
-    if (s_params.cols > 0 && s_params.rows > 0)
-        wolfSSH_ChangeTerminalSize(ssh, s_params.cols, s_params.rows, 0, 0);
+    if (s->params.cols > 0 && s->params.rows > 0)
+        wolfSSH_ChangeTerminalSize(ssh, s->params.cols, s->params.rows, 0, 0);
 #endif
 
-    s_up = true;
-    ESP_LOGI(TAG, "shell up on %s@%s:%d", s_params.user, s_params.host,
-             s_params.port);
+    s->up = true;
+    ESP_LOGI(TAG, "shell up on %s@%s:%d (session %d)", s->params.user,
+             s->params.host, s->params.port, s->id);
 
     /* shorter recv timeout for the interactive loop so tx/resize get
        serviced promptly between reads */
@@ -192,18 +219,19 @@ static void ssh_session(WOLFSSH_CTX *ctx)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
     byte rxbuf[SSH_RX_CHUNK];
-    while (!s_stop) {
+    while (!s->stop) {
         /* pending pty resize (only where the lib compiled the call) */
-        if (s_resize_req) {
-            s_resize_req = false;
+        if (s->resize_req) {
+            s->resize_req = false;
 #if defined(WOLFSSH_TERM) && !defined(NO_FILESYSTEM)
-            wolfSSH_ChangeTerminalSize(ssh, s_resize_cols, s_resize_rows, 0, 0);
+            wolfSSH_ChangeTerminalSize(ssh, s->resize_cols, s->resize_rows,
+                                       0, 0);
 #endif
         }
 
         /* drain queued keystrokes to the server */
         byte txbuf[256];
-        size_t n = xStreamBufferReceive(s_tx, txbuf, sizeof txbuf, 0);
+        size_t n = xStreamBufferReceive(s->tx, txbuf, sizeof txbuf, 0);
         while (n > 0) {
             int sent = wolfSSH_stream_send(ssh, txbuf, (word32)n);
             if (sent <= 0) {
@@ -213,7 +241,7 @@ static void ssh_session(WOLFSSH_CTX *ctx)
                 reason = "write error";
                 goto done;
             }
-            n = xStreamBufferReceive(s_tx, txbuf, sizeof txbuf, 0);
+            n = xStreamBufferReceive(s->tx, txbuf, sizeof txbuf, 0);
         }
 
         /* read server output (blocks up to SSH_RECV_TMO_MS) */
@@ -222,7 +250,7 @@ static void ssh_session(WOLFSSH_CTX *ctx)
             char *copy = malloc(got);
             if (copy) {
                 memcpy(copy, rxbuf, got);
-                if (!mqjs_post_ssh_data(copy, got)) {
+                if (!mqjs_post_ssh_data(s->id, copy, got)) {
                     free(copy); /* JS loop wedged: give up the session */
                     reason = "rx overflow";
                     goto done;
@@ -240,7 +268,7 @@ static void ssh_session(WOLFSSH_CTX *ctx)
             }
         }
     }
-    if (s_stop)
+    if (s->stop)
         reason = "closed";
 
 done:
@@ -250,105 +278,161 @@ done:
     }
     if (fd >= 0)
         close(fd);
-    s_up = false;
-    mqjs_post_ssh_closed(reason);
+    s->up = false;
+    mqjs_post_ssh_closed(s->id, reason);
+}
+
+/* one-time library init: wolfSSH_Init/Cleanup pairs are refcounted in
+   wolfCrypt, but with several session tasks racing it is simpler to do
+   it exactly once and never clean up (device runs forever anyway) */
+static bool ssh_lib_init(void)
+{
+    static bool inited;
+    if (!inited) {
+        if (wolfSSH_Init() != WS_SUCCESS)
+            return false;
+        inited = true;
+    }
+    return true;
 }
 
 static void ssh_task(void *arg)
 {
-    (void)arg;
+    ssh_sess_t *s = arg;
     WOLFSSH_CTX *ctx = NULL;
-    if (wolfSSH_Init() != WS_SUCCESS) {
-        mqjs_post_ssh_closed("wolfSSH init failed");
+    if (!ssh_lib_init()) {
+        mqjs_post_ssh_closed(s->id, "wolfSSH init failed");
         goto cleanup;
     }
     ctx = wolfSSH_CTX_new(WOLFSSH_ENDPOINT_CLIENT, NULL);
     if (!ctx) {
-        mqjs_post_ssh_closed("no ctx");
+        mqjs_post_ssh_closed(s->id, "no ctx");
         goto cleanup;
     }
     wolfSSH_SetUserAuth(ctx, ssh_userauth_cb);
     wolfSSH_CTX_SetPublicKeyCheck(ctx, ssh_pubkey_check_cb);
 
-    ssh_session(ctx);
+    ssh_session(s, ctx);
 
 cleanup:
     if (ctx)
         wolfSSH_CTX_free(ctx);
-    wolfSSH_Cleanup();
-    s_active = false;
-    s_up = false;
-    s_task = NULL;
+    s->up = false;
+    s->active = false; /* last: frees the slot for reuse */
     vTaskDelete(NULL);
 }
 
-bool mqjs_ssh_connect(const char *host, int port, const char *user,
-                      const char *pass, int cols, int rows)
+int mqjs_ssh_connect(const char *host, int port, const char *user,
+                     const char *pass, int cols, int rows)
 {
-    if (s_active)
-        return false;
     if (!host || !user || !pass)
-        return false;
+        return 0;
+    int slot = -1;
+    for (int i = 0; i < SSHC_MAX_SESSIONS; i++) {
+        if (!s_sess[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        return 0; /* all sessions in use */
+    ssh_sess_t *s = &s_sess[slot];
 
-    memset(&s_params, 0, sizeof s_params);
-    strlcpy(s_params.host, host, sizeof s_params.host);
-    strlcpy(s_params.user, user, sizeof s_params.user);
-    strlcpy(s_params.pass, pass, sizeof s_params.pass);
-    s_params.port = (port > 0) ? port : 22;
-    s_params.cols = cols;
-    s_params.rows = rows;
+    memset(&s->params, 0, sizeof s->params);
+    strlcpy(s->params.host, host, sizeof s->params.host);
+    strlcpy(s->params.user, user, sizeof s->params.user);
+    strlcpy(s->params.pass, pass, sizeof s->params.pass);
+    s->params.port = (port > 0) ? port : 22;
+    s->params.cols = cols;
+    s->params.rows = rows;
 
-    if (!s_tx) {
-        s_tx = xStreamBufferCreate(SSH_TX_BUF_BYTES, 1);
-        if (!s_tx)
-            return false;
+    if (!s->tx) {
+        s->tx = xStreamBufferCreate(SSH_TX_BUF_BYTES, 1);
+        if (!s->tx)
+            return 0;
     } else {
-        xStreamBufferReset(s_tx);
+        xStreamBufferReset(s->tx);
     }
 
-    s_stop = false;
-    s_up = false;
-    s_resize_req = false;
-    s_active = true;
-    if (xTaskCreate(ssh_task, "ssh", SSH_TASK_STACK, NULL, SSH_TASK_PRIO,
-                    &s_task) != pdPASS) {
-        s_active = false;
-        return false;
+    s->gen++;
+    s->id = sess_id(slot);
+    s->stop = false;
+    s->up = false;
+    s->resize_req = false;
+    s->active = true;
+    char name[8];
+    snprintf(name, sizeof name, "ssh%d", slot);
+    if (xTaskCreate(ssh_task, name, SSH_TASK_STACK, s, SSH_TASK_PRIO,
+                    NULL) != pdPASS) {
+        s->active = false;
+        return 0;
     }
-    return true;
+    return s->id;
 }
 
-bool mqjs_ssh_write(const void *data, size_t len)
+bool mqjs_ssh_write(int id, const void *data, size_t len)
 {
-    if (!s_tx || !s_up || !data || !len)
+    int slot = sess_lookup(id);
+    if (slot < 0 || !s_sess[slot].up || !data || !len)
         return false;
     /* non-blocking: a full tx buffer means the link is saturated */
-    return xStreamBufferSend(s_tx, data, len, 0) == len;
+    return xStreamBufferSend(s_sess[slot].tx, data, len, 0) == len;
 }
 
-void mqjs_ssh_resize(int cols, int rows)
+void mqjs_ssh_resize(int id, int cols, int rows)
 {
-    if (cols <= 0 || rows <= 0)
+    int slot = sess_lookup(id);
+    if (slot < 0 || cols <= 0 || rows <= 0)
         return;
-    s_resize_cols = cols;
-    s_resize_rows = rows;
-    s_resize_req = true;
+    s_sess[slot].resize_cols = cols;
+    s_sess[slot].resize_rows = rows;
+    s_sess[slot].resize_req = true;
 }
 
-void mqjs_ssh_close(void)
+void mqjs_ssh_close(int id)
 {
-    if (!s_active)
+    int slot = sess_lookup(id);
+    if (slot < 0)
         return;
-    s_stop = true;
+    s_sess[slot].stop = true;
     /* wait (bounded) for the task to self-delete; recv timeout is 50ms
        in the loop, connect timeout up to 10s in the worst case */
-    for (int i = 0; i < 300 && s_active; i++)
+    for (int i = 0; i < 300 && s_sess[slot].active; i++)
         vTaskDelay(pdMS_TO_TICKS(50));
-    if (s_active)
-        ESP_LOGW(TAG, "ssh task did not stop in time");
+    if (s_sess[slot].active)
+        ESP_LOGW(TAG, "ssh task %d did not stop in time", id);
 }
 
-bool mqjs_ssh_active(void) { return s_active; }
-bool mqjs_ssh_up(void) { return s_up; }
+void mqjs_ssh_close_all(void)
+{
+    for (int i = 0; i < SSHC_MAX_SESSIONS; i++) {
+        if (s_sess[i].active)
+            s_sess[i].stop = true;
+    }
+    /* one bounded wait for all of them together */
+    for (int t = 0; t < 300; t++) {
+        bool any = false;
+        for (int i = 0; i < SSHC_MAX_SESSIONS; i++)
+            any = any || s_sess[i].active;
+        if (!any)
+            return;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGW(TAG, "some ssh tasks did not stop in time");
+}
+
+bool mqjs_ssh_active(void)
+{
+    for (int i = 0; i < SSHC_MAX_SESSIONS; i++)
+        if (s_sess[i].active)
+            return true;
+    return false;
+}
+
+bool mqjs_ssh_up(int id)
+{
+    int slot = sess_lookup(id);
+    return slot >= 0 && s_sess[slot].up;
+}
 
 #endif /* CONFIG_MQJS_SSH */
