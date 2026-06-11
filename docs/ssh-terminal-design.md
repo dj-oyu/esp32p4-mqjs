@@ -212,11 +212,23 @@ per-cell `ui.text` は重すぎた (グリフ毎に `lv_draw_label` レイヤを
 - C 側は「ボタン → トークン」対応を持つだけ。端末の意味は全部 JS で解釈。
 
 ### T3a: コントロールバー + 特殊/修飾キー (価値最大、Tab 補完解禁)
-- テキストキーボードの上に端末専用 control bar (`lv_buttonmatrix`):
-  `[Esc][Tab][Ctrl][Alt][Fn][←][↓][↑][→][Copy][Paste]`、Fn で数字↔F1-F12。
-- **修飾キーは one-shot sticky** (押した次の 1 キーだけ効く)。JS の `ui.onKey`
-  状態機械で変換: Ctrl → `c & 0x1F`、Alt → `"\x1b" + c`。Fn キーは xterm
-  シーケンス表を JS が持つ。
+
+**実装済み 2026-06-11** (実機目視は次の flash で):
+- `ui.keyboard(mode)`: 0=隠す / 1=キーボード / 2=キーボード+control bar。
+  返り値 = 画面下部の予約高さ px (0/400/480) — ssh_vt は
+  `KB_H = ui.keyboard(2)` で問い合わせてグリッドを導出 (§4d の
+  ハードコード排除を維持。80×28 になる)。
+- control bar (`lv_buttonmatrix`, ui_tab5.cpp):
+  `[Esc][Tab][Ctrl][Alt][Fn][←][↓][↑][→][Copy][Paste]`、Fn でバーが
+  F1-F12 マップに切替 (C ローカル、トークンなし)。ボタンは
+  `"\x00name"` トークンを `mqjs_post_key` で送るだけ (C 文字列では
+  `"\0esc"` — `\x00e` は hex エスケープが 'e' を食うため octal で書く)。
+- **修飾キーは one-shot sticky** (押した次の 1 キーだけ効く、再タップで
+  解除)。JS (ssh_vt) の `ui.onKey` 状態機械で変換: Ctrl → `c & 0x1F`
+  (Ctrl+Space=NUL)、Alt → `"\x1b" + c`。F キー/矢印/Home… は xterm
+  シーケンス表 TOKSEQ。武装中はタブバー右端に CTRL/ALT バッジ。
+- Paste = `ssh.write(clipboard.get().data)` (P4d の最初の消費者)。
+  Copy は選択 UI (T3b) まで通知のみ。
 - **Tab 補完はこれだけで使える** (Tab=`\t` をサーバへ送るだけ、補完はサーバ側
   readline、結果は既存 VT パーサが描画)。受信 `\t` のタブストップ8展開を
   `feed()` に足すかは任意。
@@ -227,6 +239,10 @@ per-cell `ui.text` は重すぎた (グリフ毎に `lv_draw_label` レイヤを
   `clipboard.onChange(fn)`。JS コンテキスト外の C バッファなのでタスク切替を
   跨いで生存、将来のマルチタスクで全 app が共有 = **アプリ間 IPC の最初の一手**。
   型 (`text/plain` `text/csv` `application/json` `number` …) で受け手が判別。
+  → **層1 は P4d として実装済み 2026-06-11**
+  (`docs/launcher-multiapp-design.md` §7: NVS 永続 / EV_CLIP setter 除外
+  / onChange(data, type))。残りの T3b スコープは選択 UI (ロングプレス
+  ドラッグ → グリッド抽出 → clipboard.set) とブラケットペースト。
 - 選択: `ui.onTouch` に選択モード (ロングプレスでドラッグ開始)。ドラッグ →
   セル座標、選択セルをハイライト、離したらグリッドモデルから抽出 → clipboard。
 - Paste = `ssh.write(clipboard.get().data)` (対応サーバはブラケットペースト

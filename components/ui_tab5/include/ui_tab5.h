@@ -39,7 +39,10 @@ typedef enum {
     UI_CMD_LINE,      /* line from x,y to w,h (endpoint, not size) */
     UI_CMD_TEXT,      /* UTF-8 text at x,y */
     UI_CMD_PIXEL,     /* single pixel at x,y */
-    UI_CMD_KEYBOARD,  /* show (x!=0) / hide (x==0) the on-screen keyboard */
+    UI_CMD_KEYBOARD,  /* on-screen keyboard mode in x: 0 = hide,
+                         1 = keyboard, 2 = keyboard + terminal control
+                         bar (T3a: Esc/Tab/Ctrl/Alt/Fn/arrows/Copy/Paste
+                         as "\0name" key tokens) */
     UI_CMD_CELLS,     /* monospace run: text at cell (x=col, y=row), color=fg,
                          bg=bg. Drawn with the terminal grid font (ui.cells). */
     UI_CMD_SCROLL,    /* scroll cell-rows [x=top, y=bot] by w lines
@@ -109,6 +112,11 @@ void ui_tab5_text_size(const char *utf8, int *w, int *h);
 /* Cell size (advance width, line height) of the monospace terminal font
  * used by ui.cells/UI_CMD_CELLS. 0x0 when the UI is off. Const tables only. */
 void ui_tab5_cell_size(int *w, int *h);
+/* Pixels the keyboard overlay reserves at the canvas bottom in `mode`
+ * (0/1/2, see UI_CMD_KEYBOARD). Constant per mode; 0 when the UI is
+ * off. Synchronous (ui.keyboard's return value: the JS terminal sizes
+ * its grid with it). */
+int ui_tab5_kb_reserved(int mode);
 
 /* Create a widget screen (flex column + title), retain the previously
  * active screen on the navigation stack and slide the new one in.
@@ -200,6 +208,11 @@ static inline void ui_tab5_cell_size(int *w, int *h)
 {
     *w = 0;
     *h = 0;
+}
+static inline int ui_tab5_kb_reserved(int mode)
+{
+    (void)mode;
+    return 0;
 }
 static inline uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
 {

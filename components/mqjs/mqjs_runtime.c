@@ -129,7 +129,7 @@ typedef struct {
    (also when it drops the event because its owner died). */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
-               EV_FOCUS } MqjsEventType;
+               EV_FOCUS, EV_CLIP } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -209,6 +209,7 @@ typedef struct {
     bool fg_used;  JSGCRef fg_cb;   /* sys.onForeground */
     bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
+    bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
 
 #ifdef ESP_PLATFORM
     esp_mqtt_client_handle_t mqtt;  /* per-app client: "mqjs-app-<slot>" */
@@ -1279,17 +1280,31 @@ static void dispatch_touch_event(AppSlot *app, const MqjsEvent *ev)
         dump_error(ctx);
 }
 
-/* on-screen keyboard (Phase 4): ui.keyboard(show) toggles the LVGL
-   keyboard overlay; keys arrive via mqjs_post_key as short UTF-8
-   strings ("\n" enter, "\b" backspace, "\x1b[C"/"\x1b[D" arrows) */
+/* on-screen keyboard (Phase 4): ui.keyboard(mode) drives the LVGL
+   keyboard overlay — 0 = hide, 1 = keyboard, 2 = keyboard + terminal
+   control bar (T3a). Keys arrive via mqjs_post_key as short UTF-8
+   strings ("\n" enter, "\b" backspace, "\x1b[C"/"\x1b[D" arrows);
+   control-bar buttons send "\x00name" tokens (esc tab ctrl alt
+   left/down/up/right f1..f12 copy paste) whose meaning is the app's
+   business. Returns the px height the overlay reserves at the canvas
+   bottom, so a terminal derives its grid without hardcoding it. */
 JSValue js_ui_keyboard(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    int show = 1;
+    int mode = 1;
     if (argc >= 1 && !JS_IsUndefined(argv[0]) &&
-        JS_ToInt32(ctx, &show, argv[0]))
+        JS_ToInt32(ctx, &mode, argv[0]))
         return JS_EXCEPTION;
-    ui_post(UI_CMD_KEYBOARD, show ? 1 : 0, 0, 0, 0, 0, NULL);
-    return JS_UNDEFINED;
+    if (mode < 0)
+        mode = 0;
+    if (mode > 2)
+        mode = 2;
+    ui_post(UI_CMD_KEYBOARD, mode, 0, 0, 0, 0, NULL);
+#ifdef ESP_PLATFORM
+    return JS_NewInt32(ctx, ui_tab5_kb_reserved(mode));
+#else
+    /* stub mirrors the Tab5 constants so PC runs exercise grid math */
+    return JS_NewInt32(ctx, mode == 0 ? 0 : mode == 1 ? 400 : 480);
+#endif
 }
 
 JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -1939,6 +1954,193 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     s_pc_store[i].val = NULL;
     return JS_NewBool(1);
 #endif
+}
+
+/* ------------------------------------------------------------------ */
+/* clipboard: typed, system-shared buffer (P4d, ssh-terminal §7).      */
+/* One C-owned value outside every JS context: survives app stops and  */
+/* foreground switches, and is the first app-to-app data hand-off      */
+/* (calculator result -> terminal paste). The type tag is free-form    */
+/* MIME-ish text ("text/plain", "text/csv", "application/json",       */
+/* "number", ...) so the receiver can decide what to do with the data. */
+/* Local-first (§7.1): persisted in NVS, NOT in retained MQTT — a      */
+/* mirror app can bridge clipboard.onChange <-> mqtt later (layer 2).  */
+/* clipboard.set posts EV_CLIP to every OTHER app with an onChange     */
+/* handler (the setter knows what it did; this also keeps a future     */
+/* mqtt-mirror app from echoing its own writes back to the broker).    */
+/* Handlers read the CURRENT value at dispatch time: latest wins.      */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_CLIP_DATA_MAX 4000 /* one NVS blob; covers a full 80x33
+                                   terminal screen selection */
+#define MQJS_CLIP_TYPE_MAX 31
+
+static char *s_clip_data;          /* heap; NULL = empty clipboard */
+static size_t s_clip_len;
+static char s_clip_type[MQJS_CLIP_TYPE_MAX + 1];
+
+#ifdef ESP_PLATFORM
+static nvs_handle_t s_clip_nvs;
+static bool s_clip_nvs_open;
+static bool s_clip_loaded;
+
+static bool clip_nvs_open(void)
+{
+    if (s_clip_nvs_open)
+        return true;
+    /* own namespace: store.* keys live in "mqjs" and must not collide */
+    if (nvs_open("mqjsclip", NVS_READWRITE, &s_clip_nvs) != ESP_OK) {
+        nvs_flash_init();
+        if (nvs_open("mqjsclip", NVS_READWRITE, &s_clip_nvs) != ESP_OK)
+            return false;
+    }
+    s_clip_nvs_open = true;
+    return true;
+}
+
+/* lazy boot-time restore: makes the clipboard survive reboots (§7.1
+   "再起動後も残す" without depending on a broker being up) */
+static void clip_load(void)
+{
+    if (s_clip_loaded)
+        return;
+    s_clip_loaded = true;
+    if (!clip_nvs_open())
+        return;
+    size_t len = 0;
+    if (nvs_get_blob(s_clip_nvs, "data", NULL, &len) != ESP_OK ||
+        len == 0 || len > MQJS_CLIP_DATA_MAX)
+        return;
+    char *buf = malloc(len);
+    if (!buf)
+        return;
+    if (nvs_get_blob(s_clip_nvs, "data", buf, &len) != ESP_OK) {
+        free(buf);
+        return;
+    }
+    size_t tlen = sizeof s_clip_type;
+    if (nvs_get_str(s_clip_nvs, "type", s_clip_type, &tlen) != ESP_OK)
+        snprintf(s_clip_type, sizeof s_clip_type, "text/plain");
+    s_clip_data = buf;
+    s_clip_len = len;
+}
+
+static void clip_persist(void)
+{
+    if (!clip_nvs_open())
+        return;
+    if (!s_clip_data) {
+        nvs_erase_key(s_clip_nvs, "data");
+        nvs_erase_key(s_clip_nvs, "type");
+    } else {
+        nvs_set_blob(s_clip_nvs, "data", s_clip_data, s_clip_len);
+        nvs_set_str(s_clip_nvs, "type", s_clip_type);
+    }
+    nvs_commit(s_clip_nvs);
+}
+#else
+#define clip_load()    ((void)0)
+#define clip_persist() ((void)0) /* PC: session-only */
+#endif
+
+/* clipboard.set(data[, type]) -> bool: replace the shared value and
+   notify every other app. type defaults to "text/plain"; an empty
+   data string clears the clipboard. */
+JSValue js_clipboard_set(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    char type[MQJS_CLIP_TYPE_MAX + 1];
+    snprintf(type, sizeof type, "text/plain");
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) &&
+        uiw_copy_str(ctx, argv[1], type, sizeof type))
+        return JS_EXCEPTION;
+    /* read the data AFTER the type was copied out (compacting GC may
+       move the first string on a second ToCString — store.set idiom) */
+    JSCStringBuf buf;
+    size_t len;
+    const char *data = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!data)
+        return JS_EXCEPTION;
+    if (len > MQJS_CLIP_DATA_MAX)
+        return JS_ThrowRangeError(ctx, "clipboard data too large (max %d)",
+                                  MQJS_CLIP_DATA_MAX);
+    char *copy = NULL;
+    if (len > 0) {
+        copy = malloc(len);
+        if (!copy)
+            return JS_ThrowOutOfMemory(ctx);
+        memcpy(copy, data, len);
+    }
+    clip_load(); /* mark loaded: this value now shadows whatever NVS had */
+    free(s_clip_data);
+    s_clip_data = copy;
+    s_clip_len = copy ? len : 0;
+    snprintf(s_clip_type, sizeof s_clip_type, "%s", type);
+    clip_persist();
+
+    /* wake the other listeners (best effort: a full queue drops the
+       nudge, the value itself is never lost) */
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        AppSlot *app = &s_apps[i];
+        if (!app->used || !app->clip_used || app == s_cur_app)
+            continue;
+        MqjsEvent ev = { .type = EV_CLIP, .slot = app->slot,
+                         .gen = app->gen };
+        ev_post(&ev, 0);
+    }
+    return JS_NewBool(1);
+}
+
+/* clipboard.get() -> {data, type} | undefined (empty clipboard) */
+JSValue js_clipboard_get(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    clip_load();
+    if (!s_clip_data)
+        return JS_UNDEFINED;
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    /* root obj: the compacting GC moves it when the strings allocate */
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "data",
+                      JS_NewStringLen(ctx, s_clip_data, s_clip_len));
+    JS_SetPropertyStr(ctx, obj_ref.val, "type",
+                      JS_NewString(ctx, s_clip_type));
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+}
+
+/* clipboard.onChange(fn(data, type)): fires when ANOTHER app replaces
+   the clipboard. Registration counts as pending (an app may live as a
+   pure clipboard listener, e.g. the future mqtt mirror). */
+JSValue js_clipboard_onChange(JSContext *ctx, JSValue *this_val, int argc,
+                              JSValue *argv)
+{
+    return register_cb(ctx, argv[0], &s_cur_app->clip_used,
+                       &s_cur_app->clip_cb);
+}
+
+static void dispatch_clip(AppSlot *app, const MqjsEvent *ev)
+{
+    (void)ev; /* no payload: the handler reads the current value */
+    JSContext *ctx = app->ctx;
+    if (!app->clip_used || !s_clip_data)
+        return; /* cleared again before dispatch: nothing to report */
+    if (JS_StackCheck(ctx, 4)) {
+        dump_error(ctx);
+        return;
+    }
+    /* args are pushed in reverse: last-pushed becomes arg0 */
+    JS_PushArg(ctx, JS_NewString(ctx, s_clip_type));               /* arg1 */
+    JS_PushArg(ctx, JS_NewStringLen(ctx, s_clip_data, s_clip_len)); /* arg0 */
+    JS_PushArg(ctx, app->clip_cb.val);                             /* func */
+    JS_PushArg(ctx, JS_NULL);                                      /* this */
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 2);
+    if (JS_IsException(ret))
+        dump_error(ctx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3121,8 +3323,9 @@ static bool anything_pending(const AppSlot *app)
             return true;
     if (app->touch_used || app->key_used)
         return true;
-    if (app->fg_used || app->bg_used || app->sig_used)
-        return true; /* lifecycle/signal sinks keep the app alive (§3.8) */
+    if (app->fg_used || app->bg_used || app->sig_used || app->clip_used)
+        return true; /* lifecycle/signal/clipboard sinks keep the app
+                        alive (§3.8: "sleep until something happens") */
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
         if (app->widget_cbs[i].used) /* a live widget screen, too */
             return true;
@@ -3204,6 +3407,10 @@ static void app_reset_bindings(AppSlot *app)
         JS_DeleteGCRef(ctx, &app->sig_cb);
         app->sig_used = false;
     }
+    if (app->clip_used) {
+        JS_DeleteGCRef(ctx, &app->clip_cb);
+        app->clip_used = false;
+    }
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
         if (app->ssh_cbs[i].used)
             sshcb_release(ctx, &app->ssh_cbs[i]);
@@ -3268,6 +3475,7 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
     app->touch_used = false;
     app->key_used = false;
     app->fg_used = app->bg_used = app->sig_used = false;
+    app->clip_used = false;
     app->sink_len = 0;
     snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
 
@@ -3405,7 +3613,8 @@ static AppSlot *event_owner(const MqjsEvent *ev)
         return NULL;
     case EV_MQTT_CONNECTED:
     case EV_MQTT_DATA:
-    case EV_SIGNAL: {
+    case EV_SIGNAL:
+    case EV_CLIP: {
         AppSlot *app = &s_apps[ev->slot];
         return (app->used && app->gen == ev->gen) ? app : NULL;
     }
@@ -3442,6 +3651,7 @@ static void dispatch_event(AppSlot *app, MqjsEvent *ev)
     case EV_SSH_CLOSED:     dispatch_ssh_closed(app, ev);    break;
     case EV_WIDGET:         dispatch_widget_event(app, ev);  break;
     case EV_SIGNAL:         dispatch_signal(app, ev);        break;
+    case EV_CLIP:           dispatch_clip(app, ev);          break;
     }
     s_cur_app = prev;
 }

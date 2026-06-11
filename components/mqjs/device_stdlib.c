@@ -449,6 +449,20 @@ static const JSPropDef js_ssh[] = {
 static const JSClassDef js_ssh_obj =
     JS_OBJECT_DEF("SSH", js_ssh);
 
+/* ---- device API: clipboard object (P4d typed clipboard IPC) ----
+   One system-shared, typed value in a C buffer outside every JS
+   context: survives app stops, persisted in NVS across reboots.
+   set() notifies every OTHER app that registered onChange. ---- */
+static const JSPropDef js_clipboard[] = {
+    JS_CFUNC_DEF("set", 2, js_clipboard_set),
+    JS_CFUNC_DEF("get", 0, js_clipboard_get),
+    JS_CFUNC_DEF("onChange", 1, js_clipboard_onChange),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_clipboard_obj =
+    JS_OBJECT_DEF("Clipboard", js_clipboard);
+
 /* ---- device API: store object (NVS-backed key-value, W2) ---- */
 static const JSPropDef js_store[] = {
     JS_CFUNC_DEF("get", 1, js_store_get),
@@ -544,6 +558,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
+    JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
        ui.screen(); the names just make the ROM protos reachable). */

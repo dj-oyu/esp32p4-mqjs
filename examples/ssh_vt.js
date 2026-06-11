@@ -45,7 +45,11 @@ var DEMO_SCRIPT =
    最上段 TAB_ROWS 行はタブバーに割り、端末グリッドはその下に置く。 */
 var sz = ui.size();
 var W = sz[0] || 720, H = sz[1] || 1192;
-var KB_H = 400;                     /* 常時表示キーボードの高さ */
+/* キーボード + コントロールバー (T3a, mode 2) の予約高さは C に聞く。
+   返り値が問い合わせを兼ねるので一度出してすぐ仕舞う (同一バッチで
+   処理されるため画面には出ない)。 */
+var KB_H = ui.keyboard(2) || 480;
+ui.keyboard(0);
 var VIEW_H = H - KB_H;
 var cell = ui.cellSize();           /* HackGen 等幅: [9, 24] */
 var CW = cell[0] || 9;
@@ -554,6 +558,10 @@ if (SELFTEST) {
         return e.user + "@" + e.host + ":" + e.port;
     };
 
+    /* T3a one-shot 修飾 (コントロールバーの Ctrl/Alt): 押した次の
+       1 キーだけ効く。再タップで解除。武装中はタブバー右端に表示。 */
+    var pendCtrl = false, pendAlt = false;
+
     /* ---- タブバー (キャンバス最上段、ui.cells 直描き) ---- */
     var drawTabs = function () {
         tabHit = [];
@@ -577,6 +585,9 @@ if (SELFTEST) {
             ui.cells(c, 0, plus, TAB_ACT_FG, 0x256B45);
             tabHit.push({ x0: c * CW, x1: (c + plus.length) * CW, idx: -1 });
         }
+        var mods = (pendCtrl ? " CTRL " : "") + (pendAlt ? " ALT " : "");
+        if (mods)
+            ui.cells(COLS - mods.length, 0, mods, 0x000000, 0xFFD479);
     };
 
     var switchTo = function (i) {
@@ -591,16 +602,59 @@ if (SELFTEST) {
         drawTabs();
     };
 
+    /* T3a: コントロールバーは "\x00name" トークンを送ってくる (C は
+       ボタン→トークン対応だけ、意味付けはここ — 設計 §7)。xterm 系
+       シーケンス表 + one-shot Ctrl/Alt 変換。 */
+    var TOKSEQ = {
+        esc: "\x1b", tab: "\t",
+        up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D",
+        home: "\x1b[H", end: "\x1b[F",
+        pgup: "\x1b[5~", pgdn: "\x1b[6~", del: "\x1b[3~", ins: "\x1b[2~",
+        f1: "\x1bOP", f2: "\x1bOQ", f3: "\x1bOR", f4: "\x1bOS",
+        f5: "\x1b[15~", f6: "\x1b[17~", f7: "\x1b[18~", f8: "\x1b[19~",
+        f9: "\x1b[20~", f10: "\x1b[21~", f11: "\x1b[23~", f12: "\x1b[24~"
+    };
     ui.onKey(function (k) {
         if (actIdx < 0)
             return;
         var id = sessions[actIdx].id;
-        if (k === "\n")
-            ssh.write(id, "\r");
-        else if (k === "\b")
-            ssh.write(id, "\x7f");
-        else
-            ssh.write(id, k);
+        if (k.charCodeAt(0) === 0) {
+            var name = k.slice(1);
+            if (name === "ctrl") { pendCtrl = !pendCtrl; drawTabs(); return; }
+            if (name === "alt") { pendAlt = !pendAlt; drawTabs(); return; }
+            if (name === "copy") {
+                /* 選択 UI は T3b。それまではコピー元なし。 */
+                sys.notify("コピーは選択 (T3b) から");
+                return;
+            }
+            if (name === "paste") {
+                var clip = clipboard.get();
+                if (clip && clip.data)
+                    ssh.write(id, clip.data);
+                return;
+            }
+            k = TOKSEQ[name] || "";
+            if (!k)
+                return;
+        } else if (k === "\n") {
+            k = "\r";
+        } else if (k === "\b") {
+            k = "\x7f";
+        }
+        if (pendCtrl) {
+            pendCtrl = false;
+            if (k === " ")
+                k = "\x00";                       /* Ctrl+Space = NUL */
+            else if (k.length === 1 && k.charCodeAt(0) >= 64)
+                k = String.fromCharCode(k.charCodeAt(0) & 0x1F);
+            drawTabs();
+        }
+        if (pendAlt) {
+            pendAlt = false;
+            k = "\x1b" + k;                       /* Meta = ESC prefix */
+            drawTabs();
+        }
+        ssh.write(id, k);
     });
 
     /* タブバーのタップ: 切替 / [+] = ホストページ。それ以外のタップは
@@ -620,7 +674,7 @@ if (SELFTEST) {
             }
             return;
         }
-        ui.keyboard(1);
+        ui.keyboard(2);
     });
 
     setInterval(function () {
@@ -669,7 +723,7 @@ if (SELFTEST) {
         inForm = false;
         unwind();
         ui.clear(BG);
-        ui.keyboard(1);
+        ui.keyboard(2);
         switchTo(sessions.length - 1);
     };
 
@@ -764,7 +818,7 @@ if (SELFTEST) {
                 if (actIdx >= 0)
                     sessions[actIdx].term.markAll();
                 drawTabs();
-                ui.keyboard(1);
+                ui.keyboard(2);
             });
         }
     };
@@ -779,7 +833,7 @@ if (SELFTEST) {
             ui.clear(BG);
             sessions[actIdx].term.markAll(); /* flush 間隔が描き直す */
             drawTabs();
-            ui.keyboard(1);
+            ui.keyboard(2);
         } else {
             inForm = true;
             hostsPage(sessions.length ? "接続は維持されています" : null);

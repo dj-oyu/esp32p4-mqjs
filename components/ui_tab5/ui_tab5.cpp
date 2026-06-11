@@ -1232,16 +1232,107 @@ private:
 /* ------------------------------------------------------------------ */
 
 #define UI_KB_H 400 /* 4 rows x 100px: comfortable on the 5" panel */
+#define UI_CB_H 80  /* T3a control bar row above the keyboard */
 
 static lv_obj_t *s_kb;
+static lv_obj_t *s_cbar;    /* T3a terminal control bar (mode 2) */
+static bool s_cbar_fn;      /* current map: false = main, true = F1-F12 */
 static lv_obj_t *s_root_scr; /* console screen: fixed parent for s_kb (a
                                 widget screen could be active when JS calls
                                 ui.keyboard(1); parenting there would leave
                                 s_kb dangling when that screen is freed) */
 
-static void kb_show(bool show)
+/* T3a control bar (ssh-terminal-design §7): generic key-token source.
+   C only maps button -> "\0name" token (NUL-sentinel, design keytoken
+   convention); the terminal's meaning (one-shot Ctrl/Alt, xterm F-key
+   sequences, paste) lives in JS where it can be pushed OTA. Fn flips
+   the bar between the main map and F1-F12 (handled here: it changes
+   the bar itself, no token). Octal "\0" not hex: "\x00esc" would eat
+   'e' as a hex digit. */
+static const char *CB_MAP_MAIN[] = {
+    "Esc", "Tab", "Ctrl", "Alt", "Fn",
+    LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
+    LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "",
+};
+static const char *CB_TOK_MAIN[] = {
+    "\0esc", "\0tab", "\0ctrl", "\0alt", NULL /* Fn */,
+    "\0left", "\0down", "\0up", "\0right",
+    "\0copy", "\0paste",
+};
+static const char *CB_MAP_FN[] = {
+    "Fn", "F1", "F2", "F3", "F4", "F5", "F6",
+    "F7", "F8", "F9", "F10", "F11", "F12", "",
+};
+static const char *CB_TOK_FN[] = {
+    NULL /* Fn */, "\0f1", "\0f2", "\0f3", "\0f4", "\0f5", "\0f6",
+    "\0f7", "\0f8", "\0f9", "\0f10", "\0f11", "\0f12",
+};
+
+static void cbar_show(bool show)
 {
     if (!show) {
+        if (s_cbar)
+            lv_obj_add_flag(s_cbar, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (!s_cbar) {
+        s_cbar = lv_buttonmatrix_create(s_root_scr ? s_root_scr
+                                                   : lv_screen_active());
+        lv_obj_set_size(s_cbar, UI_LCD_H_RES, UI_CB_H);
+        lv_obj_align(s_cbar, LV_ALIGN_BOTTOM_MID, 0, -UI_KB_H);
+        lv_obj_set_style_pad_all(s_cbar, 4, 0);
+        lv_obj_set_style_pad_gap(s_cbar, 4, 0);
+        lv_obj_set_style_text_font(s_cbar, ui_font(), 0);
+        lv_buttonmatrix_set_map(s_cbar, CB_MAP_MAIN);
+        s_cbar_fn = false;
+        lv_obj_add_event_cb(
+            s_cbar,
+            [](lv_event_t *e) {
+                lv_obj_t *bm = (lv_obj_t *)lv_event_get_current_target(e);
+                uint32_t id = lv_buttonmatrix_get_selected_button(bm);
+                if (id == LV_BUTTONMATRIX_BUTTON_NONE)
+                    return;
+                const char *tok;
+                size_t ntok;
+                if (s_cbar_fn) {
+                    if (id >= sizeof CB_TOK_FN / sizeof CB_TOK_FN[0])
+                        return;
+                    tok = CB_TOK_FN[id];
+                } else {
+                    if (id >= sizeof CB_TOK_MAIN / sizeof CB_TOK_MAIN[0])
+                        return;
+                    tok = CB_TOK_MAIN[id];
+                }
+                if (!tok) { /* Fn: flip the map locally */
+                    s_cbar_fn = !s_cbar_fn;
+                    lv_buttonmatrix_set_map(bm, s_cbar_fn ? CB_MAP_FN
+                                                          : CB_MAP_MAIN);
+                    return;
+                }
+                ntok = 1 + strlen(tok + 1); /* NUL sentinel + name */
+                mqjs_post_key(tok, ntok);
+            },
+            LV_EVENT_VALUE_CHANGED, nullptr);
+    }
+    lv_obj_remove_flag(s_cbar, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_cbar);
+}
+
+/* px the keyboard overlay reserves at the canvas bottom in `mode` —
+   ui.keyboard(mode)'s synchronous return, so the JS terminal derives
+   its grid from screen height minus this (design §4d, no hardcode) */
+extern "C" int ui_tab5_kb_reserved(int mode)
+{
+    if (!s_canvas_w || mode <= 0)
+        return 0;
+    return mode == 1 ? UI_KB_H : UI_KB_H + UI_CB_H;
+}
+
+/* mode: 0 = hide, 1 = keyboard, 2 = keyboard + terminal control bar */
+static void kb_show(int mode)
+{
+    cbar_show(mode >= 2);
+    if (mode <= 0) {
         if (s_kb)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -1277,7 +1368,7 @@ static void kb_show(bool show)
                 lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_SPECIAL);
             else if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
                      !strcmp(txt, LV_SYMBOL_KEYBOARD))
-                kb_show(false);
+                kb_show(0);
             else if (!strcmp(txt, LV_SYMBOL_BACKSPACE))
                 mqjs_post_key("\b", 1);
             else if (!strcmp(txt, LV_SYMBOL_NEW_LINE) ||
@@ -1331,7 +1422,7 @@ public:
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             if (cmd.op == UI_CMD_KEYBOARD) {
                 /* not a drawing op: must not unhide the canvas */
-                kb_show(cmd.x != 0);
+                kb_show(cmd.x);
                 continue;
             }
             if (cmd.op == UI_CMD_RESET) {
@@ -1340,7 +1431,7 @@ public:
                    keyboard down. The next app redraws from its model. */
                 fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
                 lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
-                kb_show(false);
+                kb_show(0);
                 continue;
             }
             apply(cmd);
@@ -1374,7 +1465,7 @@ private:
             memcpy(_origin, to, sizeof _origin);
             fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
             lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
-            kb_show(false); /* a new task should not inherit the kb */
+            kb_show(0); /* a new task should not inherit the kb */
         }
     }
 
