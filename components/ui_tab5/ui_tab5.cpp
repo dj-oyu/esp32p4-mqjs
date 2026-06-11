@@ -1268,6 +1268,49 @@ static const char *CB_TOK_FN[] = {
     "\0f7", "\0f8", "\0f9", "\0f10", "\0f11", "\0f12",
 };
 
+/* One-shot modifier latch, mirrored on the buttons themselves (user
+   feedback: the tab-bar badge alone was too subtle). The SEMANTIC
+   one-shot state lives in the terminal JS; this visual copy stays in
+   sync by construction because both are driven by the same key
+   stream — armed on the Ctrl/Alt tap, cleared by the next key from
+   either the bar or the keyboard (exactly when JS consumes it). */
+#define CB_ID_CTRL 2 /* index in CB_MAP_MAIN */
+#define CB_ID_ALT  3
+static bool s_mod_ctrl, s_mod_alt;
+
+/* (re)apply checkable + checked to Ctrl/Alt — needed after every
+   set_map, which wipes per-button ctrl flags (Fn flips back and forth) */
+static void cbar_apply_mods(void)
+{
+    if (!s_cbar || s_cbar_fn)
+        return;
+    lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_CTRL,
+                                    LV_BUTTONMATRIX_CTRL_CHECKABLE);
+    lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_ALT,
+                                    LV_BUTTONMATRIX_CTRL_CHECKABLE);
+    if (s_mod_ctrl)
+        lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_CTRL,
+                                        LV_BUTTONMATRIX_CTRL_CHECKED);
+    else
+        lv_buttonmatrix_clear_button_ctrl(s_cbar, CB_ID_CTRL,
+                                          LV_BUTTONMATRIX_CTRL_CHECKED);
+    if (s_mod_alt)
+        lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_ALT,
+                                        LV_BUTTONMATRIX_CTRL_CHECKED);
+    else
+        lv_buttonmatrix_clear_button_ctrl(s_cbar, CB_ID_ALT,
+                                          LV_BUTTONMATRIX_CTRL_CHECKED);
+}
+
+/* the next key consumed the one-shot: drop the latch (no-op when idle) */
+static void cbar_clear_mods(void)
+{
+    if (!s_mod_ctrl && !s_mod_alt)
+        return;
+    s_mod_ctrl = s_mod_alt = false;
+    cbar_apply_mods();
+}
+
 static void cbar_show(bool show)
 {
     if (!show) {
@@ -1283,8 +1326,17 @@ static void cbar_show(bool show)
         lv_obj_set_style_pad_all(s_cbar, 4, 0);
         lv_obj_set_style_pad_gap(s_cbar, 4, 0);
         lv_obj_set_style_text_font(s_cbar, ui_font(), 0);
+        /* armed one-shot Ctrl/Alt latch on the button itself (same
+           amber as the terminal's tab-bar badge) */
+        lv_obj_set_style_bg_color(s_cbar, lv_color_hex(0xFFD479),
+                                  (uint32_t)LV_PART_ITEMS |
+                                      (uint32_t)LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(s_cbar, lv_color_black(),
+                                    (uint32_t)LV_PART_ITEMS |
+                                        (uint32_t)LV_STATE_CHECKED);
         lv_buttonmatrix_set_map(s_cbar, CB_MAP_MAIN);
         s_cbar_fn = false;
+        cbar_apply_mods();
         lv_obj_add_event_cb(
             s_cbar,
             [](lv_event_t *e) {
@@ -1307,10 +1359,23 @@ static void cbar_show(bool show)
                     s_cbar_fn = !s_cbar_fn;
                     lv_buttonmatrix_set_map(bm, s_cbar_fn ? CB_MAP_FN
                                                           : CB_MAP_MAIN);
+                    cbar_apply_mods(); /* set_map wiped the latch */
                     return;
                 }
                 ntok = 1 + strlen(tok + 1); /* NUL sentinel + name */
+                if (!s_cbar_fn && id == CB_ID_CTRL) {
+                    /* LVGL already toggled CHECKED: read the new state */
+                    s_mod_ctrl = lv_buttonmatrix_has_button_ctrl(
+                        bm, CB_ID_CTRL, LV_BUTTONMATRIX_CTRL_CHECKED);
+                } else if (!s_cbar_fn && id == CB_ID_ALT) {
+                    s_mod_alt = lv_buttonmatrix_has_button_ctrl(
+                        bm, CB_ID_ALT, LV_BUTTONMATRIX_CTRL_CHECKED);
+                }
                 mqjs_post_key(tok, ntok);
+                /* any key but Ctrl/Alt themselves consumes the one-shot
+                   (in the FN map ids 2/3 are F2/F3, not modifiers) */
+                if (s_cbar_fn || (id != CB_ID_CTRL && id != CB_ID_ALT))
+                    cbar_clear_mods();
             },
             LV_EVENT_VALUE_CHANGED, nullptr);
     }
@@ -1360,16 +1425,26 @@ static void kb_show(int mode)
             const char *txt = lv_buttonmatrix_get_button_text(kb, id);
             if (!txt)
                 return;
-            if (!strcmp(txt, "abc"))
+            /* map/mode switches post nothing to JS: return before the
+               one-shot latch clear below */
+            if (!strcmp(txt, "abc")) {
                 lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
-            else if (!strcmp(txt, "ABC"))
+                return;
+            }
+            if (!strcmp(txt, "ABC")) {
                 lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
-            else if (!strcmp(txt, "1#"))
+                return;
+            }
+            if (!strcmp(txt, "1#")) {
                 lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_SPECIAL);
-            else if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
-                     !strcmp(txt, LV_SYMBOL_KEYBOARD))
+                return;
+            }
+            if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
+                !strcmp(txt, LV_SYMBOL_KEYBOARD)) {
                 kb_show(0);
-            else if (!strcmp(txt, LV_SYMBOL_BACKSPACE))
+                return;
+            }
+            if (!strcmp(txt, LV_SYMBOL_BACKSPACE))
                 mqjs_post_key("\b", 1);
             else if (!strcmp(txt, LV_SYMBOL_NEW_LINE) ||
                      !strcmp(txt, LV_SYMBOL_OK))
@@ -1380,6 +1455,10 @@ static void kb_show(int mode)
                 mqjs_post_key("\x1b[C", 3);
             else
                 mqjs_post_key(txt, strlen(txt));
+            /* every key the keyboard posts consumes a pending one-shot
+               modifier in the terminal JS — mirror it on the bar latch
+               (mode-switch taps returned above and don't get here) */
+            cbar_clear_mods();
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
 }
@@ -1432,6 +1511,7 @@ public:
                 fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
                 lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
                 kb_show(0);
+                cbar_clear_mods(); /* one-shot state died with the app */
                 continue;
             }
             apply(cmd);
@@ -1466,6 +1546,7 @@ private:
             fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
             lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
             kb_show(0); /* a new task should not inherit the kb */
+            cbar_clear_mods(); /* ... nor an armed one-shot latch */
         }
     }
 

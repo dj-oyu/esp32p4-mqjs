@@ -622,12 +622,17 @@ if (SELFTEST) {
             var name = k.slice(1);
             if (name === "ctrl") { pendCtrl = !pendCtrl; drawTabs(); return; }
             if (name === "alt") { pendAlt = !pendAlt; drawTabs(); return; }
-            if (name === "copy") {
-                /* 選択 UI は T3b。それまではコピー元なし。 */
-                sys.notify("コピーは選択 (T3b) から");
-                return;
-            }
-            if (name === "paste") {
+            if (name === "copy" || name === "paste") {
+                /* どのキーでも one-shot は消費 (バーのラッチ解除と同期) */
+                if (pendCtrl || pendAlt) {
+                    pendCtrl = pendAlt = false;
+                    drawTabs();
+                }
+                if (name === "copy") {
+                    /* 選択 UI は T3b。それまではコピー元なし。 */
+                    sys.notify("コピーは選択 (T3b) から");
+                    return;
+                }
                 var clip = clipboard.get();
                 if (clip && clip.data)
                     ssh.write(id, clip.data);
