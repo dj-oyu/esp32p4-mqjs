@@ -41,6 +41,7 @@
 #include "mooncake.h"
 
 #include "ui_tab5.h"
+#include "ui_tab5_internal.h"
 
 #include "esp_lcd_st7121.h"
 #include "esp_lcd_st7123.h"
@@ -368,7 +369,7 @@ extern "C" int __wrap_esp_hosted_init(void)
 #define UI_DPHY_LDO_MV      2500
 #define UI_BACKLIGHT_GPIO   22
 #define UI_LVGL_BUF_LINES   50
-#define UI_STATUSBAR_H      88 /* canvas/console area starts below this */
+/* UI_STATUSBAR_H lives in ui_tab5_internal.h (shared with ui_widgets.cpp) */
 
 /* Tab5 shipped with different panels over time; the variant is identified
  * by which touch controller answers on the internal I2C bus
@@ -802,12 +803,17 @@ static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color)
 
 /* Top bar: WiFi/MQTT link dots, current task, last platform event.
    Reads the status snapshot every frame and only touches widgets when
-   the generation counter moved. */
+   the generation counter moved.
+   Lives on lv_layer_top() — the display-global layer above every
+   screen — so it stays visible on W1 widget pages too (system chrome,
+   user feedback 2026-06-11). It also does not slide with screen-load
+   animations, which is exactly how a status bar should behave. Widget
+   screens reserve UI_STATUSBAR_H of top padding (ui_widgets.cpp). */
 class StatusBar : public mooncake::UIAbility {
 public:
     void onCreate() override
     {
-        lv_obj_t *bar = lv_obj_create(lv_screen_active());
+        lv_obj_t *bar = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(bar);
         lv_obj_set_pos(bar, 0, 0);
         lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
@@ -994,6 +1000,10 @@ private:
 #define UI_KB_H 400 /* 4 rows x 100px: comfortable on the 5" panel */
 
 static lv_obj_t *s_kb;
+static lv_obj_t *s_root_scr; /* console screen: fixed parent for s_kb (a
+                                widget screen could be active when JS calls
+                                ui.keyboard(1); parenting there would leave
+                                s_kb dangling when that screen is freed) */
 
 static void kb_show(bool show)
 {
@@ -1007,7 +1017,7 @@ static void kb_show(bool show)
         lv_obj_move_foreground(s_kb);
         return;
     }
-    s_kb = lv_keyboard_create(lv_screen_active());
+    s_kb = lv_keyboard_create(s_root_scr ? s_root_scr : lv_screen_active());
     /* the default VALUE_CHANGED handler is built for a textarea and
        switches maps before our callback could read the key, so replace
        it wholesale: mode switching is redone below via set_mode */
@@ -1401,8 +1411,8 @@ extern "C" void ui_tab5_start(void)
     /* status bar + console + canvas, driven by mooncake from an
        lv_timer (i.e. inside the LVGL task, under the port lock) */
     lvgl_port_lock(0);
-    lv_obj_set_style_bg_color(lv_display_get_screen_active(disp),
-                              lv_color_hex(UI_COL_BG), 0);
+    s_root_scr = lv_display_get_screen_active(disp);
+    lv_obj_set_style_bg_color(s_root_scr, lv_color_hex(UI_COL_BG), 0);
     auto &mc = mooncake::GetMooncake();
     mc.createExtension(std::make_unique<StatusBar>());
     mc.openApp(mc.installApp(std::make_unique<ConsoleApp>()));

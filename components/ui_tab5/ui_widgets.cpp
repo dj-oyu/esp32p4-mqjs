@@ -203,6 +203,9 @@ extern "C" uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
     lv_obj_set_style_text_color(scr, lv_color_hex(UI_COL_TEXT), 0);
     lv_obj_set_style_text_font(scr, ui_tab5_jp_font(), 0);
     lv_obj_set_style_pad_all(scr, 16, 0);
+    /* the status bar floats on lv_layer_top() above every screen:
+       keep page content out from under it */
+    lv_obj_set_style_pad_top(scr, UI_STATUSBAR_H + 12, 0);
     lv_obj_set_style_pad_row(scr, 12, 0);
     lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(scr, LV_DIR_VER);
