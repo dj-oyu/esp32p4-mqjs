@@ -130,6 +130,13 @@ uint32_t ui_tab5_w_back(void);
 uint32_t ui_tab5_w_create(int kind, uint32_t parent, const char *text,
                           int a, int b, int c);
 
+/* Add a trailing close (✕) button to a UI_WK_ITEM list row (P4b: the
+ * launcher stops apps inline instead of via a confirm page). Returns
+ * the button's own widget handle (its tap posts EV_WIDGET like any
+ * button), 0 for stale/non-item handles. Tapping ✕ does not trigger
+ * the row's own callback. */
+uint32_t ui_tab5_w_item_close(uint32_t item);
+
 /* Replace the visible text of a LABEL / BUTTON / ITEM (child label) or
  * the content of a FIELD. false for stale handles / other kinds. */
 bool ui_tab5_w_set_text(uint32_t handle, const char *text);
@@ -208,6 +215,11 @@ static inline uint32_t ui_tab5_w_create(int kind, uint32_t parent,
     (void)a;
     (void)b;
     (void)c;
+    return 0;
+}
+static inline uint32_t ui_tab5_w_item_close(uint32_t item)
+{
+    (void)item;
     return 0;
 }
 static inline bool ui_tab5_w_set_text(uint32_t handle, const char *text)

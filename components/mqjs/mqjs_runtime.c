@@ -1679,7 +1679,9 @@ JSValue js_uiscreen_create(JSContext *ctx, JSValue *this_val, int argc,
     return uiw_make(ctx, h, sh->screen, magic, JS_CLASS_UI_WIDGET);
 }
 
-/* UiWidget.prototype.add(text, onTap) — list rows */
+/* UiWidget.prototype.add(text, onTap[, onClose]) — list rows. With
+   onClose the row gets a trailing ✕ button (P4b: the launcher stops
+   apps inline); tapping ✕ fires onClose only, never onTap. */
 JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JsUiHandle *lh = uiw_get(ctx, this_val, JS_CLASS_UI_WIDGET);
@@ -1690,6 +1692,9 @@ JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
     JSValue cb = argv[1];
     if (!JS_IsUndefined(cb) && !JS_IsNull(cb) && !JS_IsFunction(ctx, cb))
+        return JS_ThrowTypeError(ctx, "not a function");
+    JSValue ccb = argv[2];
+    if (!JS_IsUndefined(ccb) && !JS_IsNull(ccb) && !JS_IsFunction(ctx, ccb))
         return JS_ThrowTypeError(ctx, "not a function");
     uint32_t h = 0;
     if (ui_is_fg()) {
@@ -1702,6 +1707,17 @@ JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
     }
     if (h && JS_IsFunction(ctx, cb)) {
         if (wcb_add(ctx, h, lh->screen, cb))
+            return JS_ThrowInternalError(ctx, "too many widget callbacks");
+    }
+    if (h && JS_IsFunction(ctx, ccb)) {
+        uint32_t hc;
+#ifdef ESP_PLATFORM
+        hc = ui_tab5_w_item_close(h);
+#else
+        hc = s_pcw_next++;
+        printf("[ui] list.add close button -> #%u (stub)\n", (unsigned)hc);
+#endif
+        if (hc && wcb_add(ctx, hc, lh->screen, ccb))
             return JS_ThrowInternalError(ctx, "too many widget callbacks");
     }
     return uiw_make(ctx, h, lh->screen, UIW_K_ITEM, JS_CLASS_UI_WIDGET);

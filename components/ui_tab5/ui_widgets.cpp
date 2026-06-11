@@ -519,6 +519,53 @@ extern "C" uint32_t ui_tab5_w_create(int kind, uint32_t parent,
     return 0;
 }
 
+/* Trailing ✕ on a list row (P4b launcher: inline stop, no confirm
+   page). The button is its own table entry — its CLICKED posts
+   EV_WIDGET with its own handle; LVGL hit-testing targets the deepest
+   clickable object, so a ✕ tap never fires the row's callback. */
+extern "C" uint32_t ui_tab5_w_item_close(uint32_t item)
+{
+    if (!ui_up())
+        return 0;
+    lvgl_port_lock(0);
+    int islot = w_lookup(item);
+    if (islot < 0 || s_w[islot].kind != UI_WK_ITEM) {
+        lvgl_port_unlock();
+        return 0;
+    }
+    lv_obj_t *row = s_w[islot].obj;
+    /* keep the row label clear of the button */
+    lv_obj_set_style_pad_right(row, 76, 0);
+
+    lv_obj_t *btn = lv_button_create(row);
+    lv_obj_remove_style_all(btn);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    /* list rows lay children out with flex: opt out so align() sticks */
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_size(btn, 60, 44);
+    lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 68, 0); /* inside the pad zone */
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A3540), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xE05A4E), LV_STATE_PRESSED);
+    lv_obj_t *l = lv_label_create(btn);
+    lv_label_set_text(l, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(l, lv_color_hex(UI_COL_DIM), 0);
+    lv_obj_center(l);
+
+    int slot = w_alloc(UI_WK_BUTTON, s_w[islot].scr_slot, btn);
+    if (slot < 0) {
+        lv_obj_delete(btn);
+        lvgl_port_unlock();
+        return 0;
+    }
+    uint32_t h = w_handle(slot);
+    lv_obj_add_event_cb(btn, w_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)h);
+    lvgl_port_unlock();
+    return h;
+}
+
 extern "C" bool ui_tab5_w_set_text(uint32_t handle, const char *text)
 {
     if (!ui_up() || !text)

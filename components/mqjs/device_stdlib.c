@@ -396,7 +396,7 @@ static const JSClassDef js_uiscreen_class =
                  js_uiscreen_proto, NULL, js_ui_handle_finalizer);
 
 static const JSPropDef js_uiwidget_proto[] = {
-    JS_CFUNC_DEF("add", 2, js_uiwidget_add),     /* list rows */
+    JS_CFUNC_DEF("add", 3, js_uiwidget_add),     /* list rows (+optional ✕) */
     JS_CFUNC_DEF("value", 0, js_uiwidget_value), /* field/toggle/slider */
     JS_CFUNC_DEF("setText", 1, js_uiwidget_setText), /* label/button/field */
     JS_PROP_END,

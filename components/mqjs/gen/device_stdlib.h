@@ -3788,7 +3788,7 @@ static const JSCFunctionDef js_c_function_table[] = {
     JS_CFUNC_constructor, 0, JS_CLASS_UI_WIDGET },
   { { .generic = js_uiwidget_add },
     JS_ROM_VALUE(982) /* add */,
-    JS_CFUNC_generic, 2, 0 },
+    JS_CFUNC_generic, 3, 0 },
   { { .generic = js_uiwidget_value },
     JS_ROM_VALUE(172) /* value */,
     JS_CFUNC_generic, 0, 0 },

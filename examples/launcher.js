@@ -1,7 +1,9 @@
 // ランチャー (P4b): slot 0 常駐の組み込みアプリ。
 //
-// - アプリ一覧: 実行中 (●) はタップで 切替/停止 ページ、停止中 (○) は
-//   タップで起動 (= 開く)。dev タスクの再開行もここ。
+// - アプリ一覧: 実行中 (●) はタップで即切替・行末の ✕ で即停止、
+//   停止中 (○) はタップで起動 (= 開く)。dev タスクの再開行もここ。
+//   確認ページは置かない: 停止の被害は「消える」だけで、○ 行 /
+//   ステータスバーのチップから 1 タップで復活できる。
 // - 「開く」要求の解決役: ステータスバーのチップ/通知タップは
 //   {"op":"open","app":<name>} のシグナルとしてここに届く。動いていれば
 //   focus、止まっていれば launch → focus (差出人は問わない: アプリからの
@@ -40,29 +42,27 @@ sys.onSignal(function (v, from) {
         openApp(req.app);
 });
 
-function appPage(app) {
-    var s = ui.screen(app.name);
-    s.label("slot " + app.slot + " で実行中");
-    s.button("前面に切替", function () { sys.focus(app.slot); });
-    s.button("停止", function () {
-        sys.stop(app.slot);
-        build(); // 一覧を作り直す (古い一覧は retain スタック側に残る)
-    });
-    s.button("キャンセル", ui.back);
-}
-
 function build() {
+    /* 停止 (✕) 後の作り直しで retain スタックを太らせない: 一覧は常に
+       コンソール直上の 1 枚だけにする */
+    while (ui.back()) {}
     var s = ui.screen("アプリ");
     var list = s.list();
     var apps = sys.apps();
     var running = {};
     for (var i = 0; i < apps.length; i++) {
         running[apps[i].name] = true;
-        if (apps[i].slot === 0)
-            continue; // 自分は載せない
+        if (apps[i].name === "launcher")
+            continue; // 自分は載せない (PC テストでは slot 0 とは限らない)
         (function (app) {
+            /* 行タップ = 即切替、行末の ✕ = 即停止 (確認ページなし。
+               誤タップしても ○ 行 / チップから 1 タップで復活できる) */
             list.add("● " + app.name + "  (slot " + app.slot + ")",
-                     function () { appPage(app); });
+                     function () { sys.focus(app.slot); },
+                     function () {
+                         sys.stop(app.slot);
+                         build();
+                     });
         })(apps[i]);
     }
     /* dev スロット (1) が明示停止で寝ているときだけ再開行を出す
@@ -81,7 +81,7 @@ function build() {
                 list.add("○ " + name, function () { openApp(name); });
             })(inst[j]);
     }
-    s.label("● 実行中 / ○ 停止中 — バー長押しでいつでもここへ");
+    s.label("● 実行中 (✕ で停止) / ○ 停止中 — バー長押しでいつでもここへ");
 }
 
 sys.onForeground(build);
