@@ -82,6 +82,47 @@ void storage_save_task(const char *src, size_t len)
         ESP_LOGI(TAG, "persisted task (%zu bytes)", len);
 }
 
+char *storage_load_app(const char *name, size_t *len)
+{
+    *len = 0;
+    if (!s_mounted)
+        return NULL;
+    char path[64];
+    snprintf(path, sizeof path, MOUNT "/apps/%s.js", name);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > MAX_TASK) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[rd] = '\0';
+    *len = rd;
+    return buf;
+}
+
+bool storage_delete_app(const char *name)
+{
+    if (!s_mounted)
+        return false;
+    char path[64];
+    snprintf(path, sizeof path, MOUNT "/apps/%s.js", name);
+    if (remove(path) != 0)
+        return false;
+    ESP_LOGI(TAG, "uninstalled app '%s'", name);
+    return true;
+}
+
 bool storage_save_app(const char *name, const char *src, size_t len)
 {
     if (!s_mounted)

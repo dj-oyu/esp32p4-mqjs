@@ -260,6 +260,16 @@ void mqjs_set_notify_sink(void (*fn)(const char *text))
     s_notify_sink = fn;
 }
 
+/* P4c: last notification per app (name-keyed; survives the app's stop
+   so "what was that about?" stays answerable from the launcher) */
+typedef struct {
+    char app[32];
+    char text[96];
+    uint32_t seq; /* 0 = empty; ordering for sys.notices() */
+} Notice;
+static Notice s_notices[8];
+static uint32_t s_notice_seq;
+
 void mqjs_register_app_source(const char *name, const char *src, size_t len)
 {
     for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
@@ -1679,9 +1689,10 @@ JSValue js_uiscreen_create(JSContext *ctx, JSValue *this_val, int argc,
     return uiw_make(ctx, h, sh->screen, magic, JS_CLASS_UI_WIDGET);
 }
 
-/* UiWidget.prototype.add(text, onTap[, onClose]) — list rows. With
-   onClose the row gets a trailing ✕ button (P4b: the launcher stops
-   apps inline); tapping ✕ fires onClose only, never onTap. */
+/* UiWidget.prototype.add(text, onTap[, onClose[, icon]]) — list rows.
+   With onClose the row gets a trailing action button (P4b/P4c: the
+   launcher stops/uninstalls inline); tapping it fires onClose only,
+   never onTap. icon: "trash" for uninstall semantics, default ✕. */
 JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JsUiHandle *lh = uiw_get(ctx, this_val, JS_CLASS_UI_WIDGET);
@@ -1710,12 +1721,17 @@ JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
             return JS_ThrowInternalError(ctx, "too many widget callbacks");
     }
     if (h && JS_IsFunction(ctx, ccb)) {
+        char icon[16];
+        if (uiw_copy_str(ctx, argv[3], icon, sizeof icon))
+            return JS_EXCEPTION;
+        int ic = strcmp(icon, "trash") == 0 ? 1 : 0;
         uint32_t hc;
 #ifdef ESP_PLATFORM
-        hc = ui_tab5_w_item_close(h);
+        hc = ui_tab5_w_item_close(h, ic);
 #else
         hc = s_pcw_next++;
-        printf("[ui] list.add close button -> #%u (stub)\n", (unsigned)hc);
+        printf("[ui] list.add %s button -> #%u (stub)\n",
+               ic ? "trash" : "close", (unsigned)hc);
 #endif
         if (hc && wcb_add(ctx, hc, lh->screen, ccb))
             return JS_ThrowInternalError(ctx, "too many widget callbacks");
@@ -2096,9 +2112,64 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return arr;
 }
 
-/* sys.installed() -> array of launchable names: the embedded source
-   registry + the .js files under /littlefs/apps. The launcher filters
-   and decorates. */
+/* Pull one "// @<key> value" directive out of a script's leading
+   comment block (the in-file manifest, design §4.5). Stops at the
+   first non-comment line so body strings can't spoof directives. */
+static void manifest_field(const char *buf, size_t n, const char *key,
+                           char *out, size_t cap)
+{
+    size_t klen = strlen(key);
+    size_t i = 0;
+    out[0] = '\0';
+    while (i < n) {
+        if (i + 1 < n && buf[i] == '/' && buf[i + 1] == '/') {
+            if (i + klen <= n && !strncmp(buf + i, key, klen)) {
+                size_t j = i + klen, k = 0;
+                while (j < n && buf[j] != '\n' && buf[j] != '\r' &&
+                       k < cap - 1)
+                    out[k++] = buf[j++];
+                while (k > 0 && out[k - 1] == ' ')
+                    k--;
+                out[k] = '\0';
+                return;
+            }
+        } else if (buf[i] != '\n' && buf[i] != '\r' && buf[i] != ' ' &&
+                   buf[i] != '\t') {
+            return; /* past the header block */
+        }
+        while (i < n && buf[i] != '\n')
+            i++;
+        i++;
+    }
+}
+
+/* append one {name, title, perm} entry to the installed() array */
+static int installed_push(JSContext *ctx, JSGCRef *arr_ref, int idx,
+                          const char *name, const char *head, size_t hlen)
+{
+    char title[48], perm[64];
+    manifest_field(head, hlen, "// @title ", title, sizeof title);
+    manifest_field(head, hlen, "// @perm ", perm, sizeof perm);
+
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return -1;
+    JS_PUSH_VALUE(ctx, obj);
+    JSValue v = JS_NewString(ctx, name);
+    JS_SetPropertyStr(ctx, obj_ref.val, "name", v);
+    v = JS_NewString(ctx, title[0] ? title : name);
+    JS_SetPropertyStr(ctx, obj_ref.val, "title", v);
+    v = JS_NewString(ctx, perm);
+    JS_SetPropertyStr(ctx, obj_ref.val, "perm", v);
+    JS_POP_VALUE(ctx, obj);
+    JS_SetPropertyUint32(ctx, arr_ref->val, (uint32_t)idx, obj);
+    return 0;
+}
+
+/* sys.installed() -> [{name, title, perm}] of launchable apps: the
+   embedded source registry + the .js files under /littlefs/apps.
+   title/perm come from the in-file manifest directives. */
 JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSGCRef arr_ref;
@@ -2112,8 +2183,13 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
         if (!s_app_sources[i].used ||
             !strcmp(s_app_sources[i].name, "launcher"))
             continue;
-        JSValue s = JS_NewString(ctx, s_app_sources[i].name);
-        JS_SetPropertyUint32(ctx, arr_ref.val, n++, s);
+        size_t hlen = s_app_sources[i].len < 512 ? s_app_sources[i].len : 512;
+        if (installed_push(ctx, &arr_ref, n, s_app_sources[i].name,
+                           s_app_sources[i].src, hlen)) {
+            JS_POP_VALUE(ctx, arr);
+            return JS_EXCEPTION;
+        }
+        n++;
     }
 #ifdef ESP_PLATFORM
     DIR *d = opendir("/littlefs/apps");
@@ -2125,8 +2201,21 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
                 continue;
             char base[32];
             snprintf(base, sizeof base, "%.*s", (int)(l - 3), e->d_name);
-            JSValue s = JS_NewString(ctx, base);
-            JS_SetPropertyUint32(ctx, arr_ref.val, n++, s);
+            char head[512];
+            size_t hlen = 0;
+            char path[96];
+            snprintf(path, sizeof path, "/littlefs/apps/%.40s", e->d_name);
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                hlen = fread(head, 1, sizeof head, f);
+                fclose(f);
+            }
+            if (installed_push(ctx, &arr_ref, n, base, head, hlen)) {
+                closedir(d);
+                JS_POP_VALUE(ctx, arr);
+                return JS_EXCEPTION;
+            }
+            n++;
         }
         closedir(d);
     }
@@ -2284,7 +2373,8 @@ JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_NewBool(1);
 }
 
-/* sys.notify(text): one status-bar line, prefixed with the sender. */
+/* sys.notify(text): one status-bar line, prefixed with the sender, and
+   recorded as the sender's latest notice (sys.notices / launcher). */
 JSValue js_sys_notify(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSCStringBuf buf;
@@ -2292,13 +2382,86 @@ JSValue js_sys_notify(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     const char *text = JS_ToCStringLen(ctx, &len, argv[0], &buf);
     if (!text)
         return JS_EXCEPTION;
+    const char *app = s_cur_app ? s_cur_app->name : "?";
+
+    /* keep the latest notice per app: reuse the sender's entry, else
+       the oldest one */
+    Notice *n = NULL;
+    for (int i = 0; i < (int)(sizeof s_notices / sizeof s_notices[0]); i++) {
+        if (!strcmp(s_notices[i].app, app)) {
+            n = &s_notices[i];
+            break;
+        }
+        if (!n || s_notices[i].seq < n->seq)
+            n = &s_notices[i];
+    }
+    snprintf(n->app, sizeof n->app, "%s", app);
+    snprintf(n->text, sizeof n->text, "%.*s", (int)len, text);
+    n->seq = ++s_notice_seq;
+
     if (s_notify_sink) {
         char line[128];
-        snprintf(line, sizeof line, "[%s] %.*s",
-                 s_cur_app ? s_cur_app->name : "?", (int)len, text);
+        snprintf(line, sizeof line, "[%s] %.*s", app, (int)len, text);
         s_notify_sink(line);
     }
     return JS_UNDEFINED;
+}
+
+/* sys.notices() -> [{app, text}] newest first (the per-app latest). */
+JSValue js_sys_notices(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+    JS_PUSH_VALUE(ctx, arr);
+    int cnt = (int)(sizeof s_notices / sizeof s_notices[0]);
+    int idx = 0;
+    uint32_t last = 0xFFFFFFFFu;
+    for (;;) {
+        /* next-highest seq below `last` (n is tiny: scan per element) */
+        Notice *best = NULL;
+        for (int i = 0; i < cnt; i++) {
+            if (s_notices[i].seq && s_notices[i].seq < last &&
+                (!best || s_notices[i].seq > best->seq))
+                best = &s_notices[i];
+        }
+        if (!best)
+            break;
+        last = best->seq;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        JSValue app = JS_NewString(ctx, best->app);
+        JS_SetPropertyStr(ctx, obj_ref.val, "app", app);
+        JSValue text = JS_NewString(ctx, best->text);
+        JS_SetPropertyStr(ctx, obj_ref.val, "text", text);
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, idx++, obj);
+    }
+    JS_POP_VALUE(ctx, arr);
+    return arr;
+}
+
+/* sys.uninstall(name) -> bool: remove /littlefs/apps/<name>.js. A
+   running instance is untouched; a registry-managed app comes back on
+   the next broker sync unless its retained message was tombstoned. */
+JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char name[64];
+    if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+        return JS_EXCEPTION;
+    if (!name[0])
+        return JS_NewBool(0);
+    char path[128];
+    if (strchr(name, '/'))
+        snprintf(path, sizeof path, "%.127s", name);
+    else
+        snprintf(path, sizeof path, "/littlefs/apps/%.96s.js", name);
+    return JS_NewBool(remove(path) == 0);
 }
 
 /* Status-bar chip / notification tap: ask the resident launcher to

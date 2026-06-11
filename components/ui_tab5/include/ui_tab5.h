@@ -130,12 +130,14 @@ uint32_t ui_tab5_w_back(void);
 uint32_t ui_tab5_w_create(int kind, uint32_t parent, const char *text,
                           int a, int b, int c);
 
-/* Add a trailing close (✕) button to a UI_WK_ITEM list row (P4b: the
- * launcher stops apps inline instead of via a confirm page). Returns
- * the button's own widget handle (its tap posts EV_WIDGET like any
- * button), 0 for stale/non-item handles. Tapping ✕ does not trigger
+/* Add a trailing action button to a UI_WK_ITEM list row (P4b/P4c: the
+ * launcher stops apps / uninstalls inline instead of via a confirm
+ * page). `icon`: 0 = close (✕, stop), 1 = trash (uninstall) — both
+ * FontAwesome glyphs from the Montserrat fallback font. Returns the
+ * button's own widget handle (its tap posts EV_WIDGET like any
+ * button), 0 for stale/non-item handles. Tapping it does not trigger
  * the row's own callback. */
-uint32_t ui_tab5_w_item_close(uint32_t item);
+uint32_t ui_tab5_w_item_close(uint32_t item, int icon);
 
 /* Replace the visible text of a LABEL / BUTTON / ITEM (child label) or
  * the content of a FIELD. false for stale handles / other kinds. */
@@ -217,9 +219,10 @@ static inline uint32_t ui_tab5_w_create(int kind, uint32_t parent,
     (void)c;
     return 0;
 }
-static inline uint32_t ui_tab5_w_item_close(uint32_t item)
+static inline uint32_t ui_tab5_w_item_close(uint32_t item, int icon)
 {
     (void)item;
+    (void)icon;
     return 0;
 }
 static inline bool ui_tab5_w_set_text(uint32_t handle, const char *text)

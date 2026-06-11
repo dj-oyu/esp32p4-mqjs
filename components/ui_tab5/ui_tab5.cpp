@@ -923,6 +923,14 @@ public:
         lv_obj_set_style_bg_color(_event_lbl, lv_color_hex(UI_COL_FLASH), 0);
         lv_obj_set_style_bg_opa(_event_lbl, LV_OPA_TRANSP, 0);
         lv_label_set_text(_event_lbl, "");
+        /* P4c: tapping a "[app] ..." notification opens its sender. The
+           displayed text itself is parsed, so the tap can never chase a
+           stale target; non-notify events just don't match. The label
+           is its own click target — bar long-press is unaffected except
+           when the press starts on this bottom strip. */
+        lv_obj_add_flag(_event_lbl, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(_event_lbl, notify_tap_cb, LV_EVENT_CLICKED,
+                            this);
 
         /* long-press progress strip along the bar's bottom edge */
         _strip = lv_obj_create(bar);
@@ -1032,6 +1040,22 @@ private:
     {
         auto *self = (StatusBar *)lv_event_get_user_data(e);
         self->cancel_press();
+    }
+
+    static void notify_tap_cb(lv_event_t *e)
+    {
+        auto *self = (StatusBar *)lv_event_get_user_data(e);
+        const char *t = lv_label_get_text(self->_event_lbl);
+        if (!t || t[0] != '[')
+            return; /* not a sys.notify line */
+        const char *end = strchr(t, ']');
+        if (!end || end == t + 1 || end - t > 32)
+            return;
+        char name[32];
+        size_t n = (size_t)(end - t - 1);
+        memcpy(name, t + 1, n);
+        name[n] = '\0';
+        mqjs_request_open(name);
     }
 
     void cancel_press()

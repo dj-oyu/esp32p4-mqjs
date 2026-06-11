@@ -396,7 +396,7 @@ static const JSClassDef js_uiscreen_class =
                  js_uiscreen_proto, NULL, js_ui_handle_finalizer);
 
 static const JSPropDef js_uiwidget_proto[] = {
-    JS_CFUNC_DEF("add", 3, js_uiwidget_add),     /* list rows (+optional ✕) */
+    JS_CFUNC_DEF("add", 4, js_uiwidget_add), /* rows (+optional ✕/trash) */
     JS_CFUNC_DEF("value", 0, js_uiwidget_value), /* field/toggle/slider */
     JS_CFUNC_DEF("setText", 1, js_uiwidget_setText), /* label/button/field */
     JS_PROP_END,
@@ -480,6 +480,9 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("launch", 1, js_sys_launch),
     JS_CFUNC_DEF("stop", 1, js_sys_stop),
     JS_CFUNC_DEF("notify", 1, js_sys_notify),
+    /* P4c registry: uninstall + per-app latest notifications */
+    JS_CFUNC_DEF("uninstall", 1, js_sys_uninstall),
+    JS_CFUNC_DEF("notices", 0, js_sys_notices),
     JS_PROP_END,
 };
 

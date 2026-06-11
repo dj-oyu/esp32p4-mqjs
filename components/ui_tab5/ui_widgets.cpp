@@ -523,7 +523,7 @@ extern "C" uint32_t ui_tab5_w_create(int kind, uint32_t parent,
    page). The button is its own table entry — its CLICKED posts
    EV_WIDGET with its own handle; LVGL hit-testing targets the deepest
    clickable object, so a ✕ tap never fires the row's callback. */
-extern "C" uint32_t ui_tab5_w_item_close(uint32_t item)
+extern "C" uint32_t ui_tab5_w_item_close(uint32_t item, int icon)
 {
     if (!ui_up())
         return 0;
@@ -549,7 +549,8 @@ extern "C" uint32_t ui_tab5_w_item_close(uint32_t item)
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0xE05A4E), LV_STATE_PRESSED);
     lv_obj_t *l = lv_label_create(btn);
-    lv_label_set_text(l, LV_SYMBOL_CLOSE);
+    /* FontAwesome glyphs shipped inside the Montserrat fallback font */
+    lv_label_set_text(l, icon == 1 ? LV_SYMBOL_TRASH : LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_color(l, lv_color_hex(UI_COL_DIM), 0);
     lv_obj_center(l);
 

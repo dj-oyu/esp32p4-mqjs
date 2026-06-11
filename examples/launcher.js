@@ -74,14 +74,40 @@ function build() {
     if (!devRunning)
         list.add("○ dev タスク (push されたタスクを再開)",
                  function () { openApp("dev"); });
-    var inst = sys.installed();
+    var inst = sys.installed(); /* P4c: [{name, title, perm}] */
     for (var j = 0; j < inst.length; j++) {
-        if (!running[inst[j]])
-            (function (name) {
-                list.add("○ " + name, function () { openApp(name); });
+        if (!running[inst[j].name])
+            (function (it) {
+                var label = "○ " + it.title;
+                if (it.perm)
+                    label += "  [" + it.perm + "]";
+                /* タップ = 起動、✕ = アンインストール。レジストリ配布の
+                   アプリは broker に retained が残っていれば次の同期で
+                   戻る (恒久削除は tombstone、設計 §4.5) */
+                list.add(label,
+                         function () { openApp(it.name); },
+                         function () {
+                             sys.uninstall(it.name);
+                             build();
+                         },
+                         "trash"); /* 停止の ✕ と意味を分ける */
             })(inst[j]);
     }
     s.label("● 実行中 / x で停止 / ○ 停止中 ... バー長押しでいつでもここへ");
+
+    /* P4c: アプリ毎の最終通知。タップで発信アプリを開く (停止中なら
+       起動して開く — open 経路がそのまま面倒を見る) */
+    var nts = sys.notices();
+    if (nts.length) {
+        s.label("通知");
+        var nl = s.list();
+        for (var k2 = 0; k2 < nts.length; k2++) {
+            (function (nt) {
+                nl.add(nt.app + ": " + nt.text,
+                       function () { openApp(nt.app); });
+            })(nts[k2]);
+        }
+    }
 }
 
 sys.onForeground(build);
