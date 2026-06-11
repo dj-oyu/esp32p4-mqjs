@@ -46,10 +46,9 @@ var DEMO_SCRIPT =
 var sz = ui.size();
 var W = sz[0] || 720, H = sz[1] || 1192;
 /* キーボード + コントロールバー (T3a, mode 2) の予約高さは C に聞く。
-   返り値が問い合わせを兼ねるので一度出してすぐ仕舞う (同一バッチで
-   処理されるため画面には出ない)。 */
-var KB_H = ui.keyboard(2) || 480;
-ui.keyboard(0);
+   負数 = 表示を変えない純クエリ (出して仕舞うハックは描画ティックを
+   跨ぐとキーボードが 1 フレーム全面に光る — 実機で点滅として観測)。 */
+var KB_H = ui.keyboard(-2) || 480;
 var VIEW_H = H - KB_H;
 var cell = ui.cellSize();           /* HackGen 等幅: [9, 24] */
 var CW = cell[0] || 9;

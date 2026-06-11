@@ -1287,18 +1287,26 @@ static void dispatch_touch_event(AppSlot *app, const MqjsEvent *ev)
    control-bar buttons send "\x00name" tokens (esc tab ctrl alt
    left/down/up/right f1..f12 copy paste) whose meaning is the app's
    business. Returns the px height the overlay reserves at the canvas
-   bottom, so a terminal derives its grid without hardcoding it. */
+   bottom, so a terminal derives its grid without hardcoding it;
+   ui.keyboard(-m) returns mode m's height without changing anything
+   (the startup grid probe). */
 JSValue js_ui_keyboard(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int mode = 1;
     if (argc >= 1 && !JS_IsUndefined(argv[0]) &&
         JS_ToInt32(ctx, &mode, argv[0]))
         return JS_EXCEPTION;
-    if (mode < 0)
-        mode = 0;
+    /* negative = pure metric query: return the reserved height of
+       mode |m| WITHOUT touching visibility. The show-then-hide probe
+       a terminal would otherwise need at startup can straddle a
+       render tick and flash the full keyboard for a frame. */
+    bool query = mode < 0;
+    if (query)
+        mode = -mode;
     if (mode > 2)
         mode = 2;
-    ui_post(UI_CMD_KEYBOARD, mode, 0, 0, 0, 0, NULL);
+    if (!query)
+        ui_post(UI_CMD_KEYBOARD, mode, 0, 0, 0, 0, NULL);
 #ifdef ESP_PLATFORM
     return JS_NewInt32(ctx, ui_tab5_kb_reserved(mode));
 #else
