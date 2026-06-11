@@ -476,4 +476,92 @@ manifest に `// @autostart` の 1 行があるアプリを、**opt-in 済みな
 ## 10. TODO (次弾候補)
 
 - 選択インストール (§9 範囲外項目): インデックス topic + 本体の
-  オンデマンド取得。棚の「全部入り」をやめるとき。
+  オンデマンド取得。棚の「全部入り」をやめるとき。→ **§11 で設計済み**。
+
+## 11. ストアカタログ + 選択インストール (設計 2026-06-12)
+
+動機 (ユーザー): ランチャーから「インストール前のアプリ」が見えない。
+app store には必須の機能。
+
+### 11.1 現状分析 — なぜ一部しか見えないか
+
+- ランチャー一覧 = `sys.installed()` = デバイスの `/littlefs/apps/`。
+  リポジトリ examples/ は PC 側ソースであり、デバイスには
+  `// @app` manifest 付きで署名 push したものしか入らない
+  (2026-06-12 時点で @app 持ちは clip_mirror / p4_bg_app の 2 本のみ。
+  残りは dev タスク世代のスクリプトで、ランチャーには構造的に出ない)。
+- §4.5 の同期意味論は「棚 (retained) = 接続のたび全量自動インストール」。
+  **「棚にあるが未インストール」という状態がそもそも存在しない** —
+  「見る→選ぶ→入れる」というストア体験の前提が欠けている。
+
+### 11.2 プロトコル: カタログ topic の追加
+
+- **カタログ**: `<TASK_TOPIC>/store/<name>` に retained で publish する
+  **スクリプト先頭の manifest コメントブロックそのもの** (+ ツールが
+  `// @size <bytes>` を追記)。新しいフォーマットを発明しない:
+  デバイスには manifest_field パーサが既にある。1 エントリ数百バイト。
+- **本体**: 既存どおり `<TASK_TOPIC>/apps/<name>` retained (Ed25519 封筒)。
+- **カタログは無署名を許す** (tombstone と同じ理屈): 偽装されても
+  起きるのは「ストアに嘘の行が並ぶ」まで。インストール = 本体の
+  署名検証は不変なので、コードの信頼境界は §4.5 から動かない。
+- tombstone: `--delete` は store/ と apps/ の両方に空 retained。
+
+### 11.3 デバイス: 購読モデルの変更 (task_source.c)
+
+現行の `apps/+` ワイルドカード購読 (= 全量同期) をやめ、
+
+1. 接続時: `store/+` を購読 (カタログ常時同期、RAM 上の小テーブル
+   — 24 エントリ × name 25B + head 224B ≈ 6KB 静的)。
+2. 接続時: `/littlefs/apps/*.js` を列挙し、**インストール済みの分だけ**
+   `apps/<name>` を個別購読 — 更新と tombstone は従来どおり届く
+   (= 既存インストール分の挙動は不変。clip_mirror 等は何も変わらない)。
+3. `sys.install(name)`: `apps/<name>` を購読 → retained 本体が届く →
+   既存 registry_rx の検証+保存パスへ (コード再利用、自動実行なしも
+   §6 のまま)。以後は購読継続 = 更新も流れる。
+4. `sys.uninstall(name)`: runtime に uninstall hook を追加し
+   (print sink と同じ登録パターン、mqjs→main の依存逆転を回避)、
+   main 側で `apps/<name>` を unsubscribe。
+
+**意味論の改善が副産物**: §4.5 の注意書き「ローカル ✕ は次の同期で
+戻る」が消える。アンインストール = 購読解除なので戻らず、ストアの
+「入手可能」に並び直す — ユーザーの自然な期待と一致する。
+
+### 11.4 JS API (binding は store provider 経由)
+
+- `sys.store()` → `[{name, title, icon, desc, size, installed}]`
+  (カタログ ∪ インストール済み。installed はファイル存在で判定)。
+- `sys.install(name)` → bool (購読要求の成否。完了は非同期:
+  既存の「installed: <name>」status/イベント通知が完了報)。
+- runtime は `mqjs_set_store_provider(count/get/install の関数表)` を
+  公開し main が登録する。未登録 (PC ビルド) では store() = 空配列。
+
+### 11.5 ランチャー UI (§9 ストアページの増築)
+
+- ストアページを 2 セクション化: 「インストール済み」(現行) +
+  「**入手可能**」(installed=false のカタログ行、@icon @title)。
+- 入手可能の詳細ページ: @desc / @perm / サイズ表示 +
+  [インストール] → `sys.install(name)` → 「インストール中…」表示
+  → 完了通知後の build() 再描画で済み側に移る。
+
+### 11.6 ツール (mqjs_push.py)
+
+- `--shelf` フラグ新設: `apps/<name>` へ署名本体 + `store/<name>` へ
+  manifest ヘッダ (+@size) を、どちらも retain=1 で publish。
+  name はファイルの `// @app` 行から取る (topic の手書きミス防止)。
+- `--delete` を両 topic tombstone に拡張。
+
+### 11.7 互換と移行
+
+- 旧ファーム共存: 旧デバイスは `apps/+` 購読のままなので、棚に本体が
+  retained で残っている限り従来どおり全量同期する (カタログ topic は
+  無視される)。新ファームだけが選択インストールになる。
+- カタログ未掲載のインストール済みアプリ (旧経路で入れたもの) は
+  installed 側の一覧に出るだけ — 欠落しない。
+- examples のストア掲載は別作業: 各ファイルに `// @app @title @icon
+  @desc` を付与して `--shelf` で publish (掲載候補の選定はユーザー)。
+
+### 11.8 見送り (この弾の範囲外)
+
+- バージョン表記 / 更新差分表示 (`// @ver` は将来ディレクティブ)。
+- カタログの署名 (LAN 限定 broker の脅威モデルでは過剰、§4.5 踏襲)。
+- インストール進捗 UI (retained 配送は実測ほぼ即時、通知で足りる)。
