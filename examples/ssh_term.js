@@ -9,6 +9,7 @@
  * 切断されるとフォームに戻る。PC ではウィジェットイベントが発火しない
  * ためフォームから先へは進まない (端末コアの構文チェックのみ)。 */
 "use strict";
+sys.setAppName("ssh_term");
 
 var sz = ui.size();
 var W = sz[0], H = sz[1];

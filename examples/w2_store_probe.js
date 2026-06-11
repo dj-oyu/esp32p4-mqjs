@@ -3,6 +3,7 @@
 // 自動再実行されるので同一ブート内の永続が、ウォッチドッグ再起動を
 // 挟めばリブート跨ぎの永続が、購読側からそのまま観測できる。
 "use strict";
+sys.setAppName("w2_store_probe");
 
 var prev = store.get("w2test");
 var hosts = store.get("ssh_hosts");

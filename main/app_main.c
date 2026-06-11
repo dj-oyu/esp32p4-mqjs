@@ -1,16 +1,18 @@
 /*
- * Stamp-P4 / Tab5 mquickjs host: the P4a multi-app runtime.
+ * Stamp-P4 / Tab5 mquickjs host: the P4b multi-app runtime + launcher.
  *
  * js_task owns every JS context (cooperative multi-context, see
- * docs/launcher-multiapp-design.md). Two apps are started hardcoded —
- * the P4a verification setup, the P4b launcher replaces this:
+ * docs/launcher-multiapp-design.md):
+ *   - slot 0: the resident launcher (embedded examples/launcher.js,
+ *     auto-started and kept alive by the scheduler, unstoppable).
  *   - dev slot (1): the classic development flow. The script comes from
  *     LittleFS (persisted) or the embedded examples/ file
  *     (idf.py -DMQJS_SCRIPT=life.js build flash) and is replaced by
  *     signed pushes over MQTT; it auto-reruns 1s after a natural end.
- *   - slot 2: the embedded background app (-DMQJS_APP2=p4_bg_app.js),
- *     proving that timers/mqtt keep running behind the foreground app.
- * Tapping the status bar cycles the foreground app.
+ *   - the second embedded app (-DMQJS_APP2=p4_bg_app.js) is registered
+ *     as a launchable source; start it from the launcher.
+ * Status bar: the chip opens the previous app, a long-press opens the
+ * launcher.
  */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -29,6 +31,11 @@ static const char *TAG = "app";
 /* embedded by EMBED_TXTFILES (NUL-terminated) */
 extern const char _binary_task_js_start[];
 extern const char _binary_app2_js_start[];
+extern const char _binary_launcher_js_start[];
+
+#ifndef MQJS_APP2_NAME
+#define MQJS_APP2_NAME "app2" /* set by CMake from the MQJS_APP2 filename */
+#endif
 
 /* current dev-slot source; owned here (the runtime only borrows it,
    so the buffer must outlive the running app — see mqjs_app_start) */
@@ -63,17 +70,19 @@ static void js_task(void *arg)
 {
     mqjs_rt_init(); /* arenas (4 x 256KB PSRAM) + shared event queue */
 
+    /* relaunchable embedded sources: the scheduler keeps "launcher"
+       resident in slot 0; the second app starts from the launcher */
+    mqjs_register_app_source("launcher", _binary_launcher_js_start,
+                             strlen(_binary_launcher_js_start));
+    if (_binary_app2_js_start[0] != '\0')
+        mqjs_register_app_source(MQJS_APP2_NAME, _binary_app2_js_start,
+                                 strlen(_binary_app2_js_start));
+
     /* a previously verified+persisted task takes over the embedded one.
        lengths are tracked explicitly: bytecode tasks contain NULs */
     s_net_script = storage_load_task(&s_net_len);
     if (s_net_script)
         s_origin = "persisted";
-
-    /* P4a hardcoded second app (background-execution proof) */
-    const char *app2 = _binary_app2_js_start;
-    if (app2[0] != '\0' &&
-        mqjs_app_start(2, app2, strlen(app2), "bg_app") != 0)
-        ESP_LOGW(TAG, "embedded app2 failed to start");
 
     mqjs_runtime_run(dev_next_source, NULL); /* never returns */
 }
@@ -83,6 +92,7 @@ void app_main(void)
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
+    mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     storage_init();            /* mount LittleFS for persisted tasks */
 
     /* network first: blocks up to 30s for an IP, JS runs either way */

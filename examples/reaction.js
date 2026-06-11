@@ -16,6 +16,7 @@
  * (LED は配線があれば光る。無くてもゲームは成立する)
  */
 "use strict";
+sys.setAppName("reaction");
 
 var HAS_UI = ui.size()[0] !== 0;
 

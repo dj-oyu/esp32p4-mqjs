@@ -59,6 +59,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include <dirent.h>
 #include "mqtt_client.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -130,8 +131,6 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
                EV_FOCUS } MqjsEventType;
 
-#define MQJS_FOCUS_NEXT 0xFF /* EV_FOCUS target: cycle to the next app */
-
 typedef struct {
     uint8_t type;
     uint8_t slot;   /* owner slot for slot-addressed events (EV_MQTT_*,
@@ -185,12 +184,16 @@ typedef struct {
    RAM per slot; the 256KB context arena lives in PSRAM. */
 typedef struct {
     bool used;
+    bool kill_req;            /* deferred sys.stop (self-stop must not free
+                                 the context under its own active JS frame:
+                                 the reaper does it after the dispatch) */
     uint8_t slot;             /* own index (for s_fg_slot comparisons) */
     uint16_t gen;             /* bumped on every start: stale-event filter */
     char name[32];
     uint8_t *mem;             /* fixed arena (design §3.6) */
     size_t mem_size;
     JSContext *ctx;
+    char *src_owned;          /* sys.launch file source: freed at stop */
 
     TimerSlot timers[MQJS_MAX_TIMERS];
     GpioSlot  gpio_cb[MQJS_MAX_GPIO_CB];
@@ -223,9 +226,76 @@ static AppSlot s_apps[MQJS_MAX_APPS];
 static AppSlot *s_cur_app;        /* app whose JS is on the C stack — the
                                      single biggest dividend of the serial
                                      model: every binding reads it */
-static volatile int s_fg_slot = MQJS_SLOT_DEV; /* until the P4b launcher */
+static volatile int s_fg_slot = MQJS_SLOT_DEV; /* boot: dev app in front */
 static volatile bool s_stop_req; /* dev-slot stop (task push / PC ^C) */
 static int64_t s_run_deadline;   /* JS watchdog */
+
+/* P4b: relaunchable app sources (embedded buffers, live forever).
+   sys.launch(name) resolves here first; "launcher" is kept resident. */
+typedef struct {
+    bool used;
+    char name[32];
+    const char *src;
+    size_t len;
+} AppSource;
+static AppSource s_app_sources[4];
+
+static bool s_dev_hold;          /* explicit sys.stop(dev): no auto-rerun
+                                    until the next push / sys.launch("dev") */
+static int64_t s_dev_retry_at;   /* next time to ask the dev provider */
+static int64_t s_launcher_retry_at;
+
+/* the status-bar chip target: the previous foreground app, kept by NAME
+   (a relaunch may land in a different slot) */
+static char s_prev_name[32];
+
+static void (*s_notify_sink)(const char *text);
+
+void mqjs_set_notify_sink(void (*fn)(const char *text))
+{
+    s_notify_sink = fn;
+}
+
+void mqjs_register_app_source(const char *name, const char *src, size_t len)
+{
+    for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
+         i++) {
+        AppSource *as = &s_app_sources[i];
+        if (as->used && strcmp(as->name, name) != 0)
+            continue;
+        as->used = true;
+        snprintf(as->name, sizeof as->name, "%s", name);
+        as->src = src;
+        as->len = len;
+        return;
+    }
+}
+
+static const AppSource *app_source_find(const char *name)
+{
+    for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
+         i++)
+        if (s_app_sources[i].used && !strcmp(s_app_sources[i].name, name))
+            return &s_app_sources[i];
+    return NULL;
+}
+
+/* push the current/previous app names to the status-bar chip. Driven by
+   the events that can change them (switch / start / stop / rename) —
+   never polled (see design §4: liveness is checked at tap time only). */
+static void bar_update(void)
+{
+#ifdef ESP_PLATFORM
+    AppSlot *fg = &s_apps[s_fg_slot];
+    bool prev_running = false;
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        if (s_apps[i].used && !strcmp(s_apps[i].name, s_prev_name)) {
+            prev_running = true;
+            break;
+        }
+    ui_tab5_set_fg_apps(fg->used ? fg->name : "", s_prev_name, prev_running);
+#endif
+}
 
 #ifdef ESP_PLATFORM
 static QueueHandle_t s_event_queue;
@@ -1941,6 +2011,290 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_UNDEFINED;
 }
 
+/* ---- P4b: launcher support (apps/launch/stop/setAppName/notify) ---- */
+
+static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
+                              const char *name);
+static void app_stop_internal(AppSlot *app);
+static void switch_foreground(int new_slot);
+
+/* sys.setAppName(name) -> bool: the app's identity for sys.signal, the
+   status-bar chip and the launcher. False on a duplicate (names are
+   the address space) or an unusable name. */
+JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char name[32];
+    if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+        return JS_EXCEPTION;
+    if (!name[0])
+        return JS_NewBool(0);
+    for (const char *p = name; *p; p++) {
+        /* names travel inside JSON open requests: keep them quote-free */
+        if ((unsigned char)*p < 0x20 || *p == '"' || *p == '\\')
+            return JS_NewBool(0);
+    }
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        if (s_apps[i].used && &s_apps[i] != s_cur_app &&
+            !strcmp(s_apps[i].name, name))
+            return JS_NewBool(0);
+    }
+    snprintf(s_cur_app->name, sizeof s_cur_app->name, "%s", name);
+    bar_update();
+    return JS_NewBool(1);
+}
+
+/* sys.apps() -> [{slot, name, running:true}] for every live app. The
+   compacting GC moves objects on allocation, so parents are rooted with
+   the JS_PUSH_VALUE stack refs while children are created. */
+JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+    JS_PUSH_VALUE(ctx, arr);
+    int n = 0;
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        if (!s_apps[i].used)
+            continue;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        JSValue name = JS_NewString(ctx, s_apps[i].name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "slot", JS_NewInt32(ctx, i));
+        JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    JS_POP_VALUE(ctx, arr);
+    return arr;
+}
+
+/* sys.installed() -> array of launchable names: the embedded source
+   registry + the .js files under /littlefs/apps. The launcher filters
+   and decorates. */
+JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+    JS_PUSH_VALUE(ctx, arr);
+    int n = 0;
+    for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
+         i++) {
+        if (!s_app_sources[i].used ||
+            !strcmp(s_app_sources[i].name, "launcher"))
+            continue;
+        JSValue s = JS_NewString(ctx, s_app_sources[i].name);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, s);
+    }
+#ifdef ESP_PLATFORM
+    DIR *d = opendir("/littlefs/apps");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if (l < 4 || l > 34 || strcmp(e->d_name + l - 3, ".js"))
+                continue;
+            char base[32];
+            snprintf(base, sizeof base, "%.*s", (int)(l - 3), e->d_name);
+            JSValue s = JS_NewString(ctx, base);
+            JS_SetPropertyUint32(ctx, arr_ref.val, n++, s);
+        }
+        closedir(d);
+    }
+#endif
+    JS_POP_VALUE(ctx, arr);
+    return arr;
+}
+
+static int app_free_slot(void)
+{
+    /* 0 = launcher, 1 = dev: launched apps live in the user slots */
+    for (int i = MQJS_SLOT_DEV + 1; i < MQJS_MAX_APPS; i++)
+        if (!s_apps[i].used)
+            return i;
+    return -1;
+}
+
+/* ESP arenas come from mqjs_rt_init; the PC build allocates lazily */
+static bool app_ensure_mem(AppSlot *app)
+{
+#ifndef ESP_PLATFORM
+    if (!app->mem) {
+        app->mem = malloc(MQJS_APP_MEM_SIZE);
+        app->mem_size = MQJS_APP_MEM_SIZE;
+    }
+#endif
+    return app->mem != NULL;
+}
+
+/* sys.launch(nameOrPath) -> slot (>= 0) or -1. Open semantics live in
+   the launcher (focus-or-launch); this only starts things. Resolution:
+   "dev" re-enables the dev provider; a running app returns its slot;
+   then the embedded registry; then /littlefs/apps/<name>.js (or the
+   verbatim path when it contains '/'). File sources are owned by the
+   slot and freed at stop. */
+JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char arg[96];
+    if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
+        return JS_EXCEPTION;
+    if (!arg[0])
+        return JS_NewInt32(ctx, -1);
+
+    if (!strcmp(arg, "dev")) {
+        s_dev_hold = false;
+        s_dev_retry_at = 0; /* the scheduler asks the provider next pass */
+        return JS_NewInt32(ctx, MQJS_SLOT_DEV);
+    }
+
+    /* app name = basename without .js (also the path case) */
+    const char *base = arg;
+    for (const char *p = arg; *p; p++)
+        if (*p == '/')
+            base = p + 1;
+    char name[32];
+    snprintf(name, sizeof name, "%.31s", base);
+    char *dot = strrchr(name, '.');
+    if (dot && dot != name)
+        *dot = '\0';
+
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        if (s_apps[i].used && !strcmp(s_apps[i].name, name))
+            return JS_NewInt32(ctx, i); /* already running */
+    if (!strcmp(name, "launcher")) /* resident in slot 0, never elsewhere */
+        return JS_NewInt32(ctx, -1);
+
+    int slot = app_free_slot();
+    if (slot < 0 || !app_ensure_mem(&s_apps[slot]))
+        return JS_NewInt32(ctx, -1);
+
+    const AppSource *as = app_source_find(name);
+    if (as) {
+        if (app_start_internal(&s_apps[slot], as->src, as->len, as->name))
+            return JS_NewInt32(ctx, -1);
+        return JS_NewInt32(ctx, slot);
+    }
+
+    char path[128];
+    if (strchr(arg, '/'))
+        snprintf(path, sizeof path, "%.127s", arg);
+    else
+        snprintf(path, sizeof path, "/littlefs/apps/%.96s.js", arg);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return JS_NewInt32(ctx, -1);
+    fseek(f, 0, SEEK_END);
+    long flen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (flen <= 0 || flen > 64 * 1024) {
+        fclose(f);
+        return JS_NewInt32(ctx, -1);
+    }
+#ifdef ESP_PLATFORM
+    char *buf = heap_caps_malloc((size_t)flen + 1, MALLOC_CAP_SPIRAM);
+    if (!buf)
+        buf = malloc((size_t)flen + 1);
+#else
+    char *buf = malloc((size_t)flen + 1);
+#endif
+    if (!buf || fread(buf, 1, (size_t)flen, f) != (size_t)flen) {
+        fclose(f);
+        free(buf);
+        return JS_NewInt32(ctx, -1);
+    }
+    fclose(f);
+    buf[flen] = '\0';
+    if (app_start_internal(&s_apps[slot], buf, (size_t)flen, name)) {
+        free(buf);
+        return JS_NewInt32(ctx, -1);
+    }
+    s_apps[slot].src_owned = buf;
+    return JS_NewInt32(ctx, slot);
+}
+
+/* sys.stop(slot) -> bool. Open to every app (the signing gate is the
+   trust boundary); the C invariants hold regardless of caller: the
+   launcher is unstoppable, an explicitly stopped dev slot stays down
+   until the next push / sys.launch("dev"), and every stop is
+   attributed on the console. Self-stop is deferred to the reaper (the
+   context cannot be freed under its own running JS frame). */
+JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int slot;
+    if (JS_ToInt32(ctx, &slot, argv[0]))
+        return JS_EXCEPTION;
+    if (slot == MQJS_SLOT_LAUNCHER)
+        return JS_ThrowTypeError(ctx, "the launcher cannot be stopped");
+    if (slot < 0 || slot >= MQJS_MAX_APPS || !s_apps[slot].used)
+        return JS_NewBool(0);
+
+    AppSlot *app = &s_apps[slot];
+    char line[96];
+    snprintf(line, sizeof line, "sys: stop '%s' (slot %d) by '%s'\n",
+             app->name, slot, s_cur_app ? s_cur_app->name : "?");
+    out_write(line, strlen(line));
+
+    if (slot == MQJS_SLOT_DEV)
+        s_dev_hold = true;
+    if (app == s_cur_app) {
+        app->kill_req = true; /* reaper finishes after this dispatch */
+        return JS_NewBool(1);
+    }
+    bool was_fg = (slot == s_fg_slot);
+    app_stop_internal(app);
+    if (was_fg && s_apps[MQJS_SLOT_LAUNCHER].used)
+        switch_foreground(MQJS_SLOT_LAUNCHER);
+    return JS_NewBool(1);
+}
+
+/* sys.notify(text): one status-bar line, prefixed with the sender. */
+JSValue js_sys_notify(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *text = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!text)
+        return JS_EXCEPTION;
+    if (s_notify_sink) {
+        char line[128];
+        snprintf(line, sizeof line, "[%s] %.*s",
+                 s_cur_app ? s_cur_app->name : "?", (int)len, text);
+        s_notify_sink(line);
+    }
+    return JS_UNDEFINED;
+}
+
+/* Status-bar chip / notification tap: ask the resident launcher to
+   open `name` (it decides focus vs relaunch and resolves the source).
+   Callable from the LVGL task; a benign race on gen just drops the
+   request. */
+void mqjs_request_open(const char *name)
+{
+    AppSlot *l = &s_apps[MQJS_SLOT_LAUNCHER];
+    if (!name || !name[0] || !l->used)
+        return;
+    size_t n = strlen(name);
+    if (n > 31)
+        return;
+    char *val = malloc(n + 32);
+    if (!val)
+        return;
+    snprintf(val, n + 32, "{\"op\":\"open\",\"app\":\"%s\"}", name);
+    MqjsEvent ev = { .type = EV_SIGNAL, .slot = MQJS_SLOT_LAUNCHER,
+                     .gen = l->gen };
+    ev.u.signal.value = val;
+    snprintf(ev.u.signal.from, sizeof ev.u.signal.from, "system");
+    if (!ev_post(&ev, 0))
+        free(val);
+}
+
 static void dispatch_signal(AppSlot *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
@@ -2682,13 +3036,21 @@ static void app_stop_internal(AppSlot *app)
 {
     if (!app->used)
         return;
+    /* a dying foreground app becomes the chip target: "tap to bring it
+       back" survives the stop (design §4: open = focus-or-relaunch) */
+    if (app->slot == s_fg_slot)
+        snprintf(s_prev_name, sizeof s_prev_name, "%s", app->name);
     app_reset_bindings(app);
     JS_FreeContext(app->ctx);  /* runs user-object finalizers */
     app->ctx = NULL;
     app->used = false;
+    app->kill_req = false;
+    free(app->src_owned);      /* sys.launch file source, if any */
+    app->src_owned = NULL;
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "app '%s' (slot %d) stopped", app->name, app->slot);
 #endif
+    bar_update();
 }
 
 static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
@@ -2698,6 +3060,7 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
         return -1;
 
     app->gen++; /* stale events of the previous occupant die now */
+    app->kill_req = false;
     memset(app->timers, 0, sizeof app->timers);
     memset(app->gpio_cb, 0, sizeof app->gpio_cb);
     memset(app->mqtt_subs, 0, sizeof app->mqtt_subs);
@@ -2757,6 +3120,7 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "app '%s' started in slot %d", app->name, app->slot);
 #endif
+    bar_update();
     return 0;
 }
 
@@ -2782,6 +3146,8 @@ static void switch_foreground(int new_slot)
 #else
         pcw_reset();
 #endif
+        /* the outgoing app becomes the status-bar chip target */
+        snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
     }
 
     s_fg_slot = new_slot;
@@ -2791,6 +3157,7 @@ static void switch_foreground(int new_slot)
 #else
     printf("[sys] foreground -> '%s' (slot %d)\n", nw->name, new_slot);
 #endif
+    bar_update();
     if (nw->fg_used)
         app_call0(nw, &nw->fg_cb);   /* the app rebuilds its UI here */
     ui_tab5_w_commit();              /* §3.4: anim only after the rebuild */
@@ -2798,18 +3165,8 @@ static void switch_foreground(int new_slot)
 
 static void focus_apply(int target)
 {
-    if (target == MQJS_FOCUS_NEXT) {
-        for (int i = 1; i <= MQJS_MAX_APPS; i++) {
-            int s = (s_fg_slot + i) % MQJS_MAX_APPS;
-            if (s_apps[s].used) {
-                target = s;
-                break;
-            }
-        }
-        if (target == MQJS_FOCUS_NEXT)
-            return; /* nothing running */
-    }
-    switch_foreground(target);
+    if (target < MQJS_MAX_APPS)
+        switch_foreground(target);
 }
 
 /* drop an event without dispatching: free its heap payload */
@@ -2917,24 +3274,33 @@ static bool pump_one_event(int idle)
     return true;
 }
 
-/* Reap apps with nothing pending (and a dev slot whose stop was
-   requested). Returns true when the dev slot was reaped. */
-static bool reap_idle_apps(void)
+/* Reap apps that are done: nothing pending, a deferred sys.stop
+   (kill_req), or a dev slot whose replacement was requested. The
+   foreground falls back to the launcher when its app went away —
+   except a dev natural end, which auto-reruns and keeps the screen. */
+static void reap_idle_apps(void)
 {
-    bool dev_reaped = false;
     for (int i = 0; i < MQJS_MAX_APPS; i++) {
         AppSlot *app = &s_apps[i];
         if (!app->used)
             continue;
-        bool stop = (i == MQJS_SLOT_DEV && s_stop_req) ||
+        bool stop = app->kill_req ||
+                    (i == MQJS_SLOT_DEV && s_stop_req) ||
                     !anything_pending(app);
         if (!stop)
             continue;
+        bool was_fg = (i == s_fg_slot);
         app_stop_internal(app);
-        if (i == MQJS_SLOT_DEV)
-            dev_reaped = true;
+        if (i == MQJS_SLOT_DEV) {
+            /* push-replace = ask the provider right away; natural end =
+               the classic 1s-rerun (unless an explicit stop holds it) */
+            s_dev_retry_at = s_stop_req ? 0 : time_ms() + MQJS_DEV_RESTART_MS;
+            s_stop_req = false;
+        }
+        if (was_fg && s_apps[MQJS_SLOT_LAUNCHER].used &&
+            (i != MQJS_SLOT_DEV || s_dev_hold))
+            switch_foreground(MQJS_SLOT_LAUNCHER);
     }
-    return dev_reaped;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2974,13 +3340,9 @@ int mqjs_app_start(int slot, const char *src, size_t src_len,
 {
     if (slot < 0 || slot >= MQJS_MAX_APPS)
         return -1;
-#ifndef ESP_PLATFORM
     s_apps[slot].slot = (uint8_t)slot;
-    if (!s_apps[slot].mem) { /* PC: lazy arena */
-        s_apps[slot].mem = malloc(MQJS_APP_MEM_SIZE);
-        s_apps[slot].mem_size = MQJS_APP_MEM_SIZE;
-    }
-#endif
+    if (!app_ensure_mem(&s_apps[slot]))
+        return -1;
     return app_start_internal(&s_apps[slot], src, src_len, name);
 }
 
@@ -3005,13 +3367,6 @@ void mqjs_focus(int slot)
     ev_post(&ev, 0);
 }
 
-void mqjs_focus_next(void)
-{
-    MqjsEvent ev = { .type = EV_FOCUS };
-    ev.u.focus.target = MQJS_FOCUS_NEXT;
-    ev_post(&ev, 0);
-}
-
 void mqjs_runtime_stop(void)
 {
     s_stop_req = true;
@@ -3019,22 +3374,41 @@ void mqjs_runtime_stop(void)
 
 /* The permanent multi-app loop (§3.7). The dev slot is restarted from
    the provider: immediately after a stop request (task push), 1s after
-   a natural end (the pre-P4 auto-rerun behavior). */
+   a natural end (the pre-P4 auto-rerun behavior), never while an
+   explicit sys.stop holds it. The launcher (when a source named
+   "launcher" was registered) is kept resident in slot 0. */
 void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
 {
-    int64_t dev_retry_at = 0; /* 0 = ask the provider right away */
+    s_dev_retry_at = 0; /* 0 = ask the provider right away */
 
     for (;;) {
-        if (next_dev && !s_apps[MQJS_SLOT_DEV].used &&
-            time_ms() >= dev_retry_at) {
+        /* launcher residency: chrome (chip / open requests) depends on
+           it, so it is restarted if it ever dies (1s backoff) */
+        if (!s_apps[MQJS_SLOT_LAUNCHER].used &&
+            time_ms() >= s_launcher_retry_at) {
+            const AppSource *as = app_source_find("launcher");
+            if (as)
+                app_start_internal(&s_apps[MQJS_SLOT_LAUNCHER], as->src,
+                                   as->len, "launcher");
+            s_launcher_retry_at = time_ms() + 1000;
+        }
+
+        /* a push that arrived while the dev slot was idle or held */
+        if (s_stop_req && !s_apps[MQJS_SLOT_DEV].used) {
+            s_stop_req = false;
+            s_dev_hold = false;
+            s_dev_retry_at = 0;
+        }
+        if (next_dev && !s_apps[MQJS_SLOT_DEV].used && !s_dev_hold &&
+            time_ms() >= s_dev_retry_at) {
             const char *src = NULL, *name = NULL;
             size_t len = 0;
             s_stop_req = false;
             if (next_dev(&src, &len, &name, user) && src) {
                 if (mqjs_app_start(MQJS_SLOT_DEV, src, len, name) != 0)
-                    dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
+                    s_dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
             } else {
-                dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
+                s_dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
             }
         }
 
@@ -3042,8 +3416,7 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
         pump_one_event(idle);
         ui_tab5_w_commit(); /* §3.4: start a queued screen-load anim only
                                after this dispatch finished building */
-        if (reap_idle_apps())
-            dev_retry_at = s_stop_req ? 0 : time_ms() + MQJS_DEV_RESTART_MS;
+        reap_idle_apps();
     }
 }
 
@@ -3080,7 +3453,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
         ui_tab5_w_commit();
         for (int i = 0; i < MQJS_MAX_APPS; i++) {
             AppSlot *app = &s_apps[i];
-            if (app->used && !anything_pending(app))
+            if (app->used && (app->kill_req || !anything_pending(app)))
                 app_stop_internal(app);
         }
     }

@@ -10,6 +10,7 @@
  *  - 閉じるのは必ず ui.back() (リテインスタックが画面を回収)
  * PC では onTouch / ウィジェットイベントは発火しない (スタブ)。 */
 "use strict";
+sys.setAppName("touch_demo");
 
 var sz = ui.size();
 var W = sz[0], H = sz[1];

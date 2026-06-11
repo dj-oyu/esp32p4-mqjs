@@ -5,6 +5,7 @@
 //   [bg_app] background (tick=...)
 // が周回し、bg_app の画面が復帰のたびに再構築されることを確認する。
 "use strict";
+sys.setAppName("p4_fg_probe");
 
 sys.onForeground(function () { print("PROBE FOREGROUND"); });
 sys.onBackground(function () { print("PROBE BACKGROUND"); });

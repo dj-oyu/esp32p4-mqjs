@@ -9,6 +9,7 @@
 // screen up. List taps / Save write into the status label on the screen
 // itself, so the callback round-trip is visible without the console.
 
+sys.setAppName("settings_demo");
 function heapLine(tag) {
   var h = sys.heap();
   print(tag + " heap: int=" + h[0] + " psram=" + h[1] + " lvgl=" + h[2]);

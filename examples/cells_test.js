@@ -3,6 +3,7 @@
  * クラッシュせず画面に正しいグリフ・色・罫線・反転が出れば C 側 OK。
  * これが通ってから初めて ssh_vt.js の全体を流す (段階テスト)。 */
 "use strict";
+sys.setAppName("cells_test");
 
 var cs = ui.cellSize();
 print("cellSize = " + cs[0] + " x " + cs[1]);

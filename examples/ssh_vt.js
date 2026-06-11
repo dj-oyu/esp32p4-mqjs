@@ -18,6 +18,7 @@
  *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
  *   REPORT=true   … 実機で色付きデモを画面に流し続ける (SSH 不要・目視用) */
 "use strict";
+sys.setAppName("ssh_vt");
 
 var HOST = "192.168.1.10";
 var PORT = 22;

@@ -52,7 +52,8 @@
    depends on this component for ui_tab5.h, same trick as wifi.c) */
 extern "C" void mqjs_post_touch(int x, int y, int kind);
 extern "C" void mqjs_post_key(const char *utf8, size_t len);
-extern "C" void mqjs_focus_next(void);
+extern "C" void mqjs_focus(int slot);
+extern "C" void mqjs_request_open(const char *name);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -126,6 +127,15 @@ static SemaphoreHandle_t s_log_mtx;
 static ui_status_t s_status;
 static uint32_t s_status_gen; /* bumped on every snapshot */
 static SemaphoreHandle_t s_status_mtx;
+
+/* P4b: foreground/previous app names for the bar chip (same guard) */
+typedef struct {
+    char cur[32];
+    char prev[32];
+    bool prev_running;
+} ui_fgapps_t;
+static ui_fgapps_t s_fgapps;
+static uint32_t s_fgapps_gen;
 
 /* ANSI 16-color palette tuned for the dark console background */
 static const uint32_t ansi_palette[16] = {
@@ -283,6 +293,19 @@ extern "C" void ui_tab5_set_status(const ui_status_t *st)
     xSemaphoreTake(s_status_mtx, portMAX_DELAY);
     s_status = *st;
     s_status_gen++;
+    xSemaphoreGive(s_status_mtx);
+}
+
+extern "C" void ui_tab5_set_fg_apps(const char *cur, const char *prev,
+                                    bool prev_running)
+{
+    if (!s_status_mtx)
+        return;
+    xSemaphoreTake(s_status_mtx, portMAX_DELAY);
+    strlcpy(s_fgapps.cur, cur ? cur : "", sizeof s_fgapps.cur);
+    strlcpy(s_fgapps.prev, prev ? prev : "", sizeof s_fgapps.prev);
+    s_fgapps.prev_running = prev_running;
+    s_fgapps_gen++;
     xSemaphoreGive(s_status_mtx);
 }
 
@@ -810,7 +833,22 @@ static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color)
    screen — so it stays visible on W1 widget pages too (system chrome,
    user feedback 2026-06-11). It also does not slide with screen-load
    animations, which is exactly how a status bar should behave. Widget
-   screens reserve UI_STATUSBAR_H of top padding (ui_widgets.cpp). */
+   screens reserve UI_STATUSBAR_H of top padding (ui_widgets.cpp).
+
+   P4b navigation chrome (launcher-multiapp-design §4):
+   - the CHIP shows the previous foreground app by name — tap = open it
+     (focus-or-relaunch via the launcher; dimmed when stopped). With no
+     previous app it reads "アプリ一覧" and opens the launcher, so a
+     visible path to the launcher always exists.
+   - LONG-PRESS anywhere on the bar = launcher, with armed feedback: a
+     progress strip fills while holding (driven per-frame here, NOT by
+     LVGL's global long_press_time, so threshold and visual can't
+     drift), turns green + "離すとランチャー" when armed; the action
+     commits on RELEASE, sliding off the bar cancels (PRESS_LOST).
+   - a short tap outside the chip does nothing: the bar is an
+     information surface, accidental touches must stay consequence-free. */
+#define UI_HOLD_MS 500 /* long-press threshold = strip fill time */
+
 class StatusBar : public mooncake::UIAbility {
 public:
     void onCreate() override
@@ -821,19 +859,16 @@ public:
         lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
         lv_obj_set_style_bg_color(bar, lv_color_hex(UI_COL_BAR), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-        /* P4a: tapping the bar cycles the foreground app (it is system
-           chrome visible from everywhere). The P4b launcher will turn
-           this into "go home" (switch_foreground(0)). */
         lv_obj_add_flag(bar, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(
-            bar, [](lv_event_t *) { mqjs_focus_next(); }, LV_EVENT_CLICKED,
-            NULL);
+        lv_obj_add_event_cb(bar, press_cb, LV_EVENT_PRESSED, this);
+        lv_obj_add_event_cb(bar, release_cb, LV_EVENT_RELEASED, this);
+        lv_obj_add_event_cb(bar, lost_cb, LV_EVENT_PRESS_LOST, this);
 
         lv_obj_t *row = lv_obj_create(bar);
         lv_obj_remove_style_all(row);
         lv_obj_set_pos(row, 0, 0);
         lv_obj_set_size(row, UI_LCD_H_RES, 44);
-        /* let taps on the row land on the bar's CLICKED handler */
+        /* hit-testing falls through to the bar's press state machine */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_pad_hor(row, UI_PAD, 0);
         lv_obj_set_style_pad_column(row, 10, 0);
@@ -852,6 +887,19 @@ public:
         _drop_lbl = make_label(row, UI_COL_DROP);
         lv_label_set_text(_drop_lbl, "");
 
+        /* previous-app chip ("open X" button; self-labeling target) */
+        _chip = lv_obj_create(row);
+        lv_obj_remove_style_all(_chip);
+        lv_obj_remove_flag(_chip, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_color(_chip, lv_color_hex(0x2A3540), 0);
+        lv_obj_set_style_bg_opa(_chip, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(_chip, 8, 0);
+        lv_obj_set_style_pad_hor(_chip, 14, 0);
+        lv_obj_set_style_pad_ver(_chip, 6, 0);
+        lv_obj_set_size(_chip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        _chip_lbl = make_label(_chip, UI_COL_DIM);
+        lv_label_set_text(_chip_lbl, "アプリ一覧");
+
         lv_obj_t *spacer = lv_obj_create(row);
         lv_obj_remove_style_all(spacer);
         lv_obj_remove_flag(spacer, LV_OBJ_FLAG_CLICKABLE);
@@ -860,6 +908,12 @@ public:
 
         _task_lbl = make_label(row, UI_COL_DIM);
         lv_label_set_text(_task_lbl, "");
+        /* pulse surface: highlights when the foreground app changes
+           (feedback also for switches the user did not initiate) */
+        lv_obj_set_style_pad_hor(_task_lbl, 6, 0);
+        lv_obj_set_style_radius(_task_lbl, 4, 0);
+        lv_obj_set_style_bg_color(_task_lbl, lv_color_hex(UI_COL_FLASH), 0);
+        lv_obj_set_style_bg_opa(_task_lbl, LV_OPA_TRANSP, 0);
 
         _event_lbl = make_label(bar, UI_COL_EVENT);
         lv_obj_set_pos(_event_lbl, UI_PAD, 48);
@@ -869,19 +923,53 @@ public:
         lv_obj_set_style_bg_color(_event_lbl, lv_color_hex(UI_COL_FLASH), 0);
         lv_obj_set_style_bg_opa(_event_lbl, LV_OPA_TRANSP, 0);
         lv_label_set_text(_event_lbl, "");
+
+        /* long-press progress strip along the bar's bottom edge */
+        _strip = lv_obj_create(bar);
+        lv_obj_remove_style_all(_strip);
+        lv_obj_remove_flag(_strip, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_pos(_strip, 0, UI_STATUSBAR_H - 4);
+        lv_obj_set_size(_strip, 1, 4);
+        lv_obj_set_style_bg_color(_strip, lv_color_hex(0x4FC3F7), 0);
+        lv_obj_set_style_bg_opa(_strip, LV_OPA_COVER, 0);
+        lv_obj_add_flag(_strip, LV_OBJ_FLAG_HIDDEN);
     }
 
     void onForeground() override
     {
         ui_status_t st;
+        ui_fgapps_t fa;
         xSemaphoreTake(s_status_mtx, portMAX_DELAY);
         uint32_t gen = s_status_gen;
+        uint32_t fgen = s_fgapps_gen;
         st = s_status;
+        fa = s_fgapps;
         xSemaphoreGive(s_status_mtx);
 
         if (gen != _seen_gen) {
             _seen_gen = gen;
             apply(st);
+        }
+        if (fgen != _fg_seen_gen || _chip_refresh) {
+            _fg_seen_gen = fgen;
+            _chip_refresh = false;
+            apply_fgapps(fa);
+        }
+
+        /* long-press progress (self-driven: threshold == visual) */
+        if (_pressed) {
+            uint32_t held = lv_tick_elaps(_press_tick);
+            uint32_t capped = held > UI_HOLD_MS ? UI_HOLD_MS : held;
+            int w = (int)((uint32_t)UI_LCD_H_RES * capped / UI_HOLD_MS);
+            lv_obj_set_width(_strip, w < 8 ? 8 : w);
+            lv_obj_remove_flag(_strip, LV_OBJ_FLAG_HIDDEN);
+            if (!_armed && held >= UI_HOLD_MS) {
+                _armed = true;
+                lv_obj_set_style_bg_color(_strip, lv_color_hex(UI_COL_OK), 0);
+                lv_label_set_text(_chip_lbl, "離すとランチャー");
+                lv_obj_set_style_text_color(_chip_lbl,
+                                            lv_color_hex(UI_COL_OK), 0);
+            }
         }
 
         /* fade out the highlight behind a fresh event (spring to 0) */
@@ -889,6 +977,11 @@ public:
         if (opa != _flash_opa) {
             _flash_opa = opa;
             lv_obj_set_style_bg_opa(_event_lbl, (lv_opa_t)opa, 0);
+        }
+        int fopa = (int)(float)_fgflash;
+        if (fopa != _fgflash_opa) {
+            _fgflash_opa = fopa;
+            lv_obj_set_style_bg_opa(_task_lbl, (lv_opa_t)fopa, 0);
         }
 
         /* draw-command drop counter (visible backpressure, Phase 2) */
@@ -900,6 +993,56 @@ public:
     }
 
 private:
+    static void press_cb(lv_event_t *e)
+    {
+        auto *self = (StatusBar *)lv_event_get_user_data(e);
+        lv_indev_t *indev = lv_indev_active();
+        if (indev)
+            lv_indev_get_point(indev, &self->_press_pt);
+        self->_press_tick = lv_tick_get();
+        self->_pressed = true;
+        self->_armed = false;
+    }
+
+    static void release_cb(lv_event_t *e)
+    {
+        auto *self = (StatusBar *)lv_event_get_user_data(e);
+        if (!self->_pressed)
+            return;
+        bool armed = self->_armed;
+        self->cancel_press();
+        if (armed) {
+            mqjs_focus(0); /* launcher is resident: plain focus works */
+            return;
+        }
+        /* short tap: only the chip acts (slop-inflated hit test) */
+        lv_area_t a;
+        lv_obj_get_coords(self->_chip, &a);
+        lv_point_t p = self->_press_pt;
+        if (p.x >= a.x1 - 8 && p.x <= a.x2 + 8 && p.y >= a.y1 - 8 &&
+            p.y <= a.y2 + 8) {
+            if (self->_chip_target[0])
+                mqjs_request_open(self->_chip_target);
+            else
+                mqjs_focus(0);
+        }
+    }
+
+    static void lost_cb(lv_event_t *e)
+    {
+        auto *self = (StatusBar *)lv_event_get_user_data(e);
+        self->cancel_press();
+    }
+
+    void cancel_press()
+    {
+        _pressed = false;
+        _armed = false;
+        lv_obj_add_flag(_strip, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(_strip, lv_color_hex(0x4FC3F7), 0);
+        _chip_refresh = true; /* restore the chip label next frame */
+    }
+
     void apply(const ui_status_t &st)
     {
         lv_obj_set_style_bg_color(
@@ -909,9 +1052,9 @@ private:
                                          : "未接続");
         lv_obj_set_style_bg_color(
             _mqtt_dot, lv_color_hex(st.mqtt_up ? UI_COL_OK : UI_COL_DOWN), 0);
-        if (st.task_name[0])
-            lv_label_set_text_fmt(_task_lbl, "%s (%s)", st.task_name,
-                                  st.task_origin);
+        strlcpy(_st_task, st.task_name, sizeof _st_task);
+        strlcpy(_st_origin, st.task_origin, sizeof _st_origin);
+        update_task_label();
         if (strcmp(_last_event, st.last_event) != 0) {
             strlcpy(_last_event, st.last_event, sizeof _last_event);
             lv_label_set_text(_event_lbl, st.last_event);
@@ -920,15 +1063,59 @@ private:
         }
     }
 
+    void apply_fgapps(const ui_fgapps_t &fa)
+    {
+        strlcpy(_chip_target, fa.prev, sizeof _chip_target);
+        if (fa.prev[0]) {
+            lv_label_set_text(_chip_lbl, fa.prev);
+            /* dimmed = stopped: tapping still works (relaunch), but the
+               app starts fresh rather than "where you left it" */
+            lv_obj_set_style_text_color(
+                _chip_lbl,
+                lv_color_hex(fa.prev_running ? UI_COL_TEXT : UI_COL_DIM), 0);
+        } else {
+            lv_label_set_text(_chip_lbl, "アプリ一覧");
+            lv_obj_set_style_text_color(_chip_lbl, lv_color_hex(UI_COL_DIM),
+                                        0);
+        }
+        if (fa.cur[0] && strcmp(fa.cur, _fg_cur) != 0) {
+            strlcpy(_fg_cur, fa.cur, sizeof _fg_cur);
+            update_task_label();
+            _fgflash.teleport(LV_OPA_60); /* who owns the screen now */
+            _fgflash.move(0);
+        }
+    }
+
+    void update_task_label()
+    {
+        /* foreground app name; the dev task keeps its origin suffix */
+        if (_fg_cur[0] && strcmp(_fg_cur, _st_task) == 0)
+            lv_label_set_text_fmt(_task_lbl, "%s (%s)", _fg_cur, _st_origin);
+        else if (_fg_cur[0])
+            lv_label_set_text(_task_lbl, _fg_cur);
+        else if (_st_task[0])
+            lv_label_set_text_fmt(_task_lbl, "%s (%s)", _st_task, _st_origin);
+    }
+
     lv_obj_t *_net_dot = nullptr, *_net_lbl = nullptr;
     lv_obj_t *_mqtt_dot = nullptr, *_mqtt_lbl = nullptr;
     lv_obj_t *_task_lbl = nullptr, *_event_lbl = nullptr;
     lv_obj_t *_drop_lbl = nullptr;
+    lv_obj_t *_chip = nullptr, *_chip_lbl = nullptr, *_strip = nullptr;
     uint32_t _seen_gen = 0;
+    uint32_t _fg_seen_gen = 0;
     uint32_t _seen_drops = 0;
-    int _flash_opa = -1;
+    int _flash_opa = -1, _fgflash_opa = -1;
+    bool _pressed = false, _armed = false, _chip_refresh = false;
+    uint32_t _press_tick = 0;
+    lv_point_t _press_pt = { 0, 0 };
+    char _chip_target[32] = "";
+    char _fg_cur[32] = "";
+    char _st_task[sizeof(ui_status_t::task_name)] = "";
+    char _st_origin[sizeof(ui_status_t::task_origin)] = "";
     char _last_event[sizeof(ui_status_t::last_event)] = "";
     smooth_ui_toolkit::AnimateValue _flash{0};
+    smooth_ui_toolkit::AnimateValue _fgflash{0};
 };
 
 /* Scrolling console below the bar: one label per ring line, capped at

@@ -13,6 +13,7 @@
  * LED 再生コアはヘッドレスでも従来どおり (HAS_UI ゲート、README 参照)。
  */
 "use strict";
+sys.setAppName("morse");
 
 var HAS_UI = ui.size()[0] !== 0;
 

@@ -3,6 +3,7 @@
  * キーボードの ×/⌨ で閉じたら画面のどこかをタップすると再表示。
  * PC では keyboard/onKey はスタブ (発火しない)。 */
 "use strict";
+sys.setAppName("kbd_demo");
 
 var sz = ui.size();
 var W = sz[0], H = sz[1];

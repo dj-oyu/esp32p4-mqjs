@@ -7,6 +7,7 @@
 // 計測 B: 80x32 キャンバス全再描画の発行コスト (行あたり 1 / 4 ラン)。
 //   ※ JS 側の発行時間。実ピクセルは Core1 が ~16ms 周期で消化する。
 "use strict";
+sys.setAppName("p4_rebuild_probe");
 
 function pageBuild(n) {
     var s = ui.screen("Rebuild probe #" + n);

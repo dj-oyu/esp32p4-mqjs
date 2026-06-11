@@ -13,6 +13,7 @@
  * どおり終了し、自動リピートが保たれる (README のイディオム (1) 参照)。
  */
 "use strict";
+sys.setAppName("bench");
 
 var HAS_UI = ui.size()[0] !== 0;
 

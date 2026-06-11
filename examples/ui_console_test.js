@@ -2,6 +2,7 @@
  * ANSI カラー (SGR -> LVGL recolor 変換)、'#' エスケープ、
  * tail-follow スクロール。 */
 "use strict";
+sys.setAppName("ui_console_test");
 var ESC = "\x1b[";
 var n = 0;
 print(ESC + "33m== コンソール表示テスト ==" + ESC + "0m");

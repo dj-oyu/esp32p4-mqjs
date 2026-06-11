@@ -6,6 +6,7 @@
 // real widget leak. It also forces extra JS garbage so the compacting GC
 // runs and frees JsUiHandle opaques (internal-RAM noise in the demo).
 
+sys.setAppName("widget_leak_probe");
 function page(n) {
   var s = ui.screen("Probe " + n);
   s.label("leak probe");

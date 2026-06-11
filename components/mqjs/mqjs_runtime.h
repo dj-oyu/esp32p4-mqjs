@@ -75,12 +75,34 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user);
 /*
  * Request a foreground switch (queued; the switch runs on the JS task:
  * background callback -> screen/canvas teardown -> foreground callback,
- * design §3.3). mqjs_focus_next cycles through the running apps — the
- * status-bar tap hook until the P4b launcher takes that gesture over.
- * Callable from any task (not from an ISR).
+ * design §3.3). Callable from any task (not from an ISR).
  */
 void mqjs_focus(int slot);
-void mqjs_focus_next(void);
+
+/*
+ * Register a relaunchable app source (embedded buffer, must live
+ * forever). sys.launch(name) resolves names against this registry
+ * before falling back to /littlefs/apps/<name>.js. The entry named
+ * "launcher" is special: the scheduler keeps it resident in slot 0
+ * (auto-started, restarted if it ever dies). Call before
+ * mqjs_runtime_run.
+ */
+void mqjs_register_app_source(const char *name, const char *src,
+                              size_t len);
+
+/*
+ * Ask the launcher to open `name` (focus it if running, launch it
+ * otherwise) — the status-bar chip / notification tap entry point.
+ * Posts an open request to the resident launcher app; a no-op when no
+ * launcher is running. Callable from any task (not from an ISR).
+ */
+void mqjs_request_open(const char *name);
+
+/*
+ * sys.notify(text) sink: receives "[appname] text" lines on the JS
+ * task (the host wires this to the status bar). NULL disables.
+ */
+void mqjs_set_notify_sink(void (*fn)(const char *text));
 
 /*
  * Single-app compatibility wrapper (PC builds: run_pc / test_pc).

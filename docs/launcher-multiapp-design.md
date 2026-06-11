@@ -1,13 +1,18 @@
 # Tab5 マルチアプリランタイム + ランチャー 設計書 (P4)
 
-Status: **P4a 実装済み・実機検証済み** (2026-06-11)。§3 のとおり実装
-(AppSlot / slot+世代ルーティング / 前面切替 / sys.signal/onSignal /
-sys.onForeground/onBackground / 背景 ui.* ゲート / screen の構築後アニメ)。
-検証: PC は run_pc 2 スクリプト (tools/p4_ping.js + p4_pong.js)、実機は
-dev スロット + 組み込み bg_app (examples/p4_bg_app.js) で §5 の項目を確認。
-P4a の暫定措置 (P4b で置換): 前面切替ジェスチャ = ステータスバータップで
-巡回 / `sys.focus` は全アプリに開放。次は **P4b(ランチャー)**。P4c
-(MQTT アプリレジストリ)と P4d(typed clipboard IPC)は次弾。
+Status: **P4a + P4b 実装済み・実機検証済み** (2026-06-11)。§3 / §4 の
+とおり実装。P4a: AppSlot / slot+世代ルーティング / 前面切替 /
+sys.signal/onSignal / sys.onForeground/onBackground / 背景 ui.* ゲート /
+screen の構築後アニメ。P4b: 常駐ランチャー (slot 0、examples/launcher.js)
++ ステータスバーのチップ (直前アプリを「開く」) と長押し (武装プログレス
+→ ランチャー) + sys.setAppName/apps/installed/launch/stop/notify
+(全アプリ開放 + C の 3 不変条件) + `// @app` インストール + 全 examples
+の setAppName 宣言。実機検証: 4 スロット同時実行、open シグナル経路、
+@app インストール → littlefs 起動、dev 明示停止の自動再実行抑止 +
+push での解除、停止の帰属ログ、前面フォールバック。残: チップ/長押しの
+タッチ操作の目視確認 (経路自体は sys.signal/sys.focus で検証済み)。
+次は **P4c(MQTT アプリレジストリ + manifest)**、P4d(typed clipboard
+IPC)。
 
 関連: `docs/widget-framework-design.md`(W1〜W3 済 — 画面遷移・リテイン
 スタック・マルチ SSH はこの土台)、`docs/ssh-terminal-design.md` §7

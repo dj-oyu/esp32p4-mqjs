@@ -90,6 +90,37 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         m[mlen] = '\0';
 
+        /* P4b-lite install: a "// @app <name>" first line means
+           "save to /littlefs/apps/, do NOT replace the running task"
+           (the launcher lists and starts it). This separation is
+           deliberate: store-delivered apps must never auto-run —
+           publish->immediate-replace stays a dev-only behavior
+           (launcher-multiapp-design §6). */
+        if (mlen > 8 && memcmp(m, "// @app ", 8) == 0) {
+            char name[25];
+            size_t n = 0;
+            const char *p = (const char *)m + 8;
+            while (n < sizeof name - 1 &&
+                   ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                    (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) {
+                name[n++] = *p++;
+            }
+            name[n] = '\0';
+            char ev2[48];
+            if (n > 0 && storage_save_app(name, (const char *)m,
+                                          (size_t)mlen)) {
+                snprintf(ev2, sizeof ev2, "installed: %s (%uB)", name,
+                         (unsigned)mlen);
+                publish_status(ev2);
+            } else {
+                snprintf(ev2, sizeof ev2, "install failed: bad @app name");
+                publish_status("error: bad @app name");
+            }
+            ui_status_set_event(ev2);
+            free(m);
+            break;
+        }
+
         storage_save_task((const char *)m, (size_t)mlen);
 
         xSemaphoreTake(s_lock, portMAX_DELAY);

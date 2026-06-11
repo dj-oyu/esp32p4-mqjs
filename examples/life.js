@@ -1,3 +1,4 @@
+sys.setAppName("life");
 /*
  * life.js - Conway's Game of Life animated on the serial console.
  *

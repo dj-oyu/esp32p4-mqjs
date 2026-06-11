@@ -13,6 +13,7 @@
 //   mqtt.connected()                   - 1/0
 //   mqtt.disconnect()                  - セッション破棄 (ループ終了要因)
 "use strict";
+sys.setAppName("mqtt_demo");
 
 var HAS_UI = ui.size()[0] !== 0;
 

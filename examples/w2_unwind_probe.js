@@ -3,6 +3,7 @@
 // 競合していたまさにそのパターン)。修正前は 1〜2 pop で止まり、
 // 修正後は必ず 3 pop になる。結果は MQTT で報告。
 "use strict";
+sys.setAppName("w2_unwind_probe");
 
 var r1 = [];
 ui.screen("probe-1");

@@ -90,6 +90,12 @@ void ui_tab5_start(void);
 void ui_tab5_log(const char *line, size_t n);
 /* Publish a new status snapshot (thread-safe, copies). */
 void ui_tab5_set_status(const ui_status_t *st);
+/* P4b: current/previous foreground app for the status-bar chip
+ * (thread-safe, copies). `prev` may name a stopped app — the chip shows
+ * it dimmed and a tap relaunches it via the launcher. Empty strings
+ * clear the respective display. */
+void ui_tab5_set_fg_apps(const char *cur, const char *prev,
+                         bool prev_running);
 /* Post a drawing command (thread-safe, non-blocking). Returns false
  * when the queue is full or the UI is absent — the command is dropped
  * (a drop counter shows up in the status bar). */
@@ -158,6 +164,13 @@ static inline void ui_tab5_log(const char *line, size_t n)
     (void)n;
 }
 static inline void ui_tab5_set_status(const ui_status_t *st) { (void)st; }
+static inline void ui_tab5_set_fg_apps(const char *cur, const char *prev,
+                                       bool prev_running)
+{
+    (void)cur;
+    (void)prev;
+    (void)prev_running;
+}
 static inline bool ui_tab5_cmd(const ui_cmd_t *cmd)
 {
     (void)cmd;

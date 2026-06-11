@@ -6,6 +6,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include "esp_littlefs.h"
 #include "esp_log.h"
 #include "storage.h"
@@ -79,4 +80,26 @@ void storage_save_task(const char *src, size_t len)
         ESP_LOGE(TAG, "short write (%zu/%zu)", wr, len);
     else
         ESP_LOGI(TAG, "persisted task (%zu bytes)", len);
+}
+
+bool storage_save_app(const char *name, const char *src, size_t len)
+{
+    if (!s_mounted)
+        return false;
+    mkdir(MOUNT "/apps", 0777); /* EEXIST is fine */
+    char path[64];
+    snprintf(path, sizeof path, MOUNT "/apps/%s.js", name);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "cannot open %s for writing", path);
+        return false;
+    }
+    size_t wr = fwrite(src, 1, len, f);
+    fclose(f);
+    if (wr != len) {
+        ESP_LOGE(TAG, "short write (%zu/%zu)", wr, len);
+        return false;
+    }
+    ESP_LOGI(TAG, "installed app '%s' (%zu bytes)", name, len);
+    return true;
 }

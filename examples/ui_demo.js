@@ -8,6 +8,7 @@
  * (文字盤 60 本) は delay() で小分けに流す。
  * PC (run_pc) ではスタブが print されるだけ。Stamp では全部 no-op。 */
 "use strict";
+sys.setAppName("ui_demo");
 
 var sz = ui.size();
 var W = sz[0], H = sz[1];

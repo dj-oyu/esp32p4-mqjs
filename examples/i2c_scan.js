@@ -8,6 +8,7 @@
 // 画面なし (Stamp/PC): HAS_UI ゲートでウィジェットを作らないので、従来
 //   どおり print → イベントループ終了 → 約 3 秒周期で自動再実行が保たれる。
 "use strict";
+sys.setAppName("i2c_scan");
 
 var HAS_UI = ui.size()[0] !== 0;
 

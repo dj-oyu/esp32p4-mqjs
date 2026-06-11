@@ -4,6 +4,7 @@
 // takes the LVGL port lock, so if the UI task died this script hangs and
 // never prints the OK line. Seeing "console regression OK" = UI alive.
 "use strict";
+sys.setAppName("console_flood");
 var h0 = sys.heap();
 print("flood start: lvgl=" + h0[2]);
 var n = 0;

@@ -1,3 +1,4 @@
+sys.setAppName("mandelbrot");
 /*
  * mandelbrot.js - ASCII Mandelbrot zoom on the serial console.
  *

@@ -9,6 +9,7 @@
  * GPIO コアはヘッドレスでも従来どおり (HAS_UI ゲート、README 参照)。
  */
 "use strict";
+sys.setAppName("blink_button");
 
 var HAS_UI = ui.size()[0] !== 0;
 

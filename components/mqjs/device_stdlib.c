@@ -471,6 +471,15 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("signal", 2, js_sys_signal),
     JS_CFUNC_DEF("onSignal", 1, js_sys_onSignal),
     JS_CFUNC_DEF("focus", 1, js_sys_focus),
+    /* P4b launcher support — open to every app (signing gate is the
+       trust boundary); C enforces the invariants (launcher unstoppable,
+       dev-slot stop suppresses auto-rerun, attributed stop log) */
+    JS_CFUNC_DEF("setAppName", 1, js_sys_setAppName),
+    JS_CFUNC_DEF("apps", 0, js_sys_apps),
+    JS_CFUNC_DEF("installed", 0, js_sys_installed),
+    JS_CFUNC_DEF("launch", 1, js_sys_launch),
+    JS_CFUNC_DEF("stop", 1, js_sys_stop),
+    JS_CFUNC_DEF("notify", 1, js_sys_notify),
     JS_PROP_END,
 };
 

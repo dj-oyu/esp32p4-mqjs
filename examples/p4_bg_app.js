@@ -10,6 +10,7 @@
 // 巡回)。dev スロットのタスクからは sys.signal("bg_app", "...") で
 // このアプリへシグナルを送れる。
 "use strict";
+sys.setAppName("p4_bg_app");
 
 var BROKER = "mqtt://test.mosquitto.org";
 var TOPIC = "esp32p4-mqjs/p4a-bg";
