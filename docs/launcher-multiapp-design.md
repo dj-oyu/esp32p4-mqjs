@@ -1,16 +1,18 @@
 # Tab5 マルチアプリランタイム + ランチャー 設計書 (P4)
 
-Status: **P4a + P4b 実装済み・実機検証済み** (2026-06-11)。§3 / §4 の
-とおり実装。P4a: AppSlot / slot+世代ルーティング / 前面切替 /
-sys.signal/onSignal / sys.onForeground/onBackground / 背景 ui.* ゲート /
-screen の構築後アニメ。P4b: 常駐ランチャー (slot 0、examples/launcher.js)
-+ ステータスバーのチップ (直前アプリを「開く」) と長押し (武装プログレス
-→ ランチャー) + sys.setAppName/apps/installed/launch/stop/notify
-(全アプリ開放 + C の 3 不変条件) + `// @app` インストール + 全 examples
-の setAppName 宣言。実機検証: 4 スロット同時実行、open シグナル経路、
-@app インストール → littlefs 起動、dev 明示停止の自動再実行抑止 +
-push での解除、停止の帰属ログ、前面フォールバック。残: チップ/長押しの
-タッチ操作の目視確認 (経路自体は sys.signal/sys.focus で検証済み)。
+Status: **P4a + P4b 完了** (2026-06-11、タッチ操作までユーザー実機確認
+済み)。§3 / §4 のとおり実装。P4a: AppSlot / slot+世代ルーティング /
+前面切替 / sys.signal/onSignal / sys.onForeground/onBackground / 背景
+ui.* ゲート / screen の構築後アニメ。P4b: 常駐ランチャー (slot 0、
+examples/launcher.js = 唯一の組み込みアプリ) + ステータスバーのチップ
+(直前アプリを「開く」) と長押し (武装プログレス → ランチャー) + 一覧の
+行末 ✕ で即停止 (確認ページなし) + sys.setAppName/apps/installed/
+launch/stop/notify (全アプリ開放 + C の 3 不変条件) + `// @app`
+インストール + 全 examples の setAppName 宣言 + UI アプリの
+onForeground 移行 (ssh_vt / mqtt_demo / p4_bg_app / launcher)。
+**P4c へ繰り越し**: §3.8 の通知拡張 (アプリ毎最終 1 件のランチャー行
+表示・通知タップで発信アプリへ focus — manifest/永続化と絡むため)、
+アンインストール (○ 行の ✕)、manifest 権限 default-deny。
 次は **P4c(MQTT アプリレジストリ + manifest)**、P4d(typed clipboard
 IPC)。
 
