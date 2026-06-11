@@ -42,6 +42,54 @@ sys.onSignal(function (v, from) {
         openApp(req.app);
 });
 
+/* ---- §9 ストア: インストール済み (= 棚と同期した littlefs) の閲覧。
+   メインのスイッチャー役を毀損しないよう ui.screen のサブページで
+   増築 (retain スタック: メイン → ストア → 詳細 = 深さ 3 で枠内)。 */
+function storePage() {
+    var s = ui.screen("ストア");
+    var inst = sys.installed();
+    var apps = sys.apps();
+    var running = {};
+    for (var i = 0; i < apps.length; i++)
+        running[apps[i].name] = true;
+    if (!inst.length)
+        s.label("インストール済みアプリはありません");
+    var list = s.list();
+    for (var j = 0; j < inst.length; j++) {
+        (function (it) {
+            var label = (running[it.name] ? "● " : "○ ") +
+                        (it.icon ? it.icon + " " : "") + it.title;
+            list.add(label, function () { detailPage(it, !!running[it.name]); });
+        })(inst[j]);
+    }
+    s.label("行タップで詳細 (説明 / 権限 / 起動)");
+    s.button("戻る", function () { ui.back(); });
+}
+
+function detailPage(it, isRunning) {
+    var s = ui.screen((it.icon ? it.icon + " " : "") + it.title);
+    s.label("name: " + it.name + (isRunning ? "  (実行中)" : ""));
+    if (it.desc)
+        s.label(it.desc);
+    if (it.perm)
+        s.label("権限 (宣言のみ): " + it.perm);
+    s.label("サイズ: " + it.size + " B");
+    if (it.autostart)
+        s.label(it.optin ? "自動起動: 有効 (起動時に常駐)"
+                         : "自動起動: 宣言あり (一度起動すると有効化)");
+    s.button(isRunning ? "前面へ" : "起動して開く", function () {
+        openApp(it.name); /* 既存の open 経路: focus-or-launch */
+    });
+    s.button("アンインストール", function () {
+        sys.uninstall(it.name);
+        /* レジストリ配布物は broker に retained が残っていれば次の
+           同期で戻る (恒久削除は tombstone、設計 §4.5) */
+        sys.notify("削除: " + it.name + " (棚に残っていれば次の同期で復帰)");
+        build();
+    });
+    s.button("戻る", function () { ui.back(); });
+}
+
 function build() {
     /* 停止 (✕) 後の作り直しで retain スタックを太らせない: 一覧は常に
        コンソール直上の 1 枚だけにする */
@@ -79,25 +127,10 @@ function build() {
     if (!devRunning)
         list.add("○ dev タスク (push されたタスクを再開)",
                  function () { openApp("dev"); });
-    for (var j = 0; j < inst.length; j++) {
-        if (!running[inst[j].name])
-            (function (it) {
-                var label = "○ " + (it.icon ? it.icon + " " : "") + it.title;
-                if (it.perm)
-                    label += "  [" + it.perm + "]";
-                /* タップ = 起動、✕ = アンインストール。レジストリ配布の
-                   アプリは broker に retained が残っていれば次の同期で
-                   戻る (恒久削除は tombstone、設計 §4.5) */
-                list.add(label,
-                         function () { openApp(it.name); },
-                         function () {
-                             sys.uninstall(it.name);
-                             build();
-                         },
-                         "trash"); /* 停止の ✕ と意味を分ける */
-            })(inst[j]);
-    }
-    s.label("● 実行中 / x で停止 / ○ 停止中 ... バー長押しでいつでもここへ");
+    /* §9: ○ (停止中) の一覧はストアページへ移動 — メインは
+       スイッチャー専念。停止中アプリはストア経由かチップで開く。 */
+    s.button("ストア (インストール済み " + inst.length + " 本)", storePage);
+    s.label("● タップで切替 / x で停止 ... バー長押しでいつでもここへ");
 
     /* P4c: アプリ毎の最終通知。タップで発信アプリを開く (停止中なら
        起動して開く — open 経路がそのまま面倒を見る) */

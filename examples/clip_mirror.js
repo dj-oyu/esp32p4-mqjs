@@ -1,5 +1,6 @@
 // @app clip_mirror
 // @title クリップボード同期
+// @desc クリップボードを MQTT (retained) で他デバイスと共有する常駐ブリッジ。ブローカー不在時はローカルのみ。
 // @perm mqtt,clipboard
 // @autostart
 //

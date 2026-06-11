@@ -120,6 +120,14 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
 void mqjs_runtime_stop(void);
 
 /*
+ * T3c stats panel: copy the current clipboard head (type + data
+ * truncated to dcap-1 bytes at a UTF-8 boundary) for display. The only
+ * clipboard entry point callable OFF the JS task (mutex-guarded).
+ * Returns false when the clipboard is empty (outputs untouched).
+ */
+bool mqjs_clipboard_peek(char *type, size_t tcap, char *data, size_t dcap);
+
+/*
  * Tee everything js_print / console.log / uncaught-exception dumps write
  * to stdout into `fn` as well, one UTF-8 line per call (no trailing
  * newline; long lines are split at a UTF-8 boundary). Lines are

@@ -1986,6 +1986,12 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 static char *s_clip_data;          /* heap; NULL = empty clipboard */
 static size_t s_clip_len;
 static char s_clip_type[MQJS_CLIP_TYPE_MAX + 1];
+#ifdef ESP_PLATFORM
+/* T3c: the stats panel peeks at the clipboard from the LVGL task, so
+   the (infrequent) buffer swaps and the peek copy take a small lock.
+   Everything else clipboard runs on the JS task as before. */
+static SemaphoreHandle_t s_clip_mtx;
+#endif
 
 #ifdef ESP_PLATFORM
 static nvs_handle_t s_clip_nvs;
@@ -2026,11 +2032,17 @@ static void clip_load(void)
         free(buf);
         return;
     }
-    size_t tlen = sizeof s_clip_type;
-    if (nvs_get_str(s_clip_nvs, "type", s_clip_type, &tlen) != ESP_OK)
-        snprintf(s_clip_type, sizeof s_clip_type, "text/plain");
+    char type[MQJS_CLIP_TYPE_MAX + 1];
+    size_t tlen = sizeof type;
+    if (nvs_get_str(s_clip_nvs, "type", type, &tlen) != ESP_OK)
+        snprintf(type, sizeof type, "text/plain");
+    if (s_clip_mtx)
+        xSemaphoreTake(s_clip_mtx, portMAX_DELAY);
+    snprintf(s_clip_type, sizeof s_clip_type, "%s", type);
     s_clip_data = buf;
     s_clip_len = len;
+    if (s_clip_mtx)
+        xSemaphoreGive(s_clip_mtx);
 }
 
 static void clip_persist(void)
@@ -2080,10 +2092,18 @@ JSValue js_clipboard_set(JSContext *ctx, JSValue *this_val, int argc,
         memcpy(copy, data, len);
     }
     clip_load(); /* mark loaded: this value now shadows whatever NVS had */
+#ifdef ESP_PLATFORM
+    if (s_clip_mtx)
+        xSemaphoreTake(s_clip_mtx, portMAX_DELAY);
+#endif
     free(s_clip_data);
     s_clip_data = copy;
     s_clip_len = copy ? len : 0;
     snprintf(s_clip_type, sizeof s_clip_type, "%s", type);
+#ifdef ESP_PLATFORM
+    if (s_clip_mtx)
+        xSemaphoreGive(s_clip_mtx);
+#endif
     clip_persist();
 
     /* wake the other listeners (best effort: a full queue drops the
@@ -2097,6 +2117,37 @@ JSValue js_clipboard_set(JSContext *ctx, JSValue *this_val, int argc,
         ev_post(&ev, 0);
     }
     return JS_NewBool(1);
+}
+
+/* T3c stats panel: copy the clipboard head for display (callable from
+   the LVGL task — the only clipboard entry point off the JS task).
+   Returns false on an empty clipboard. The data is truncated to dcap-1
+   bytes at a UTF-8 boundary. */
+bool mqjs_clipboard_peek(char *type, size_t tcap, char *data, size_t dcap)
+{
+#ifdef ESP_PLATFORM
+    if (!s_clip_mtx)
+        return false;
+    xSemaphoreTake(s_clip_mtx, portMAX_DELAY);
+    bool has = s_clip_data != NULL;
+    if (has) {
+        snprintf(type, tcap, "%s", s_clip_type);
+        size_t n = s_clip_len < dcap - 1 ? s_clip_len : dcap - 1;
+        if (n < s_clip_len) /* truncated: back off to a UTF-8 boundary */
+            while (n > 0 && ((unsigned char)s_clip_data[n] & 0xC0) == 0x80)
+                n--;
+        memcpy(data, s_clip_data, n);
+        data[n] = '\0';
+    }
+    xSemaphoreGive(s_clip_mtx);
+    return has;
+#else
+    (void)type;
+    (void)tcap;
+    (void)data;
+    (void)dcap;
+    return false;
+#endif
 }
 
 /* clipboard.get() -> {data, type} | undefined (empty clipboard) */
@@ -2480,16 +2531,28 @@ static void autostart_optin_remove(const char *name)
 }
 #endif /* ESP_PLATFORM */
 
-/* append one {name, title, perm, icon} entry to the installed() array.
+/* append one {name, title, perm, icon, desc, size, autostart, optin}
+   entry to the installed() array (store detail page, design §9).
    icon = a Nerd Font glyph character from the "// @icon " directive
    (the ui_font fallback chain renders it anywhere, design §4.5). */
 static int installed_push(JSContext *ctx, JSGCRef *arr_ref, int idx,
-                          const char *name, const char *head, size_t hlen)
+                          const char *name, const char *head, size_t hlen,
+                          size_t fsize)
 {
-    char title[48], perm[64], icon[12];
+    char title[48], perm[64], icon[12], desc[96];
     manifest_field(head, hlen, "// @title ", title, sizeof title);
     manifest_field(head, hlen, "// @perm ", perm, sizeof perm);
     manifest_field(head, hlen, "// @icon ", icon, sizeof icon);
+    manifest_field(head, hlen, "// @desc ", desc, sizeof desc);
+    bool autostart = manifest_has(head, hlen, "// @autostart");
+    bool optin = false;
+#ifdef ESP_PLATFORM
+    if (autostart) {
+        char roster[MQJS_AUTOSTART_LIST_MAX];
+        autostart_load(roster, sizeof roster);
+        optin = autostart_list_has(roster, name);
+    }
+#endif
 
     JSGCRef obj_ref;
     JSValue obj = JS_NewObject(ctx);
@@ -2504,6 +2567,12 @@ static int installed_push(JSContext *ctx, JSGCRef *arr_ref, int idx,
     JS_SetPropertyStr(ctx, obj_ref.val, "perm", v);
     v = JS_NewString(ctx, icon);
     JS_SetPropertyStr(ctx, obj_ref.val, "icon", v);
+    v = JS_NewString(ctx, desc);
+    JS_SetPropertyStr(ctx, obj_ref.val, "desc", v);
+    JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                      JS_NewInt32(ctx, (int32_t)fsize));
+    JS_SetPropertyStr(ctx, obj_ref.val, "autostart", JS_NewBool(autostart));
+    JS_SetPropertyStr(ctx, obj_ref.val, "optin", JS_NewBool(optin));
     JS_POP_VALUE(ctx, obj);
     JS_SetPropertyUint32(ctx, arr_ref->val, (uint32_t)idx, obj);
     return 0;
@@ -2527,7 +2596,8 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
             continue;
         size_t hlen = s_app_sources[i].len < 512 ? s_app_sources[i].len : 512;
         if (installed_push(ctx, &arr_ref, n, s_app_sources[i].name,
-                           s_app_sources[i].src, hlen)) {
+                           s_app_sources[i].src, hlen,
+                           s_app_sources[i].len)) {
             JS_POP_VALUE(ctx, arr);
             return JS_EXCEPTION;
         }
@@ -2544,15 +2614,18 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
             char base[32];
             snprintf(base, sizeof base, "%.*s", (int)(l - 3), e->d_name);
             char head[512];
-            size_t hlen = 0;
+            size_t hlen = 0, fsize = 0;
             char path[96];
             snprintf(path, sizeof path, "/littlefs/apps/%.40s", e->d_name);
             FILE *f = fopen(path, "rb");
             if (f) {
                 hlen = fread(head, 1, sizeof head, f);
+                fseek(f, 0, SEEK_END);
+                long fl = ftell(f);
+                fsize = fl > 0 ? (size_t)fl : 0;
                 fclose(f);
             }
-            if (installed_push(ctx, &arr_ref, n, base, head, hlen)) {
+            if (installed_push(ctx, &arr_ref, n, base, head, hlen, fsize)) {
                 closedir(d);
                 JS_POP_VALUE(ctx, arr);
                 return JS_EXCEPTION;
@@ -3877,6 +3950,9 @@ void mqjs_rt_init(void)
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
         s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
+    if (!s_clip_mtx)
+        s_clip_mtx = xSemaphoreCreateMutex();
+    clip_load(); /* eager: the T3c panel peeks before any app touches it */
     /* fixed arenas, allocated once and kept (design §3.6): app_start can
        never fail with OOM and the PSRAM heap is not churned */
     for (int i = 0; i < MQJS_MAX_APPS; i++) {

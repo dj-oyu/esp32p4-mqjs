@@ -27,6 +27,7 @@
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_lcd_ili9881c.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
@@ -1405,15 +1406,214 @@ extern "C" int ui_tab5_kb_reserved(int mode)
     return mode == 1 ? UI_KB_H : UI_KB_H + UI_CB_H;
 }
 
-/* mode: 0 = hide, 1 = keyboard, 2 = keyboard + terminal control bar */
+/* ------------------------------------------------------------------ */
+/* T3c: stats panel hidden behind the keyboard (ssh-terminal §7 T3c). */
+/* The keyboard's close key COLLAPSES instead of hiding: the reserved  */
+/* area shows a C-owned dashboard (fg app, uptime, heap, link state,   */
+/* clipboard preview, brightness dial) — a resting / stability-check   */
+/* surface for long keyboard sessions. The app's grid is untouched     */
+/* (same reserved height), output keeps flowing above. The ⌨ button   */
+/* (or the app re-requesting ui.keyboard) lifts the keyboard back.     */
+/* App ui.keyboard(0) / UI_CMD_RESET = OFF: panel hidden too.          */
+/* ------------------------------------------------------------------ */
+
+extern "C" bool mqjs_clipboard_peek(char *type, size_t tcap, char *data,
+                                    size_t dcap);
+static void kb_show(int mode); /* fwd: the ⌨ button restores */
+
+static int s_kb_mode = 2;   /* last shown mode: what ⌨ restores to */
+static lv_obj_t *s_spanel;
+static lv_obj_t *s_sp_stats, *s_sp_clip, *s_sp_pct;
+static lv_obj_t *s_sp_arc;
+static lv_timer_t *s_sp_timer;
+static int s_brightness = 100; /* boot value set by ui_tab5_start */
+
+static void spanel_apply_brightness(int v)
+{
+    if (v < 5)
+        v = 5;   /* never to 0 from the dial: a black panel reads as
+                    a crash, and recovery would need blind taps */
+    if (v > 100)
+        v = 100;
+    v = ((v + 2) / 5) * 5; /* 5% snap */
+    s_brightness = v;
+    backlight_set(v);
+    if (s_sp_arc)
+        lv_arc_set_value(s_sp_arc, v);
+    if (s_sp_pct) {
+        char b[8];
+        snprintf(b, sizeof b, "%d%%", v);
+        lv_label_set_text(s_sp_pct, b);
+    }
+}
+
+static void spanel_update(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_spanel || lv_obj_has_flag(s_spanel, LV_OBJ_FLAG_HIDDEN))
+        return;
+
+    ui_status_t st;
+    ui_fgapps_t fa;
+    xSemaphoreTake(s_status_mtx, portMAX_DELAY);
+    st = s_status;
+    fa = s_fgapps;
+    xSemaphoreGive(s_status_mtx);
+
+    int64_t up = esp_timer_get_time() / 1000000;
+    unsigned ih = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) /
+                             1024);
+    unsigned ph = (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) /
+                             1024 / 1024);
+    unsigned lh = (unsigned)(ui_tab5_lv_mem_free() / 1024);
+
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "アプリ: %s\n"
+             "稼働: %02d:%02d:%02d\n"
+             "heap: 内蔵 %uKB / PSRAM %uMB / LVGL %uKB\n"
+             "WiFi: %s %s   MQTT: %s",
+             fa.cur[0] ? fa.cur : "-",
+             (int)(up / 3600), (int)(up / 60 % 60), (int)(up % 60),
+             ih, ph, lh,
+             st.wifi_up ? "接続" : "切断", st.wifi_up ? st.ip : "",
+             st.mqtt_up ? "接続" : "切断");
+    lv_label_set_text(s_sp_stats, buf);
+
+    char ctype[32], cdata[81];
+    if (mqjs_clipboard_peek(ctype, sizeof ctype, cdata, sizeof cdata)) {
+        /* control chars would garble the one-line preview */
+        for (char *p = cdata; *p; p++)
+            if ((unsigned char)*p < 0x20)
+                *p = ' ';
+        char cb[160];
+        snprintf(cb, sizeof cb, "クリップボード [%s]\n%s", ctype, cdata);
+        lv_label_set_text(s_sp_clip, cb);
+    } else {
+        lv_label_set_text(s_sp_clip, "クリップボード: (空)");
+    }
+}
+
+static void spanel_build(void)
+{
+    s_spanel = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    lv_obj_set_style_bg_color(s_spanel, lv_color_hex(UI_COL_BG), 0);
+    lv_obj_set_style_bg_opa(s_spanel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_spanel, 1, 0);
+    lv_obj_set_style_border_color(s_spanel, lv_color_hex(UI_COL_BAR), 0);
+    lv_obj_set_style_border_side(s_spanel, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_radius(s_spanel, 0, 0);
+    lv_obj_set_style_pad_all(s_spanel, 16, 0);
+    lv_obj_remove_flag(s_spanel, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* left column: stats + clipboard preview (1s refresh) */
+    s_sp_stats = make_label(s_spanel, UI_COL_TEXT);
+    lv_obj_set_pos(s_sp_stats, 0, 0);
+    lv_obj_set_width(s_sp_stats, 420);
+    lv_label_set_text(s_sp_stats, "...");
+
+    s_sp_clip = make_label(s_spanel, UI_COL_DIM);
+    lv_obj_set_pos(s_sp_clip, 0, 200);
+    lv_obj_set_width(s_sp_clip, 420);
+    lv_label_set_long_mode(s_sp_clip, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_sp_clip, "");
+
+    /* right: brightness arc (relative drag + 5% snap + ± nudge) */
+    s_sp_arc = lv_arc_create(s_spanel);
+    lv_obj_set_size(s_sp_arc, 200, 200);
+    lv_obj_align(s_sp_arc, LV_ALIGN_TOP_RIGHT, -20, 0);
+    lv_arc_set_range(s_sp_arc, 5, 100);
+    lv_arc_set_value(s_sp_arc, s_brightness);
+    lv_obj_set_style_arc_color(s_sp_arc, lv_color_hex(UI_COL_BAR),
+                               LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_sp_arc, lv_color_hex(UI_COL_EVENT),
+                               LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_sp_arc, lv_color_hex(UI_COL_TEXT),
+                              LV_PART_KNOB);
+    lv_obj_add_event_cb(
+        s_sp_arc,
+        [](lv_event_t *e) {
+            lv_obj_t *a = (lv_obj_t *)lv_event_get_current_target(e);
+            spanel_apply_brightness(lv_arc_get_value(a));
+        },
+        LV_EVENT_VALUE_CHANGED, nullptr);
+
+    s_sp_pct = make_label(s_sp_arc, UI_COL_TEXT);
+    lv_obj_center(s_sp_pct);
+    lv_label_set_text(s_sp_pct, "100%");
+
+    /* ± nudge + keyboard-restore buttons under the arc */
+    struct Btn { const char *txt; int dv; };
+    static const Btn btns[] = { { "-", -5 }, { "+", +5 },
+                                { LV_SYMBOL_KEYBOARD, 0 } };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *b = lv_button_create(s_spanel);
+        lv_obj_set_size(b, 88, 64);
+        lv_obj_align(b, LV_ALIGN_BOTTOM_RIGHT, -20 - (2 - i) * 100, -8);
+        lv_obj_set_style_bg_color(b, lv_color_hex(UI_COL_BAR), 0);
+        lv_obj_t *l = make_label(b, UI_COL_TEXT);
+        lv_label_set_text(l, btns[i].txt);
+        lv_obj_center(l);
+        lv_obj_add_event_cb(
+            b,
+            [](lv_event_t *e) {
+                intptr_t dv = (intptr_t)lv_event_get_user_data(e);
+                if (dv == 0)
+                    kb_show(s_kb_mode); /* ⌨: lift the keyboard back */
+                else
+                    spanel_apply_brightness(s_brightness + (int)dv);
+            },
+            LV_EVENT_CLICKED, (void *)(intptr_t)btns[i].dv);
+    }
+
+    s_sp_timer = lv_timer_create(spanel_update, 1000, nullptr);
+}
+
+static void spanel_show(bool show)
+{
+    if (!show) {
+        if (s_spanel) {
+            lv_obj_add_flag(s_spanel, LV_OBJ_FLAG_HIDDEN);
+            if (s_sp_timer)
+                lv_timer_pause(s_sp_timer);
+        }
+        return;
+    }
+    if (!s_spanel)
+        spanel_build();
+    int h = ui_tab5_kb_reserved(s_kb_mode ? s_kb_mode : 2);
+    lv_obj_set_size(s_spanel, UI_LCD_H_RES, h);
+    lv_obj_align(s_spanel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_remove_flag(s_spanel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_spanel);
+    if (s_sp_timer) {
+        lv_timer_resume(s_sp_timer);
+        lv_timer_ready(s_sp_timer); /* refresh now, not in 1s */
+    }
+}
+
+/* keyboard close key: collapse to the panel instead of plain hide */
+static void kb_collapse(void)
+{
+    if (s_kb)
+        lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    cbar_show(false);
+    spanel_show(true);
+}
+
+/* mode: 0 = hide (OFF: stats panel gone too), 1 = keyboard,
+   2 = keyboard + terminal control bar. Showing always lifts the
+   keyboard over a collapsed panel (T3c SHOWN state). */
 static void kb_show(int mode)
 {
     cbar_show(mode >= 2);
+    spanel_show(false);
     if (mode <= 0) {
         if (s_kb)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    s_kb_mode = mode; /* what the panel's ⌨ button restores */
     if (s_kb) {
         lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_kb);
@@ -1463,7 +1663,7 @@ static void kb_show(int mode)
             }
             if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
                 !strcmp(txt, LV_SYMBOL_KEYBOARD)) {
-                kb_show(0);
+                kb_collapse(); /* T3c: reveal the stats panel behind */
                 return;
             }
             if (!strcmp(txt, LV_SYMBOL_BACKSPACE))

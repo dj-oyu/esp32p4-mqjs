@@ -1,5 +1,6 @@
 // @app p4_bg_app
 // @title バックグラウンドデモ
+// @desc 背景実行 + onForeground 再構築 + sys.signal IPC を体験できる P4a デモ。
 // @icon 
 // バックグラウンド実行のデモアプリ (P4a 検証から派生)。push すると
 // 上のディレクティブにより /littlefs/apps/ にインストールされ、

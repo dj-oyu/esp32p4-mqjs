@@ -770,8 +770,12 @@ if (SELFTEST) {
                 return;
             }
             endPress();
+            if (y >= GRID_ROWS * LH)
+                return; /* 予約領域 (キーボード / T3c パネル) のタップは
+                           端末に拾わせない — パネル操作のたびに
+                           キーボードが復帰してしまうため */
             press = { x: x, y: y, moved: false, timer: null };
-            if (y < GRID_ROWS * LH && actIdx >= 0) {
+            if (actIdx >= 0) {
                 press.timer = setTimeout(function () {
                     if (press === null || press.moved)
                         return;
