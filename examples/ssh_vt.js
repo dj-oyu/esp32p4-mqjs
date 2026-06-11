@@ -1,3 +1,8 @@
+// @app ssh_vt
+// @title SSHターミナル
+// @icon 
+// @desc VT100 端末エミュレータ (マルチセッション・選択コピー対応)。
+// @perm ssh,clipboard,store
 /* Tab5 SSH ターミナルエミュレータ (Phase T3 + W3): mquickjs 製 VT100、
  * マルチセッション対応。
  *

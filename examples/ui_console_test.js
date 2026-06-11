@@ -1,3 +1,7 @@
+// @app ui_console_test
+// @title コンソール試験
+// @icon 
+// @desc ANSI 色・長行分割・タブ展開のコンソール表示試験。
 /* Tab5 コンソール表示試験: 日本語/長行 (96B 分割)、タブ展開、
  * ANSI カラー (SGR -> LVGL recolor 変換)、'#' エスケープ、
  * tail-follow スクロール。 */

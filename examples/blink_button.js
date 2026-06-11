@@ -1,3 +1,8 @@
+// @app blink_button
+// @title Lチカ
+// @icon 
+// @desc LED 点滅 + 周期スライダー + ボタンエッジ報告の GPIO デモ。
+// @perm gpio
 /*
  * blink_button.js - the original first-milestone demo.
  *

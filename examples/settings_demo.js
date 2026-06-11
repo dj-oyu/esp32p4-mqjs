@@ -1,3 +1,7 @@
+// @app settings_demo
+// @title 設定画面デモ
+// @icon 
+// @desc ウィジェット一式 (フィールド/トグル/スライダー/リスト) の見本。
 // settings_demo.js — W1-3/W1-4: widget-framework settings-page skeleton +
 // heap-stability measurement (docs/widget-framework-design.md §4).
 //

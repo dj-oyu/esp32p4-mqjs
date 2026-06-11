@@ -1,3 +1,7 @@
+// @app bench
+// @title JSベンチ
+// @icon 
+// @desc fib・sieve・JSON・正規表現のマイクロベンチマークを繰り返し実行。
 /*
  * bench.js - micro-benchmarks for mquickjs on the ESP32-P4 (360 MHz).
  *

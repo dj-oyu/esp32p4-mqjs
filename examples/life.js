@@ -1,3 +1,7 @@
+// @app life
+// @title ライフゲーム
+// @icon 
+// @desc コンソールに描く Conway のライフゲーム (ANSI、自動再走)。
 sys.setAppName("life");
 /*
  * life.js - Conway's Game of Life animated on the serial console.

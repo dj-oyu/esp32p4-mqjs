@@ -1,3 +1,8 @@
+// @app morse
+// @title モールス
+// @icon 
+// @desc LED モールス送信機。メッセージは UI で編集可能。
+// @perm gpio
 /*
  * morse.js - blink a message in Morse code on the LED (G2), forever.
  *

@@ -1,3 +1,7 @@
+// @app mandelbrot
+// @title マンデルブロ
+// @icon 
+// @desc ASCII マンデルブロ集合のズームアニメーション (FPU)。
 sys.setAppName("mandelbrot");
 /*
  * mandelbrot.js - ASCII Mandelbrot zoom on the serial console.

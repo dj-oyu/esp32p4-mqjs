@@ -1,3 +1,8 @@
+// @app reaction
+// @title 反射神経ゲーム
+// @icon 
+// @desc LED 点灯からボタン押下までの反応時間を計測。
+// @perm gpio
 /*
  * reaction.js - reaction-time game with one button and one LED.
  *

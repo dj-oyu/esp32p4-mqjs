@@ -1,3 +1,8 @@
+// @app mqtt_demo
+// @title MQTTデモ
+// @icon 
+// @desc 公開ブローカーへのループバック送受信デモ。
+// @perm mqtt
 // MQTT デモ: パブリックブローカーに接続し、自分の publish を自分の
 // subscribe で受けるループバック。配線不要 (WiFi 必須)。
 //
