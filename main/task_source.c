@@ -25,7 +25,12 @@
 
 #define SIG_LEN        64
 #define MAX_SCRIPT_LEN (64 * 1024)
-#define RX_BUF_SIZE    (32 * 1024)   /* sig+script must fit in one packet */
+/* sig+script must fit in one esp-mqtt packet: honor MAX_SCRIPT_LEN with
+   topic/header headroom. 32KB silently capped pushes below the
+   documented limit (ssh_vt grew past it at T3b: "rejected: too large"
+   while the sender said published). */
+#define RX_BUF_SIZE    (MAX_SCRIPT_LEN + 2048)
+#define TX_BUF_SIZE    2048          /* out = short status lines only */
 
 static const char *TAG = "task_src";
 
@@ -152,8 +157,11 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (e->current_data_offset != 0 || e->data_len != e->total_data_len) {
             ESP_LOGW(TAG, "payload does not fit the rx buffer (%d bytes), ignored",
                      e->total_data_len);
+            char ev0[48];
+            snprintf(ev0, sizeof ev0, "rejected: too large (%dB)",
+                     e->total_data_len);
             publish_status("error: too large");
-            ui_status_set_event("rejected: too large");
+            ui_status_set_event(ev0);
             break;
         }
         /* route by topic: registry shelf vs the dev task topic */
@@ -251,6 +259,8 @@ void task_source_start(void)
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = CONFIG_MQJS_TASK_BROKER,
         .buffer.size = RX_BUF_SIZE,
+        /* without this, out inherits buffer.size = a second 66KB block */
+        .buffer.out_size = TX_BUF_SIZE,
         /* Ed25519 verify runs in the mqtt event task; give it headroom */
         .task.stack_size = 8192,
     };
