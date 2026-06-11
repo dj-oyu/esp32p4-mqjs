@@ -288,3 +288,11 @@ toggle/slider/list 6 行/Save/Cancel)を 5 枚 push(N=3 超え → evict 発生)
   内容を置換)。デモはタップ/Save の結果を画面内ステータスラベルに表示する
   ように変更(コールバック往復が console なしで見える)。Save は back
   しなくなった(値の確認がしやすいように)。
+- **ステータスバーは `lv_layer_top()` のシステムクロームに**(08db8f5)。
+  ウィジェット画面でも常時表示・遷移アニメで動かない。ウィジェット画面は
+  UI_STATUSBAR_H(ui_tab5_internal.h で共有)の top padding を確保。
+  端末キーボード(ui.keyboard)の親もコンソール画面に固定(ウィジェット
+  画面上で作られると破棄時に dangling になるため)。
+- examples は全面的に 3 形態(ウィジェット/キャンバス/ハイブリッド)へ
+  対応済み(5856abd、examples/README.md に標準イディオム集)。ssh_vt /
+  ssh_term は接続フォーム入力になり認証情報がファイルから消えた。
