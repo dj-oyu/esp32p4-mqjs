@@ -9,22 +9,62 @@ idf.py -DMQJS_SCRIPT=life.js build flash
 (`-B <ASCII パス>` が必要な環境では他のコマンド同様に付ける。
  デフォルトは `blink_button.js`)
 
-| スクリプト | 配線 | 内容 |
-|---|---|---|
-| `blink_button.js` | LED G2 / ボタン G5 | Lチカ + ボタンエッジ表示 (最初のマイルストーン) |
-| `morse.js` | LED G2 | メッセージをモールス信号で点滅。setTimeout チェーン 1 本で再生 |
-| `life.js` | 不要 | ライフゲームをシリアルコンソールに ANSI アニメーション表示 |
-| `mandelbrot.js` | 不要 | マンデルブロ集合へ 40 フレームの ASCII ズーム。終了後イベントループが自然終了 → タスク再起動でリプレイ |
-| `reaction.js` | LED G2 / ボタン G5 | 反射神経ゲーム。デバウンス・clearTimeout・ステートマシンの実例 |
-| `bench.js` | 不要 | マイクロベンチマーク 7 種 (再帰 / 篩 / 文字列 / Array 高階関数 / libm / JSON / RegExp) |
-| `mqtt_demo.js` | 不要 (要 WiFi) | test.mosquitto.org へ接続し publish→subscribe ループバック。mqtt.* API の実例 |
-| `i2c_scan.js` | I2C デバイス (Tab5 は内蔵) | バススキャン + BMI270 の chip_id 読み出し。i2c.* API の実例 |
-| `ui_console_test.js` | 不要 (Tab5 画面で確認) | コンソール表示試験: 日本語/長行/タブ/記号/**ANSI カラー** (SGR 16 色、行跨ぎの色持続) |
-| `ui_demo.js` | 不要 (Tab5 画面で確認) | ui.* 描画 API のデモ: アナログ時計 + サイン波の掃引。Stamp では no-op |
-| `touch_demo.js` | 不要 (Tab5 画面で操作) | ui.onTouch のお絵かきデモ: なぞって描く、指を上げると色替え、右上 □ でクリア |
-| `kbd_demo.js` | 不要 (Tab5 画面で操作) | ui.keyboard + ui.onKey + ui.textSize の行エディタ (JS ターミナルの種)。Enter で履歴に確定、タップでキーボード再表示 |
-| `ssh_term.js` | 要 WiFi + sshd (Tab5 画面で操作) | SSH 接続の最小端末 (Phase T1)。印字+改行+BS のみ。HOST/USER/PASS を自分の環境に書き換える |
-| `ssh_vt.js` | 要 WiFi + sshd (Tab5 画面で操作) | SSH ターミナルエミュレータ (Phase T2)。VT100 パーサ + 80x24 グリッド + 16 色。ls --color / vi / top 対応。`SELFTEST=true` で PC パーサ検証 |
+## UI の 3 形態と標準イディオム (W1 ウィジェットフレームワーク)
+
+サンプルは UI の使い方で 3 形態に分かれる
+(docs/widget-framework-design.md §1):
+
+1. **ウィジェットモード** — 設定・フォーム・リストは `ui.screen()` で作る。
+   スクロール・フォーカス・オンスクリーンキーボードは LVGL 任せの標準路。
+   例: `settings_demo.js` `i2c_scan.js` `mqtt_demo.js`
+2. **キャンバスモード (性能バイパス)** — 高頻度描画は `ui.cells / rect /
+   line / scroll` でコマンドキュー直行。ウィジェットを経由しないので
+   端末・グラフ・お絵かきはこちら。例: `ssh_vt.js` の描画部、`cells_test.js`
+3. **ハイブリッド** — ホットパスはキャンバスのまま、設定・フォームだけ
+   ウィジェット画面を重ねる。例: `touch_demo.js` `ui_demo.js`
+   `ssh_vt.js`/`ssh_term.js` (接続フォーム)
+
+どのサンプルも共通で使う 3 つのイディオム:
+
+```js
+// (1) 画面なし機 (Stamp) ではウィジェットを作らない。コールバックを
+//     登録するとイベントループが終了しなくなる (タスクの自動再実行が
+//     止まる) ので、ヘッドレス動作を保つスクリプトは必ずこのゲートを通す。
+var HAS_UI = ui.size()[0] !== 0;
+
+// (2) ウィジェット画面が開いている間はキャンバスの onTouch を遮断する。
+//     タッチはウィジェット画面の上でも mqjs に届くため。
+var inSettings = false;
+ui.onTouch(function (x, y, kind) {
+    if (inSettings) return;          // ウィジェットに任せる
+    /* ... キャンバスのホットパス ... */
+});
+
+// (3) 動的リストは「画面ごと作り直す」。行の個別削除 API は無い。
+//     ui.screen() を作り直せばリテインスタック (N=3) が古い画面を回収する。
+```
+
+ウィジェット API の使用例は `settings_demo.js`、設計と実測値は
+docs/widget-framework-design.md §3/§10 を参照。
+
+| スクリプト | 配線 | UI 形態 | 内容 |
+|---|---|---|---|
+| `blink_button.js` | LED G2 / ボタン G5 | ウィジェット (任意) | Lチカ + ボタンエッジ表示 (最初のマイルストーン)。Tab5 では点滅トグル/周期スライダー/エッジ表示のパネル付き |
+| `morse.js` | LED G2 | ウィジェット (任意) | メッセージをモールス信号で点滅。setTimeout チェーン 1 本で再生。Tab5 では FIELD でメッセージ差し替え |
+| `life.js` | 不要 | コンソール | ライフゲームをシリアルコンソールに ANSI アニメーション表示 |
+| `mandelbrot.js` | 不要 | コンソール | マンデルブロ集合へ 40 フレームの ASCII ズーム。終了後イベントループが自然終了 → タスク再起動でリプレイ |
+| `reaction.js` | LED G2 / ボタン G5 (無くても可) | ウィジェット (任意) | 反射神経ゲーム。デバウンス・clearTimeout・ステートマシン。Tab5 では画面の PRESS ボタンでも遊べる |
+| `bench.js` | 不要 | ウィジェット (表示のみ) | マイクロベンチマーク 7 種。Tab5 では結果をラベルに setText (ボタン無し = 自動リピート維持の実例) |
+| `mqtt_demo.js` | 不要 (要 WiFi) | ウィジェット | publish→subscribe ループバック + コントロールパネル (状態/最終受信/自動 publish トグル) |
+| `i2c_scan.js` | I2C デバイス (Tab5 は内蔵) | ウィジェット | バススキャン結果をリスト表示、行タップで reg0 読み出し、再スキャンは画面作り直し (動的リストの標準パターン) |
+| `settings_demo.js` | 不要 (Tab5 画面で操作) | ウィジェット | W1 ウィジェット API 一式のショーケース + ヒープ安定性計測 (navigate/back 周回) |
+| `ui_console_test.js` | 不要 (Tab5 画面で確認) | コンソール | コンソール表示試験: 日本語/長行/タブ/記号/**ANSI カラー** (SGR 16 色、行跨ぎの色持続) |
+| `ui_demo.js` | 不要 (Tab5 画面で確認) | ハイブリッド | アナログ時計 + サイン波 (キャンバス)。右上 □ で波形設定 (ウィジェット) |
+| `touch_demo.js` | 不要 (Tab5 画面で操作) | ハイブリッド | お絵かき (キャンバス直描き)。右上 □ でペン色/太さ/クリアの設定画面 |
+| `kbd_demo.js` | 不要 (Tab5 画面で操作) | キャンバス | ui.keyboard + ui.onKey + ui.textSize の行エディタ (端末キーボード経路のサンプル)。Enter で履歴に確定、タップでキーボード再表示 |
+| `cells_test.js` | 不要 (Tab5 画面で確認) | キャンバス | ui.cells/ui.scroll (グリフ直接ブリット) の最小スモーク |
+| `ssh_term.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH 最小端末 (Phase T1)。接続フォーム (ウィジェット) → 端末 (キャンバス)。認証情報はフォーム入力 |
+| `ssh_vt.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH ターミナルエミュレータ (Phase T2/T3)。VT100 パーサ + セルグリッド + 16 色。ls --color / vi / top 対応。接続フォーム入力、切断でフォームに復帰。`SELFTEST=true` で PC パーサ検証 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。

@@ -11,7 +11,10 @@
  * 将来 横画面化しても自動で追従する。HackGen 9x24 で 720px = 80 桁、
  * キーボード (常時表示, 400px) の上に 33 行。
  *
- * 接続先は下の HOST/USER/PASS を自分の環境に書き換える。
+ * 接続先は W1 ウィジェットの接続フォームで入力する (ハイブリッド UI:
+ * フォーム = ウィジェット、端末描画 = キャンバスの性能バイパスのまま)。
+ * 認証情報はスクリプトに残らない。切断されるとフォームに戻る。
+ * 下の HOST/PORT/USER はフォームの初期値 (書き換えてもよい)。
  *
  * 検証モード (どちらも committed 版は false):
  *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
@@ -22,7 +25,7 @@
 var HOST = "192.168.1.10";
 var PORT = 22;
 var USER = "user";
-var PASS = "password";
+var PASS = "";
 
 /* 検証フラグ。コメントは必ず 1 行に収める (フラグを sed で書き換えて
    push するため、複数行コメントだと注入で構文が壊れる)。 */
@@ -526,14 +529,18 @@ if (SELFTEST) {
              "\x1b[0m  scroll/cursor/SGR ok\r\n");
     }, 500);
 } else {
-    ui.clear(BG);
-    ui.keyboard(1);
+    /* 端末本体 (キャンバス) は常駐し、接続フォーム (ウィジェット画面) を
+       前面に重ねる。フォーム表示中は inForm でキャンバス側のタッチを遮断
+       (README のハイブリッド標準イディオム)。 */
+    var inForm = false;
 
     ssh.onData(function (chunk) {
         feed(chunk);
     });
     ssh.onClose(function (reason) {
         feed("\r\n*** SSH closed: " + reason + " ***\r\n");
+        ui.keyboard(0);
+        connectForm("切断: " + reason); /* フォームに戻る (再接続 UX) */
     });
     ui.onKey(function (k) {
         if (k === "\n")
@@ -545,12 +552,45 @@ if (SELFTEST) {
     });
 
     /* キーボードの ⌨ アイコン (LVGL の「閉じる」キー) で消えても、画面を
-       タップすれば呼び戻せるようにする (常時表示の保険)。 */
+       タップすれば呼び戻せるようにする (常時表示の保険)。フォームが前面の
+       間は何もしない (端末キーボードがフォームに被ってしまう)。 */
     ui.onTouch(function (x, y, kind) {
+        if (inForm)
+            return;
         if (kind === 0)
             ui.keyboard(1);
     });
 
     setInterval(flush, 25); /* ~40fps でダーティ行を消化 */
-    ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
+
+    /* ブロック内の function 宣言は mquickjs では巻き上げられない:
+       var への関数式代入にする (onClose より先に評価される位置に置く) */
+    var connectForm = function (note) {
+        inForm = true;
+        var s = ui.screen("SSH 接続");
+        if (note)
+            s.label(note);
+        var fh = s.field("Host");
+        fh.setText(HOST);
+        var fp = s.field("Port");
+        fp.setText("" + PORT);
+        var fu = s.field("User");
+        fu.setText(USER);
+        var fw = s.field("Password", { secret: true });
+        s.button("接続", function () {
+            HOST = fh.value();
+            USER = fu.value();
+            PASS = fw.value();
+            var p = parseInt(fp.value(), 10);
+            if (!isNaN(p))
+                PORT = p;
+            inForm = false;
+            ui.back();          /* キャンバス画面に戻ってから端末開始 */
+            ui.clear(BG);
+            resetTerm();
+            ui.keyboard(1);
+            ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
+        });
+    };
+    connectForm(null);
 }

@@ -7,7 +7,15 @@
  *
  * Timing note: the event loop runs on a 100 Hz FreeRTOS tick, so
  * durations are quantized to 10 ms. UNIT must stay well above that.
+ *
+ * 画面あり (Tab5) なら W1 ウィジェットでメッセージを差し替えられる:
+ * FIELD に入力して「送信」(フィールドはタップでオンスクリーンキーボード)。
+ * LED 再生コアはヘッドレスでも従来どおり (HAS_UI ゲート、README 参照)。
  */
+"use strict";
+
+var HAS_UI = ui.size()[0] !== 0;
+
 var LED = 2;
 var UNIT = 120;            /* ms per Morse unit */
 var MESSAGE = 'HELLO P4';
@@ -53,16 +61,18 @@ function compile(msg) {
     return seq;
 }
 
-var seq = compile(MESSAGE);
-
-/* pretty-print what we are about to send */
-var dots = '';
-var upper = MESSAGE.toUpperCase();
-for (var i = 0; i < upper.length; i++) {
-    var c = upper.charAt(i);
-    dots += (c === ' ') ? ' / ' : (codeOf(c) || '?') + ' ';
+function dotsOf(msg) {
+    var dots = '';
+    var upper = msg.toUpperCase();
+    for (var i = 0; i < upper.length; i++) {
+        var c = upper.charAt(i);
+        dots += (c === ' ') ? ' / ' : (codeOf(c) || '?') + ' ';
+    }
+    return dots;
 }
-print('sending forever:', MESSAGE, '=>', dots);
+
+var seq = compile(MESSAGE);
+print('sending forever:', MESSAGE, '=>', dotsOf(MESSAGE));
 
 var pos = 0;
 function step() {
@@ -75,3 +85,23 @@ function step() {
     setTimeout(step, ev[1] * UNIT);
 }
 step();
+
+if (HAS_UI) {
+    var s = ui.screen("モールス送信機 (LED G2)");
+    var stNow = s.label("送信中: " + MESSAGE);
+    var stDots = s.label(dotsOf(MESSAGE));
+    var f = s.field("メッセージ (A-Z 0-9 スペース)");
+    f.setText(MESSAGE);
+    s.button("この内容で送信", function () {
+        var m = f.value();
+        if (!m.length)
+            return;
+        MESSAGE = m;
+        seq = compile(MESSAGE);
+        pos = 0;                       /* 次の step から新タイムライン */
+        stNow.setText("送信中: " + MESSAGE);
+        stDots.setText(dotsOf(MESSAGE));
+        print('message changed:', MESSAGE, '=>', dotsOf(MESSAGE));
+    });
+    s.button("コンソールへ戻る", ui.back);
+}

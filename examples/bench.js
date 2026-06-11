@@ -7,7 +7,15 @@
  *
  * Numbers to expect: the VM is a bytecode interpreter, but the P4 has
  * a hardware double FPU, so float code is comparatively fast.
+ *
+ * 画面あり (Tab5) なら結果を W1 ウィジェットのラベルにも setText で流す。
+ * ボタンは置かない: コールバックを登録しなければイベントループは従来
+ * どおり終了し、自動リピートが保たれる (README のイディオム (1) 参照)。
  */
+"use strict";
+
+var HAS_UI = ui.size()[0] !== 0;
+
 function pad(s, n) {
     s = '' + s;
     while (s.length < n)
@@ -81,12 +89,25 @@ var benches = [
 
 print('=== mquickjs micro-bench on ESP32-P4 @ 360 MHz ===');
 
+/* 結果表示用ラベル (ボタン無し = イベントループ寿命に影響しない) */
+var rowLabels = [];
+var totalLabel = null;
+if (HAS_UI) {
+    var scr = ui.screen("mquickjs ベンチマーク");
+    scr.label("1 項目 = 1 tick (5s ウォッチドッグを跨がない)");
+    for (var bi = 0; bi < benches.length; bi++)
+        rowLabels.push(scr.label(benches[bi][0] + " ..."));
+    totalLabel = scr.label("TOTAL ...");
+}
+
 var idx = 0;
 var total = 0;
 function runNext() {
     if (idx >= benches.length) {
         print(pad('TOTAL', 28) + pad(total + ' ms', 10));
         print('suite done - task will restart and run again in ~1s');
+        if (totalLabel)
+            totalLabel.setText('TOTAL ' + total + ' ms — 終了 (1s 後に再実行)');
         return;                               /* no timers left: loop exits */
     }
     var name = benches[idx][0], fn = benches[idx][1];
@@ -95,6 +116,8 @@ function runNext() {
     var dt = performance.now() - t0;
     total += dt;
     print(pad(name, 28) + pad(dt + ' ms', 10) + ' => ' + result);
+    if (rowLabels.length > idx)
+        rowLabels[idx].setText(name + ': ' + dt + ' ms => ' + result);
     idx++;
     setTimeout(runNext, 10);
 }

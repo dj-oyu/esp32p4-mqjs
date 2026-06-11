@@ -1,8 +1,12 @@
-/* Tab5 ui.* デモ (Phase 2 受け入れ): push した JS だけで時計とグラフを描く。
- * PC (run_pc) ではスタブが print されるだけ。Stamp では全部 no-op。
+/* Tab5 ui.* デモ: アナログ時計 + サイン波。ハイブリッド UI のサンプル。
+ *
+ *  - 描画 = キャンバスモード (ui.line/rect/text)。毎秒の針更新と 50ms の
+ *    波形掃引はコマンドキュー直行の性能バイパス。
+ *  - 設定 (波形の速さ/一時停止) = ウィジェットモード。右上の □ をタップ。
  *
  * キューは満杯時に非ブロッキングで捨てる設計なので、起動時の静的シーン
- * (文字盤 60 本) は delay() で小分けに流す。 */
+ * (文字盤 60 本) は delay() で小分けに流す。
+ * PC (run_pc) ではスタブが print されるだけ。Stamp では全部 no-op。 */
 "use strict";
 
 var sz = ui.size();
@@ -14,7 +18,8 @@ var BG = 0x102030, FG = 0xE0E6EA, DIM = 0x47566A;
 var ACC = 0x4FC3F7, RED = 0xE05A4E;
 
 ui.clear(BG);
-ui.text(20, 14, "mqjs ui デモ (Phase 2)", FG);
+ui.text(20, 14, "mqjs ui デモ", FG);
+ui.rect(W - 72, 8, 56, 56, 0x2E6BD6); /* 設定を開くボタン */
 
 /* ---- アナログ時計: 文字盤 ---- */
 var CX = Math.round(W / 2), CY = 360, R = 210;
@@ -59,19 +64,45 @@ function drawClock() {
 setInterval(drawClock, 1000);
 drawClock();
 
-/* ---- ライブグラフ: サイン波の掃引 ---- */
-ui.text(20, 860, "サイン波 (50ms 周期)", DIM);
+/* ---- ライブグラフ: サイン波の掃引 (ホットパス) ---- */
+ui.text(20, 860, "サイン波 (50ms 周期) — 右上 □ で設定", DIM);
 var GC = 1020, GA = 100, gx = 0, ph = 0;
+var waveStep = 2;      /* 掃引の速さ (px/tick): 設定スライダーで変更 */
+var waveRun = true;    /* 一時停止トグル */
 ui.line(0, GC, W - 1, GC, DIM);
 setInterval(function () {
+    if (!waveRun)
+        return;
     ui.line(gx, GC - GA - 6, gx, GC + GA + 6, BG);   /* 自分の列を消す */
     var v = Math.sin(gx / 40 + ph);
     var y = GC - Math.round(v * GA);
     ui.rect(gx, y - 1, 2, 3, ACC);
     ui.pixel(gx, GC, DIM);                            /* 軸を復元 */
-    gx += 2;
+    gx += waveStep;
     if (gx >= W) {
         gx = 0;
         ph += 0.7;
     }
 }, 50);
+
+/* ---- ウィジェット設定画面 (ハイブリッドの「設定だけ標準 UI」部) ---- */
+var inSettings = false;
+
+function openSettings() {
+    inSettings = true;
+    var s = ui.screen("デモ設定");
+    s.label("サイン波");
+    s.toggle("掃引する", waveRun ? 1 : 0, function (v) { waveRun = v !== 0; });
+    s.slider(1, 10, waveStep, function (v) { waveStep = v; });
+    s.button("閉じる", function () {
+        inSettings = false;
+        ui.back();
+    });
+}
+
+ui.onTouch(function (x, y, kind) {
+    if (inSettings)
+        return;
+    if (kind === 0 && x > W - 80 && y < 72)
+        openSettings();
+});

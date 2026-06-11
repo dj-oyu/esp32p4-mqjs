@@ -1,16 +1,14 @@
 /* Tab5 SSH ターミナル (Phase T1): オンスクリーンキーボード + ssh.* で
  * 本物の SSH シェルに繋ぐ最小ターミナル。サーバの出力をコンソール風に
- * 流し、キーボード入力をそのまま送る。VT エスケープの厳密な解釈はまだ
- * せず、印字可能文字と改行・BS だけ扱う (T2 で拡張)。
+ * 流し、キーボード入力をそのまま送る。VT エスケープの厳密な解釈はせず、
+ * 印字可能文字と改行・BS だけ扱う (本格版は ssh_vt.js)。
  *
- * 接続先は下の HOST/USER/PASS を自分の環境に書き換えること。
- * PC では ssh.* はスタブ (接続しない)。 */
+ * 接続先はハードコードせず、W1 ウィジェットの接続フォームで入力する
+ * (ハイブリッド UI: フォーム = ウィジェット、端末描画 = キャンバス)。
+ * 認証情報がスクリプトに残らないので、このファイルはそのまま共有できる。
+ * 切断されるとフォームに戻る。PC ではウィジェットイベントが発火しない
+ * ためフォームから先へは進まない (端末コアの構文チェックのみ)。 */
 "use strict";
-
-var HOST = "192.168.1.10";
-var PORT = 22;
-var USER = "pi";
-var PASS = "changeme";
 
 var sz = ui.size();
 var W = sz[0], H = sz[1];
@@ -20,30 +18,30 @@ if (!W)
 var BG = 0x0B0E11;
 var FG = 0xC9D1D9;
 var cell = ui.textSize("M");      /* 等幅近似: 半角 1 マス */
-var CW = cell[0], LH = cell[1] + 2;
+var CW = cell[0] || 10, LH = (cell[1] || 25) + 2;
 var KB_H = 400;
 var VIEW_H = H - KB_H;
-/* wolfSSH の pty は組込み設定では 80x24 固定 (ライブリサイズ不可、T3 で対応)。
- * サーバの stty とずれないよう端末側もこれに合わせる。 */
 var COLS = 80;
 var ROWS = 24;
 
-/* 行バッファ (素朴な端末: 制御は \n \r \b と印字文字のみ) */
+/* ---- 端末コア (キャンバスモード: ui.rect/text 直描き) ---- */
+
 var lines = [""];
 var dirty = true;
+var running = false;     /* 端末 / フォームのどちらが前面か */
 
 function putChar(c) {
     var code = c.charCodeAt(0);
     if (c === "\n") {
         lines.push("");
     } else if (c === "\r") {
-        /* キャリッジリターン: 現在行頭へ (上書きは簡略化で無視) */
+        /* キャリッジリターン: 上書きは簡略化で無視 */
     } else if (code === 8 || code === 127) { /* BS / DEL */
         var ln = lines[lines.length - 1];
         if (ln.length)
             lines[lines.length - 1] = ln.slice(0, -1);
     } else if (code === 27) {
-        /* ESC シーケンス: T2 までは無視 (次の 1〜2 文字も捨てない簡易版) */
+        /* ESC シーケンス: この最小版では無視 */
     } else if (code >= 32) {
         lines[lines.length - 1] += c;
     }
@@ -58,7 +56,7 @@ function feed(s) {
 }
 
 function redraw() {
-    if (!dirty)
+    if (!dirty || !running)
         return;
     dirty = false;
     ui.rect(0, 0, W, VIEW_H, BG);
@@ -76,6 +74,8 @@ ssh.onClose(function (reason) {
     feed("\n*** SSH closed: " + reason + " ***\n");
     redraw();
     ui.keyboard(0);
+    running = false;
+    connectForm("切断: " + reason); /* フォームに戻る (再接続 UX) */
 });
 
 ui.onKey(function (k) {
@@ -88,7 +88,34 @@ ui.onKey(function (k) {
         ssh.write(k);
 });
 
-feed("ssh " + USER + "@" + HOST + ":" + PORT + " ...\n");
-redraw();
-ui.keyboard(1);
-ssh.connect(HOST, PORT, USER, PASS, COLS, ROWS);
+function startTerm(host, port, user, pass) {
+    running = true;
+    lines = [""];
+    feed("ssh " + user + "@" + host + ":" + port + " ...\n");
+    dirty = true;
+    redraw();
+    ui.keyboard(1);
+    ssh.connect(host, port, user, pass, COLS, ROWS);
+}
+
+/* ---- 接続フォーム (ウィジェットモード) ---- */
+
+function connectForm(note) {
+    var s = ui.screen("SSH 接続 (T1 ミニ端末)");
+    if (note)
+        s.label(note);
+    var host = s.field("Host");
+    host.setText("192.168.1.10");
+    var port = s.field("Port");
+    port.setText("22");
+    var user = s.field("User");
+    user.setText("pi");
+    var pass = s.field("Password", { secret: true });
+    s.button("接続", function () {
+        var p = parseInt(port.value(), 10);
+        ui.back(); /* キャンバス (コンソール) 画面に戻ってから端末開始 */
+        startTerm(host.value(), isNaN(p) ? 22 : p, user.value(), pass.value());
+    });
+}
+
+connectForm(null);
