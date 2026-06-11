@@ -81,7 +81,7 @@ function build() {
                 list.add("○ " + name, function () { openApp(name); });
             })(inst[j]);
     }
-    s.label("● 実行中 (✕ で停止) / ○ 停止中 — バー長押しでいつでもここへ");
+    s.label("● 実行中 / x で停止 / ○ 停止中 ... バー長押しでいつでもここへ");
 }
 
 sys.onForeground(build);

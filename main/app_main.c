@@ -4,13 +4,14 @@
  * js_task owns every JS context (cooperative multi-context, see
  * docs/launcher-multiapp-design.md):
  *   - slot 0: the resident launcher (embedded examples/launcher.js,
- *     auto-started and kept alive by the scheduler, unstoppable).
+ *     auto-started and kept alive by the scheduler, unstoppable) —
+ *     the only embedded app.
  *   - dev slot (1): the classic development flow. The script comes from
  *     LittleFS (persisted) or the embedded examples/ file
  *     (idf.py -DMQJS_SCRIPT=life.js build flash) and is replaced by
  *     signed pushes over MQTT; it auto-reruns 1s after a natural end.
- *   - the second embedded app (-DMQJS_APP2=p4_bg_app.js) is registered
- *     as a launchable source; start it from the launcher.
+ *   - slots 2-3: apps installed over MQTT ("// @app <name>" push ->
+ *     /littlefs/apps/), started from the launcher / sys.launch.
  * Status bar: the chip opens the previous app, a long-press opens the
  * launcher.
  */
@@ -30,12 +31,7 @@ static const char *TAG = "app";
 
 /* embedded by EMBED_TXTFILES (NUL-terminated) */
 extern const char _binary_task_js_start[];
-extern const char _binary_app2_js_start[];
 extern const char _binary_launcher_js_start[];
-
-#ifndef MQJS_APP2_NAME
-#define MQJS_APP2_NAME "app2" /* set by CMake from the MQJS_APP2 filename */
-#endif
 
 /* current dev-slot source; owned here (the runtime only borrows it,
    so the buffer must outlive the running app — see mqjs_app_start) */
@@ -70,13 +66,9 @@ static void js_task(void *arg)
 {
     mqjs_rt_init(); /* arenas (4 x 256KB PSRAM) + shared event queue */
 
-    /* relaunchable embedded sources: the scheduler keeps "launcher"
-       resident in slot 0; the second app starts from the launcher */
+    /* the scheduler keeps the registered "launcher" resident in slot 0 */
     mqjs_register_app_source("launcher", _binary_launcher_js_start,
                              strlen(_binary_launcher_js_start));
-    if (_binary_app2_js_start[0] != '\0')
-        mqjs_register_app_source(MQJS_APP2_NAME, _binary_app2_js_start,
-                                 strlen(_binary_app2_js_start));
 
     /* a previously verified+persisted task takes over the embedded one.
        lengths are tracked explicitly: bytecode tasks contain NULs */

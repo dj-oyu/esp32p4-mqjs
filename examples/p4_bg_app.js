@@ -1,14 +1,14 @@
-// P4a 検証用バックグラウンドアプリ (slot 2 に組み込みで常駐)。
+// @app p4_bg_app
+// バックグラウンド実行のデモアプリ (P4a 検証から派生)。push すると
+// 上のディレクティブにより /littlefs/apps/ にインストールされ、
+// ランチャーから起動できる (dev タスクとしては実行されない)。
 //
-// 確認したいこと (launcher-multiapp-design.md §5 実装順):
+// 見せるもの:
 //   1. 背景でも実行が続く: 1 秒ごとの tick と MQTT ループバックが
-//      前面が ssh_vt でも止まらない (コンソールに [bg_app] 行が流れ続ける)
-//   2. 前面復帰でアプリが画面を自前で再構築する (sys.onForeground)
+//      前面が ssh_vt でも止まらない
+//   2. 前面復帰で画面を自前で再構築する (sys.onForeground)
 //   3. sys.signal / sys.onSignal の最小 IPC
-//
-// 切替はステータスバーをタップ (P4a の暫定ジェスチャ、フォアグラウンドを
-// 巡回)。dev スロットのタスクからは sys.signal("bg_app", "...") で
-// このアプリへシグナルを送れる。
+//      (dev タスクから sys.signal("p4_bg_app", "...") で送れる)
 "use strict";
 sys.setAppName("p4_bg_app");
 
