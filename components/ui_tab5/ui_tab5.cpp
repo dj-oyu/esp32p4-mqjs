@@ -97,11 +97,21 @@ const lv_font_t *ui_tab5_jp_font(void)
  * 24px line height. Glyphs are blitted directly (no lv_draw_label) and
  * clipped to the cell, so the box-drawing overhang (box_w up to 11) tiles
  * cleanly across cell edges. */
+#include "driver/ppa.h"
+
 extern "C" {
 LV_FONT_DECLARE(font_term_mono);
 }
 #define UI_CELL_W 9
 #define UI_CELL_H 24
+
+/* PPA fill offload (device-measured 2026-06-12, main/ppa_bench.c): CPU
+   fills are PSRAM-bandwidth-bound at ~43 Mpix/s regardless of store
+   width, ppa_do_fill sustains ~175; the blocking-op overhead (~60us)
+   puts the break-even near 2.5k px. Rects below the threshold (and all
+   glyph blits) stay on the CPU, which wins there. */
+#define UI_PPA_FILL_MIN_PX 4096
+static ppa_client_handle_t s_ppa_fill;
 
 /* blend fg over bg on RGB565 by a 4-bit alpha (0=bg .. 15=fg) */
 static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
@@ -1697,12 +1707,23 @@ public:
 
     void onCreate() override
     {
-        size_t bytes = (size_t)s_canvas_w * s_canvas_h * 2;
-        _buf = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        /* 64B (L1/L2 cache line) aligned start + size: lets the PPA do
+           cache-coherent fills straight into the canvas */
+        size_t bytes = ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
+        _buf = (uint16_t *)heap_caps_aligned_alloc(64, bytes,
+                                                   MALLOC_CAP_SPIRAM);
         if (!_buf) {
             ESP_LOGE(TAG, "canvas buffer alloc failed (%u bytes)",
                      (unsigned)bytes);
             return;
+        }
+        if (!s_ppa_fill) {
+            ppa_client_config_t cfg = {};
+            cfg.oper_type = PPA_OPERATION_FILL;
+            if (ppa_register_client(&cfg, &s_ppa_fill) != ESP_OK) {
+                s_ppa_fill = nullptr;
+                ESP_LOGW(TAG, "PPA unavailable, large fills stay on CPU");
+            }
         }
         fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
         _canvas = lv_canvas_create(lv_screen_active());
@@ -1774,9 +1795,7 @@ private:
 
     void fill_all(uint16_t px)
     {
-        size_t n = (size_t)s_canvas_w * s_canvas_h;
-        for (size_t i = 0; i < n; i++)
-            _buf[i] = px;
+        fill_rect(0, 0, s_canvas_w, s_canvas_h, px);
     }
 
     void fill_rect(int x, int y, int w, int h, uint16_t px)
@@ -1787,6 +1806,29 @@ private:
             x1 = s_canvas_w;
         if (y1 > s_canvas_h)
             y1 = s_canvas_h;
+        if (s_ppa_fill && x1 - x0 > 0 && y1 - y0 > 0 &&
+            (x1 - x0) * (y1 - y0) >= UI_PPA_FILL_MIN_PX) {
+            ppa_fill_oper_config_t op = {};
+            op.out.buffer = _buf;
+            op.out.buffer_size =
+                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
+            op.out.pic_w = (uint32_t)s_canvas_w;
+            op.out.pic_h = (uint32_t)s_canvas_h;
+            op.out.block_offset_x = (uint32_t)x0;
+            op.out.block_offset_y = (uint32_t)y0;
+            op.out.fill_cm = PPA_FILL_COLOR_MODE_RGB565;
+            op.fill_block_w = (uint32_t)(x1 - x0);
+            op.fill_block_h = (uint32_t)(y1 - y0);
+            /* 565 -> 888 by zero-extend; PPA truncates back, lossless */
+            op.fill_argb_color.a = 0xFF;
+            op.fill_argb_color.r = (uint32_t)(((px >> 11) & 0x1F) << 3);
+            op.fill_argb_color.g = (uint32_t)(((px >> 5) & 0x3F) << 2);
+            op.fill_argb_color.b = (uint32_t)((px & 0x1F) << 3);
+            op.mode = PPA_TRANS_MODE_BLOCKING;
+            if (ppa_do_fill(s_ppa_fill, &op) == ESP_OK)
+                return;
+            /* any PPA error: fall through to the CPU loop */
+        }
         for (int yy = y0; yy < y1; yy++)
             for (int xx = x0; xx < x1; xx++)
                 _buf[(size_t)yy * s_canvas_w + xx] = px;
@@ -1898,6 +1940,15 @@ private:
         uint16_t fg = lv_color_to_u16(lv_color_hex(cmd.color));
         uint16_t bg = lv_color_to_u16(lv_color_hex(cmd.bg));
         const uint8_t *s = (const uint8_t *)cmd.text;
+        /* the run has a single bg: clear it in one rect (instead of one
+           9x24 fill per cell) — row-contiguous, and long runs clear the
+           PPA threshold */
+        int n = 0;
+        for (const uint8_t *p = s; *p; p++)
+            if ((*p & 0xC0) != 0x80)
+                n++;
+        fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W, UI_CELL_H,
+                  bg);
         int c = col;
         while (*s) {
             /* minimal UTF-8 decode */
@@ -1914,7 +1965,6 @@ private:
                 s += 1;
             }
             int cx0 = c * UI_CELL_W, cy0 = row * UI_CELL_H;
-            fill_rect(cx0, cy0, UI_CELL_W, UI_CELL_H, bg);
             blit_glyph(cx0, cy0, cp, fg);
             c++;
         }
