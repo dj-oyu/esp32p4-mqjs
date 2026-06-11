@@ -113,6 +113,36 @@ LV_FONT_DECLARE(font_term_mono);
 #define UI_PPA_FILL_MIN_PX 4096
 static ppa_client_handle_t s_ppa_fill;
 
+/* PPA blend offload for cells runs (same bench: CPU A4 blend ~8 Mpix/s
+   at -O2, PPA ~45 at row sizes, break-even ~900px ≈ 4 cells; 6 leaves
+   margin for the compose pass). The run's glyph coverage is composed
+   into an A8 buffer in internal SRAM — A8, not A4, because the PPA
+   expands A4 alpha by <<4 (a=15 -> 240/255, never fully opaque,
+   probed 2026-06-12 in main/ppa_bench.c) while A8 a4*17=255 matches
+   ui_blend565's a/15 math exactly. One full text row max. */
+#define UI_PPA_CELLS_MIN_CELLS 6
+static ppa_client_handle_t s_ppa_blend;
+/* 720 = canvas width; 64B-aligned (and 64B-multiple) for PPA cache ops */
+static uint8_t s_cells_a8[720 * UI_CELL_H] __attribute__((aligned(64)));
+
+/* minimal UTF-8 decode, shared by both cells paths */
+static inline uint32_t cells_utf8_next(const uint8_t *&s)
+{
+    uint32_t cp = *s++;
+    if (cp >= 0xF0 && (s[0] & 0xC0) == 0x80) {
+        cp = ((cp & 0x07) << 18) | ((s[0] & 0x3F) << 12) |
+             ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        s += 3;
+    } else if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80) {
+        cp = ((cp & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F);
+        s += 2;
+    } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
+        cp = ((cp & 0x1F) << 6) | (s[0] & 0x3F);
+        s += 1;
+    }
+    return cp;
+}
+
 /* blend fg over bg on RGB565 by a 4-bit alpha (0=bg .. 15=fg) */
 static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
 {
@@ -1725,6 +1755,14 @@ public:
                 ESP_LOGW(TAG, "PPA unavailable, large fills stay on CPU");
             }
         }
+        if (!s_ppa_blend) {
+            ppa_client_config_t cfg = {};
+            cfg.oper_type = PPA_OPERATION_BLEND;
+            if (ppa_register_client(&cfg, &s_ppa_blend) != ESP_OK) {
+                s_ppa_blend = nullptr; /* cells runs stay on the CPU */
+                ESP_LOGW(TAG, "PPA blend unavailable, cells stay on CPU");
+            }
+        }
         fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
         _canvas = lv_canvas_create(lv_screen_active());
         lv_canvas_set_buffer(_canvas, _buf, s_canvas_w, s_canvas_h,
@@ -1930,8 +1968,55 @@ private:
         }
     }
 
+    /* Compose one glyph's coverage into the run's A8 buffer (no canvas
+       access, no blending — just alpha bytes). Mirrors blit_glyph's
+       positioning/clipping; a4*17 so 15 -> 255 = fully opaque. */
+    void compose_glyph_a8(uint8_t *dst, int dst_w, int cx0, uint32_t cp)
+    {
+        const lv_font_t *font = &font_term_mono;
+        lv_font_glyph_dsc_t g;
+        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
+            return;
+        if (g.box_w == 0 || g.box_h == 0)
+            return;
+        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
+        if (!rf->get_glyph_bitmap)
+            return;
+        g.req_raw_bitmap = 1;
+        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
+        if (!bmp)
+            return;
+        const int bpp = 4;
+        int baseline = UI_CELL_H - font->base_line;
+        int gx0 = cx0 + g.ofs_x;
+        int gy0 = baseline - g.ofs_y - g.box_h;
+        int clipL = cx0 < 0 ? 0 : cx0;
+        int clipR = cx0 + UI_CELL_W;
+        if (clipR > dst_w)
+            clipR = dst_w;
+        for (int py = 0; py < g.box_h; py++) {
+            int y = gy0 + py;
+            if (y < 0 || y >= UI_CELL_H)
+                continue;
+            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
+            uint8_t *drow = dst + (size_t)y * dst_w;
+            for (int px = 0; px < g.box_w; px++) {
+                int x = gx0 + px;
+                if (x < clipL || x >= clipR)
+                    continue;
+                int bitpos = rowbit + px * bpp;
+                uint8_t byte = bmp[bitpos >> 3];
+                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
+                if (a)
+                    drow[x] = (uint8_t)(a * 17);
+            }
+        }
+    }
+
     /* Draw a run of cells (one fg/bg) starting at (col,row) using the
-       monospace grid font. UTF-8 decoded to codepoints. */
+       monospace grid font. UTF-8 decoded to codepoints. Long runs that
+       sit fully on the grid go compose-then-one-PPA-blend; short runs
+       and any PPA failure use the per-glyph CPU blit. */
     void cells(const ui_cmd_t &cmd)
     {
         if (!cmd.text)
@@ -1947,25 +2032,57 @@ private:
         for (const uint8_t *p = s; *p; p++)
             if ((*p & 0xC0) != 0x80)
                 n++;
-        fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W, UI_CELL_H,
-                  bg);
+        int x0 = col * UI_CELL_W, y0 = row * UI_CELL_H, bw = n * UI_CELL_W;
+        fill_rect(x0, y0, bw, UI_CELL_H, bg);
+
+        if (s_ppa_blend && n >= UI_PPA_CELLS_MIN_CELLS && x0 >= 0 &&
+            y0 >= 0 && x0 + bw <= s_canvas_w &&
+            y0 + UI_CELL_H <= s_canvas_h &&
+            (size_t)bw * UI_CELL_H <= sizeof(s_cells_a8)) {
+            memset(s_cells_a8, 0, (size_t)bw * UI_CELL_H);
+            const uint8_t *p = s;
+            for (int c = 0; *p; c++)
+                compose_glyph_a8(s_cells_a8, bw, c * UI_CELL_W,
+                                 cells_utf8_next(p));
+            ppa_blend_oper_config_t op = {};
+            op.in_bg.buffer = _buf;
+            op.in_bg.pic_w = (uint32_t)s_canvas_w;
+            op.in_bg.pic_h = (uint32_t)s_canvas_h;
+            op.in_bg.block_w = (uint32_t)bw;
+            op.in_bg.block_h = UI_CELL_H;
+            op.in_bg.block_offset_x = (uint32_t)x0;
+            op.in_bg.block_offset_y = (uint32_t)y0;
+            op.in_bg.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
+            op.in_fg.buffer = s_cells_a8;
+            op.in_fg.pic_w = (uint32_t)bw;
+            op.in_fg.pic_h = UI_CELL_H;
+            op.in_fg.block_w = (uint32_t)bw;
+            op.in_fg.block_h = UI_CELL_H;
+            op.in_fg.blend_cm = PPA_BLEND_COLOR_MODE_A8;
+            op.out.buffer = _buf;
+            op.out.buffer_size =
+                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
+            op.out.pic_w = (uint32_t)s_canvas_w;
+            op.out.pic_h = (uint32_t)s_canvas_h;
+            op.out.block_offset_x = (uint32_t)x0;
+            op.out.block_offset_y = (uint32_t)y0;
+            op.out.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
+            op.bg_alpha_update_mode = PPA_ALPHA_FIX_VALUE;
+            op.bg_alpha_fix_val = 255;
+            op.fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+            op.fg_fix_rgb_val.r = (uint32_t)(((fg >> 11) & 0x1F) << 3);
+            op.fg_fix_rgb_val.g = (uint32_t)(((fg >> 5) & 0x3F) << 2);
+            op.fg_fix_rgb_val.b = (uint32_t)((fg & 0x1F) << 3);
+            op.mode = PPA_TRANS_MODE_BLOCKING;
+            if (ppa_do_blend(s_ppa_blend, &op) == ESP_OK)
+                return;
+            /* any PPA error: fall through to the per-glyph CPU path */
+        }
+
         int c = col;
         while (*s) {
-            /* minimal UTF-8 decode */
-            uint32_t cp = *s++;
-            if (cp >= 0xF0 && (s[0] & 0xC0) == 0x80) {
-                cp = ((cp & 0x07) << 18) | ((s[0] & 0x3F) << 12) |
-                     ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-                s += 3;
-            } else if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80) {
-                cp = ((cp & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F);
-                s += 2;
-            } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
-                cp = ((cp & 0x1F) << 6) | (s[0] & 0x3F);
-                s += 1;
-            }
-            int cx0 = c * UI_CELL_W, cy0 = row * UI_CELL_H;
-            blit_glyph(cx0, cy0, cp, fg);
+            uint32_t cp = cells_utf8_next(s);
+            blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg);
             c++;
         }
     }

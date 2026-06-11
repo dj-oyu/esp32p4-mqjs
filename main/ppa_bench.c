@@ -376,6 +376,54 @@ void ppa_bench_run(void)
     s_canvas = NULL;
 }
 
+/* One-shot probe: which nibble of a PPA A4 foreground byte is the
+   FIRST (leftmost) pixel? Blend a buffer whose byte 0 is 0xF0 (high
+   nibble = opaque) over black with a white fix color, then look at
+   which of px[0]/px[1] turned white.
+   ANSWER (measured 2026-06-12): first px = LOW nibble, and A4 alpha is
+   expanded by <<4 (a=15 -> 240/255, NOT fully opaque: px read back
+   0xf79e, ~94% white). ui_tab5's cells blend therefore feeds the PPA
+   an A8 foreground (a4*17 -> 255 = truly opaque, same a/15 math as
+   ui_blend565) instead of A4. */
+void ppa_bench_a4_order(void)
+{
+    enum { W = 32, H = 24 };
+    uint16_t *bg = heap_caps_aligned_alloc(64, (size_t)W * H * 2,
+                                           MALLOC_CAP_SPIRAM);
+    uint8_t *fg = heap_caps_aligned_alloc(64, (size_t)W * H / 2,
+                                          MALLOC_CAP_INTERNAL);
+    if (!bg || !fg) {
+        ESP_LOGE(TAG, "a4 order probe: alloc failed");
+        return;
+    }
+    memset(bg, 0, (size_t)W * H * 2);
+    memset(fg, 0, (size_t)W * H / 2);
+    fg[0] = 0xF0;
+
+    ppa_client_handle_t cl;
+    ppa_client_config_t cfg = { .oper_type = PPA_OPERATION_BLEND };
+    ESP_ERROR_CHECK(ppa_register_client(&cfg, &cl));
+    ppa_blend_oper_config_t op = {
+        .in_bg = { .buffer = bg, .pic_w = W, .pic_h = H, .block_w = W,
+                   .block_h = H, .blend_cm = PPA_BLEND_COLOR_MODE_RGB565 },
+        .in_fg = { .buffer = fg, .pic_w = W, .pic_h = H, .block_w = W,
+                   .block_h = H, .blend_cm = PPA_BLEND_COLOR_MODE_A4 },
+        .out = { .buffer = bg, .buffer_size = (size_t)W * H * 2, .pic_w = W,
+                 .pic_h = H, .blend_cm = PPA_BLEND_COLOR_MODE_RGB565 },
+        .bg_alpha_update_mode = PPA_ALPHA_FIX_VALUE,
+        .bg_alpha_fix_val = 255,
+        .fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+        .fg_fix_rgb_val = { .r = 255, .g = 255, .b = 255 },
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    ESP_ERROR_CHECK(ppa_do_blend(cl, &op));
+    ESP_LOGI(TAG, "a4 nibble order: px[0]=%04x px[1]=%04x -> first px = %s nibble",
+             bg[0], bg[1], bg[0] ? "HIGH" : (bg[1] ? "LOW" : "??"));
+    ppa_unregister_client(cl);
+    heap_caps_free(fg);
+    heap_caps_free(bg);
+}
+
 /* === CPU/PPA crossover search ======================================== */
 
 /* blit a w x h block out of a pic_w-wide A4 picture (row stride follows
