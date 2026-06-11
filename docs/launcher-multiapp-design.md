@@ -13,11 +13,14 @@ onForeground 移行 (ssh_vt / mqtt_demo / p4_bg_app / launcher)。
 **P4c も完了** (2026-06-11、実機検証済み — §4.5): retained メッセージ =
 ストアの棚 (apps/+ 購読で接続毎に同期、バイト比較で冪等、install-only)、
 tombstone = 空 retained でアンインストール、manifest ディレクティブ
-(@app/@title/@perm — perm は表示のみ)、sys.uninstall + ランチャー ○ 行の
-ゴミ箱ボタン (LV_SYMBOL_TRASH、停止の ✕ と区別)、sys.notices() +
+(@app/@title/@icon/@perm — perm は表示のみ)、sys.uninstall + ランチャー
+○ 行のゴミ箱ボタン (LV_SYMBOL_TRASH、停止の ✕ と区別)、sys.notices() +
 ランチャー通知セクション + バー通知行タップで発信アプリを開く、
-mqjs_push.py --retain/--delete。見送り (発動条件 = 署名鍵以外の出所):
-権限強制 / アイコン / store 名前空間強制。
+mqjs_push.py --retain/--delete。**Nerd Font 統合も完了** (HackGen
+Console NF: 端末 17px に NF BMP 範囲、UI 20px を ui_font 連鎖 3 段目に;
+ステータスバーの状態グリフ・チップのモードグリフ・通知ベル・@icon の
+ランチャー表示 — 全部実機で表示確認済み 2026-06-11)。見送り
+(発動条件 = 署名鍵以外の出所): 権限強制 / store 名前空間強制。
 次は **P4d(typed clipboard IPC)**。
 
 関連: `docs/widget-framework-design.md`(W1〜W3 済 — 画面遷移・リテイン
@@ -344,9 +347,10 @@ for (;;) {
   ない。ラベルは独立タップ対象なのでバーの長押し状態機械とは干渉
   しない。
 
-**見送り (P4c 範囲外と明示)**: 権限強制 / アイコン / store 名前空間
-強制 (NVS キー 15 字の予算と単一オーナー運用のため、発動条件は権限
-強制と同じ「他人のコードが入るとき」)。
+**見送り (P4c 範囲外と明示)**: 権限強制 / store 名前空間強制 (NVS キー
+15 字の予算と単一オーナー運用のため、発動条件は権限強制と同じ
+「他人のコードが入るとき」)。アイコンは当初見送りだったが、Nerd Font
+統合 (`@icon` = ただの 1 文字) でコストが消えたため P4c 内で実装済み。
 
 ## 5. フェーズ計画
 
