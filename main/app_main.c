@@ -81,6 +81,10 @@ static void js_task(void *arg)
 
 void app_main(void)
 {
+    /* boot-time micro-benches (2026-06-12): ppa_bench_run() /
+       ppa_bench_crossover() / jsmem_bench_run() — call here to
+       re-measure on a quiet system. Measured: PPA 4-13x on >=500px
+       fills/blends; JS arena SRAM-vs-PSRAM only ~3% (L2 absorbs it). */
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
