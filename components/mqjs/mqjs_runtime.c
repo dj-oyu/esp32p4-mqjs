@@ -244,6 +244,10 @@ static bool s_dev_hold;          /* explicit sys.stop(dev): no auto-rerun
                                     until the next push / sys.launch("dev") */
 static int64_t s_dev_retry_at;   /* next time to ask the dev provider */
 static int64_t s_launcher_retry_at;
+static char s_last_dev_name[32]; /* what the dev app called itself: lets
+                                    the chip relaunch a stopped dev task
+                                    by its real name (sys.launch falls
+                                    back to the provider on a match) */
 
 /* the status-bar chip target: the previous foreground app, kept by NAME
    (a relaunch may land in a different slot) */
@@ -2039,6 +2043,8 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
             return JS_NewBool(0);
     }
     snprintf(s_cur_app->name, sizeof s_cur_app->name, "%s", name);
+    if (s_cur_app->slot == MQJS_SLOT_DEV)
+        snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", name);
     bar_update();
     return JS_NewBool(1);
 }
@@ -2170,6 +2176,14 @@ JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
             return JS_NewInt32(ctx, i); /* already running */
     if (!strcmp(name, "launcher")) /* resident in slot 0, never elsewhere */
         return JS_NewInt32(ctx, -1);
+    /* the stopped dev task addressed by its setAppName identity (the
+       chip remembers "ssh_vt", not "dev"): rerun via the provider */
+    if (!s_apps[MQJS_SLOT_DEV].used && s_last_dev_name[0] &&
+        !strcmp(name, s_last_dev_name)) {
+        s_dev_hold = false;
+        s_dev_retry_at = 0;
+        return JS_NewInt32(ctx, MQJS_SLOT_DEV);
+    }
 
     int slot = app_free_slot();
     if (slot < 0 || !app_ensure_mem(&s_apps[slot]))
@@ -3120,6 +3134,8 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "app '%s' started in slot %d", app->name, app->slot);
 #endif
+    if (app->slot == MQJS_SLOT_DEV)
+        snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", app->name);
     bar_update();
     return 0;
 }

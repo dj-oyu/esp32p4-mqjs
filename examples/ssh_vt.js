@@ -769,5 +769,22 @@ if (SELFTEST) {
         }
     };
 
+    /* ---- P4b ライフサイクル: 画面は切替時に C 側で全破棄されるので、
+       復帰時にいまのモードを描き直す。モデル (sessions / 端末グリッド /
+       hosts) は背景でも生きていて受信は continue するから、端末はフル
+       再描画 + flush で追い付き、ページは一覧から再入する (フォーム
+       入力中の内容だけは戻らない — モデルではないので)。 */
+    sys.onForeground(function () {
+        if (!inForm && actIdx >= 0 && actIdx < sessions.length) {
+            ui.clear(BG);
+            sessions[actIdx].term.markAll(); /* flush 間隔が描き直す */
+            drawTabs();
+            ui.keyboard(1);
+        } else {
+            inForm = true;
+            hostsPage(sessions.length ? "接続は維持されています" : null);
+        }
+    });
+
     hostsPage(null);
 }

@@ -24,6 +24,7 @@ var autoPub = true;
 
 /* ウィジェットは作った後で setText する (画面なし機ではダミーの no-op) */
 var stConn = null, stRx = null;
+var lastRx = "";
 
 mqtt.onConnect(function () {
     print("[mqtt_demo] connected to " + BROKER);
@@ -34,6 +35,7 @@ mqtt.onConnect(function () {
 // 接続前に subscribe してよい (接続確立時にまとめて購読される)
 mqtt.subscribe(TOPIC, function (t, p) {
     print("[mqtt_demo] rx " + t + " = " + p);
+    lastRx = p;
     if (stRx)
         stRx.setText("rx: " + p);
 });
@@ -52,12 +54,20 @@ setInterval(function () {
         publishNow();
 }, 3000);
 
-if (HAS_UI) {
+/* P4b: 画面は切替時に破棄されるので、初回もフォアグラウンド復帰も
+   同じ buildPanel で現在のモデルから作り直す */
+var buildPanel = function () {
     var s = ui.screen("MQTT デモ");
-    stConn = s.label("接続待ち: " + BROKER);
+    stConn = s.label((mqtt.connected() ? "接続中: " : "接続待ち: ") + BROKER);
     s.label("topic: " + TOPIC);
-    stRx = s.label("rx: (まだ)");
-    s.toggle("3 秒ごとに自動 publish", 1, function (v) { autoPub = v !== 0; });
+    stRx = s.label("rx: " + (lastRx || "(まだ)"));
+    s.toggle("3 秒ごとに自動 publish", autoPub ? 1 : 0,
+             function (v) { autoPub = v !== 0; });
     s.button("今すぐ publish", function () { publishNow(); });
     s.button("コンソールへ戻る", ui.back);
+};
+
+if (HAS_UI) {
+    buildPanel();
+    sys.onForeground(buildPanel);
 }
