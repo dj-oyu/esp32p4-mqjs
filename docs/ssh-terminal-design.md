@@ -233,23 +233,34 @@ per-cell `ui.text` は重すぎた (グリフ毎に `lv_draw_label` レイヤを
   readline、結果は既存 VT パーサが描画)。受信 `\t` のタブストップ8展開を
   `feed()` に足すかは任意。
 
-### T3b: コピー&ペースト (ほぼ JS のみ)
+### T3b: コピー&ペースト — **実装済み 2026-06-11** (選択の実機目視は残)
 - **クリップボードは型付き・システム共有の C プリミティブ** (層1):
   `clipboard.set(data, type)` / `clipboard.get()` → `{data, type}` /
   `clipboard.onChange(fn)`。JS コンテキスト外の C バッファなのでタスク切替を
   跨いで生存、将来のマルチタスクで全 app が共有 = **アプリ間 IPC の最初の一手**。
   型 (`text/plain` `text/csv` `application/json` `number` …) で受け手が判別。
-  → **層1 は P4d として実装済み 2026-06-11**
-  (`docs/launcher-multiapp-design.md` §7: NVS 永続 / EV_CLIP setter 除外
-  / onChange(data, type))。残りの T3b スコープは選択 UI (ロングプレス
-  ドラッグ → グリッド抽出 → clipboard.set) とブラケットペースト。
-- 選択: `ui.onTouch` に選択モード (ロングプレスでドラッグ開始)。ドラッグ →
-  セル座標、選択セルをハイライト、離したらグリッドモデルから抽出 → clipboard。
-- Paste = `ssh.write(clipboard.get().data)` (対応サーバはブラケットペースト
-  `\x1b[200~`…`\x1b[201~` で囲む)。
-- **MQTT ミラー (層2) は API に焼き込まず外付け** (`clipboard.onChange→mqtt.publish`
-  と `mqtt.subscribe→clipboard.set` を橋渡しする小 app/ランチャー)。retained
-  トピックで永続化 + クロスデバイス共有。echo は sender ID で無視。Phase 4。
+  → **層1 = P4d 実装済み** (`docs/launcher-multiapp-design.md` §7:
+  NVS 永続 / EV_CLIP setter 除外 / onChange(data, type))。
+- **選択 (実装済み)**: 端末領域 500ms 長押しで選択モード、ドラッグで
+  読み順セル範囲 (単色反転ハイライト)、離した瞬間にグリッドモデルから
+  抽出 (行毎 trimEnd) → `clipboard.set(text, "text/plain")` + 通知。
+  受信出力に上書きされたハイライトは flush 間隔 (25ms) の再適用で
+  自己修復。12px 以上動いたら長押しキャンセル。短タップ = キーボード
+  呼び戻し (従来) は up 時判定に移動。Copy ボタンは使い方ガイド通知に
+  変更 (選択即コピー方式のため)。
+- **Paste (実装済み)**: `ssh.write(clipboard.get().data)`。パーサが
+  DECSET/DECRST **?2004** を追従し、宣言サーバには `\x1b[200~`…`\x1b[201~`
+  で囲んで送る (SELFTEST に bracketed=false/true/false を追加)。
+- **MQTT ミラー (層2、実装済み) = examples/clip_mirror.js** (API に
+  焼き込まず外付け、@app 配布)。`clipboard.onChange→publish retained` /
+  `subscribe→clipboard.set`。echo は sender ID (`store` 永続の乱数 id) で
+  無視、受信・送信とも同一値スキップの冪等ガード (EV_CLIP は latest-wins
+  なので連続 set は同じ最終値を複数回見せてくる)。ローカルファースト:
+  ブローカー不在時は `mqtt.connected()` ゲートで黙ってローカル動作。
+  **リモート実機検証済み 2026-06-11**: PC→デバイス (retained csv →
+  boot-get=text/csv) / デバイス→PC (probe set → retained mirror publish)
+  / echo ループなし。注意: 受信ペイロード上限 4096B — 4000B 級クリップは
+  JSON の包みで超えて同期が落ちうる (割り切り)。
 
 ### T3c: システム制御/stats パネル (キーボード非表示時に出る、C 所有)
 - ステータスバーと同じシステム UI 層。明るさ/音量はデバイス機能なので C 所有の

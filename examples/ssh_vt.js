@@ -201,6 +201,7 @@ function makeTerm() {
     var state = ST_GROUND;
     var csiParams = "";
     var csiPriv = false;
+    var bracketed = false;  /* DECSET 2004: ブラケットペースト (T3b) */
 
     function params() {
         var out = [];
@@ -363,6 +364,13 @@ function makeTerm() {
         }
         else if (fin === "s") { savedCx = cx; savedCy = cy; }
         else if (fin === "u") { cx = savedCx; cy = savedCy; }
+        else if ((fin === "h" || fin === "l") && csiPriv) {
+            /* DEC プライベートモード。2004 = ブラケットペースト宣言
+               だけ追従する (ペースト時に \x1b[200~..201~ で囲む)。 */
+            for (var pm = 0; pm < p.length; pm++)
+                if (p[pm] === 2004)
+                    bracketed = (fin === "h");
+        }
     }
 
     function feed(s) {
@@ -434,6 +442,7 @@ function makeTerm() {
         }
         cx = 0; cy = 0; scrollTop = 0; scrollBot = ROWS - 1;
         curFg = 0; curBg = 0; bold = false; inverse = false;
+        bracketed = false;
         markAll();
     }
 
@@ -483,8 +492,10 @@ function makeTerm() {
         feed: feed,
         flush: flush,
         markAll: markAll,
+        markRow: markDirty,  /* T3b: 選択ハイライト解除後の行復元 */
         reset: resetTerm,
         rows: rows,
+        bracketed: function () { return bracketed; },
         cursor: function () { return [cx, cy]; }
     };
     return self;
@@ -510,8 +521,15 @@ if (SELFTEST) {
     for (var li = 0; li < lines.length; li++)
         print(lines[li]);
     var cur = t.cursor();
+    /* T3b: DECSET/DECRST 2004 (ブラケットペースト) の追従 */
+    var br0 = t.bracketed();
+    t.feed("\x1b[?2004h");
+    var br1 = t.bracketed();
+    t.feed("\x1b[?2004l");
+    var br2 = t.bracketed();
     print("END cursor=" + cur[0] + "," + cur[1] + " cols_vis=" + COLS +
-          " rows_vis=" + ROWS + " cw=" + CW + " lh=" + LH);
+          " rows_vis=" + ROWS + " cw=" + CW + " lh=" + LH +
+          " bracketed=" + br0 + "/" + br1 + "/" + br2);
 } else if (REPORT) {
     var rt = makeTerm();
     rt.act = true;
@@ -595,6 +613,7 @@ if (SELFTEST) {
             return;
         if (actIdx >= 0 && actIdx < sessions.length)
             sessions[actIdx].term.act = false;
+        sel = null; /* 選択はアクティブ端末に属する (markAll が描き直す) */
         actIdx = i;
         var t = sessions[i].term;
         t.act = true;
@@ -629,13 +648,18 @@ if (SELFTEST) {
                     drawTabs();
                 }
                 if (name === "copy") {
-                    /* 選択 UI は T3b。それまではコピー元なし。 */
-                    sys.notify("コピーは選択 (T3b) から");
+                    /* 選択即コピー方式なのでボタンは使い方ガイド */
+                    sys.notify("画面を長押し→なぞってコピー");
                     return;
                 }
                 var clip = clipboard.get();
-                if (clip && clip.data)
-                    ssh.write(id, clip.data);
+                if (clip && clip.data) {
+                    var pd = clip.data;
+                    /* サーバが DECSET 2004 を宣言していたら囲む */
+                    if (sessions[actIdx].term.bracketed())
+                        pd = "\x1b[200~" + pd + "\x1b[201~";
+                    ssh.write(id, pd);
+                }
                 return;
             }
             k = TOKSEQ[name] || "";
@@ -662,29 +686,146 @@ if (SELFTEST) {
         ssh.write(id, k);
     });
 
-    /* タブバーのタップ: 切替 / [+] = ホストページ。それ以外のタップは
-       キーボード呼び戻し (ページ前面中は inForm で遮断)。 */
-    ui.onTouch(function (x, y, kind) {
-        if (inForm || kind !== 0)
+    /* ---- T3b: ロングプレス選択 → clipboard (設計 §7 T3b) ----
+       端末領域を 500ms 押し続けると選択モード。ドラッグでセル範囲
+       (読み順) を伸ばし、ハイライトは行を単色反転で重ね描き。指を
+       離したらグリッドモデルから抽出して clipboard.set。受信出力が
+       ハイライトを上書きしても、flush 間隔の再適用で自己修復する。 */
+    var SEL_FG = 0x000000, SEL_BG = 0x9CC4E4;
+    var LP_MS = 500;
+    var sel = null;       /* {a:{c,r}, b:{c,r}} 端末セル座標 (a=起点) */
+    var press = null;     /* 押下追跡 {x, y, moved, timer} */
+
+    var cellAt = function (x, y) {
+        var c = (x / CW) | 0;
+        var r = ((y / LH) | 0) - TAB_ROWS;
+        if (c < 0) c = 0; if (c >= COLS) c = COLS - 1;
+        if (r < 0) r = 0; if (r >= ROWS) r = ROWS - 1;
+        return { c: c, r: r };
+    };
+    /* 読み順で正規化した [from, to] (両端含む) */
+    var selRange = function () {
+        var a = sel.a, b = sel.b;
+        if (a.r < b.r || (a.r === b.r && a.c <= b.c))
+            return [a, b];
+        return [b, a];
+    };
+    var drawSel = function () {
+        if (!sel || actIdx < 0)
             return;
-        if (y < TAB_ROWS * LH + 8) {
-            for (var i = 0; i < tabHit.length; i++) {
-                if (x >= tabHit[i].x0 && x < tabHit[i].x1) {
-                    if (tabHit[i].idx < 0)
-                        hostsPage(null);
-                    else
-                        switchTo(tabHit[i].idx);
-                    return;
+        var t = sessions[actIdx].term;
+        var fr = selRange(), f = fr[0], to = fr[1];
+        for (var r = f.r; r <= to.r; r++) {
+            var c0 = (r === f.r) ? f.c : 0;
+            var c1 = (r === to.r) ? to.c : COLS - 1;
+            ui.cells(c0, r + TAB_ROWS, t.rows[r].ch.slice(c0, c1 + 1),
+                     SEL_FG, SEL_BG);
+        }
+    };
+    /* 選択が覆っていた行をモデルから描き直させる */
+    var unmarkSel = function () {
+        if (!sel || actIdx < 0)
+            return;
+        var t = sessions[actIdx].term;
+        var fr = selRange(), f = fr[0], to = fr[1];
+        for (var r = f.r; r <= to.r; r++)
+            t.markRow(r);
+    };
+    var selText = function () {
+        var t = sessions[actIdx].term;
+        var fr = selRange(), f = fr[0], to = fr[1];
+        var out = [];
+        for (var r = f.r; r <= to.r; r++) {
+            var c0 = (r === f.r) ? f.c : 0;
+            var c1 = (r === to.r) ? to.c : COLS - 1;
+            out.push(t.rows[r].ch.slice(c0, c1 + 1).trimEnd());
+        }
+        return out.join("\n");
+    };
+    var endPress = function () {
+        if (press && press.timer !== null)
+            clearTimeout(press.timer);
+        press = null;
+    };
+
+    /* タブバーのタップ: 切替 / [+] = ホストページ。端末領域は
+       ロングプレスで選択開始、短タップはキーボード呼び戻し。 */
+    ui.onTouch(function (x, y, kind) {
+        if (inForm)
+            return;
+        if (kind === 0) {
+            if (sel) { /* 前回の選択が残っていたら掃除 */
+                unmarkSel();
+                sel = null;
+            }
+            if (y < TAB_ROWS * LH + 8) {
+                for (var i = 0; i < tabHit.length; i++) {
+                    if (x >= tabHit[i].x0 && x < tabHit[i].x1) {
+                        if (tabHit[i].idx < 0)
+                            hostsPage(null);
+                        else
+                            switchTo(tabHit[i].idx);
+                        return;
+                    }
+                }
+                return;
+            }
+            endPress();
+            press = { x: x, y: y, moved: false, timer: null };
+            if (y < GRID_ROWS * LH && actIdx >= 0) {
+                press.timer = setTimeout(function () {
+                    if (press === null || press.moved)
+                        return;
+                    press.timer = null;
+                    var cell0 = cellAt(press.x, press.y);
+                    sel = { a: cell0, b: cell0 };
+                    drawSel(); /* 点灯 = 選択モードのフィードバック */
+                }, LP_MS);
+            }
+            return;
+        }
+        if (kind === 1) {
+            if (sel) {
+                var cur = cellAt(x, y);
+                if (cur.c !== sel.b.c || cur.r !== sel.b.r) {
+                    unmarkSel(); /* 縮んだ分を復元してから引き直す */
+                    sel.b = cur;
+                    drawSel();
+                }
+            } else if (press && !press.moved) {
+                var dx = x - press.x, dy = y - press.y;
+                if (dx * dx + dy * dy > 144) { /* 12px: 長押しキャンセル */
+                    press.moved = true;
+                    if (press.timer !== null) {
+                        clearTimeout(press.timer);
+                        press.timer = null;
+                    }
                 }
             }
             return;
         }
-        ui.keyboard(2);
+        /* kind 2: 離した */
+        if (sel) {
+            var text = selText();
+            unmarkSel();
+            sel = null;
+            if (text) {
+                clipboard.set(text, "text/plain");
+                sys.notify("コピー: " + text.length + " 文字");
+            }
+            endPress();
+            return;
+        }
+        if (press && !press.moved)
+            ui.keyboard(2); /* 旧来の短タップ = キーボード呼び戻し */
+        endPress();
     });
 
     setInterval(function () {
-        if (actIdx >= 0 && actIdx < sessions.length)
+        if (actIdx >= 0 && actIdx < sessions.length) {
             sessions[actIdx].term.flush();
+            drawSel(); /* 受信出力に上書きされたハイライトの自己修復 */
+        }
     }, 25); /* ~40fps でアクティブ端末のダーティ行を消化 */
 
     /* セッションを開く。成功で端末ビューへ。 */
