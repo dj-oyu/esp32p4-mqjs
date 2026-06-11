@@ -66,8 +66,6 @@ docs/widget-framework-design.md §3/§10 を参照。
 | `ssh_term.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH 最小端末 (Phase T1)。接続フォーム (ウィジェット) → 端末 (キャンバス)。認証情報はフォーム入力 |
 | `ssh_vt.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH ターミナルエミュレータ (Phase T2/T3)。VT100 パーサ + セルグリッド + 16 色。ls --color / vi / top 対応。T3a: キーボード上のコントロールバー (Esc/Tab/one-shot Ctrl·Alt/Fn→F1-F12/矢印/Paste=clipboard)。T3b: 長押し→なぞって選択コピー (clipboard へ)、ブラケットペースト (?2004) 追従。接続フォーム入力、切断でフォームに復帰。`SELFTEST=true` で PC パーサ検証 |
 | `clip_mirror.js` | 不要 (要 WiFi + broker) | ヘッドレス | T3b 層2: クリップボードの MQTT ミラー。onChange→retained publish / subscribe→set、sender ID で echo 無視、同一値スキップ。ブローカー不在時はローカルのみ (日和見同期) |
-| `p4_clip_probe.js` | 不要 (要 WiFi、結果は MQTT) | ヘッドレス | P4d typed clipboard の実機スモーク: set/get 往復を esp32p4-mqjs/clipprobe に publish。type=number の "123" をクリップボードに残す (ssh_vt の Paste 確認用) |
-| `p4_clip_get.js` | 不要 (要 WiFi、結果は MQTT) | ヘッドレス | P4d 再起動永続の確認: set せずに get だけ publish。probe → これを push → 再起動で NVS 残存を見る |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。
