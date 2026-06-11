@@ -74,6 +74,40 @@ static void cpu_blend_a4(const uint8_t *bmp, int bw, int bh, int x0, int y0,
     }
 }
 
+/* 32-bit stores, two pixels each — the "cheap portable fix" variant.
+   Full-width rows only (contiguous run, even pixel count). */
+static void cpu32_fill_rows(int y, int h, uint16_t px)
+{
+    uint32_t v = ((uint32_t)px << 16) | px;
+    uint32_t *d = (uint32_t *)(s_canvas + (size_t)y * BW);
+    size_t n = (size_t)BW * h / 2;
+    for (size_t i = 0; i < n; i++)
+        d[i] = v;
+}
+
+/* PIE 128-bit stores (xespv2p1, 8 px per store; the toolchain already
+   targets the extension — see build_tab5/toolchain/cflags). Needs a
+   16B-aligned contiguous run, byte count a multiple of 16: full-width
+   rows qualify (row = 1440B, canvas 64B-aligned). Pattern is splatted
+   via a 16B aligned scratch + esp.vld so only vld/vst mnemonics are
+   needed. q0 is ours alone: nothing else in this firmware uses PIE. */
+static void pie_fill_rows(int y, int h, uint16_t px)
+{
+    uint16_t pat[8] __attribute__((aligned(16))) = { px, px, px, px,
+                                                     px, px, px, px };
+    uint8_t *d = (uint8_t *)(s_canvas + (size_t)y * BW);
+    size_t bytes = (size_t)BW * h * 2;
+    const uint16_t *p = pat;
+    asm volatile("esp.vld.128.ip q0, %[p], 0\n"
+                 "1:\n"
+                 "esp.vst.128.ip q0, %[d], 16\n"
+                 "addi %[n], %[n], -16\n"
+                 "bnez %[n], 1b\n"
+                 : [d] "+r"(d), [n] "+r"(bytes), [p] "+r"(p)
+                 :
+                 : "memory");
+}
+
 /* === PPA side ======================================================== */
 
 static void ppa_fill_rect(int x, int y, int w, int h, uint16_t px)
@@ -229,12 +263,27 @@ void ppa_bench_run(void)
     ESP_LOGI(TAG, "coherency: ppa->cpu %s, cpu->ppa %s", ok ? "OK" : "FAIL",
              ok2 ? "OK" : "FAIL");
 
+    /* sanity: PIE fill writes what we think (alignment / pattern) */
+    pie_fill_rows(100, 1, 0xA5A5);
+    ESP_LOGI(TAG, "pie fill check: %s",
+             (s_canvas[(size_t)100 * BW] == 0xA5A5 &&
+              s_canvas[(size_t)100 * BW + BW - 1] == 0xA5A5 &&
+              s_canvas[(size_t)101 * BW] != 0xA5A5) ? "OK" : "FAIL");
+
     /* ------------------------------- FILL ----------------------------- */
     int reps = 10;
     t = esp_timer_get_time();
     for (int i = 0; i < reps; i++)
         cpu_fill_rect(0, 0, BW, BH, C1 + (uint16_t)i);
-    report("fill full   CPU", reps, esp_timer_get_time() - t, BW, BH);
+    report("fill full   CPU16", reps, esp_timer_get_time() - t, BW, BH);
+    t = esp_timer_get_time();
+    for (int i = 0; i < reps; i++)
+        cpu32_fill_rows(0, BH, C1 + (uint16_t)i);
+    report("fill full   CPU32", reps, esp_timer_get_time() - t, BW, BH);
+    t = esp_timer_get_time();
+    for (int i = 0; i < reps; i++)
+        pie_fill_rows(0, BH, C1 + (uint16_t)i);
+    report("fill full   PIE", reps, esp_timer_get_time() - t, BW, BH);
     t = esp_timer_get_time();
     for (int i = 0; i < reps; i++)
         ppa_fill_rect(0, 0, BW, BH, C2 + (uint16_t)i);
@@ -245,7 +294,15 @@ void ppa_bench_run(void)
     t = esp_timer_get_time();
     for (int i = 0; i < reps; i++)
         cpu_fill_rect(0, pos_y(i, 50), BW, 50, C1);
-    report("fill 720x50 CPU", reps, esp_timer_get_time() - t, BW, 50);
+    report("fill 720x50 CPU16", reps, esp_timer_get_time() - t, BW, 50);
+    t = esp_timer_get_time();
+    for (int i = 0; i < reps; i++)
+        cpu32_fill_rows(pos_y(i, 50), 50, C1);
+    report("fill 720x50 CPU32", reps, esp_timer_get_time() - t, BW, 50);
+    t = esp_timer_get_time();
+    for (int i = 0; i < reps; i++)
+        pie_fill_rows(pos_y(i, 50), 50, C1);
+    report("fill 720x50 PIE", reps, esp_timer_get_time() - t, BW, 50);
     t = esp_timer_get_time();
     for (int i = 0; i < reps; i++)
         ppa_fill_rect(0, pos_y(i, 50), BW, 50, C2);

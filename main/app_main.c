@@ -83,8 +83,11 @@ void app_main(void)
 {
     /* boot-time micro-benches (2026-06-12): ppa_bench_run() /
        ppa_bench_crossover() / jsmem_bench_run() — call here to
-       re-measure on a quiet system. Measured: PPA 4-13x on >=500px
-       fills/blends; JS arena SRAM-vs-PSRAM only ~3% (L2 absorbs it). */
+       re-measure on a quiet system. Measured at -O2: PPA 4x on big
+       fills (CPU fill is PSRAM-bound at ~43Mpx/s, store width moot),
+       5.5-7x on row+/full blends, blend crossover w=36/38 at h=24
+       (~900px ~ 4 cells); JS arena SRAM-vs-PSRAM ~4% (skip). -O2
+       itself: pixel loops ~2x, JS ~20% vs -Og. */
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */

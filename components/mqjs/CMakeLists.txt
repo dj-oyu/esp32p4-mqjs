@@ -26,11 +26,14 @@ idf_component_register(
 )
 
 # Vendored engine: uint32_t is 'long unsigned int' on riscv32, so the
-# upstream %d/%x format strings trip -Werror=format. Keep upstream pristine
-# and relax the warnings for those files only.
+# upstream %d/%x format strings trip -Werror=format. -O2 additionally
+# trips -Werror=dangling-pointer on the stack-scanned GC-root pattern
+# (string_buffer_push stores &local into ctx->top_gc_ref on purpose;
+# the root is popped before return). Keep upstream pristine and relax
+# the warnings for those files only.
 set_source_files_properties(
     ${MQJS_DIR}/mquickjs.c ${MQJS_DIR}/cutils.c ${MQJS_DIR}/dtoa.c ${MQJS_DIR}/libm.c
-    PROPERTIES COMPILE_OPTIONS "-Wno-format;-Wno-type-limits"
+    PROPERTIES COMPILE_OPTIONS "-Wno-format;-Wno-type-limits;-Wno-dangling-pointer"
 )
 
 # device_stdlib.c is primarily the HOST generator source (its main() is
