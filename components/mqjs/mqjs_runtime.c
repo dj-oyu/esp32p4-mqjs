@@ -2345,6 +2345,133 @@ static void manifest_field(const char *buf, size_t n, const char *key,
     }
 }
 
+/* presence-only manifest flag ("// @autostart"): true when the
+   directive line exists in the leading comment block. The char after
+   the key must end the word so "@autostartx" does not match. */
+static bool manifest_has(const char *buf, size_t n, const char *key)
+{
+    size_t klen = strlen(key);
+    size_t i = 0;
+    while (i < n) {
+        if (i + 1 < n && buf[i] == '/' && buf[i + 1] == '/') {
+            if (i + klen <= n && !strncmp(buf + i, key, klen) &&
+                (i + klen == n || buf[i + klen] == '\n' ||
+                 buf[i + klen] == '\r' || buf[i + klen] == ' '))
+                return true;
+        } else if (buf[i] != '\n' && buf[i] != '\r' && buf[i] != ' ' &&
+                   buf[i] != '\t') {
+            return false; /* past the header block */
+        }
+        while (i < n && buf[i] != '\n')
+            i++;
+        i++;
+    }
+    return false;
+}
+
+#ifdef ESP_PLATFORM
+/* ---- @autostart opt-in roster (design §8) ----
+   Comma-separated app names in NVS ("mqjsauto"/"optin"). A name gets
+   on the roster only when the app is launched LOCALLY while its
+   installed file declares "// @autostart" — a shelf push alone never
+   makes anything run at boot (the §6 principle extended to reboots).
+   sys.uninstall takes the name off again. */
+#define MQJS_AUTOSTART_LIST_MAX 480
+
+static bool autostart_nvs(nvs_handle_t *out)
+{
+    static nvs_handle_t h;
+    static bool opened;
+    if (!opened) {
+        if (nvs_open("mqjsauto", NVS_READWRITE, &h) != ESP_OK) {
+            nvs_flash_init();
+            if (nvs_open("mqjsauto", NVS_READWRITE, &h) != ESP_OK)
+                return false;
+        }
+        opened = true;
+    }
+    *out = h;
+    return true;
+}
+
+static void autostart_load(char *buf, size_t cap)
+{
+    buf[0] = '\0';
+    nvs_handle_t h;
+    if (!autostart_nvs(&h))
+        return;
+    size_t len = cap;
+    if (nvs_get_str(h, "optin", buf, &len) != ESP_OK)
+        buf[0] = '\0';
+}
+
+static bool autostart_list_has(const char *list, const char *name)
+{
+    size_t nl = strlen(name);
+    const char *p = list;
+    while (*p) {
+        const char *q = strchr(p, ',');
+        size_t l = q ? (size_t)(q - p) : strlen(p);
+        if (l == nl && !strncmp(p, name, nl))
+            return true;
+        p = q ? q + 1 : p + l;
+    }
+    return false;
+}
+
+static void autostart_save(const char *list)
+{
+    nvs_handle_t h;
+    if (!autostart_nvs(&h))
+        return;
+    if (list[0])
+        nvs_set_str(h, "optin", list);
+    else
+        nvs_erase_key(h, "optin");
+    nvs_commit(h);
+}
+
+static void autostart_optin_add(const char *name)
+{
+    char list[MQJS_AUTOSTART_LIST_MAX];
+    autostart_load(list, sizeof list);
+    if (autostart_list_has(list, name))
+        return;
+    size_t l = strlen(list);
+    if (l + strlen(name) + 2 > sizeof list) {
+        ESP_LOGW(TAG, "autostart roster full, '%s' not recorded", name);
+        return;
+    }
+    snprintf(list + l, sizeof list - l, "%s%s", l ? "," : "", name);
+    autostart_save(list);
+    ESP_LOGI(TAG, "autostart opt-in: '%s'", name);
+}
+
+static void autostart_optin_remove(const char *name)
+{
+    char list[MQJS_AUTOSTART_LIST_MAX];
+    autostart_load(list, sizeof list);
+    if (!autostart_list_has(list, name))
+        return;
+    char out[MQJS_AUTOSTART_LIST_MAX];
+    size_t o = 0, nl = strlen(name);
+    const char *p = list;
+    while (*p) {
+        const char *q = strchr(p, ',');
+        size_t l = q ? (size_t)(q - p) : strlen(p);
+        if (!(l == nl && !strncmp(p, name, nl))) {
+            if (o)
+                out[o++] = ',';
+            memcpy(out + o, p, l);
+            o += l;
+        }
+        p = q ? q + 1 : p + l;
+    }
+    out[o] = '\0';
+    autostart_save(out);
+}
+#endif /* ESP_PLATFORM */
+
 /* append one {name, title, perm, icon} entry to the installed() array.
    icon = a Nerd Font glyph character from the "// @icon " directive
    (the ui_font fallback chain renders it anywhere, design §4.5). */
@@ -2452,6 +2579,54 @@ static bool app_ensure_mem(AppSlot *app)
     return app->mem != NULL;
 }
 
+/* Start /littlefs/apps/<arg>.js (or the verbatim path when arg has a
+   '/') in `slot`. The file source is owned by the slot (freed at
+   stop). Returns the slot or -1. A successful start of a file whose
+   manifest declares "// @autostart" records the boot opt-in (§8):
+   that local launch is exactly the user gesture the roster wants. */
+static int start_from_file(int slot, const char *arg, const char *name)
+{
+    char path[128];
+    if (strchr(arg, '/'))
+        snprintf(path, sizeof path, "%.127s", arg);
+    else
+        snprintf(path, sizeof path, "/littlefs/apps/%.96s.js", arg);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    fseek(f, 0, SEEK_END);
+    long flen = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (flen <= 0 || flen > 64 * 1024) {
+        fclose(f);
+        return -1;
+    }
+#ifdef ESP_PLATFORM
+    char *buf = heap_caps_malloc((size_t)flen + 1, MALLOC_CAP_SPIRAM);
+    if (!buf)
+        buf = malloc((size_t)flen + 1);
+#else
+    char *buf = malloc((size_t)flen + 1);
+#endif
+    if (!buf || fread(buf, 1, (size_t)flen, f) != (size_t)flen) {
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+    buf[flen] = '\0';
+    if (app_start_internal(&s_apps[slot], buf, (size_t)flen, name)) {
+        free(buf);
+        return -1;
+    }
+    s_apps[slot].src_owned = buf;
+#ifdef ESP_PLATFORM
+    if (manifest_has(buf, (size_t)flen, "// @autostart"))
+        autostart_optin_add(name);
+#endif
+    return slot;
+}
+
 /* sys.launch(nameOrPath) -> slot (>= 0) or -1. Open semantics live in
    the launcher (focus-or-launch); this only starts things. Resolution:
    "dev" re-enables the dev provider; a running app returns its slot;
@@ -2508,41 +2683,7 @@ JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
         return JS_NewInt32(ctx, slot);
     }
 
-    char path[128];
-    if (strchr(arg, '/'))
-        snprintf(path, sizeof path, "%.127s", arg);
-    else
-        snprintf(path, sizeof path, "/littlefs/apps/%.96s.js", arg);
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return JS_NewInt32(ctx, -1);
-    fseek(f, 0, SEEK_END);
-    long flen = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (flen <= 0 || flen > 64 * 1024) {
-        fclose(f);
-        return JS_NewInt32(ctx, -1);
-    }
-#ifdef ESP_PLATFORM
-    char *buf = heap_caps_malloc((size_t)flen + 1, MALLOC_CAP_SPIRAM);
-    if (!buf)
-        buf = malloc((size_t)flen + 1);
-#else
-    char *buf = malloc((size_t)flen + 1);
-#endif
-    if (!buf || fread(buf, 1, (size_t)flen, f) != (size_t)flen) {
-        fclose(f);
-        free(buf);
-        return JS_NewInt32(ctx, -1);
-    }
-    fclose(f);
-    buf[flen] = '\0';
-    if (app_start_internal(&s_apps[slot], buf, (size_t)flen, name)) {
-        free(buf);
-        return JS_NewInt32(ctx, -1);
-    }
-    s_apps[slot].src_owned = buf;
-    return JS_NewInt32(ctx, slot);
+    return JS_NewInt32(ctx, start_from_file(slot, arg, name));
 }
 
 /* sys.stop(slot) -> bool. Open to every app (the signing gate is the
@@ -2668,6 +2809,10 @@ JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
         snprintf(path, sizeof path, "%.127s", name);
     else
         snprintf(path, sizeof path, "/littlefs/apps/%.96s.js", name);
+#ifdef ESP_PLATFORM
+    if (!strchr(name, '/'))
+        autostart_optin_remove(name); /* uninstall revokes the boot opt-in */
+#endif
     return JS_NewBool(remove(path) == 0);
 }
 
@@ -3782,6 +3927,79 @@ void mqjs_runtime_stop(void)
     s_stop_req = true;
 }
 
+#ifdef ESP_PLATFORM
+/* Boot pass of the @autostart roster (design §8): start every
+   installed app that (a) the user opted in by launching it locally
+   once and (b) STILL declares "// @autostart" (an update that drops
+   the directive stops the boot launch without touching the roster).
+   Runs once before the scheduler loop; failures and slot overflow are
+   log/notice only — boot is never blocked. Order = directory order. */
+static void autostart_boot(void)
+{
+    char list[MQJS_AUTOSTART_LIST_MAX];
+    autostart_load(list, sizeof list);
+    if (!list[0])
+        return;
+    DIR *d = opendir("/littlefs/apps");
+    if (!d)
+        return;
+    char started[96];
+    size_t so = 0;
+    started[0] = '\0';
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (l < 4 || l > 34 || strcmp(e->d_name + l - 3, ".js"))
+            continue;
+        char name[32];
+        snprintf(name, sizeof name, "%.*s", (int)(l - 3), e->d_name);
+        if (!autostart_list_has(list, name))
+            continue;
+        char path[96];
+        snprintf(path, sizeof path, "/littlefs/apps/%.40s", e->d_name);
+        char head[512];
+        size_t hlen = 0;
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            hlen = fread(head, 1, sizeof head, f);
+            fclose(f);
+        }
+        if (!manifest_has(head, hlen, "// @autostart"))
+            continue;
+        int slot = app_free_slot();
+        if (slot < 0) {
+            ESP_LOGW(TAG, "autostart: no free slot for '%s'", name);
+            continue;
+        }
+        if (start_from_file(slot, name, name) < 0) {
+            ESP_LOGW(TAG, "autostart: '%s' failed to start", name);
+            continue;
+        }
+        ESP_LOGI(TAG, "autostart: '%s' -> slot %d", name, slot);
+        if (so < sizeof started - strlen(name) - 3)
+            so += snprintf(started + so, sizeof started - so, "%s%s",
+                           so ? ", " : "", name);
+    }
+    closedir(d);
+    if (!started[0])
+        return;
+    /* visible trace: the per-app notice table (launcher 通知 section)
+       + the status bar when its sink is already wired */
+    Notice *n = &s_notices[0];
+    for (int i = 1; i < (int)(sizeof s_notices / sizeof s_notices[0]); i++)
+        if (s_notices[i].seq < n->seq)
+            n = &s_notices[i];
+    snprintf(n->app, sizeof n->app, "system");
+    snprintf(n->text, sizeof n->text, "autostart: %.84s", started);
+    n->seq = ++s_notice_seq;
+    if (s_notify_sink) {
+        char line[128];
+        snprintf(line, sizeof line, "[system] autostart: %s", started);
+        s_notify_sink(line);
+    }
+}
+#endif /* ESP_PLATFORM */
+
 /* The permanent multi-app loop (§3.7). The dev slot is restarted from
    the provider: immediately after a stop request (task push), 1s after
    a natural end (the pre-P4 auto-rerun behavior), never while an
@@ -3790,6 +4008,9 @@ void mqjs_runtime_stop(void)
 void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
 {
     s_dev_retry_at = 0; /* 0 = ask the provider right away */
+#ifdef ESP_PLATFORM
+    autostart_boot(); /* §8: opted-in resident apps come back at boot */
+#endif
 
     for (;;) {
         /* launcher residency: chrome (chip / open requests) depends on

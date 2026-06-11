@@ -1,6 +1,7 @@
 // @app clip_mirror
 // @title クリップボード同期
 // @perm mqtt,clipboard
+// @autostart
 //
 // T3b 層2: クリップボードの MQTT ミラー (ssh-terminal-design §7/§7.1)。
 // 同期は API に焼き込まず、この小アプリが clipboard.onChange と
