@@ -44,6 +44,8 @@ typedef enum {
                          bg=bg. Drawn with the terminal grid font (ui.cells). */
     UI_CMD_SCROLL,    /* scroll cell-rows [x=top, y=bot] by w lines
                          (w>0 up, w<0 down); vacated rows filled with color */
+    UI_CMD_RESET,     /* foreground-app switch: clear + hide the canvas and
+                         hide the keyboard (same hygiene as a task switch) */
 } ui_cmd_op_t;
 
 typedef struct {
@@ -136,6 +138,12 @@ int ui_tab5_w_value_int(uint32_t handle);
  * task switch). Safe to call when nothing was ever created. */
 void ui_tab5_w_reset(void);
 
+/* Start the slide-in animation of the most recent ui_tab5_w_screen()
+ * (P4a, design §3.4): screens are created WITHOUT loading so the page
+ * can be fully built first; the JS runtime calls this at the end of
+ * each event dispatch. No-op when nothing is queued. */
+void ui_tab5_w_commit(void);
+
 /* Free bytes in the LVGL heap (builtin tlsf pool; 0 with CLIB malloc or
  * when the UI is down). Third element of sys.heap() — the W1-4 thrash
  * metric lives inside the preallocated pool, invisible to heap_caps. */
@@ -208,6 +216,7 @@ static inline int ui_tab5_w_value_int(uint32_t handle)
     return 0;
 }
 static inline void ui_tab5_w_reset(void) {}
+static inline void ui_tab5_w_commit(void) {}
 static inline size_t ui_tab5_lv_mem_free(void) { return 0; }
 
 #endif /* CONFIG_MQJS_TAB5_UI */

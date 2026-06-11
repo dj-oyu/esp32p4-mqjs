@@ -460,9 +460,17 @@ static const JSPropDef js_store[] = {
 static const JSClassDef js_store_obj =
     JS_OBJECT_DEF("Store", js_store);
 
-/* ---- device API: sys object (heap telemetry, W1-4) ---- */
+/* ---- device API: sys object (heap telemetry W1-4; P4a lifecycle +
+   app-to-app signals + foreground switching, launcher-multiapp design
+   §3.3/§3.8). focus() is launcher-territory long term (P4b) but open to
+   every app until the manifest permissions of P4c exist. ---- */
 static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("heap", 0, js_sys_heap),
+    JS_CFUNC_DEF("onForeground", 1, js_sys_onForeground),
+    JS_CFUNC_DEF("onBackground", 1, js_sys_onBackground),
+    JS_CFUNC_DEF("signal", 2, js_sys_signal),
+    JS_CFUNC_DEF("onSignal", 1, js_sys_onSignal),
+    JS_CFUNC_DEF("focus", 1, js_sys_focus),
     JS_PROP_END,
 };
 

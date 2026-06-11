@@ -83,6 +83,12 @@ static int s_cur = -1;       /* slot of the ACTIVE widget screen, -1 = console.
                                 (user-reported W2 bug). */
 static lv_obj_t *s_root;     /* console screen (bottom of every stack) */
 static lv_obj_t *s_field_kb; /* shared lv_keyboard for FIELD textareas */
+static int s_pending_load = -1; /* screen awaiting its slide-in: created by
+                                   ui_tab5_w_screen but loaded only by
+                                   ui_tab5_w_commit at end-of-dispatch, so
+                                   children are built BEFORE the animation
+                                   starts (P4a §3.4: no pop-in, no lock
+                                   contention with the slide). */
 
 static inline uint32_t w_handle(int slot)
 {
@@ -239,8 +245,10 @@ extern "C" uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
         s_stack[s_sp++] = cur_slot;
     s_cur = slot;
 
-    lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, UI_NAV_ANIM_MS, 0,
-                        false);
+    /* defer the slide-in to ui_tab5_w_commit (§3.4). A second screen()
+       in the same dispatch simply takes the pending spot over — the
+       overtaken screen stays built-but-hidden like any retained one. */
+    s_pending_load = slot;
 
     /* depth > N: destroy the deepest retained (non-console) screen */
     int retained = 0;
@@ -289,16 +297,43 @@ extern "C" uint32_t ui_tab5_w_back(void)
     s_cur = (prev_slot == UI_SLOT_ROOT) ? -1 : (int)prev_slot;
     uint32_t destroyed = w_handle(cur_slot);
     w_orphan_screen(cur_slot);
-    (void)cur_obj;
-    /* auto_del=true frees the departing tree after the animation — the
-       design's "アニメ完了後に旧を解放" without any timer bookkeeping.
-       Rapid chained back() calls are safe: lv_screen_load_anim force-
-       completes an in-flight load (and del_prev-deletes the screen it
-       was leaving) before starting the next one. */
-    lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_MOVE_RIGHT, UI_NAV_ANIM_MS, 0,
-                        true);
+    if (cur_slot == s_pending_load) {
+        /* the departing screen was never loaded (screen() and back() in
+           one dispatch): the display still shows the screen below it.
+           Free the hidden tree now and re-queue whatever we fell back
+           to — commit skips it when it is already the active screen. */
+        lv_obj_delete(cur_obj);
+        s_pending_load = (prev == s_root) ? -1 : (int)prev_slot;
+    } else {
+        /* auto_del=true frees the departing tree after the animation — the
+           design's "アニメ完了後に旧を解放" without any timer bookkeeping.
+           Rapid chained back() calls are safe: lv_screen_load_anim force-
+           completes an in-flight load (and del_prev-deletes the screen it
+           was leaving) before starting the next one. */
+        lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_MOVE_RIGHT, UI_NAV_ANIM_MS,
+                            0, true);
+    }
     lvgl_port_unlock();
     return destroyed;
+}
+
+/* End-of-dispatch hook from the JS runtime (§3.4): the pending screen
+   is fully built by now, start its slide-in. Called on js_task like
+   every other ui_tab5_w_*; cheap when nothing is pending. */
+extern "C" void ui_tab5_w_commit(void)
+{
+    if (s_pending_load < 0 || !ui_up())
+        return;
+    lvgl_port_lock(0);
+    int slot = s_pending_load;
+    s_pending_load = -1;
+    if (s_w[slot].used && s_w[slot].kind == UI_WK_SCREEN_SLOT &&
+        s_w[slot].obj && s_cur == slot &&
+        lv_screen_active() != s_w[slot].obj) {
+        lv_screen_load_anim(s_w[slot].obj, LV_SCR_LOAD_ANIM_MOVE_LEFT,
+                            UI_NAV_ANIM_MS, 0, false);
+    }
+    lvgl_port_unlock();
 }
 
 extern "C" void ui_tab5_w_reset(void)
@@ -306,6 +341,7 @@ extern "C" void ui_tab5_w_reset(void)
     if (!ui_up() || !s_root)
         return;
     lvgl_port_lock(0);
+    s_pending_load = -1;
     if (lv_screen_active() != s_root)
         lv_screen_load(s_root);
     s_field_kb = NULL;

@@ -1,27 +1,41 @@
 /*
- * mqjs_runtime.c - MicroQuickJS runtime for ESP32-P4 (Stamp-P4)
+ * mqjs_runtime.c - MicroQuickJS multi-app runtime for ESP32-P4 (P4a)
  *
  * Implements the C side of the device stdlib defined in device_stdlib.c:
  *   - print / console.log
  *   - setTimeout / setInterval / clearTimeout / clearInterval / delay
  *   - gpio.setMode / gpio.write / gpio.read / gpio.onChange
+ *   - mqtt.* / ssh.* / ui.* / store.* / sys.*
  *   - Date / performance.now
  *
- * Design notes:
+ * Design notes (docs/launcher-multiapp-design.md §3):
+ *   - Up to MQJS_MAX_APPS cooperative contexts live on ONE FreeRTOS
+ *     task. All per-app binding state is bundled in AppSlot; dispatch
+ *     is serial, so a single global `s_cur_app` tells every binding
+ *     which app is calling — no TLS, no locks.
+ *   - Ownership invariant: events carry (or resolve to) slot +
+ *     generation. app_stop never drains the shared queue; the
+ *     dispatcher drops (and frees) events whose owner died. Same
+ *     pattern as W1 widget generations and W3 ssh session ids.
+ *   - UI is exclusive to the foreground app: background ui.* calls are
+ *     silent no-ops (queries still answer). On a foreground switch the
+ *     outgoing app's screens are destroyed (ui_tab5_w_reset + canvas
+ *     reset); the incoming app rebuilds in sys.onForeground.
  *   - Callbacks are held with JS_AddGCRef (persistent GC reference).
  *     The compacting GC moves objects, so raw JSValue must never be
- *     stored in C; JSGCRef.val is auto-updated by the GC. This is the
- *     same pattern mqjs.c uses for its own setTimeout.
- *   - ISRs NEVER touch the JS context. They only post an event to a
- *     FreeRTOS queue; the host loop (the task that owns the context)
- *     dispatches to JS.
+ *     stored in C; JSGCRef.val is auto-updated by the GC.
+ *   - ISRs NEVER touch a JS context. They only post an event to a
+ *     FreeRTOS queue; the JS task dispatches.
  *   - A JS interrupt handler aborts any single JS run (eval or
- *     callback) that exceeds MQJS_MAX_RUN_MS, so a buggy task cannot
- *     hang the loop.
+ *     callback) that exceeds MQJS_MAX_RUN_MS, so a buggy app cannot
+ *     hang the loop (it CAN stall other apps for up to that long —
+ *     accepted cooperative-model worst case, design §6).
  *
  * Build with -DESP_PLATFORM (default under ESP-IDF). Without it, a
  * PC stub build is produced for desktop testing (gpio.* print to
- * stdout, onChange registers but never fires).
+ * stdout, onChange registers but never fires). The PC build keeps a
+ * tiny in-process event ring so sys.signal / sys.focus and multi-app
+ * scheduling are testable on the host.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,11 +76,13 @@ static const char *TAG = "mqjs";
 #define MQJS_MAX_MQTT_SUB     8
 #define MQJS_MQTT_TOPIC_MAX   96
 #define MQJS_MQTT_PAYLOAD_MAX 4096
+#define MQJS_SIGNAL_VAL_MAX   4096
 #define MQJS_MAX_RUN_MS       5000  /* per JS_Eval / callback watchdog */
 #define MQJS_QUEUE_LEN        32
+#define MQJS_DEV_RESTART_MS   1000  /* natural-end rerun delay (compat) */
 
 /* ------------------------------------------------------------------ */
-/* time / log                                                          */
+/* time                                                                */
 /* ------------------------------------------------------------------ */
 
 static int64_t time_ms(void)
@@ -88,65 +104,6 @@ static int64_t date_ms(void)
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-/* print sink: tee of all JS-visible output, assembled into lines so the
-   UI console can store fixed-size records (see mqjs_set_print_sink).
-   The split width bounds one on-screen console record: too small and
-   long lines visibly break before the panel edge (256B = 85 CJK or
-   256 ASCII glyphs, comfortably past one 720px row). */
-static void (*s_print_sink)(const char *, size_t);
-static char s_sink_line[256];
-static size_t s_sink_len;
-
-void mqjs_set_print_sink(void (*fn)(const char *, size_t))
-{
-    s_print_sink = fn;
-}
-
-static void sink_flush(void)
-{
-    if (s_print_sink && s_sink_len)
-        s_print_sink(s_sink_line, s_sink_len);
-    s_sink_len = 0;
-}
-
-static void out_write(const void *buf, size_t len)
-{
-    fwrite(buf, 1, len, stdout);
-    if (!s_print_sink)
-        return;
-    const char *p = buf;
-    for (size_t i = 0; i < len; i++) {
-        char c = p[i];
-        if (c == '\n') {
-            sink_flush();
-            continue;
-        }
-        if (s_sink_len == sizeof(s_sink_line)) {
-            /* split overlong lines at a UTF-8 sequence boundary */
-            size_t cut = s_sink_len;
-            while (cut > 0 && (s_sink_line[cut - 1] & 0xC0) == 0x80)
-                cut--;
-            if (cut > 0 && (s_sink_line[cut - 1] & 0x80))
-                cut--; /* drop the lead byte of the split sequence too */
-            if (cut == 0)
-                cut = s_sink_len;
-            size_t rest = s_sink_len - cut;
-            char carry[4];
-            memcpy(carry, s_sink_line + cut, rest);
-            s_sink_len = cut;
-            sink_flush();
-            memcpy(s_sink_line, carry, rest);
-            s_sink_len = rest;
-        }
-        s_sink_line[s_sink_len++] = c;
-    }
-}
-
-static void js_log_func(void *opaque, const void *buf, size_t buf_len)
-{
-    out_write(buf, buf_len);
-}
-
 /* ------------------------------------------------------------------ */
 /* runtime state                                                       */
 /* ------------------------------------------------------------------ */
@@ -165,14 +122,22 @@ typedef struct {
     JSGCRef fn;
 } GpioSlot;
 
-/* one queue feeds the JS loop; producers are the GPIO ISR and the
-   esp-mqtt event task. mqtt strings are heap copies owned by the
-   event: the dispatcher (or the drain in reset_slots) frees them. */
+/* one queue feeds the JS task; producers are the GPIO ISR, the esp-mqtt
+   event tasks, the UI task and the ssh session tasks. mqtt/ssh/signal
+   strings are heap copies owned by the event: the dispatcher frees them
+   (also when it drops the event because its owner died). */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
-               EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET } MqjsEventType;
+               EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
+               EV_FOCUS } MqjsEventType;
+
+#define MQJS_FOCUS_NEXT 0xFF /* EV_FOCUS target: cycle to the next app */
 
 typedef struct {
     uint8_t type;
+    uint8_t slot;   /* owner slot for slot-addressed events (EV_MQTT_*,
+                       EV_SIGNAL); other types resolve their owner at
+                       dispatch time (§3.2 routing table) */
+    uint16_t gen;   /* owner generation: stale events are dropped */
     union {
         struct { uint8_t pin; uint8_t level; } gpio;
         struct { char *topic; char *payload; uint32_t len; } mqtt;
@@ -181,6 +146,9 @@ typedef struct {
         struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
         struct { char reason[22]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
+        struct { char *value; char from[32]; } signal; /* sys.signal;
+                       from[] sized to AppSlot.name */
+        struct { uint8_t target; } focus;
     } u;
 } MqjsEvent;
 
@@ -192,7 +160,7 @@ typedef struct {
 
 /* One JS callback per interactive widget (button/list row/toggle/slider).
    `screen` is the owning screen's handle: when that screen is destroyed
-   (ui.back() / retain-depth eviction / task end) every slot it owned is
+   (ui.back() / retain-depth eviction / app end) every slot it owned is
    released in one sweep, so the compacting GC repacks once instead of
    per-widget (design §4④). */
 typedef struct {
@@ -201,17 +169,6 @@ typedef struct {
     uint32_t screen;  /* owning screen handle */
     JSGCRef fn;
 } WidgetCb;
-
-static TimerSlot s_timers[MQJS_MAX_TIMERS];
-static GpioSlot  s_gpio_cb[MQJS_MAX_GPIO_CB];
-static MqttSub   s_mqtt_subs[MQJS_MAX_MQTT_SUB];
-static WidgetCb  s_widget_cbs[MQJS_MAX_WIDGET_CB];
-static bool      s_mqtt_onconn_used;
-static JSGCRef   s_mqtt_onconn;
-static volatile bool s_touch_used; /* read by the UI task (poster) */
-static JSGCRef   s_touch_cb;
-static volatile bool s_key_used;   /* read by the UI task (poster) */
-static JSGCRef   s_key_cb;
 
 /* per-session ssh callbacks (W3 handle-style: ssh.onData(id, fn)).
    Sized to the sshc session cap + slack; sshc.h is ESP-only so the
@@ -223,16 +180,168 @@ typedef struct {
     bool data_used, close_used;
     JSGCRef data_fn, close_fn;
 } SshCb;
-static SshCb s_ssh_cbs[MQJS_MAX_SSH_CB];
-static volatile bool s_stop_req;
-static int64_t s_run_deadline;          /* JS watchdog */
+
+/* All binding state of one app, bundled (design §3.1). ~2KB of internal
+   RAM per slot; the 256KB context arena lives in PSRAM. */
+typedef struct {
+    bool used;
+    uint8_t slot;             /* own index (for s_fg_slot comparisons) */
+    uint16_t gen;             /* bumped on every start: stale-event filter */
+    char name[32];
+    uint8_t *mem;             /* fixed arena (design §3.6) */
+    size_t mem_size;
+    JSContext *ctx;
+
+    TimerSlot timers[MQJS_MAX_TIMERS];
+    GpioSlot  gpio_cb[MQJS_MAX_GPIO_CB];
+    MqttSub   mqtt_subs[MQJS_MAX_MQTT_SUB];
+    bool      mqtt_onconn_used;
+    JSGCRef   mqtt_onconn;
+    WidgetCb  widget_cbs[MQJS_MAX_WIDGET_CB]; /* only the fg app has live screens */
+    SshCb     ssh_cbs[MQJS_MAX_SSH_CB];
+    volatile bool touch_used; /* read by the UI task (poster) */
+    JSGCRef   touch_cb;
+    volatile bool key_used;   /* read by the UI task (poster) */
+    JSGCRef   key_cb;
+    bool fg_used;  JSGCRef fg_cb;   /* sys.onForeground */
+    bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
+    bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
+
+#ifdef ESP_PLATFORM
+    esp_mqtt_client_handle_t mqtt;  /* per-app client: "mqjs-app-<slot>" */
+    volatile bool mqtt_up;          /* broker session established */
+#endif
+
+    /* print sink line assembler, per app so lines never interleave.
+       The split width bounds one on-screen console record (256B = 85
+       CJK or 256 ASCII glyphs, comfortably past one 720px row). */
+    char sink_line[256];
+    size_t sink_len;
+} AppSlot;
+
+static AppSlot s_apps[MQJS_MAX_APPS];
+static AppSlot *s_cur_app;        /* app whose JS is on the C stack — the
+                                     single biggest dividend of the serial
+                                     model: every binding reads it */
+static volatile int s_fg_slot = MQJS_SLOT_DEV; /* until the P4b launcher */
+static volatile bool s_stop_req; /* dev-slot stop (task push / PC ^C) */
+static int64_t s_run_deadline;   /* JS watchdog */
 
 #ifdef ESP_PLATFORM
 static QueueHandle_t s_event_queue;
 static bool s_isr_service_installed;
-static esp_mqtt_client_handle_t s_mqtt;
-static volatile bool s_mqtt_up;         /* broker session established */
+#else
+/* PC build: tiny in-process ring instead of a FreeRTOS queue, so
+   sys.signal / sys.focus work in host smoke runs (single thread: the
+   only producers are bindings called from the loop itself). */
+static MqjsEvent s_pc_q[MQJS_QUEUE_LEN];
+static int s_pc_q_head, s_pc_q_count;
 #endif
+
+static bool ev_post(const MqjsEvent *ev, int wait_ms)
+{
+#ifdef ESP_PLATFORM
+    if (!s_event_queue)
+        return false;
+    return xQueueSend(s_event_queue, ev, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
+#else
+    (void)wait_ms;
+    if (s_pc_q_count == MQJS_QUEUE_LEN)
+        return false;
+    s_pc_q[(s_pc_q_head + s_pc_q_count) % MQJS_QUEUE_LEN] = *ev;
+    s_pc_q_count++;
+    return true;
+#endif
+}
+
+#ifndef ESP_PLATFORM
+static bool pc_q_recv(MqjsEvent *ev)
+{
+    if (!s_pc_q_count)
+        return false;
+    *ev = s_pc_q[s_pc_q_head];
+    s_pc_q_head = (s_pc_q_head + 1) % MQJS_QUEUE_LEN;
+    s_pc_q_count--;
+    return true;
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+/* print sink (tee of all JS-visible output, assembled into lines)     */
+/* ------------------------------------------------------------------ */
+
+static void (*s_print_sink)(const char *, size_t);
+
+/* output produced outside any app dispatch (early init etc.) */
+static char s_orphan_line[256];
+static size_t s_orphan_len;
+
+void mqjs_set_print_sink(void (*fn)(const char *, size_t))
+{
+    s_print_sink = fn;
+}
+
+/* Flush one assembled line to the sink. Non-dev apps get a "[name] "
+   prefix so the shared console stays attributable (§3.5). */
+static void sink_flush(void)
+{
+    AppSlot *app = s_cur_app;
+    char *line = app ? app->sink_line : s_orphan_line;
+    size_t *plen = app ? &app->sink_len : &s_orphan_len;
+    if (s_print_sink && *plen) {
+        if (app && app->slot != MQJS_SLOT_DEV && app->name[0]) {
+            char buf[sizeof(app->sink_line) + sizeof(app->name) + 4];
+            int n = snprintf(buf, sizeof buf, "[%s] ", app->name);
+            memcpy(buf + n, line, *plen);
+            s_print_sink(buf, (size_t)n + *plen);
+        } else {
+            s_print_sink(line, *plen);
+        }
+    }
+    *plen = 0;
+}
+
+static void out_write(const void *buf, size_t len)
+{
+    fwrite(buf, 1, len, stdout);
+    if (!s_print_sink)
+        return;
+    AppSlot *app = s_cur_app;
+    char *line = app ? app->sink_line : s_orphan_line;
+    size_t *plen = app ? &app->sink_len : &s_orphan_len;
+    size_t cap = app ? sizeof(app->sink_line) : sizeof(s_orphan_line);
+    const char *p = buf;
+    for (size_t i = 0; i < len; i++) {
+        char c = p[i];
+        if (c == '\n') {
+            sink_flush();
+            continue;
+        }
+        if (*plen == cap) {
+            /* split overlong lines at a UTF-8 sequence boundary */
+            size_t cut = *plen;
+            while (cut > 0 && (line[cut - 1] & 0xC0) == 0x80)
+                cut--;
+            if (cut > 0 && (line[cut - 1] & 0x80))
+                cut--; /* drop the lead byte of the split sequence too */
+            if (cut == 0)
+                cut = *plen;
+            size_t rest = *plen - cut;
+            char carry[4];
+            memcpy(carry, line + cut, rest);
+            *plen = cut;
+            sink_flush();
+            memcpy(line, carry, rest);
+            *plen = rest;
+        }
+        line[(*plen)++] = c;
+    }
+}
+
+static void js_log_func(void *opaque, const void *buf, size_t buf_len)
+{
+    out_write(buf, buf_len);
+}
 
 /* ------------------------------------------------------------------ */
 /* watchdog: abort runaway JS                                          */
@@ -259,6 +368,42 @@ static void dump_error(JSContext *ctx)
     out_write(pfx, sizeof(pfx) - 1);
     JS_PrintValueF(ctx, e, JS_DUMP_LONG); /* goes through js_log_func */
     out_write("\n", 1);
+}
+
+/* ------------------------------------------------------------------ */
+/* shared callback helpers                                             */
+/* ------------------------------------------------------------------ */
+
+/* replace-register one persistent callback (ui.onTouch idiom) */
+static JSValue register_cb(JSContext *ctx, JSValue fn, bool *used,
+                           JSGCRef *ref)
+{
+    if (!JS_IsFunction(ctx, fn))
+        return JS_ThrowTypeError(ctx, "not a function");
+    if (*used)
+        JS_DeleteGCRef(ctx, ref);
+    JSValue *pf = JS_AddGCRef(ctx, ref);
+    *pf = fn;
+    *used = true;
+    return JS_UNDEFINED;
+}
+
+/* call a no-arg persistent callback on `app` (lifecycle hooks) */
+static void app_call0(AppSlot *app, JSGCRef *fn)
+{
+    AppSlot *prev = s_cur_app;
+    s_cur_app = app;
+    if (JS_StackCheck(app->ctx, 2)) {
+        dump_error(app->ctx);
+    } else {
+        JS_PushArg(app->ctx, fn->val);  /* func */
+        JS_PushArg(app->ctx, JS_NULL);  /* this */
+        arm_watchdog();
+        JSValue ret = JS_Call(app->ctx, 0);
+        if (JS_IsException(ret))
+            dump_error(app->ctx);
+    }
+    s_cur_app = prev;
 }
 
 /* ------------------------------------------------------------------ */
@@ -315,7 +460,7 @@ JSValue js_performance_now(JSContext *ctx, JSValue *this_val, int argc, JSValue 
 }
 
 /* ------------------------------------------------------------------ */
-/* timers                                                              */
+/* timers (per app)                                                    */
 /* ------------------------------------------------------------------ */
 
 static JSValue set_timer(JSContext *ctx, JSValue *argv, bool repeat)
@@ -332,7 +477,7 @@ static JSValue set_timer(JSContext *ctx, JSValue *argv, bool repeat)
         delay = 1;
 
     for (int i = 0; i < MQJS_MAX_TIMERS; i++) {
-        TimerSlot *t = &s_timers[i];
+        TimerSlot *t = &s_cur_app->timers[i];
         if (!t->used) {
             JSValue *pf = JS_AddGCRef(ctx, &t->fn);
             *pf = argv[0];
@@ -361,13 +506,15 @@ JSValue js_clearTimer(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     int id;
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
-    if (id >= 0 && id < MQJS_MAX_TIMERS && s_timers[id].used) {
-        JS_DeleteGCRef(ctx, &s_timers[id].fn);
-        s_timers[id].used = false;
+    if (id >= 0 && id < MQJS_MAX_TIMERS && s_cur_app->timers[id].used) {
+        JS_DeleteGCRef(ctx, &s_cur_app->timers[id].fn);
+        s_cur_app->timers[id].used = false;
     }
     return JS_UNDEFINED;
 }
 
+/* NB: delay() blocks the WHOLE JS task — under multi-app it stalls every
+   other app too. Kept for dev-slot compatibility (README warns). */
 JSValue js_delay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int ms;
@@ -383,15 +530,16 @@ JSValue js_delay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_UNDEFINED;
 }
 
-/* Run all expired timers once. Returns the delay in ms until the next
-   timer (or `idle_max` if none is pending sooner). */
-static int run_timers(JSContext *ctx, int idle_max)
+/* Run all expired timers of ONE app. Returns the delay in ms until its
+   next timer (or `idle_max` if none is pending sooner). */
+static int run_timers(AppSlot *app, int idle_max)
 {
+    JSContext *ctx = app->ctx;
     int64_t now = time_ms();
     int min_delay = idle_max;
 
     for (int i = 0; i < MQJS_MAX_TIMERS; i++) {
-        TimerSlot *t = &s_timers[i];
+        TimerSlot *t = &app->timers[i];
         if (!t->used)
             continue;
 
@@ -428,6 +576,22 @@ static int run_timers(JSContext *ctx, int idle_max)
             }
         }
         min_delay = 0;               /* re-scan immediately */
+    }
+    return min_delay;
+}
+
+/* One scheduler pass over every app's timers (§3.7 step 1). */
+static int run_all_timers(int idle_max)
+{
+    int min_delay = idle_max;
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        if (!s_apps[i].used)
+            continue;
+        s_cur_app = &s_apps[i];
+        int d = run_timers(&s_apps[i], idle_max);
+        s_cur_app = NULL;
+        if (d < min_delay)
+            min_delay = d;
     }
     return min_delay;
 }
@@ -487,7 +651,8 @@ JSValue js_gpio_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 #ifdef ESP_PLATFORM
-/* ISR: post to queue only. NEVER call into JS from here. */
+/* ISR: post to queue only. NEVER call into JS from here. The owning app
+   is resolved at dispatch time via the pin -> slot registration scan. */
 static void IRAM_ATTR gpio_isr_handler(void *arg)
 {
     MqjsEvent ev = {
@@ -512,13 +677,18 @@ JSValue js_gpio_onChange(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     if (!JS_IsFunction(ctx, argv[1]))
         return JS_ThrowTypeError(ctx, "not a function");
 
-    for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-        GpioSlot *g = &s_gpio_cb[i];
-        if (g->used && g->pin == pin)
-            return JS_ThrowTypeError(ctx, "pin already has a handler");
+    /* a pin has one owner across ALL apps (shared hardware) */
+    for (int a = 0; a < MQJS_MAX_APPS; a++) {
+        if (!s_apps[a].used)
+            continue;
+        for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
+            GpioSlot *g = &s_apps[a].gpio_cb[i];
+            if (g->used && g->pin == pin)
+                return JS_ThrowTypeError(ctx, "pin already has a handler");
+        }
     }
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-        GpioSlot *g = &s_gpio_cb[i];
+        GpioSlot *g = &s_cur_app->gpio_cb[i];
         if (!g->used) {
             JSValue *pf = JS_AddGCRef(ctx, &g->fn);
             *pf = argv[1];
@@ -540,10 +710,11 @@ JSValue js_gpio_onChange(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return JS_ThrowInternalError(ctx, "too many gpio handlers");
 }
 
-static void dispatch_gpio_event(JSContext *ctx, const MqjsEvent *ev)
+static void dispatch_gpio_event(AppSlot *app, const MqjsEvent *ev)
 {
+    JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-        GpioSlot *g = &s_gpio_cb[i];
+        GpioSlot *g = &app->gpio_cb[i];
         if (!g->used || g->pin != ev->u.gpio.pin)
             continue;
         if (JS_StackCheck(ctx, 3)) {
@@ -562,7 +733,9 @@ static void dispatch_gpio_event(JSContext *ctx, const MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
-/* i2c (synchronous; transactions are sub-ms so they run inline)       */
+/* i2c (synchronous; transactions are sub-ms so they run inline).      */
+/* Buses are SHARED hardware: they stay global and survive app stops   */
+/* (like gpio pin config).                                             */
 /* ------------------------------------------------------------------ */
 
 #define MQJS_I2C_PORTS    2
@@ -727,7 +900,10 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 
 /* ------------------------------------------------------------------ */
 /* ui (Tab5 on-device canvas; silent no-op on UI-less devices so the   */
-/* same script runs on Stamp; PC build = print-only stubs)             */
+/* same script runs on Stamp; PC build = print-only stubs).            */
+/* P4a: the screen belongs to the FOREGROUND app only — background     */
+/* apps' ui.* mutations are silent no-ops with dummy returns (§3.3);   */
+/* query calls (size/textSize/cellSize) still answer.                  */
 /* ------------------------------------------------------------------ */
 
 #ifndef ESP_PLATFORM
@@ -735,16 +911,29 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 typedef enum {
     UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
     UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL, UI_CMD_KEYBOARD,
-    UI_CMD_CELLS, UI_CMD_SCROLL,
+    UI_CMD_CELLS, UI_CMD_SCROLL, UI_CMD_RESET,
 } ui_cmd_op_t;
+/* PC stub of the deferred screen-load commit (§3.4) */
+#define ui_tab5_w_commit() ((void)0)
 #endif
+
+/* Is the calling app allowed to touch the screen? (No app on the C
+   stack = runtime-internal call: allowed.) */
+static bool ui_is_fg(void)
+{
+    return !s_cur_app || s_cur_app->slot == s_fg_slot;
+}
 
 /* Post one drawing command. Takes ownership of `text` (heap copy) in
    every outcome; drops are counted on-screen by the UI itself. `bg` is
-   only used by UI_CMD_CELLS (cell background). */
+   only used by UI_CMD_CELLS (cell background). Background apps: no-op. */
 static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
                        uint32_t color, uint32_t bg, char *text)
 {
+    if (!ui_is_fg()) {
+        free(text);
+        return;
+    }
 #ifdef ESP_PLATFORM
     ui_cmd_t c = {
         .op = op,
@@ -759,7 +948,7 @@ static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
 #else
     static const char *names[] =
         { "clear", "fill", "rect", "line", "text", "pixel", "keyboard",
-          "cells", "scroll" };
+          "cells", "scroll", "reset" };
     printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, fg=0x%06x, bg=0x%06x%s%s) (stub)\n",
            names[op], x, y, w, h, (unsigned)color, (unsigned)bg,
            text ? ", " : "", text ? text : "");
@@ -949,16 +1138,18 @@ JSValue js_ui_text(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 /* touch: the UI task polls the controller and posts here; JS receives
-   (x, y, kind) with kind 0=down 1=move 2=up in canvas coordinates */
+   (x, y, kind) with kind 0=down 1=move 2=up in canvas coordinates.
+   Registration is allowed in the background (the callback just sleeps
+   until the app is foreground again). */
 JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     if (!JS_IsFunction(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "not a function");
-    if (s_touch_used)
-        JS_DeleteGCRef(ctx, &s_touch_cb); /* re-register replaces */
-    JSValue *pf = JS_AddGCRef(ctx, &s_touch_cb);
+    if (s_cur_app->touch_used)
+        JS_DeleteGCRef(ctx, &s_cur_app->touch_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_cur_app->touch_cb);
     *pf = argv[0];
-    s_touch_used = true;
+    s_cur_app->touch_used = true;
 #ifndef ESP_PLATFORM
     printf("[ui] onTouch registered (stub: never fires on PC)\n");
 #endif
@@ -968,7 +1159,8 @@ JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 void mqjs_post_touch(int x, int y, int kind)
 {
 #ifdef ESP_PLATFORM
-    if (!s_event_queue || !s_touch_used)
+    AppSlot *fg = &s_apps[s_fg_slot]; /* touch always goes to the fg app */
+    if (!s_event_queue || !fg->used || !fg->touch_used)
         return;
     MqjsEvent ev = {
         .type = EV_TOUCH,
@@ -982,9 +1174,10 @@ void mqjs_post_touch(int x, int y, int kind)
 #endif
 }
 
-static void dispatch_touch_event(JSContext *ctx, const MqjsEvent *ev)
+static void dispatch_touch_event(AppSlot *app, const MqjsEvent *ev)
 {
-    if (!s_touch_used)
+    JSContext *ctx = app->ctx;
+    if (!app->touch_used)
         return;
     if (JS_StackCheck(ctx, 5)) {
         dump_error(ctx);
@@ -994,7 +1187,7 @@ static void dispatch_touch_event(JSContext *ctx, const MqjsEvent *ev)
     JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.kind)); /* arg2 */
     JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.y));    /* arg1 */
     JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.touch.x));    /* arg0 */
-    JS_PushArg(ctx, s_touch_cb.val);                     /* func */
+    JS_PushArg(ctx, app->touch_cb.val);                  /* func */
     JS_PushArg(ctx, JS_NULL);                            /* this */
     arm_watchdog();
     JSValue ret = JS_Call(ctx, 3);
@@ -1019,11 +1212,11 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     if (!JS_IsFunction(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "not a function");
-    if (s_key_used)
-        JS_DeleteGCRef(ctx, &s_key_cb); /* re-register replaces */
-    JSValue *pf = JS_AddGCRef(ctx, &s_key_cb);
+    if (s_cur_app->key_used)
+        JS_DeleteGCRef(ctx, &s_cur_app->key_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_cur_app->key_cb);
     *pf = argv[0];
-    s_key_used = true;
+    s_cur_app->key_used = true;
 #ifndef ESP_PLATFORM
     printf("[ui] onKey registered (stub: never fires on PC)\n");
 #endif
@@ -1034,7 +1227,8 @@ void mqjs_post_key(const char *utf8, size_t len)
 {
 #ifdef ESP_PLATFORM
     MqjsEvent ev = { .type = EV_KEY };
-    if (!s_event_queue || !s_key_used || !utf8)
+    AppSlot *fg = &s_apps[s_fg_slot]; /* keys always go to the fg app */
+    if (!s_event_queue || !fg->used || !fg->key_used || !utf8)
         return;
     if (len == 0 || len > sizeof(ev.u.key.text))
         return;
@@ -1047,9 +1241,10 @@ void mqjs_post_key(const char *utf8, size_t len)
 #endif
 }
 
-static void dispatch_key_event(JSContext *ctx, const MqjsEvent *ev)
+static void dispatch_key_event(AppSlot *app, const MqjsEvent *ev)
 {
-    if (!s_key_used)
+    JSContext *ctx = app->ctx;
+    if (!app->key_used)
         return;
     if (JS_StackCheck(ctx, 3)) {
         dump_error(ctx);
@@ -1057,7 +1252,7 @@ static void dispatch_key_event(JSContext *ctx, const MqjsEvent *ev)
     }
     JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.key.text,
                                     ev->u.key.len));     /* arg0 */
-    JS_PushArg(ctx, s_key_cb.val);                       /* func */
+    JS_PushArg(ctx, app->key_cb.val);                    /* func */
     JS_PushArg(ctx, JS_NULL);                            /* this */
     arm_watchdog();
     JSValue ret = JS_Call(ctx, 1);
@@ -1071,7 +1266,9 @@ static void dispatch_key_event(JSContext *ctx, const MqjsEvent *ev)
 /* device_stdlib.c) wrap C-side handles; creation/mutation runs        */
 /* synchronously in ui_tab5_w_* under the LVGL lock, events come back  */
 /* through EV_WIDGET. PC build = handle bookkeeping + print stubs so   */
-/* widget scripts smoke-test on the host.                              */
+/* widget scripts smoke-test on the host. Background apps get inert    */
+/* (handle 0) objects — their old handles went stale when their        */
+/* screens were destroyed on the foreground switch.                    */
 /* ------------------------------------------------------------------ */
 
 /* opaque payload of UiScreen/UiWidget JS objects (C heap, freed by the
@@ -1144,7 +1341,7 @@ static int wcb_add(JSContext *ctx, uint32_t handle, uint32_t screen,
                    JSValue fn)
 {
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
-        WidgetCb *w = &s_widget_cbs[i];
+        WidgetCb *w = &s_cur_app->widget_cbs[i];
         if (w->used)
             continue;
         JSValue *pf = JS_AddGCRef(ctx, &w->fn);
@@ -1159,13 +1356,25 @@ static int wcb_add(JSContext *ctx, uint32_t handle, uint32_t screen,
 
 /* one sweep per destroyed screen: all its callbacks die together, so
    the compacting GC repacks once (design §4④) */
-static void wcb_release_screen(JSContext *ctx, uint32_t screen)
+static void wcb_release_screen(AppSlot *app, uint32_t screen)
 {
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
-        WidgetCb *w = &s_widget_cbs[i];
+        WidgetCb *w = &app->widget_cbs[i];
         if (w->used && w->screen == screen) {
             w->used = false;
-            JS_DeleteGCRef(ctx, &w->fn);
+            JS_DeleteGCRef(app->ctx, &w->fn);
+        }
+    }
+}
+
+/* all screens of an app died at once (foreground switch / app stop) */
+static void wcb_release_all(AppSlot *app)
+{
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
+        WidgetCb *w = &app->widget_cbs[i];
+        if (w->used) {
+            w->used = false;
+            JS_DeleteGCRef(app->ctx, &w->fn);
         }
     }
 }
@@ -1187,10 +1396,11 @@ void mqjs_post_widget(uint32_t handle, int32_t value)
 #endif
 }
 
-static void dispatch_widget_event(JSContext *ctx, const MqjsEvent *ev)
+static void dispatch_widget_event(AppSlot *app, const MqjsEvent *ev)
 {
+    JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
-        WidgetCb *w = &s_widget_cbs[i];
+        WidgetCb *w = &app->widget_cbs[i];
         if (!w->used || w->handle != ev->u.widget.handle)
             continue;
         if (JS_StackCheck(ctx, 4)) {
@@ -1267,27 +1477,31 @@ static int uiw_truthy(JSContext *ctx, JSValue v)
     return 1; /* objects/strings: truthy enough for an options flag */
 }
 
-/* ui.screen(title) -> UiScreen */
+/* ui.screen(title) -> UiScreen (inert handle for background apps) */
 JSValue js_ui_screen(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     char title[64];
     if (uiw_copy_str(ctx, argv[0], title, sizeof title))
         return JS_EXCEPTION;
-    uint32_t evicted = 0, h;
+    uint32_t evicted = 0, h = 0;
+    if (ui_is_fg()) {
 #ifdef ESP_PLATFORM
-    h = ui_tab5_w_screen(title, &evicted);
+        h = ui_tab5_w_screen(title, &evicted);
 #else
-    h = pcw_screen(title, &evicted);
+        h = pcw_screen(title, &evicted);
 #endif
-    if (evicted)
-        wcb_release_screen(ctx, evicted);
+        if (evicted)
+            wcb_release_screen(s_cur_app, evicted);
+    }
     return uiw_make(ctx, h, h, UIW_K_SCREEN, JS_CLASS_UI_SCREEN);
 }
 
-/* ui.back() -> bool (false on the console screen / UI-less build).
-   Also usable directly as a tap callback: s.button("Cancel", ui.back). */
+/* ui.back() -> bool (false on the console screen / UI-less build /
+   background app). Also usable directly as a tap callback. */
 JSValue js_ui_back(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
+    if (!ui_is_fg())
+        return JS_NewBool(0);
     uint32_t destroyed;
 #ifdef ESP_PLATFORM
     destroyed = ui_tab5_w_back();
@@ -1295,7 +1509,7 @@ JSValue js_ui_back(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     destroyed = pcw_back();
 #endif
     if (destroyed)
-        wcb_release_screen(ctx, destroyed);
+        wcb_release_screen(s_cur_app, destroyed);
     return JS_NewBool(destroyed != 0);
 }
 
@@ -1374,14 +1588,16 @@ JSValue js_uiscreen_create(JSContext *ctx, JSValue *this_val, int argc,
     if (!JS_IsUndefined(cb) && !JS_IsNull(cb) && !JS_IsFunction(ctx, cb))
         return JS_ThrowTypeError(ctx, "not a function");
 
-    uint32_t h;
+    uint32_t h = 0;
+    if (ui_is_fg()) {
 #ifdef ESP_PLATFORM
-    h = ui_tab5_w_create(magic, sh->handle, text, a, b, c);
+        h = ui_tab5_w_create(magic, sh->handle, text, a, b, c);
 #else
-    h = s_pcw_next++;
-    printf("[ui] widget(kind=%d, \"%s\") -> #%u (stub)\n", magic, text,
-           (unsigned)h);
+        h = s_pcw_next++;
+        printf("[ui] widget(kind=%d, \"%s\") -> #%u (stub)\n", magic, text,
+               (unsigned)h);
 #endif
+    }
     if (h && JS_IsFunction(ctx, cb)) {
         if (wcb_add(ctx, h, sh->screen, cb))
             return JS_ThrowInternalError(ctx, "too many widget callbacks");
@@ -1401,13 +1617,15 @@ JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
     JSValue cb = argv[1];
     if (!JS_IsUndefined(cb) && !JS_IsNull(cb) && !JS_IsFunction(ctx, cb))
         return JS_ThrowTypeError(ctx, "not a function");
-    uint32_t h;
+    uint32_t h = 0;
+    if (ui_is_fg()) {
 #ifdef ESP_PLATFORM
-    h = ui_tab5_w_create(UIW_K_ITEM, lh->handle, text, 0, 0, 0);
+        h = ui_tab5_w_create(UIW_K_ITEM, lh->handle, text, 0, 0, 0);
 #else
-    h = s_pcw_next++;
-    printf("[ui] list.add(\"%s\") -> #%u (stub)\n", text, (unsigned)h);
+        h = s_pcw_next++;
+        printf("[ui] list.add(\"%s\") -> #%u (stub)\n", text, (unsigned)h);
 #endif
+    }
     if (h && JS_IsFunction(ctx, cb)) {
         if (wcb_add(ctx, h, lh->screen, cb))
             return JS_ThrowInternalError(ctx, "too many widget callbacks");
@@ -1462,6 +1680,8 @@ JSValue js_uiwidget_value(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 /* (JS does JSON.stringify/parse on top). Keys 1-15 chars (NVS limit), */
 /* values up to ~3.9KB (NVS string limit). Survives task switches and  */
 /* reboots; PC build keeps a session-local table so flows smoke-test.  */
+/* P4: one flat namespace shared by ALL apps — prefix keys "<app>.k"   */
+/* by convention (§3.5); enforcement waits for the P4c manifest.       */
 /* ------------------------------------------------------------------ */
 
 #define MQJS_STORE_VAL_MAX 3900
@@ -1616,7 +1836,7 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 /* ------------------------------------------------------------------ */
-/* sys (W1-4): heap telemetry for the navigation-churn measurement     */
+/* sys: heap telemetry (W1-4) + P4a lifecycle / signals                */
 /* ------------------------------------------------------------------ */
 
 /* sys.heap() -> [internal_free, psram_free, lvgl_pool_free] bytes.
@@ -1638,32 +1858,137 @@ JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return arr;
 }
 
+/* sys.onForeground(fn): called after this app becomes foreground — the
+   app rebuilds its screens/canvas here (destroy-on-switch model, §3.3).
+   Registering any lifecycle/signal handler keeps the app alive. */
+JSValue js_sys_onForeground(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return register_cb(ctx, argv[0], &s_cur_app->fg_used, &s_cur_app->fg_cb);
+}
+
+/* sys.onBackground(fn): called right BEFORE the app's screens are
+   destroyed on a foreground switch (last chance to snapshot UI state). */
+JSValue js_sys_onBackground(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return register_cb(ctx, argv[0], &s_cur_app->bg_used, &s_cur_app->bg_cb);
+}
+
+/* sys.onSignal(fn(value, fromName)): minimal app-to-app IPC sink (§3.8).
+   Waiting for a signal counts as pending — "sleep until signalled". */
+JSValue js_sys_onSignal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return register_cb(ctx, argv[0], &s_cur_app->sig_used, &s_cur_app->sig_cb);
+}
+
+/* sys.signal(appName, value) -> bool: queue a signal for the named app
+   (value is stringified; JSON is the convention for structures). False
+   when no such app is running or the queue is full. */
+JSValue js_sys_signal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char name[32];
+    if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+        return JS_EXCEPTION;
+    JSCStringBuf vbuf;
+    size_t vlen;
+    const char *val = JS_ToCStringLen(ctx, &vlen, argv[1], &vbuf);
+    if (!val)
+        return JS_EXCEPTION;
+    if (vlen > MQJS_SIGNAL_VAL_MAX)
+        return JS_ThrowRangeError(ctx, "signal value too large (max %d)",
+                                  MQJS_SIGNAL_VAL_MAX);
+
+    AppSlot *target = NULL;
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        if (s_apps[i].used && !strcmp(s_apps[i].name, name)) {
+            target = &s_apps[i];
+            break;
+        }
+    }
+    if (!target)
+        return JS_NewBool(0);
+
+    char *copy = malloc(vlen + 1);
+    if (!copy)
+        return JS_ThrowOutOfMemory(ctx);
+    memcpy(copy, val, vlen);
+    copy[vlen] = '\0';
+
+    MqjsEvent ev = { .type = EV_SIGNAL, .slot = target->slot,
+                     .gen = target->gen };
+    ev.u.signal.value = copy;
+    snprintf(ev.u.signal.from, sizeof ev.u.signal.from, "%s",
+             s_cur_app ? s_cur_app->name : "");
+    if (!ev_post(&ev, 0)) {
+        free(copy);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+}
+
+/* sys.focus(slot): request a foreground switch (queued — the switch
+   never happens in the middle of the caller's own callback). P4a: any
+   app may call it; restricting it to the launcher is a P4b/P4c rule. */
+JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int slot;
+    if (JS_ToInt32(ctx, &slot, argv[0]))
+        return JS_EXCEPTION;
+    if (slot < 0 || slot >= MQJS_MAX_APPS)
+        return JS_ThrowRangeError(ctx, "bad app slot");
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = (uint8_t)slot;
+    ev_post(&ev, 0);
+    return JS_UNDEFINED;
+}
+
+static void dispatch_signal(AppSlot *app, MqjsEvent *ev)
+{
+    JSContext *ctx = app->ctx;
+    if (app->sig_used) {
+        if (JS_StackCheck(ctx, 4)) {
+            dump_error(ctx);
+        } else {
+            /* args are pushed in reverse: last-pushed becomes arg0 */
+            JS_PushArg(ctx, JS_NewString(ctx, ev->u.signal.from)); /* arg1 */
+            JS_PushArg(ctx, JS_NewString(ctx, ev->u.signal.value)); /* arg0 */
+            JS_PushArg(ctx, app->sig_cb.val);                      /* func */
+            JS_PushArg(ctx, JS_NULL);                              /* this */
+            arm_watchdog();
+            JSValue ret = JS_Call(ctx, 2);
+            if (JS_IsException(ret))
+                dump_error(ctx);
+        }
+    }
+    free(ev->u.signal.value);
+    ev->u.signal.value = NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* ssh (wolfSSH session tasks in components/sshc; PC = print stubs).   */
 /* W3 handle-style: ssh.connect() returns a session id; write/resize/  */
 /* close/connected/onData/onClose take it as the first argument, so up */
-/* to 3 sessions can be kept concurrently (design §7). Each session    */
-/* task posts EV_SSH_DATA (heap copies, owned by the event) with its   */
-/* id and one EV_SSH_CLOSED; any active session keeps the JS loop      */
-/* alive like an mqtt session does.                                    */
+/* to 3 sessions can be kept concurrently (design §7). The id -> app   */
+/* owner map (recorded at connect) routes EV_SSH_* to the opening app; */
+/* app_stop closes only that app's sessions. The session cap is GLOBAL */
+/* (all apps together), sshc does not know about apps (§3.5).          */
 /* ------------------------------------------------------------------ */
 
-static SshCb *sshcb_find(int32_t id)
+static SshCb *sshcb_find(AppSlot *app, int32_t id)
 {
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++)
-        if (s_ssh_cbs[i].used && s_ssh_cbs[i].id == id)
-            return &s_ssh_cbs[i];
+        if (app->ssh_cbs[i].used && app->ssh_cbs[i].id == id)
+            return &app->ssh_cbs[i];
     return NULL;
 }
 
-static SshCb *sshcb_get(int32_t id)
+static SshCb *sshcb_get(AppSlot *app, int32_t id)
 {
-    SshCb *c = sshcb_find(id);
+    SshCb *c = sshcb_find(app, id);
     if (c)
         return c;
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
-        if (!s_ssh_cbs[i].used) {
-            c = &s_ssh_cbs[i];
+        if (!app->ssh_cbs[i].used) {
+            c = &app->ssh_cbs[i];
             memset(c, 0, sizeof *c);
             c->used = true;
             c->id = id;
@@ -1681,6 +2006,36 @@ static void sshcb_release(JSContext *ctx, SshCb *c)
         JS_DeleteGCRef(ctx, &c->close_fn);
     memset(c, 0, sizeof *c);
 }
+
+#ifdef ESP_PLATFORM
+/* session id -> owning app (slot is enough: entries die with the app) */
+typedef struct {
+    bool used;
+    int16_t id;
+    uint8_t slot;
+} SshOwner;
+static SshOwner s_ssh_owner[MQJS_MAX_SSH_CB * 2];
+
+static void ssh_owner_add(int id, int slot)
+{
+    for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++) {
+        if (!s_ssh_owner[i].used) {
+            s_ssh_owner[i].used = true;
+            s_ssh_owner[i].id = (int16_t)id;
+            s_ssh_owner[i].slot = (uint8_t)slot;
+            return;
+        }
+    }
+}
+
+static SshOwner *ssh_owner_find(int id)
+{
+    for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++)
+        if (s_ssh_owner[i].used && s_ssh_owner[i].id == id)
+            return &s_ssh_owner[i];
+    return NULL;
+}
+#endif
 
 #ifndef ESP_PLATFORM
 static int s_pc_ssh_next = 1; /* fake session ids for PC smoke runs */
@@ -1726,6 +2081,7 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     if (!id)
         return JS_ThrowTypeError(ctx, "no free ssh session (max %d)",
                                  SSHC_MAX_SESSIONS);
+    ssh_owner_add(id, s_cur_app->slot);
 #else
     int id = s_pc_ssh_next++;
     printf("[ssh] connect(%s@%s:%d, pty %dx%d) -> #%d (stub: never connects "
@@ -1801,7 +2157,7 @@ static JSValue ssh_register(JSContext *ctx, JSValue *argv, bool close_cb)
         return JS_EXCEPTION;
     if (!JS_IsFunction(ctx, argv[1]))
         return JS_ThrowTypeError(ctx, "not a function");
-    SshCb *c = sshcb_get(id);
+    SshCb *c = sshcb_get(s_cur_app, id);
     if (!c)
         return JS_ThrowInternalError(ctx, "too many ssh callbacks");
     JSGCRef *ref = close_cb ? &c->close_fn : &c->data_fn;
@@ -1862,9 +2218,10 @@ void mqjs_post_ssh_closed(int id, const char *reason)
 #endif
 }
 
-static void dispatch_ssh_data(JSContext *ctx, MqjsEvent *ev)
+static void dispatch_ssh_data(AppSlot *app, MqjsEvent *ev)
 {
-    SshCb *c = sshcb_find(ev->u.ssh.id);
+    JSContext *ctx = app->ctx;
+    SshCb *c = sshcb_find(app, ev->u.ssh.id);
     if (c && c->data_used) {
         if (JS_StackCheck(ctx, 3)) {
             dump_error(ctx);
@@ -1880,11 +2237,18 @@ static void dispatch_ssh_data(JSContext *ctx, MqjsEvent *ev)
         }
     }
     free(ev->u.ssh.data);
+    ev->u.ssh.data = NULL;
 }
 
-static void dispatch_ssh_closed(JSContext *ctx, const MqjsEvent *ev)
+static void dispatch_ssh_closed(AppSlot *app, const MqjsEvent *ev)
 {
-    SshCb *c = sshcb_find(ev->u.ssh_closed.id);
+    JSContext *ctx = app->ctx;
+#ifdef ESP_PLATFORM
+    SshOwner *o = ssh_owner_find(ev->u.ssh_closed.id);
+    if (o)
+        o->used = false; /* session gone: stop counting it as pending */
+#endif
+    SshCb *c = sshcb_find(app, ev->u.ssh_closed.id);
     if (!c)
         return;
     if (c->close_used) {
@@ -1905,7 +2269,9 @@ static void dispatch_ssh_closed(JSContext *ctx, const MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
-/* mqtt (esp-mqtt; PC build = print-only stubs)                        */
+/* mqtt (esp-mqtt; PC build = print-only stubs). Per-app client with   */
+/* client_id "mqjs-app-<slot>" so apps cannot kick each other off the  */
+/* broker (the id-collision lesson of 2026-06-11 applied per app).     */
 /* ------------------------------------------------------------------ */
 
 /* MQTT topic filter match incl. '+' and '#' wildcards */
@@ -1938,21 +2304,27 @@ static bool mqtt_topic_match(const char *filter, const char *topic)
 }
 
 #ifdef ESP_PLATFORM
-/* runs in the esp-mqtt task: copy + enqueue only, never touch JS */
+/* runs in the esp-mqtt task: copy + enqueue only, never touch JS. The
+   handler argument carries the owning slot + generation (§3.2). */
+#define MQTT_ARG_PACK(slot, gen) ((void *)(uintptr_t)((slot) | ((gen) << 8)))
+
 static void mqtt_event_cb(void *arg, esp_event_base_t base,
                           int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t e = event_data;
-    MqjsEvent ev = { 0 };
+    uintptr_t packed = (uintptr_t)arg;
+    uint8_t slot = (uint8_t)(packed & 0xFF);
+    uint16_t gen = (uint16_t)(packed >> 8);
+    MqjsEvent ev = { .slot = slot, .gen = gen };
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        s_mqtt_up = true;
+        s_apps[slot].mqtt_up = true;
         ev.type = EV_MQTT_CONNECTED;
         xQueueSend(s_event_queue, &ev, 0);
         break;
     case MQTT_EVENT_DISCONNECTED:
-        s_mqtt_up = false;   /* esp-mqtt auto-reconnects */
+        s_apps[slot].mqtt_up = false;   /* esp-mqtt auto-reconnects */
         break;
     case MQTT_EVENT_DATA: {
         /* fragmented payloads (> internal rx buffer) are not supported */
@@ -1996,24 +2368,26 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
 
 #ifdef ESP_PLATFORM
-    if (s_mqtt)
+    AppSlot *app = s_cur_app;
+    if (app->mqtt)
         return JS_ThrowTypeError(ctx, "mqtt already started");
+    /* distinct client id per app AND distinct from the task-delivery
+       client (task_source.c): same-id clients kick each other off the
+       broker (found the hard way, 2026-06-11) */
+    char client_id[16];
+    snprintf(client_id, sizeof client_id, "mqjs-app-%d", app->slot);
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = uri,   /* copied by esp_mqtt_client_init */
-        /* distinct client id: the default is derived from the MAC, so a
-           JS task connecting to the same broker as the task-delivery
-           client (task_source.c) made the broker kick whichever
-           connected first — task pushes flapped and the status-bar MQTT
-           dot went gray (found the hard way, 2026-06-11) */
-        .credentials.client_id = "mqjs-js-task",
+        .credentials.client_id = client_id,
     };
-    s_mqtt = esp_mqtt_client_init(&cfg);
-    if (!s_mqtt)
+    app->mqtt = esp_mqtt_client_init(&cfg);
+    if (!app->mqtt)
         return JS_ThrowInternalError(ctx, "mqtt init failed (bad uri?)");
-    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_cb, NULL);
-    if (esp_mqtt_client_start(s_mqtt) != ESP_OK) {
-        esp_mqtt_client_destroy(s_mqtt);
-        s_mqtt = NULL;
+    esp_mqtt_client_register_event(app->mqtt, ESP_EVENT_ANY_ID, mqtt_event_cb,
+                                   MQTT_ARG_PACK(app->slot, app->gen));
+    if (esp_mqtt_client_start(app->mqtt) != ESP_OK) {
+        esp_mqtt_client_destroy(app->mqtt);
+        app->mqtt = NULL;
         return JS_ThrowInternalError(ctx, "mqtt start failed");
     }
 #else
@@ -2025,11 +2399,12 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 JSValue js_mqtt_disconnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
-    if (s_mqtt) {
-        esp_mqtt_client_stop(s_mqtt);
-        esp_mqtt_client_destroy(s_mqtt);
-        s_mqtt = NULL;
-        s_mqtt_up = false;
+    AppSlot *app = s_cur_app;
+    if (app->mqtt) {
+        esp_mqtt_client_stop(app->mqtt);
+        esp_mqtt_client_destroy(app->mqtt);
+        app->mqtt = NULL;
+        app->mqtt_up = false;
     }
 #else
     printf("[mqtt] disconnect (stub)\n");
@@ -2040,7 +2415,7 @@ JSValue js_mqtt_disconnect(JSContext *ctx, JSValue *this_val, int argc, JSValue 
 JSValue js_mqtt_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
-    return JS_NewInt32(ctx, s_mqtt_up ? 1 : 0);
+    return JS_NewInt32(ctx, s_cur_app->mqtt_up ? 1 : 0);
 #else
     return JS_NewInt32(ctx, 0);
 #endif
@@ -2048,14 +2423,8 @@ JSValue js_mqtt_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 
 JSValue js_mqtt_onConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    if (!JS_IsFunction(ctx, argv[0]))
-        return JS_ThrowTypeError(ctx, "not a function");
-    if (s_mqtt_onconn_used)
-        JS_DeleteGCRef(ctx, &s_mqtt_onconn);
-    JSValue *pf = JS_AddGCRef(ctx, &s_mqtt_onconn);
-    *pf = argv[0];
-    s_mqtt_onconn_used = true;
-    return JS_UNDEFINED;
+    return register_cb(ctx, argv[0], &s_cur_app->mqtt_onconn_used,
+                       &s_cur_app->mqtt_onconn);
 }
 
 JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -2076,10 +2445,10 @@ JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
 
 #ifdef ESP_PLATFORM
-    if (!s_mqtt)
+    if (!s_cur_app->mqtt)
         return JS_ThrowTypeError(ctx, "mqtt not connected");
-    int id = esp_mqtt_client_publish(s_mqtt, topic, payload, (int)plen,
-                                     qos, retain);
+    int id = esp_mqtt_client_publish(s_cur_app->mqtt, topic, payload,
+                                     (int)plen, qos, retain);
     return JS_NewInt32(ctx, id);
 #else
     printf("[mqtt] publish(%s, %s, qos=%d, retain=%d) (stub)\n",
@@ -2101,12 +2470,12 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
         return JS_ThrowTypeError(ctx, "not a function");
 
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        MqttSub *s = &s_mqtt_subs[i];
+        MqttSub *s = &s_cur_app->mqtt_subs[i];
         if (s->used && !strcmp(s->topic, topic))
             return JS_ThrowTypeError(ctx, "topic already subscribed");
     }
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        MqttSub *s = &s_mqtt_subs[i];
+        MqttSub *s = &s_cur_app->mqtt_subs[i];
         if (s->used)
             continue;
         memcpy(s->topic, topic, tlen + 1);
@@ -2114,8 +2483,8 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
         *pf = argv[1];
         s->used = true;
 #ifdef ESP_PLATFORM
-        if (s_mqtt && s_mqtt_up)
-            esp_mqtt_client_subscribe(s_mqtt, s->topic, 0);
+        if (s_cur_app->mqtt && s_cur_app->mqtt_up)
+            esp_mqtt_client_subscribe(s_cur_app->mqtt, s->topic, 0);
         /* not connected yet: dispatch_mqtt_connected() subscribes later */
 #else
         printf("[mqtt] subscribe(%s) registered (stub: never fires on PC)\n",
@@ -2126,34 +2495,36 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
     return JS_ThrowInternalError(ctx, "too many mqtt subscriptions");
 }
 
-static void dispatch_mqtt_connected(JSContext *ctx)
+static void dispatch_mqtt_connected(AppSlot *app)
 {
+    JSContext *ctx = app->ctx;
 #ifdef ESP_PLATFORM
     /* (re)subscribe everything on each broker session; duplicate
        SUBSCRIBE packets are just a refresh for the broker */
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        if (s_mqtt_subs[i].used && s_mqtt)
-            esp_mqtt_client_subscribe(s_mqtt, s_mqtt_subs[i].topic, 0);
+        if (app->mqtt_subs[i].used && app->mqtt)
+            esp_mqtt_client_subscribe(app->mqtt, app->mqtt_subs[i].topic, 0);
     }
 #endif
-    if (!s_mqtt_onconn_used)
+    if (!app->mqtt_onconn_used)
         return;
     if (JS_StackCheck(ctx, 2)) {
         dump_error(ctx);
         return;
     }
-    JS_PushArg(ctx, s_mqtt_onconn.val);  /* func */
-    JS_PushArg(ctx, JS_NULL);            /* this */
+    JS_PushArg(ctx, app->mqtt_onconn.val);  /* func */
+    JS_PushArg(ctx, JS_NULL);               /* this */
     arm_watchdog();
     JSValue ret = JS_Call(ctx, 0);
     if (JS_IsException(ret))
         dump_error(ctx);
 }
 
-static void dispatch_mqtt_data(JSContext *ctx, MqjsEvent *ev)
+static void dispatch_mqtt_data(AppSlot *app, MqjsEvent *ev)
 {
+    JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        MqttSub *s = &s_mqtt_subs[i];
+        MqttSub *s = &app->mqtt_subs[i];
         if (!s->used || !mqtt_topic_match(s->topic, ev->u.mqtt.topic))
             continue;
         if (JS_StackCheck(ctx, 4)) {
@@ -2174,149 +2545,184 @@ static void dispatch_mqtt_data(JSContext *ctx, MqjsEvent *ev)
     }
     free(ev->u.mqtt.topic);
     free(ev->u.mqtt.payload);
+    ev->u.mqtt.topic = NULL;
+    ev->u.mqtt.payload = NULL;
 }
 
 /* ------------------------------------------------------------------ */
-/* event loop                                                          */
+/* scheduler (design §3.7)                                             */
 /* ------------------------------------------------------------------ */
 
 /* generated by the host tool from device_stdlib.c; references the
    binding functions above, so it must be included after them */
 #include "device_stdlib.h"
 
-static bool anything_pending(void)
+/* Does this app still have a reason to live? (§3.2: an app with no
+   timers, handlers or sessions is reaped.) */
+static bool anything_pending(const AppSlot *app)
 {
     for (int i = 0; i < MQJS_MAX_TIMERS; i++)
-        if (s_timers[i].used)
+        if (app->timers[i].used)
             return true;
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++)
-        if (s_gpio_cb[i].used)
+        if (app->gpio_cb[i].used)
             return true;
-    if (s_touch_used) /* a touch handler keeps the loop alive */
+    if (app->touch_used || app->key_used)
         return true;
-    if (s_key_used)   /* so does a key handler */
-        return true;
+    if (app->fg_used || app->bg_used || app->sig_used)
+        return true; /* lifecycle/signal sinks keep the app alive (§3.8) */
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
-        if (s_widget_cbs[i].used) /* a live widget screen, too */
+        if (app->widget_cbs[i].used) /* a live widget screen, too */
             return true;
 #ifdef ESP_PLATFORM
-    if (s_mqtt)   /* active mqtt session keeps the loop alive */
+    if (app->mqtt)   /* active mqtt session keeps the app alive */
         return true;
-    if (mqjs_ssh_active()) /* so does an ssh session */
-        return true;
+    for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++)
+        if (s_ssh_owner[i].used && s_ssh_owner[i].slot == app->slot)
+            return true; /* so does an ssh session it owns */
 #endif
     return false;
 }
 
-static void reset_slots(JSContext *ctx)
+/* Release everything one app holds (per-app version of the old
+   reset_slots). The shared event queue is NOT drained: in-flight
+   events of this app die in the dispatcher (slot+gen check). */
+static void app_reset_bindings(AppSlot *app)
 {
+    JSContext *ctx = app->ctx;
+
     for (int i = 0; i < MQJS_MAX_TIMERS; i++) {
-        if (s_timers[i].used) {
-            JS_DeleteGCRef(ctx, &s_timers[i].fn);
-            s_timers[i].used = false;
+        if (app->timers[i].used) {
+            JS_DeleteGCRef(ctx, &app->timers[i].fn);
+            app->timers[i].used = false;
         }
     }
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-        if (s_gpio_cb[i].used) {
+        if (app->gpio_cb[i].used) {
 #ifdef ESP_PLATFORM
-            gpio_isr_handler_remove(s_gpio_cb[i].pin);
+            gpio_isr_handler_remove(app->gpio_cb[i].pin);
 #endif
-            JS_DeleteGCRef(ctx, &s_gpio_cb[i].fn);
-            s_gpio_cb[i].used = false;
+            JS_DeleteGCRef(ctx, &app->gpio_cb[i].fn);
+            app->gpio_cb[i].used = false;
         }
     }
 #ifdef ESP_PLATFORM
-    /* stop producers first, then drain the queue and free mqtt copies */
-    if (s_mqtt) {
-        esp_mqtt_client_stop(s_mqtt);
-        esp_mqtt_client_destroy(s_mqtt);
-        s_mqtt = NULL;
-        s_mqtt_up = false;
+    if (app->mqtt) {
+        esp_mqtt_client_stop(app->mqtt);
+        esp_mqtt_client_destroy(app->mqtt);
+        app->mqtt = NULL;
+        app->mqtt_up = false;
     }
-    mqjs_ssh_close_all(); /* blocks until session tasks died (bounded) */
-    if (s_event_queue) {
-        MqjsEvent ev;
-        while (xQueueReceive(s_event_queue, &ev, 0) == pdTRUE) {
-            if (ev.type == EV_MQTT_DATA) {
-                free(ev.u.mqtt.topic);
-                free(ev.u.mqtt.payload);
-            } else if (ev.type == EV_SSH_DATA) {
-                free(ev.u.ssh.data);
-            }
+    /* close only the ssh sessions THIS app opened (§3.6: shared-resource
+       ownership); other apps' sessions stay untouched */
+    for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++) {
+        if (s_ssh_owner[i].used && s_ssh_owner[i].slot == app->slot) {
+            mqjs_ssh_close(s_ssh_owner[i].id);
+            s_ssh_owner[i].used = false;
         }
     }
 #endif
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        if (s_mqtt_subs[i].used) {
-            JS_DeleteGCRef(ctx, &s_mqtt_subs[i].fn);
-            s_mqtt_subs[i].used = false;
+        if (app->mqtt_subs[i].used) {
+            JS_DeleteGCRef(ctx, &app->mqtt_subs[i].fn);
+            app->mqtt_subs[i].used = false;
         }
     }
-    if (s_mqtt_onconn_used) {
-        JS_DeleteGCRef(ctx, &s_mqtt_onconn);
-        s_mqtt_onconn_used = false;
+    if (app->mqtt_onconn_used) {
+        JS_DeleteGCRef(ctx, &app->mqtt_onconn);
+        app->mqtt_onconn_used = false;
     }
-    if (s_touch_used) {
-        s_touch_used = false; /* before the GCRef dies: gates the poster */
-        JS_DeleteGCRef(ctx, &s_touch_cb);
+    if (app->touch_used) {
+        app->touch_used = false; /* before the GCRef dies: gates the poster */
+        JS_DeleteGCRef(ctx, &app->touch_cb);
     }
-    if (s_key_used) {
-        s_key_used = false;   /* ditto */
-        JS_DeleteGCRef(ctx, &s_key_cb);
+    if (app->key_used) {
+        app->key_used = false;   /* ditto */
+        JS_DeleteGCRef(ctx, &app->key_cb);
+    }
+    if (app->fg_used) {
+        JS_DeleteGCRef(ctx, &app->fg_cb);
+        app->fg_used = false;
+    }
+    if (app->bg_used) {
+        JS_DeleteGCRef(ctx, &app->bg_cb);
+        app->bg_used = false;
+    }
+    if (app->sig_used) {
+        JS_DeleteGCRef(ctx, &app->sig_cb);
+        app->sig_used = false;
     }
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
-        if (s_ssh_cbs[i].used)
-            sshcb_release(ctx, &s_ssh_cbs[i]);
+        if (app->ssh_cbs[i].used)
+            sshcb_release(ctx, &app->ssh_cbs[i]);
     }
-    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
-        if (s_widget_cbs[i].used) {
-            s_widget_cbs[i].used = false;
-            JS_DeleteGCRef(ctx, &s_widget_cbs[i].fn);
-        }
-    }
-    /* tear down this task's widget screens; the next task starts on the
-       console screen (same hygiene as the canvas clear on task switch) */
+    wcb_release_all(app);
+
+    /* flush a half-assembled console line so it is not attributed to
+       whichever app prints next */
+    AppSlot *prev = s_cur_app;
+    s_cur_app = app;
+    sink_flush();
+    s_cur_app = prev;
+
+    /* the foreground app owned the screen: tear it down. The next
+       foreground app rebuilds in its sys.onForeground. */
+    if (app->slot == s_fg_slot) {
 #ifdef ESP_PLATFORM
-    ui_tab5_w_reset();
+        ui_tab5_w_reset();
+        ui_cmd_t c = { .op = UI_CMD_RESET };
+        ui_tab5_cmd(&c);
 #else
-    pcw_reset();
+        pcw_reset();
 #endif
+    }
 }
 
-void mqjs_runtime_stop(void)
+static void app_stop_internal(AppSlot *app)
 {
-    s_stop_req = true;
-}
-
-int mqjs_run_script(const char *src, size_t src_len, const char *name,
-                    void *mem_buf, size_t mem_size)
-{
-    int ret_code = 0;
-
-    s_stop_req = false;
-    memset(s_timers, 0, sizeof(s_timers));
-    memset(s_gpio_cb, 0, sizeof(s_gpio_cb));
-    memset(s_mqtt_subs, 0, sizeof(s_mqtt_subs));
-    memset(s_widget_cbs, 0, sizeof(s_widget_cbs));
-    s_mqtt_onconn_used = false;
-    s_touch_used = false;
-    s_key_used = false;
-    memset(s_ssh_cbs, 0, sizeof(s_ssh_cbs));
-
+    if (!app->used)
+        return;
+    app_reset_bindings(app);
+    JS_FreeContext(app->ctx);  /* runs user-object finalizers */
+    app->ctx = NULL;
+    app->used = false;
 #ifdef ESP_PLATFORM
-    if (!s_event_queue)
-        s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
+    ESP_LOGI(TAG, "app '%s' (slot %d) stopped", app->name, app->slot);
 #endif
+}
 
-    JSContext *ctx = JS_NewContext(mem_buf, mem_size, &js_stdlib);
+static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
+                              const char *name)
+{
+    if (app->used || !app->mem)
+        return -1;
+
+    app->gen++; /* stale events of the previous occupant die now */
+    memset(app->timers, 0, sizeof app->timers);
+    memset(app->gpio_cb, 0, sizeof app->gpio_cb);
+    memset(app->mqtt_subs, 0, sizeof app->mqtt_subs);
+    memset(app->widget_cbs, 0, sizeof app->widget_cbs);
+    memset(app->ssh_cbs, 0, sizeof app->ssh_cbs);
+    app->mqtt_onconn_used = false;
+    app->touch_used = false;
+    app->key_used = false;
+    app->fg_used = app->bg_used = app->sig_used = false;
+    app->sink_len = 0;
+    snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
+
+    JSContext *ctx = JS_NewContext(app->mem, app->mem_size, &js_stdlib);
     if (!ctx)
         return -1;
+    app->ctx = ctx;
+    app->used = true;
     JS_SetLogFunc(ctx, js_log_func);
     JS_SetInterruptHandler(ctx, js_interrupt_handler);
 
-    /* 1) compile + run top-level (registers callbacks) */
+    /* compile + run the top level (registers callbacks) */
+    AppSlot *prev = s_cur_app;
+    s_cur_app = app;
     arm_watchdog();
-    JSValue val;
+    bool failed = false;
     if (JS_IsBytecode((const uint8_t *)src, src_len)) {
         /* precompiled task: the buffer is patched in place and stays
            referenced for the whole context lifetime, so it must live in
@@ -2325,57 +2731,363 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
            Re-relocating the same buffer on a later run is a no-op. */
         if (JS_RelocateBytecode(ctx, (uint8_t *)src, (uint32_t)src_len)) {
             printf("mqjs: bytecode relocation failed\n");
-            ret_code = -1;
-            goto done;
-        }
-        val = JS_LoadBytecode(ctx, (const uint8_t *)src);
-        if (!JS_IsException(val))
-            val = JS_Run(ctx, val);
-    } else {
-        val = JS_Eval(ctx, src, src_len, name ? name : "<task>", 0);
-    }
-    if (JS_IsException(val)) {
-        dump_error(ctx);
-        ret_code = -1;
-        goto done;
-    }
-
-    /* 2) pump events until nothing is scheduled */
-    while (!s_stop_req && anything_pending()) {
-        int idle = run_timers(ctx, 50 /* ms */);
-#ifdef ESP_PLATFORM
-        MqjsEvent ev;
-        if (xQueueReceive(s_event_queue, &ev, pdMS_TO_TICKS(idle))) {
-            switch (ev.type) {
-            case EV_GPIO:           dispatch_gpio_event(ctx, &ev);    break;
-            case EV_MQTT_CONNECTED: dispatch_mqtt_connected(ctx);     break;
-            case EV_MQTT_DATA:      dispatch_mqtt_data(ctx, &ev);     break;
-            case EV_TOUCH:          dispatch_touch_event(ctx, &ev);   break;
-            case EV_KEY:            dispatch_key_event(ctx, &ev);     break;
-            case EV_SSH_DATA:       dispatch_ssh_data(ctx, &ev);      break;
-            case EV_SSH_CLOSED:     dispatch_ssh_closed(ctx, &ev);    break;
-            case EV_WIDGET:         dispatch_widget_event(ctx, &ev);  break;
+            failed = true;
+        } else {
+            JSValue val = JS_LoadBytecode(ctx, (const uint8_t *)src);
+            if (!JS_IsException(val))
+                val = JS_Run(ctx, val);
+            if (JS_IsException(val)) {
+                dump_error(ctx);
+                failed = true;
             }
         }
+    } else {
+        JSValue val = JS_Eval(ctx, src, src_len, name ? name : "<task>", 0);
+        if (JS_IsException(val)) {
+            dump_error(ctx);
+            failed = true;
+        }
+    }
+    s_cur_app = prev;
+
+    if (failed) {
+        app_stop_internal(app);
+        return -1;
+    }
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "app '%s' started in slot %d", app->name, app->slot);
+#endif
+    return 0;
+}
+
+/* Foreground switch protocol (§3.3), synchronous on the JS task so the
+   order background-cb -> teardown -> foreground-cb cannot interleave
+   with other dispatches. */
+static void switch_foreground(int new_slot)
+{
+    if (new_slot < 0 || new_slot >= MQJS_MAX_APPS || new_slot == s_fg_slot ||
+        !s_apps[new_slot].used)
+        return;
+
+    AppSlot *old = &s_apps[s_fg_slot];
+    if (old->used) {
+        if (old->bg_used)
+            app_call0(old, &old->bg_cb); /* may snapshot UI state */
+        /* destroy the outgoing app's screen state (§3.3 / decision 3) */
+        wcb_release_all(old);
+#ifdef ESP_PLATFORM
+        ui_tab5_w_reset();
+        ui_cmd_t c = { .op = UI_CMD_RESET };
+        ui_tab5_cmd(&c);
 #else
-        (void)dispatch_gpio_event;       /* unused in PC build */
-        (void)dispatch_mqtt_connected;
-        (void)dispatch_mqtt_data;
-        (void)dispatch_touch_event;
-        (void)dispatch_key_event;
-        (void)dispatch_ssh_data;
-        (void)dispatch_ssh_closed;
-        (void)dispatch_widget_event;
-        if (idle > 0)
-            usleep((useconds_t)idle * 1000);
+        pcw_reset();
 #endif
     }
 
-done:
-    reset_slots(ctx);
-    JS_FreeContext(ctx);  /* runs user-object finalizers */
+    s_fg_slot = new_slot;
+    AppSlot *nw = &s_apps[new_slot];
 #ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "task '%s' finished (rc=%d)", name ? name : "<task>", ret_code);
+    ESP_LOGI(TAG, "foreground -> '%s' (slot %d)", nw->name, new_slot);
+#else
+    printf("[sys] foreground -> '%s' (slot %d)\n", nw->name, new_slot);
 #endif
-    return ret_code;
+    if (nw->fg_used)
+        app_call0(nw, &nw->fg_cb);   /* the app rebuilds its UI here */
+    ui_tab5_w_commit();              /* §3.4: anim only after the rebuild */
+}
+
+static void focus_apply(int target)
+{
+    if (target == MQJS_FOCUS_NEXT) {
+        for (int i = 1; i <= MQJS_MAX_APPS; i++) {
+            int s = (s_fg_slot + i) % MQJS_MAX_APPS;
+            if (s_apps[s].used) {
+                target = s;
+                break;
+            }
+        }
+        if (target == MQJS_FOCUS_NEXT)
+            return; /* nothing running */
+    }
+    switch_foreground(target);
+}
+
+/* drop an event without dispatching: free its heap payload */
+static void free_event_payload(MqjsEvent *ev)
+{
+    switch (ev->type) {
+    case EV_MQTT_DATA:
+        free(ev->u.mqtt.topic);
+        free(ev->u.mqtt.payload);
+        break;
+    case EV_SSH_DATA:
+        free(ev->u.ssh.data);
+        break;
+    case EV_SIGNAL:
+        free(ev->u.signal.value);
+        break;
+    default:
+        break;
+    }
+}
+
+/* §3.2 routing table: which app owns this event? NULL = drop it.
+   Slot-addressed events also check the generation (stale = drop). */
+static AppSlot *event_owner(const MqjsEvent *ev)
+{
+    switch (ev->type) {
+    case EV_GPIO:
+        for (int a = 0; a < MQJS_MAX_APPS; a++) {
+            if (!s_apps[a].used)
+                continue;
+            for (int i = 0; i < MQJS_MAX_GPIO_CB; i++)
+                if (s_apps[a].gpio_cb[i].used &&
+                    s_apps[a].gpio_cb[i].pin == ev->u.gpio.pin)
+                    return &s_apps[a];
+        }
+        return NULL;
+    case EV_MQTT_CONNECTED:
+    case EV_MQTT_DATA:
+    case EV_SIGNAL: {
+        AppSlot *app = &s_apps[ev->slot];
+        return (app->used && app->gen == ev->gen) ? app : NULL;
+    }
+#ifdef ESP_PLATFORM
+    case EV_SSH_DATA:
+    case EV_SSH_CLOSED: {
+        int id = ev->type == EV_SSH_DATA ? ev->u.ssh.id : ev->u.ssh_closed.id;
+        SshOwner *o = ssh_owner_find(id);
+        return (o && s_apps[o->slot].used) ? &s_apps[o->slot] : NULL;
+    }
+#endif
+    case EV_TOUCH:
+    case EV_KEY:
+    case EV_WIDGET: {
+        AppSlot *fg = &s_apps[s_fg_slot]; /* input is foreground-only */
+        return fg->used ? fg : NULL;
+    }
+    default:
+        return NULL;
+    }
+}
+
+static void dispatch_event(AppSlot *app, MqjsEvent *ev)
+{
+    AppSlot *prev = s_cur_app;
+    s_cur_app = app;
+    switch (ev->type) {
+    case EV_GPIO:           dispatch_gpio_event(app, ev);    break;
+    case EV_MQTT_CONNECTED: dispatch_mqtt_connected(app);    break;
+    case EV_MQTT_DATA:      dispatch_mqtt_data(app, ev);     break;
+    case EV_TOUCH:          dispatch_touch_event(app, ev);   break;
+    case EV_KEY:            dispatch_key_event(app, ev);     break;
+    case EV_SSH_DATA:       dispatch_ssh_data(app, ev);      break;
+    case EV_SSH_CLOSED:     dispatch_ssh_closed(app, ev);    break;
+    case EV_WIDGET:         dispatch_widget_event(app, ev);  break;
+    case EV_SIGNAL:         dispatch_signal(app, ev);        break;
+    }
+    s_cur_app = prev;
+}
+
+/* receive + dispatch one event, waiting up to `idle` ms. Returns true
+   when an event was handled. */
+static bool pump_one_event(int idle)
+{
+    MqjsEvent ev;
+#ifdef ESP_PLATFORM
+    if (!s_event_queue ||
+        xQueueReceive(s_event_queue, &ev, pdMS_TO_TICKS(idle)) != pdTRUE)
+        return false;
+#else
+    if (!pc_q_recv(&ev)) {
+        if (idle > 0)
+            usleep((useconds_t)idle * 1000);
+        return false;
+    }
+#endif
+    if (ev.type == EV_FOCUS) {
+        focus_apply(ev.u.focus.target);
+        return true;
+    }
+    AppSlot *owner = event_owner(&ev);
+    if (!owner)
+        free_event_payload(&ev); /* dead-slot leftovers: drop (§3.2) */
+    else
+        dispatch_event(owner, &ev);
+    return true;
+}
+
+/* Reap apps with nothing pending (and a dev slot whose stop was
+   requested). Returns true when the dev slot was reaped. */
+static bool reap_idle_apps(void)
+{
+    bool dev_reaped = false;
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        AppSlot *app = &s_apps[i];
+        if (!app->used)
+            continue;
+        bool stop = (i == MQJS_SLOT_DEV && s_stop_req) ||
+                    !anything_pending(app);
+        if (!stop)
+            continue;
+        app_stop_internal(app);
+        if (i == MQJS_SLOT_DEV)
+            dev_reaped = true;
+    }
+    return dev_reaped;
+}
+
+/* ------------------------------------------------------------------ */
+/* public API                                                          */
+/* ------------------------------------------------------------------ */
+
+void mqjs_rt_init(void)
+{
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        s_apps[i].slot = (uint8_t)i;
+#ifdef ESP_PLATFORM
+    if (!s_event_queue)
+        s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
+    /* fixed arenas, allocated once and kept (design §3.6): app_start can
+       never fail with OOM and the PSRAM heap is not churned */
+    for (int i = 0; i < MQJS_MAX_APPS; i++) {
+        if (s_apps[i].mem)
+            continue;
+        uint8_t *m = heap_caps_malloc(MQJS_APP_MEM_SIZE, MALLOC_CAP_SPIRAM);
+        if (!m) {
+            ESP_LOGW(TAG, "PSRAM arena alloc failed for slot %d, trying "
+                     "internal RAM", i);
+            m = malloc(MQJS_APP_MEM_SIZE);
+        }
+        if (!m) {
+            ESP_LOGE(TAG, "no arena for app slot %d", i);
+            continue;
+        }
+        s_apps[i].mem = m;
+        s_apps[i].mem_size = MQJS_APP_MEM_SIZE;
+    }
+#endif
+}
+
+int mqjs_app_start(int slot, const char *src, size_t src_len,
+                   const char *name)
+{
+    if (slot < 0 || slot >= MQJS_MAX_APPS)
+        return -1;
+#ifndef ESP_PLATFORM
+    s_apps[slot].slot = (uint8_t)slot;
+    if (!s_apps[slot].mem) { /* PC: lazy arena */
+        s_apps[slot].mem = malloc(MQJS_APP_MEM_SIZE);
+        s_apps[slot].mem_size = MQJS_APP_MEM_SIZE;
+    }
+#endif
+    return app_start_internal(&s_apps[slot], src, src_len, name);
+}
+
+void mqjs_app_stop(int slot)
+{
+    if (slot < 0 || slot >= MQJS_MAX_APPS)
+        return;
+    app_stop_internal(&s_apps[slot]);
+}
+
+bool mqjs_app_running(int slot)
+{
+    return slot >= 0 && slot < MQJS_MAX_APPS && s_apps[slot].used;
+}
+
+void mqjs_focus(int slot)
+{
+    if (slot < 0 || slot >= MQJS_MAX_APPS)
+        return;
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = (uint8_t)slot;
+    ev_post(&ev, 0);
+}
+
+void mqjs_focus_next(void)
+{
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = MQJS_FOCUS_NEXT;
+    ev_post(&ev, 0);
+}
+
+void mqjs_runtime_stop(void)
+{
+    s_stop_req = true;
+}
+
+/* The permanent multi-app loop (§3.7). The dev slot is restarted from
+   the provider: immediately after a stop request (task push), 1s after
+   a natural end (the pre-P4 auto-rerun behavior). */
+void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
+{
+    int64_t dev_retry_at = 0; /* 0 = ask the provider right away */
+
+    for (;;) {
+        if (next_dev && !s_apps[MQJS_SLOT_DEV].used &&
+            time_ms() >= dev_retry_at) {
+            const char *src = NULL, *name = NULL;
+            size_t len = 0;
+            s_stop_req = false;
+            if (next_dev(&src, &len, &name, user) && src) {
+                if (mqjs_app_start(MQJS_SLOT_DEV, src, len, name) != 0)
+                    dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
+            } else {
+                dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
+            }
+        }
+
+        int idle = run_all_timers(50 /* ms */);
+        pump_one_event(idle);
+        ui_tab5_w_commit(); /* §3.4: start a queued screen-load anim only
+                               after this dispatch finished building */
+        if (reap_idle_apps())
+            dev_retry_at = s_stop_req ? 0 : time_ms() + MQJS_DEV_RESTART_MS;
+    }
+}
+
+/* Single-app compatibility pump (PC run_pc / test_pc; also keeps the
+   pre-P4 embedded API working). Uses the caller's buffer as the dev
+   arena and returns when no app has anything pending. */
+int mqjs_run_script(const char *src, size_t src_len, const char *name,
+                    void *mem_buf, size_t mem_size)
+{
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        s_apps[i].slot = (uint8_t)i;
+#ifdef ESP_PLATFORM
+    if (!s_event_queue)
+        s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
+#endif
+    AppSlot *dev = &s_apps[MQJS_SLOT_DEV];
+    if (dev->used)
+        return -1;
+    dev->mem = mem_buf;
+    dev->mem_size = mem_size;
+
+    s_stop_req = false;
+    if (app_start_internal(dev, src, src_len, name))
+        return -1;
+
+    for (;;) {
+        bool any = false;
+        for (int i = 0; i < MQJS_MAX_APPS; i++)
+            any |= s_apps[i].used;
+        if (!any || s_stop_req)
+            break;
+        int idle = run_all_timers(50 /* ms */);
+        pump_one_event(idle);
+        ui_tab5_w_commit();
+        for (int i = 0; i < MQJS_MAX_APPS; i++) {
+            AppSlot *app = &s_apps[i];
+            if (app->used && !anything_pending(app))
+                app_stop_internal(app);
+        }
+    }
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        app_stop_internal(&s_apps[i]);
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "task '%s' finished", name ? name : "<task>");
+#endif
+    return 0;
 }

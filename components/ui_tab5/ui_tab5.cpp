@@ -52,6 +52,7 @@
    depends on this component for ui_tab5.h, same trick as wifi.c) */
 extern "C" void mqjs_post_touch(int x, int y, int kind);
 extern "C" void mqjs_post_key(const char *utf8, size_t len);
+extern "C" void mqjs_focus_next(void);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -786,6 +787,7 @@ static lv_obj_t *make_dot(lv_obj_t *parent)
 {
     lv_obj_t *dot = lv_obj_create(parent);
     lv_obj_remove_style_all(dot);
+    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE); /* bar tap = focus */
     lv_obj_set_size(dot, 14, 14);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
@@ -819,11 +821,20 @@ public:
         lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
         lv_obj_set_style_bg_color(bar, lv_color_hex(UI_COL_BAR), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        /* P4a: tapping the bar cycles the foreground app (it is system
+           chrome visible from everywhere). The P4b launcher will turn
+           this into "go home" (switch_foreground(0)). */
+        lv_obj_add_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(
+            bar, [](lv_event_t *) { mqjs_focus_next(); }, LV_EVENT_CLICKED,
+            NULL);
 
         lv_obj_t *row = lv_obj_create(bar);
         lv_obj_remove_style_all(row);
         lv_obj_set_pos(row, 0, 0);
         lv_obj_set_size(row, UI_LCD_H_RES, 44);
+        /* let taps on the row land on the bar's CLICKED handler */
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_pad_hor(row, UI_PAD, 0);
         lv_obj_set_style_pad_column(row, 10, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -843,6 +854,7 @@ public:
 
         lv_obj_t *spacer = lv_obj_create(row);
         lv_obj_remove_style_all(spacer);
+        lv_obj_remove_flag(spacer, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_height(spacer, 1);
         lv_obj_set_flex_grow(spacer, 1);
 
@@ -1098,6 +1110,15 @@ public:
             if (cmd.op == UI_CMD_KEYBOARD) {
                 /* not a drawing op: must not unhide the canvas */
                 kb_show(cmd.x != 0);
+                continue;
+            }
+            if (cmd.op == UI_CMD_RESET) {
+                /* foreground-app switch (P4a): same hygiene as a task
+                   switch — stale pixels gone, console visible again,
+                   keyboard down. The next app redraws from its model. */
+                fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
+                lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+                kb_show(false);
                 continue;
             }
             apply(cmd);

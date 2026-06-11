@@ -1,8 +1,13 @@
 # Tab5 マルチアプリランタイム + ランチャー 設計書 (P4)
 
-Status: **設計フェーズ** (2026-06-11)。スコープは **P4a(ランタイムのマルチ
-コンテキスト化)+ P4b(ランチャー)**。P4c(MQTT アプリレジストリ)と
-P4d(typed clipboard IPC)は次弾。
+Status: **P4a 実装済み・実機検証済み** (2026-06-11)。§3 のとおり実装
+(AppSlot / slot+世代ルーティング / 前面切替 / sys.signal/onSignal /
+sys.onForeground/onBackground / 背景 ui.* ゲート / screen の構築後アニメ)。
+検証: PC は run_pc 2 スクリプト (tools/p4_ping.js + p4_pong.js)、実機は
+dev スロット + 組み込み bg_app (examples/p4_bg_app.js) で §5 の項目を確認。
+P4a の暫定措置 (P4b で置換): 前面切替ジェスチャ = ステータスバータップで
+巡回 / `sys.focus` は全アプリに開放。次は **P4b(ランチャー)**。P4c
+(MQTT アプリレジストリ)と P4d(typed clipboard IPC)は次弾。
 
 関連: `docs/widget-framework-design.md`(W1〜W3 済 — 画面遷移・リテイン
 スタック・マルチ SSH はこの土台)、`docs/ssh-terminal-design.md` §7
