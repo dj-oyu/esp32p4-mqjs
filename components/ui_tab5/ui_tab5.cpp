@@ -61,17 +61,25 @@ extern "C" void mqjs_request_open(const char *name);
 /* Noto Sans CJK JP subset, fonts/font_noto_jp_20_4.c (compiled as C).
  * The hiz8 min TTF it was generated from has no glyph for U+0020 space
  * (or U+0022) — they render as tofu. ui_font() returns a mutable copy
- * with Montserrat 20 as fallback to fill the ASCII gaps. */
+ * with a fallback chain:
+ *   Noto JP 20 -> Montserrat 20 (ASCII gaps + LV_SYMBOL FontAwesome)
+ *              -> HackGen NF icons 20px (Nerd Font BMP ranges)
+ * The NF link makes icon glyphs available to EVERY text surface
+ * (status bar, widgets, console lines, ui.text) — apps just put
+ * "\uE7xx"-style characters in strings (system decoration / @icon). */
 extern "C" {
 LV_FONT_DECLARE(font_noto_jp_20_4);
+LV_FONT_DECLARE(font_nf_ui_20);
 }
 
 static const lv_font_t *ui_font(void)
 {
-    static lv_font_t jp;
+    static lv_font_t jp, mont;
     if (!jp.line_height) {
+        mont = lv_font_montserrat_20;
+        mont.fallback = &font_nf_ui_20;
         jp = font_noto_jp_20_4;
-        jp.fallback = &lv_font_montserrat_20;
+        jp.fallback = &mont;
     }
     return &jp;
 }
@@ -82,7 +90,8 @@ const lv_font_t *ui_tab5_jp_font(void)
     return ui_font();
 }
 
-/* Monospace terminal font (HackGen Console, fonts/font_term_mono.c).
+/* Monospace terminal font (HackGen Console NF, fonts/font_term_mono.c;
+ * includes the Nerd Font BMP icon ranges, cell-fitted by upstream).
  * Fixed cell grid for ui.cells/UI_CMD_CELLS: 9px advance (720/9 = 80 cols),
  * 24px line height. Glyphs are blitted directly (no lv_draw_label) and
  * clipped to the cell, so the box-drawing overhang (box_w up to 11) tiles

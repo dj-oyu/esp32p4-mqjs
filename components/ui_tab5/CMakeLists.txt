@@ -4,9 +4,13 @@
 # flash size is unaffected.
 if(CONFIG_MQJS_TAB5_UI)
     set(UI_SRCS "ui_tab5.cpp" "ui_widgets.cpp" "fonts/font_noto_jp_20_4.c"
-        # monospace 9x19 terminal font (DejaVu Sans Mono size15 bpp4 via
-        # lv_font_conv; ASCII + box-drawing/blocks for TUIs) — used by ui.cells
+        # monospace terminal font (HackGen Console NF size17 bpp4 via
+        # lv_font_conv; ASCII + box-drawing + Nerd Font BMP icons so an
+        # SSH'd neovim/powerline/eza renders) — used by ui.cells
         "fonts/font_term_mono.c"
+        # Nerd Font icons at UI size (20px): 3rd link of the ui_font
+        # fallback chain — labels/buttons/console lines can use NF glyphs
+        "fonts/font_nf_ui_20.c"
         # ST712x panel drivers vendored from M5Tab5-UserDemo (Apache-2.0)
         "vendor/esp_lcd_st7123.c" "vendor/esp_lcd_st7121.c")
 else()
