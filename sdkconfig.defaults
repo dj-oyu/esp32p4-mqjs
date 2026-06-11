@@ -29,10 +29,17 @@ CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=42
 # line, leaving big right-side gaps). Harmless on Stamp (LVGL unlinked).
 CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=6
 
-# LVGL allocations from the ESP heap instead of the 64KB builtin pool:
-# 200 console labels (up to 320B text each) exhausted the pool and froze
-# the UI (~line 141 of the console test on hardware).
-CONFIG_LV_USE_CLIB_MALLOC=y
+# LVGL heap (W1-1): builtin tlsf pool whose backing memory comes from
+# PSRAM — LV_MEM_POOL_ALLOC is defined to heap_caps_malloc(MALLOC_CAP_SPIRAM)
+# on the lvgl target in components/ui_tab5/CMakeLists.txt, so lv_init()
+# carves the whole pool out of the 32MB PSRAM at runtime (LV_MEM_ADR can't
+# do that: it needs a compile-time address). Widget churn (screens/forms,
+# widget-framework-design.md §4①) then never touches scarce internal RAM.
+# History: the previous CLIB malloc (internal RAM) was itself a workaround
+# for ~200 console labels exhausting the old 64KB builtin pool; the 3MB
+# PSRAM pool fixes that for real. Harmless on Stamp (LVGL never inits).
+CONFIG_LV_USE_BUILTIN_MALLOC=y
+CONFIG_LV_MEM_SIZE_KILOBYTES=3072
 
 # wolfSSL/wolfSSH (components/sshc, pulled unconditionally). These make it
 # compile cleanly on BOTH Tab5 and Stamp; the actual SSH client is gated

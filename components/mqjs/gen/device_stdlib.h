@@ -886,44 +886,90 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "onKey" (offset=879) */
   0x654b6e6f,
   0x00000079,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (3 << (JS_MTAG_BITS + 3)), /* "ssh" (offset=882) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "screen" (offset=882) */
+  0x65726373,
+  0x00006e65,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (4 << (JS_MTAG_BITS + 3)), /* "back" (offset=885) */
+  0x6b636162,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (8 << (JS_MTAG_BITS + 3)), /* "navigate" (offset=888) */
+  0x6976616e,
+  0x65746167,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (3 << (JS_MTAG_BITS + 3)), /* "ssh" (offset=892) */
   0x00687373,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "resize" (offset=884) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "resize" (offset=894) */
   0x69736572,
   0x0000657a,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "close" (offset=887) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "close" (offset=897) */
   0x736f6c63,
   0x00000065,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "onData" (offset=890) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "onData" (offset=900) */
   0x61446e6f,
   0x00006174,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (7 << (JS_MTAG_BITS + 3)), /* "onClose" (offset=893) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (7 << (JS_MTAG_BITS + 3)), /* "onClose" (offset=903) */
   0x6c436e6f,
   0x0065736f,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (10 << (JS_MTAG_BITS + 3)), /* "setTimeout" (offset=896) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (3 << (JS_MTAG_BITS + 3)), /* "sys" (offset=906) */
+  0x00737973,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (4 << (JS_MTAG_BITS + 3)), /* "heap" (offset=908) */
+  0x70616568,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (8 << (JS_MTAG_BITS + 3)), /* "UiScreen" (offset=911) */
+  0x63536955,
+  0x6e656572,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "button" (offset=915) */
+  0x74747562,
+  0x00006e6f,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "label" (offset=918) */
+  0x6562616c,
+  0x0000006c,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "field" (offset=921) */
+  0x6c656966,
+  0x00000064,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (4 << (JS_MTAG_BITS + 3)), /* "list" (offset=924) */
+  0x7473696c,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "toggle" (offset=927) */
+  0x67676f74,
+  0x0000656c,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (6 << (JS_MTAG_BITS + 3)), /* "slider" (offset=930) */
+  0x64696c73,
+  0x00007265,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (8 << (JS_MTAG_BITS + 3)), /* "UiWidget" (offset=933) */
+  0x69576955,
+  0x74656764,
+  0x00000000,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (3 << (JS_MTAG_BITS + 3)), /* "add" (offset=937) */
+  0x00646461,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (7 << (JS_MTAG_BITS + 3)), /* "setText" (offset=939) */
+  0x54746573,
+  0x00747865,
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (10 << (JS_MTAG_BITS + 3)), /* "setTimeout" (offset=942) */
   0x54746573,
   0x6f656d69,
   0x00007475,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (11 << (JS_MTAG_BITS + 3)), /* "setInterval" (offset=900) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (11 << (JS_MTAG_BITS + 3)), /* "setInterval" (offset=946) */
   0x49746573,
   0x7265746e,
   0x006c6176,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (12 << (JS_MTAG_BITS + 3)), /* "clearTimeout" (offset=904) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (12 << (JS_MTAG_BITS + 3)), /* "clearTimeout" (offset=950) */
   0x61656c63,
   0x6d695472,
   0x74756f65,
   0x00000000,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (13 << (JS_MTAG_BITS + 3)), /* "clearInterval" (offset=909) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (13 << (JS_MTAG_BITS + 3)), /* "clearInterval" (offset=955) */
   0x61656c63,
   0x746e4972,
   0x61767265,
   0x0000006c,
-  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "delay" (offset=914) */
+  (JS_MTAG_STRING << 1) | (1 << JS_MTAG_BITS) | (1 << (JS_MTAG_BITS + 1)) | (0 << (JS_MTAG_BITS + 2)) | (5 << (JS_MTAG_BITS + 3)), /* "delay" (offset=960) */
   0x616c6564,
   0x00000079,
 
-  /* sorted atom table (offset=917) */
-  JS_VALUE_ARRAY_HEADER(274),
+  /* sorted atom table (offset=963) */
+  JS_VALUE_ARRAY_HEADER(289),
   JS_ROM_VALUE(134), /* empty */
   JS_ROM_VALUE(201), /* _Infinity */
   JS_ROM_VALUE(162), /* _eval_ */
@@ -975,6 +1021,8 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(650), /* TypeError */
   JS_ROM_VALUE(682), /* TypedArray */
   JS_ROM_VALUE(654), /* URIError */
+  JS_ROM_VALUE(911), /* UiScreen */
+  JS_ROM_VALUE(933), /* UiWidget */
   JS_ROM_VALUE(724), /* Uint16Array */
   JS_ROM_VALUE(732), /* Uint32Array */
   JS_ROM_VALUE(716), /* Uint8Array */
@@ -982,16 +1030,19 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(211), /* __proto__ */
   JS_ROM_VALUE(487), /* abs */
   JS_ROM_VALUE(531), /* acos */
+  JS_ROM_VALUE(937), /* add */
   JS_ROM_VALUE(270), /* apply */
   JS_ROM_VALUE(168), /* arguments */
   JS_ROM_VALUE(528), /* asin */
   JS_ROM_VALUE(534), /* atan */
   JS_ROM_VALUE(537), /* atan2 */
+  JS_ROM_VALUE(885), /* back */
   JS_ROM_VALUE(273), /* bind */
   JS_ROM_VALUE(156), /* boolean */
   JS_ROM_VALUE(221), /* bound */
   JS_ROM_VALUE(46), /* break */
   JS_ROM_VALUE(695), /* buffer */
+  JS_ROM_VALUE(915), /* button */
   JS_ROM_VALUE(667), /* byteLength */
   JS_ROM_VALUE(686), /* byteOffset */
   JS_ROM_VALUE(267), /* call */
@@ -1004,9 +1055,9 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(365), /* charCodeAt */
   JS_ROM_VALUE(84), /* class */
   JS_ROM_VALUE(840), /* clear */
-  JS_ROM_VALUE(909), /* clearInterval */
-  JS_ROM_VALUE(904), /* clearTimeout */
-  JS_ROM_VALUE(887), /* close */
+  JS_ROM_VALUE(955), /* clearInterval */
+  JS_ROM_VALUE(950), /* clearTimeout */
+  JS_ROM_VALUE(897), /* close */
   JS_ROM_VALUE(552), /* clz32 */
   JS_ROM_VALUE(369), /* codePointAt */
   JS_ROM_VALUE(380), /* concat */
@@ -1021,7 +1072,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(77), /* debugger */
   JS_ROM_VALUE(59), /* default */
   JS_ROM_VALUE(227), /* defineProperty */
-  JS_ROM_VALUE(914), /* delay */
+  JS_ROM_VALUE(960), /* delay */
   JS_ROM_VALUE(22), /* delete */
   JS_ROM_VALUE(816), /* disconnect */
   JS_ROM_VALUE(39), /* do */
@@ -1034,6 +1085,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(93), /* export */
   JS_ROM_VALUE(96), /* extends */
   JS_ROM_VALUE(3), /* false */
+  JS_ROM_VALUE(921), /* field */
   JS_ROM_VALUE(843), /* fill */
   JS_ROM_VALUE(464), /* filter */
   JS_ROM_VALUE(70), /* finally */
@@ -1061,6 +1113,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(753), /* globalThis */
   JS_ROM_VALUE(767), /* gpio */
   JS_ROM_VALUE(248), /* hasOwnProperty */
+  JS_ROM_VALUE(908), /* heap */
   JS_ROM_VALUE(795), /* i2c */
   JS_ROM_VALUE(9), /* if */
   JS_ROM_VALUE(105), /* implements */
@@ -1078,11 +1131,13 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(438), /* join */
   JS_ROM_VALUE(872), /* keyboard */
   JS_ROM_VALUE(245), /* keys */
+  JS_ROM_VALUE(918), /* label */
   JS_ROM_VALUE(585), /* lastIndex */
   JS_ROM_VALUE(386), /* lastIndexOf */
   JS_ROM_VALUE(187), /* length */
   JS_ROM_VALUE(113), /* let */
   JS_ROM_VALUE(849), /* line */
+  JS_ROM_VALUE(924), /* list */
   JS_ROM_VALUE(542), /* log */
   JS_ROM_VALUE(564), /* log10 */
   JS_ROM_VALUE(561), /* log2 */
@@ -1093,6 +1148,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(480), /* min */
   JS_ROM_VALUE(810), /* mqtt */
   JS_ROM_VALUE(205), /* name */
+  JS_ROM_VALUE(888), /* navigate */
   JS_ROM_VALUE(31), /* new */
   JS_ROM_VALUE(570), /* now */
   JS_ROM_VALUE(0), /* null */
@@ -1100,9 +1156,9 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(146), /* object */
   JS_ROM_VALUE(193), /* of */
   JS_ROM_VALUE(779), /* onChange */
-  JS_ROM_VALUE(893), /* onClose */
+  JS_ROM_VALUE(903), /* onClose */
   JS_ROM_VALUE(824), /* onConnect */
-  JS_ROM_VALUE(890), /* onData */
+  JS_ROM_VALUE(900), /* onData */
   JS_ROM_VALUE(879), /* onKey */
   JS_ROM_VALUE(876), /* onTouch */
   JS_ROM_VALUE(115), /* package */
@@ -1129,34 +1185,37 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(424), /* repeat */
   JS_ROM_VALUE(393), /* replace */
   JS_ROM_VALUE(396), /* replaceAll */
-  JS_ROM_VALUE(884), /* resize */
+  JS_ROM_VALUE(894), /* resize */
   JS_ROM_VALUE(14), /* return */
   JS_ROM_VALUE(441), /* reverse */
   JS_ROM_VALUE(495), /* round */
   JS_ROM_VALUE(800), /* scan */
+  JS_ROM_VALUE(882), /* screen */
   JS_ROM_VALUE(869), /* scroll */
   JS_ROM_VALUE(400), /* search */
   JS_ROM_VALUE(177), /* set */
   JS_ROM_VALUE(594), /* set lastIndex */
   JS_ROM_VALUE(358), /* set length */
   JS_ROM_VALUE(262), /* set prototype */
-  JS_ROM_VALUE(900), /* setInterval */
+  JS_ROM_VALUE(946), /* setInterval */
   JS_ROM_VALUE(770), /* setMode */
   JS_ROM_VALUE(237), /* setPrototypeOf */
-  JS_ROM_VALUE(896), /* setTimeout */
+  JS_ROM_VALUE(939), /* setText */
+  JS_ROM_VALUE(942), /* setTimeout */
   JS_ROM_VALUE(797), /* setup */
   JS_ROM_VALUE(444), /* shift */
   JS_ROM_VALUE(484), /* sign */
   JS_ROM_VALUE(522), /* sin */
   JS_ROM_VALUE(837), /* size */
   JS_ROM_VALUE(373), /* slice */
+  JS_ROM_VALUE(930), /* slider */
   JS_ROM_VALUE(456), /* some */
   JS_ROM_VALUE(474), /* sort */
   JS_ROM_VALUE(599), /* source */
   JS_ROM_VALUE(447), /* splice */
   JS_ROM_VALUE(403), /* split */
   JS_ROM_VALUE(498), /* sqrt */
-  JS_ROM_VALUE(882), /* ssh */
+  JS_ROM_VALUE(892), /* ssh */
   JS_ROM_VALUE(626), /* stack */
   JS_ROM_VALUE(128), /* static */
   JS_ROM_VALUE(153), /* string */
@@ -1166,6 +1225,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(376), /* substring */
   JS_ROM_VALUE(102), /* super */
   JS_ROM_VALUE(53), /* switch */
+  JS_ROM_VALUE(906), /* sys */
   JS_ROM_VALUE(526), /* tan */
   JS_ROM_VALUE(190), /* target */
   JS_ROM_VALUE(616), /* test */
@@ -1179,6 +1239,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(338), /* toPrecision */
   JS_ROM_VALUE(136), /* toString */
   JS_ROM_VALUE(410), /* toUpperCase */
+  JS_ROM_VALUE(927), /* toggle */
   JS_ROM_VALUE(414), /* trim */
   JS_ROM_VALUE(417), /* trimEnd */
   JS_ROM_VALUE(420), /* trimStart */
@@ -1199,7 +1260,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(806), /* writeReg */
   JS_ROM_VALUE(131), /* yield */
 
-  /* properties (offset=1192) */
+  /* properties (offset=1253) */
   JS_VALUE_ARRAY_HEADER(24),
   6 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -1225,7 +1286,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_OBJECT << 1,
   (6 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1217) */
+  /* properties (offset=1278) */
   JS_VALUE_ARRAY_HEADER(13),
   3 << 1, /* n_props */
   1 << 1, /* hash_mask */
@@ -1240,14 +1301,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_OBJECT - 1) << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1231) */
+  /* class (offset=1292) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1192),
+  JS_ROM_VALUE(1253),
   1,
-  JS_ROM_VALUE(1217),
+  JS_ROM_VALUE(1278),
   JS_NULL,
 
-  /* properties (offset=1236) */
+  /* properties (offset=1297) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1255,22 +1316,22 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_CLOSURE << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=1243) */
+  /* getset (offset=1304) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 10),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 11),
 
-  /* getset (offset=1246) */
+  /* getset (offset=1307) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 12),
   JS_UNDEFINED,
 
-  /* getset (offset=1249) */
+  /* getset (offset=1310) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 13),
   JS_UNDEFINED,
 
-  /* properties (offset=1252) */
+  /* properties (offset=1313) */
   JS_VALUE_ARRAY_HEADER(30),
   8 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -1279,7 +1340,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   27 << 1,
   12 << 1,
   JS_ROM_VALUE(179) /* prototype */,
-  JS_ROM_VALUE(1243),
+  JS_ROM_VALUE(1304),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(267) /* call */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 14),
@@ -1294,62 +1355,62 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 17),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(187) /* length */,
-  JS_ROM_VALUE(1246),
+  JS_ROM_VALUE(1307),
   (9 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(205) /* name */,
-  JS_ROM_VALUE(1249),
+  JS_ROM_VALUE(1310),
   (15 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_CLOSURE - 1) << 1,
   (21 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1283) */
+  /* class (offset=1344) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1236),
+  JS_ROM_VALUE(1297),
   9,
-  JS_ROM_VALUE(1252),
+  JS_ROM_VALUE(1313),
   JS_NULL,
 
-  /* float64 (offset=1288) */
+  /* float64 (offset=1349) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0xffffffff,
   0x7fefffff,
 
-  /* float64 (offset=1291) */
+  /* float64 (offset=1352) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000001,
   0x00000000,
 
-  /* float64 (offset=1294) */
+  /* float64 (offset=1355) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0x7ff80000,
 
-  /* float64 (offset=1297) */
+  /* float64 (offset=1358) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0xfff00000,
 
-  /* float64 (offset=1300) */
+  /* float64 (offset=1361) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0x7ff00000,
 
-  /* float64 (offset=1303) */
+  /* float64 (offset=1364) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0x3cb00000,
 
-  /* float64 (offset=1306) */
+  /* float64 (offset=1367) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0xffffffff,
   0x433fffff,
 
-  /* float64 (offset=1309) */
+  /* float64 (offset=1370) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0xffffffff,
   0xc33fffff,
 
-  /* properties (offset=1312) */
+  /* properties (offset=1373) */
   JS_VALUE_ARRAY_HEADER(43),
   11 << 1, /* n_props */
   7 << 1, /* hash_mask */
@@ -1368,33 +1429,33 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 20),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(295) /* MAX_VALUE */,
-  JS_ROM_VALUE(1288),
+  JS_ROM_VALUE(1349),
   (10 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(299) /* MIN_VALUE */,
-  JS_ROM_VALUE(1291),
+  JS_ROM_VALUE(1352),
   (13 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(195) /* NaN */,
-  JS_ROM_VALUE(1294),
+  JS_ROM_VALUE(1355),
   (19 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(303) /* NEGATIVE_INFINITY */,
-  JS_ROM_VALUE(1297),
+  JS_ROM_VALUE(1358),
   (16 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(309) /* POSITIVE_INFINITY */,
-  JS_ROM_VALUE(1300),
+  JS_ROM_VALUE(1361),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(315) /* EPSILON */,
-  JS_ROM_VALUE(1303),
+  JS_ROM_VALUE(1364),
   (22 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(318) /* MAX_SAFE_INTEGER */,
-  JS_ROM_VALUE(1306),
+  JS_ROM_VALUE(1367),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(324) /* MIN_SAFE_INTEGER */,
-  JS_ROM_VALUE(1309),
+  JS_ROM_VALUE(1370),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_NUMBER << 1,
   (31 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1356) */
+  /* properties (offset=1417) */
   JS_VALUE_ARRAY_HEADER(21),
   5 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -1417,14 +1478,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_NUMBER - 1) << 1,
   (9 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1378) */
+  /* class (offset=1439) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1312),
+  JS_ROM_VALUE(1373),
   18,
-  JS_ROM_VALUE(1356),
+  JS_ROM_VALUE(1417),
   JS_NULL,
 
-  /* properties (offset=1383) */
+  /* properties (offset=1444) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1432,7 +1493,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_BOOLEAN << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1390) */
+  /* properties (offset=1451) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1440,14 +1501,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_BOOLEAN - 1) << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1397) */
+  /* class (offset=1458) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1383),
+  JS_ROM_VALUE(1444),
   25,
-  JS_ROM_VALUE(1390),
+  JS_ROM_VALUE(1451),
   JS_NULL,
 
-  /* properties (offset=1402) */
+  /* properties (offset=1463) */
   JS_VALUE_ARRAY_HEADER(13),
   3 << 1, /* n_props */
   1 << 1, /* hash_mask */
@@ -1462,12 +1523,12 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_STRING << 1,
   (7 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=1416) */
+  /* getset (offset=1477) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 29),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 30),
 
-  /* properties (offset=1419) */
+  /* properties (offset=1480) */
   JS_VALUE_ARRAY_HEADER(84),
   22 << 1, /* n_props */
   15 << 1, /* hash_mask */
@@ -1488,7 +1549,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   39 << 1,
   66 << 1,
   JS_ROM_VALUE(187) /* length */,
-  JS_ROM_VALUE(1416),
+  JS_ROM_VALUE(1477),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(362) /* charAt */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 31),
@@ -1553,14 +1614,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_STRING - 1) << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1504) */
+  /* class (offset=1565) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1402),
+  JS_ROM_VALUE(1463),
   26,
-  JS_ROM_VALUE(1419),
+  JS_ROM_VALUE(1480),
   JS_NULL,
 
-  /* properties (offset=1509) */
+  /* properties (offset=1570) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1571,12 +1632,12 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=1519) */
+  /* getset (offset=1580) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 53),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 54),
 
-  /* properties (offset=1522) */
+  /* properties (offset=1583) */
   JS_VALUE_ARRAY_HEADER(87),
   23 << 1, /* n_props */
   15 << 1, /* hash_mask */
@@ -1600,7 +1661,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 55),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(187) /* length */,
-  JS_ROM_VALUE(1519),
+  JS_ROM_VALUE(1580),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(433) /* push */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 56),
@@ -1665,54 +1726,54 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_ARRAY - 1) << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1610) */
+  /* class (offset=1671) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1509),
+  JS_ROM_VALUE(1570),
   51,
-  JS_ROM_VALUE(1522),
+  JS_ROM_VALUE(1583),
   JS_NULL,
 
-  /* float64 (offset=1615) */
+  /* float64 (offset=1676) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x8b145769,
   0x4005bf0a,
 
-  /* float64 (offset=1618) */
+  /* float64 (offset=1679) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0xbbb55516,
   0x40026bb1,
 
-  /* float64 (offset=1621) */
+  /* float64 (offset=1682) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0xfefa39ef,
   0x3fe62e42,
 
-  /* float64 (offset=1624) */
+  /* float64 (offset=1685) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x652b82fe,
   0x3ff71547,
 
-  /* float64 (offset=1627) */
+  /* float64 (offset=1688) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x1526e50e,
   0x3fdbcb7b,
 
-  /* float64 (offset=1630) */
+  /* float64 (offset=1691) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x54442d18,
   0x400921fb,
 
-  /* float64 (offset=1633) */
+  /* float64 (offset=1694) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x667f3bcd,
   0x3fe6a09e,
 
-  /* float64 (offset=1636) */
+  /* float64 (offset=1697) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x667f3bcd,
   0x3ff6a09e,
 
-  /* properties (offset=1639) */
+  /* properties (offset=1700) */
   JS_VALUE_ARRAY_HEADER(117),
   33 << 1, /* n_props */
   15 << 1, /* hash_mask */
@@ -1757,28 +1818,28 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 82),
   (21 << 1) | (JS_PROP_NORMAL << 30),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_STRING_CHAR, 69) /* E */,
-  JS_ROM_VALUE(1615),
+  JS_ROM_VALUE(1676),
   (33 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(503) /* LN10 */,
-  JS_ROM_VALUE(1618),
+  JS_ROM_VALUE(1679),
   (27 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(506) /* LN2 */,
-  JS_ROM_VALUE(1621),
+  JS_ROM_VALUE(1682),
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(508) /* LOG2E */,
-  JS_ROM_VALUE(1624),
+  JS_ROM_VALUE(1685),
   (42 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(511) /* LOG10E */,
-  JS_ROM_VALUE(1627),
+  JS_ROM_VALUE(1688),
   (36 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(514) /* PI */,
-  JS_ROM_VALUE(1630),
+  JS_ROM_VALUE(1691),
   (39 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(516) /* SQRT1_2 */,
-  JS_ROM_VALUE(1633),
+  JS_ROM_VALUE(1694),
   (24 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(519) /* SQRT2 */,
-  JS_ROM_VALUE(1636),
+  JS_ROM_VALUE(1697),
   (45 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(522) /* sin */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 83),
@@ -1831,14 +1892,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(564) /* log10 */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 99),
   (60 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=1757) */
+  /* class (offset=1818) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1639),
+  JS_ROM_VALUE(1700),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=1762) */
+  /* properties (offset=1823) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1849,7 +1910,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_DATE << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1772) */
+  /* properties (offset=1833) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1860,14 +1921,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_DATE - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1782) */
+  /* class (offset=1843) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1762),
+  JS_ROM_VALUE(1823),
   100,
-  JS_ROM_VALUE(1772),
+  JS_ROM_VALUE(1833),
   JS_NULL,
 
-  /* properties (offset=1787) */
+  /* properties (offset=1848) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1878,14 +1939,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(578) /* stringify */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 104),
   (3 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=1797) */
+  /* class (offset=1858) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1787),
+  JS_ROM_VALUE(1848),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=1802) */
+  /* properties (offset=1863) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1893,22 +1954,22 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_REGEXP << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=1809) */
+  /* getset (offset=1870) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 106),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 107),
 
-  /* getset (offset=1812) */
+  /* getset (offset=1873) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 108),
   JS_UNDEFINED,
 
-  /* getset (offset=1815) */
+  /* getset (offset=1876) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 109),
   JS_UNDEFINED,
 
-  /* properties (offset=1818) */
+  /* properties (offset=1879) */
   JS_VALUE_ARRAY_HEADER(24),
   6 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -1917,13 +1978,13 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   21 << 1,
   12 << 1,
   JS_ROM_VALUE(585) /* lastIndex */,
-  JS_ROM_VALUE(1809),
+  JS_ROM_VALUE(1870),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(599) /* source */,
-  JS_ROM_VALUE(1812),
+  JS_ROM_VALUE(1873),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(606) /* flags */,
-  JS_ROM_VALUE(1815),
+  JS_ROM_VALUE(1876),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(613) /* exec */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 110),
@@ -1934,14 +1995,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_REGEXP - 1) << 1,
   (9 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1843) */
+  /* class (offset=1904) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1802),
+  JS_ROM_VALUE(1863),
   105,
-  JS_ROM_VALUE(1818),
+  JS_ROM_VALUE(1879),
   JS_NULL,
 
-  /* properties (offset=1848) */
+  /* properties (offset=1909) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1949,17 +2010,17 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=1855) */
+  /* getset (offset=1916) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 113),
   JS_UNDEFINED,
 
-  /* getset (offset=1858) */
+  /* getset (offset=1919) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 114),
   JS_UNDEFINED,
 
-  /* properties (offset=1861) */
+  /* properties (offset=1922) */
   JS_VALUE_ARRAY_HEADER(21),
   5 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -1974,22 +2035,22 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(208) /* Error */,
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(619) /* message */,
-  JS_ROM_VALUE(1855),
+  JS_ROM_VALUE(1916),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(626) /* stack */,
-  JS_ROM_VALUE(1858),
+  JS_ROM_VALUE(1919),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_ERROR - 1) << 1,
   (12 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1883) */
+  /* class (offset=1944) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1848),
+  JS_ROM_VALUE(1909),
   112,
-  JS_ROM_VALUE(1861),
+  JS_ROM_VALUE(1922),
   JS_NULL,
 
-  /* properties (offset=1888) */
+  /* properties (offset=1949) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -1997,7 +2058,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_EVAL_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1895) */
+  /* properties (offset=1956) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2008,14 +2069,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_EVAL_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1905) */
+  /* class (offset=1966) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1888),
+  JS_ROM_VALUE(1949),
   116,
-  JS_ROM_VALUE(1895),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(1956),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=1910) */
+  /* properties (offset=1971) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2023,7 +2084,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_RANGE_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1917) */
+  /* properties (offset=1978) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2034,14 +2095,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_RANGE_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1927) */
+  /* class (offset=1988) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1910),
+  JS_ROM_VALUE(1971),
   117,
-  JS_ROM_VALUE(1917),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(1978),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=1932) */
+  /* properties (offset=1993) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2049,7 +2110,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_REFERENCE_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1939) */
+  /* properties (offset=2000) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2060,14 +2121,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_REFERENCE_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1949) */
+  /* class (offset=2010) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1932),
+  JS_ROM_VALUE(1993),
   118,
-  JS_ROM_VALUE(1939),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(2000),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=1954) */
+  /* properties (offset=2015) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2075,7 +2136,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_SYNTAX_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1961) */
+  /* properties (offset=2022) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2086,14 +2147,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_SYNTAX_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1971) */
+  /* class (offset=2032) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1954),
+  JS_ROM_VALUE(2015),
   119,
-  JS_ROM_VALUE(1961),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(2022),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=1976) */
+  /* properties (offset=2037) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2101,7 +2162,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_TYPE_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=1983) */
+  /* properties (offset=2044) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2112,14 +2173,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_TYPE_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=1993) */
+  /* class (offset=2054) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1976),
+  JS_ROM_VALUE(2037),
   120,
-  JS_ROM_VALUE(1983),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(2044),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=1998) */
+  /* properties (offset=2059) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2127,7 +2188,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_URI_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2005) */
+  /* properties (offset=2066) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2138,14 +2199,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_URI_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2015) */
+  /* class (offset=2076) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(1998),
+  JS_ROM_VALUE(2059),
   121,
-  JS_ROM_VALUE(2005),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(2066),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=2020) */
+  /* properties (offset=2081) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2153,7 +2214,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_INTERNAL_ERROR << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2027) */
+  /* properties (offset=2088) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2164,14 +2225,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_INTERNAL_ERROR - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2037) */
+  /* class (offset=2098) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2020),
+  JS_ROM_VALUE(2081),
   122,
-  JS_ROM_VALUE(2027),
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(2088),
+  JS_ROM_VALUE(1944),
 
-  /* properties (offset=2042) */
+  /* properties (offset=2103) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2179,30 +2240,30 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_ARRAY_BUFFER << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=2049) */
+  /* getset (offset=2110) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 124),
   JS_UNDEFINED,
 
-  /* properties (offset=2052) */
+  /* properties (offset=2113) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
   6 << 1,
   JS_ROM_VALUE(667) /* byteLength */,
-  JS_ROM_VALUE(2049),
+  JS_ROM_VALUE(2110),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_ARRAY_BUFFER - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2062) */
+  /* class (offset=2123) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2042),
+  JS_ROM_VALUE(2103),
   123,
-  JS_ROM_VALUE(2052),
+  JS_ROM_VALUE(2113),
   JS_NULL,
 
-  /* properties (offset=2067) */
+  /* properties (offset=2128) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2210,27 +2271,27 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_TYPED_ARRAY << 1,
   (0 << 1) | (JS_PROP_SPECIAL << 30),
-  /* getset (offset=2074) */
+  /* getset (offset=2135) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 126),
   JS_UNDEFINED,
 
-  /* getset (offset=2077) */
+  /* getset (offset=2138) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 127),
   JS_UNDEFINED,
 
-  /* getset (offset=2080) */
+  /* getset (offset=2141) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 128),
   JS_UNDEFINED,
 
-  /* getset (offset=2083) */
+  /* getset (offset=2144) */
   JS_VALUE_ARRAY_HEADER(2),
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 129),
   JS_UNDEFINED,
 
-  /* properties (offset=2086) */
+  /* properties (offset=2147) */
   JS_VALUE_ARRAY_HEADER(37),
   9 << 1, /* n_props */
   7 << 1, /* hash_mask */
@@ -2243,16 +2304,16 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   34 << 1,
   28 << 1,
   JS_ROM_VALUE(187) /* length */,
-  JS_ROM_VALUE(2074),
+  JS_ROM_VALUE(2135),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(667) /* byteLength */,
-  JS_ROM_VALUE(2077),
+  JS_ROM_VALUE(2138),
   (10 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(686) /* byteOffset */,
-  JS_ROM_VALUE(2080),
+  JS_ROM_VALUE(2141),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(695) /* buffer */,
-  JS_ROM_VALUE(2083),
+  JS_ROM_VALUE(2144),
   (0 << 1) | (JS_PROP_GETSET << 30),
   JS_ROM_VALUE(438) /* join */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 58),
@@ -2269,14 +2330,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_TYPED_ARRAY - 1) << 1,
   (19 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2124) */
+  /* class (offset=2185) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2067),
+  JS_ROM_VALUE(2128),
   125,
-  JS_ROM_VALUE(2086),
+  JS_ROM_VALUE(2147),
   JS_NULL,
 
-  /* properties (offset=2129) */
+  /* properties (offset=2190) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2287,7 +2348,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_UINT8C_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2139) */
+  /* properties (offset=2200) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2298,14 +2359,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_UINT8C_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2149) */
+  /* class (offset=2210) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2129),
+  JS_ROM_VALUE(2190),
   132,
-  JS_ROM_VALUE(2139),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2200),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2154) */
+  /* properties (offset=2215) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2316,7 +2377,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_INT8_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2164) */
+  /* properties (offset=2225) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2327,14 +2388,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_INT8_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2174) */
+  /* class (offset=2235) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2154),
+  JS_ROM_VALUE(2215),
   133,
-  JS_ROM_VALUE(2164),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2225),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2179) */
+  /* properties (offset=2240) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2345,7 +2406,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_UINT8_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2189) */
+  /* properties (offset=2250) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2356,14 +2417,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_UINT8_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2199) */
+  /* class (offset=2260) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2179),
+  JS_ROM_VALUE(2240),
   134,
-  JS_ROM_VALUE(2189),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2250),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2204) */
+  /* properties (offset=2265) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2374,7 +2435,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_INT16_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2214) */
+  /* properties (offset=2275) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2385,14 +2446,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_INT16_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2224) */
+  /* class (offset=2285) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2204),
+  JS_ROM_VALUE(2265),
   135,
-  JS_ROM_VALUE(2214),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2275),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2229) */
+  /* properties (offset=2290) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2403,7 +2464,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_UINT16_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2239) */
+  /* properties (offset=2300) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2414,14 +2475,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_UINT16_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2249) */
+  /* class (offset=2310) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2229),
+  JS_ROM_VALUE(2290),
   136,
-  JS_ROM_VALUE(2239),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2300),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2254) */
+  /* properties (offset=2315) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2432,7 +2493,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_INT32_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2264) */
+  /* properties (offset=2325) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2443,14 +2504,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_INT32_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2274) */
+  /* class (offset=2335) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2254),
+  JS_ROM_VALUE(2315),
   137,
-  JS_ROM_VALUE(2264),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2325),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2279) */
+  /* properties (offset=2340) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2461,7 +2522,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_UINT32_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2289) */
+  /* properties (offset=2350) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2472,14 +2533,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_UINT32_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2299) */
+  /* class (offset=2360) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2279),
+  JS_ROM_VALUE(2340),
   138,
-  JS_ROM_VALUE(2289),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2350),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2304) */
+  /* properties (offset=2365) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2490,7 +2551,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_FLOAT32_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2314) */
+  /* properties (offset=2375) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2501,14 +2562,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_FLOAT32_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2324) */
+  /* class (offset=2385) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2304),
+  JS_ROM_VALUE(2365),
   139,
-  JS_ROM_VALUE(2314),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2375),
+  JS_ROM_VALUE(2185),
 
-  /* properties (offset=2329) */
+  /* properties (offset=2390) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2519,7 +2580,7 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(179) /* prototype */,
   JS_CLASS_FLOAT64_ARRAY << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* properties (offset=2339) */
+  /* properties (offset=2400) */
   JS_VALUE_ARRAY_HEADER(9),
   2 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2530,24 +2591,24 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(183) /* constructor */,
   (uint32_t)(-JS_CLASS_FLOAT64_ARRAY - 1) << 1,
   (3 << 1) | (JS_PROP_SPECIAL << 30),
-  /* class (offset=2349) */
+  /* class (offset=2410) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2329),
+  JS_ROM_VALUE(2390),
   140,
-  JS_ROM_VALUE(2339),
-  JS_ROM_VALUE(2124),
+  JS_ROM_VALUE(2400),
+  JS_ROM_VALUE(2185),
 
-  /* float64 (offset=2354) */
+  /* float64 (offset=2415) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0x7ff00000,
 
-  /* float64 (offset=2357) */
+  /* float64 (offset=2418) */
   JS_MB_HEADER_DEF(JS_MTAG_FLOAT64),
   0x00000000,
   0x7ff80000,
 
-  /* properties (offset=2360) */
+  /* properties (offset=2421) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2555,14 +2616,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(542) /* log */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 141),
   (0 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2367) */
+  /* class (offset=2428) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2360),
+  JS_ROM_VALUE(2421),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2372) */
+  /* properties (offset=2433) */
   JS_VALUE_ARRAY_HEADER(6),
   1 << 1, /* n_props */
   0 << 1, /* hash_mask */
@@ -2570,14 +2631,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(570) /* now */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 142),
   (0 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2379) */
+  /* class (offset=2440) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2372),
+  JS_ROM_VALUE(2433),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2384) */
+  /* properties (offset=2445) */
   JS_VALUE_ARRAY_HEADER(30),
   8 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -2609,14 +2670,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(791) /* IN_PULLDOWN */,
   3 << 1,
   (24 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2415) */
+  /* class (offset=2476) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2384),
+  JS_ROM_VALUE(2445),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2420) */
+  /* properties (offset=2481) */
   JS_VALUE_ARRAY_HEADER(16),
   4 << 1, /* n_props */
   1 << 1, /* hash_mask */
@@ -2634,14 +2695,14 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(806) /* writeReg */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 150),
   (7 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2437) */
+  /* class (offset=2498) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2420),
+  JS_ROM_VALUE(2481),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2442) */
+  /* properties (offset=2503) */
   JS_VALUE_ARRAY_HEADER(24),
   6 << 1, /* n_props */
   3 << 1, /* hash_mask */
@@ -2667,25 +2728,33 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   JS_ROM_VALUE(831) /* subscribe */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 156),
   (0 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2467) */
+  /* class (offset=2528) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2442),
+  JS_ROM_VALUE(2503),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2472) */
-  JS_VALUE_ARRAY_HEADER(52),
-  14 << 1, /* n_props */
-  7 << 1, /* hash_mask */
-  22 << 1,
-  43 << 1,
-  16 << 1,
-  37 << 1,
-  40 << 1,
-  46 << 1,
-  49 << 1,
-  34 << 1,
+  /* properties (offset=2533) */
+  JS_VALUE_ARRAY_HEADER(69),
+  17 << 1, /* n_props */
+  15 << 1, /* hash_mask */
+  30 << 1,
+  0 << 1,
+  0 << 1,
+  60 << 1,
+  63 << 1,
+  33 << 1,
+  36 << 1,
+  0 << 1,
+  0 << 1,
+  66 << 1,
+  24 << 1,
+  39 << 1,
+  0 << 1,
+  54 << 1,
+  57 << 1,
+  42 << 1,
   JS_ROM_VALUE(837) /* size */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 157),
   (0 << 1) | (JS_PROP_NORMAL << 30),
@@ -2712,167 +2781,274 @@ static const uint32_t __attribute((aligned(64))) js_stdlib_table[] = {
   (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(862) /* cellSize */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 165),
-  (19 << 1) | (JS_PROP_NORMAL << 30),
+  (27 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(866) /* cells */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 166),
-  (31 << 1) | (JS_PROP_NORMAL << 30),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(869) /* scroll */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 167),
-  (10 << 1) | (JS_PROP_NORMAL << 30),
+  (18 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(872) /* keyboard */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 168),
-  (13 << 1) | (JS_PROP_NORMAL << 30),
+  (21 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(876) /* onTouch */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 169),
-  (25 << 1) | (JS_PROP_NORMAL << 30),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
   JS_ROM_VALUE(879) /* onKey */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 170),
-  (28 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2525) */
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(882) /* screen */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 171),
+  (45 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(885) /* back */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 172),
+  (48 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(888) /* navigate */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 173),
+  (51 << 1) | (JS_PROP_NORMAL << 30),
+  /* class (offset=2603) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2472),
+  JS_ROM_VALUE(2533),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* properties (offset=2530) */
+  /* properties (offset=2608) */
   JS_VALUE_ARRAY_HEADER(27),
   7 << 1, /* n_props */
   3 << 1, /* hash_mask */
-  24 << 1,
-  18 << 1,
   15 << 1,
   21 << 1,
+  24 << 1,
+  12 << 1,
   JS_ROM_VALUE(813) /* connect */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 171),
-  (0 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(773) /* write */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 172),
-  (6 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(884) /* resize */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 173),
-  (0 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(887) /* close */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 174),
   (0 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(820) /* connected */,
+  JS_ROM_VALUE(773) /* write */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 175),
-  (12 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(890) /* onData */,
+  (6 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(894) /* resize */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 176),
   (0 << 1) | (JS_PROP_NORMAL << 30),
-  JS_ROM_VALUE(893) /* onClose */,
+  JS_ROM_VALUE(897) /* close */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 177),
   (9 << 1) | (JS_PROP_NORMAL << 30),
-  /* class (offset=2558) */
+  JS_ROM_VALUE(820) /* connected */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 178),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(900) /* onData */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 179),
+  (18 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(903) /* onClose */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 180),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  /* class (offset=2636) */
   JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
-  JS_ROM_VALUE(2530),
+  JS_ROM_VALUE(2608),
   -1,
   JS_NULL,
   JS_NULL,
 
-  /* global object properties (offset=2563) */
-  JS_VALUE_ARRAY_HEADER(100),
+  /* properties (offset=2641) */
+  JS_VALUE_ARRAY_HEADER(6),
+  1 << 1, /* n_props */
+  0 << 1, /* hash_mask */
+  3 << 1,
+  JS_ROM_VALUE(908) /* heap */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 181),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  /* class (offset=2648) */
+  JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
+  JS_ROM_VALUE(2641),
+  -1,
+  JS_NULL,
+  JS_NULL,
+
+  /* properties (offset=2653) */
+  JS_VALUE_ARRAY_HEADER(6),
+  1 << 1, /* n_props */
+  0 << 1, /* hash_mask */
+  3 << 1,
+  JS_ROM_VALUE(179) /* prototype */,
+  JS_CLASS_UI_SCREEN << 1,
+  (0 << 1) | (JS_PROP_SPECIAL << 30),
+  /* properties (offset=2660) */
+  JS_VALUE_ARRAY_HEADER(27),
+  7 << 1, /* n_props */
+  3 << 1, /* hash_mask */
+  12 << 1,
+  15 << 1,
+  24 << 1,
+  21 << 1,
+  JS_ROM_VALUE(915) /* button */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 183),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(918) /* label */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 184),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(921) /* field */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 185),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(924) /* list */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 186),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(927) /* toggle */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 187),
+  (6 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(930) /* slider */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 188),
+  (9 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(183) /* constructor */,
+  (uint32_t)(-JS_CLASS_UI_SCREEN - 1) << 1,
+  (18 << 1) | (JS_PROP_SPECIAL << 30),
+  /* class (offset=2688) */
+  JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
+  JS_ROM_VALUE(2653),
+  182,
+  JS_ROM_VALUE(2660),
+  JS_NULL,
+
+  /* properties (offset=2693) */
+  JS_VALUE_ARRAY_HEADER(6),
+  1 << 1, /* n_props */
+  0 << 1, /* hash_mask */
+  3 << 1,
+  JS_ROM_VALUE(179) /* prototype */,
+  JS_CLASS_UI_WIDGET << 1,
+  (0 << 1) | (JS_PROP_SPECIAL << 30),
+  /* properties (offset=2700) */
+  JS_VALUE_ARRAY_HEADER(16),
+  4 << 1, /* n_props */
+  1 << 1, /* hash_mask */
+  13 << 1,
+  7 << 1,
+  JS_ROM_VALUE(937) /* add */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 190),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(172) /* value */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 191),
+  (0 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(939) /* setText */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 192),
+  (4 << 1) | (JS_PROP_NORMAL << 30),
+  JS_ROM_VALUE(183) /* constructor */,
+  (uint32_t)(-JS_CLASS_UI_WIDGET - 1) << 1,
+  (10 << 1) | (JS_PROP_SPECIAL << 30),
+  /* class (offset=2717) */
+  JS_MB_HEADER_DEF(JS_MTAG_OBJECT),
+  JS_ROM_VALUE(2693),
+  189,
+  JS_ROM_VALUE(2700),
+  JS_NULL,
+
+  /* global object properties (offset=2722) */
+  JS_VALUE_ARRAY_HEADER(106),
   JS_ROM_VALUE(224) /* Object */,
-  JS_ROM_VALUE(1231),
+  JS_ROM_VALUE(1292),
   JS_ROM_VALUE(253) /* Function */,
-  JS_ROM_VALUE(1283),
+  JS_ROM_VALUE(1344),
   JS_ROM_VALUE(284) /* Number */,
-  JS_ROM_VALUE(1378),
+  JS_ROM_VALUE(1439),
   JS_ROM_VALUE(342) /* Boolean */,
-  JS_ROM_VALUE(1397),
+  JS_ROM_VALUE(1458),
   JS_ROM_VALUE(345) /* String */,
-  JS_ROM_VALUE(1504),
+  JS_ROM_VALUE(1565),
   JS_ROM_VALUE(427) /* Array */,
-  JS_ROM_VALUE(1610),
+  JS_ROM_VALUE(1671),
   JS_ROM_VALUE(477) /* Math */,
-  JS_ROM_VALUE(1757),
+  JS_ROM_VALUE(1818),
   JS_ROM_VALUE(567) /* Date */,
-  JS_ROM_VALUE(1782),
-  JS_ROM_VALUE(572) /* JSON */,
-  JS_ROM_VALUE(1797),
-  JS_ROM_VALUE(582) /* RegExp */,
   JS_ROM_VALUE(1843),
+  JS_ROM_VALUE(572) /* JSON */,
+  JS_ROM_VALUE(1858),
+  JS_ROM_VALUE(582) /* RegExp */,
+  JS_ROM_VALUE(1904),
   JS_ROM_VALUE(208) /* Error */,
-  JS_ROM_VALUE(1883),
+  JS_ROM_VALUE(1944),
   JS_ROM_VALUE(633) /* EvalError */,
-  JS_ROM_VALUE(1905),
+  JS_ROM_VALUE(1966),
   JS_ROM_VALUE(637) /* RangeError */,
-  JS_ROM_VALUE(1927),
+  JS_ROM_VALUE(1988),
   JS_ROM_VALUE(641) /* ReferenceError */,
-  JS_ROM_VALUE(1949),
+  JS_ROM_VALUE(2010),
   JS_ROM_VALUE(646) /* SyntaxError */,
-  JS_ROM_VALUE(1971),
+  JS_ROM_VALUE(2032),
   JS_ROM_VALUE(650) /* TypeError */,
-  JS_ROM_VALUE(1993),
+  JS_ROM_VALUE(2054),
   JS_ROM_VALUE(654) /* URIError */,
-  JS_ROM_VALUE(2015),
+  JS_ROM_VALUE(2076),
   JS_ROM_VALUE(658) /* InternalError */,
-  JS_ROM_VALUE(2037),
+  JS_ROM_VALUE(2098),
   JS_ROM_VALUE(663) /* ArrayBuffer */,
-  JS_ROM_VALUE(2062),
+  JS_ROM_VALUE(2123),
   JS_ROM_VALUE(676) /* Uint8ClampedArray */,
-  JS_ROM_VALUE(2149),
+  JS_ROM_VALUE(2210),
   JS_ROM_VALUE(712) /* Int8Array */,
-  JS_ROM_VALUE(2174),
+  JS_ROM_VALUE(2235),
   JS_ROM_VALUE(716) /* Uint8Array */,
-  JS_ROM_VALUE(2199),
+  JS_ROM_VALUE(2260),
   JS_ROM_VALUE(720) /* Int16Array */,
-  JS_ROM_VALUE(2224),
+  JS_ROM_VALUE(2285),
   JS_ROM_VALUE(724) /* Uint16Array */,
-  JS_ROM_VALUE(2249),
+  JS_ROM_VALUE(2310),
   JS_ROM_VALUE(728) /* Int32Array */,
-  JS_ROM_VALUE(2274),
+  JS_ROM_VALUE(2335),
   JS_ROM_VALUE(732) /* Uint32Array */,
-  JS_ROM_VALUE(2299),
+  JS_ROM_VALUE(2360),
   JS_ROM_VALUE(736) /* Float32Array */,
-  JS_ROM_VALUE(2324),
+  JS_ROM_VALUE(2385),
   JS_ROM_VALUE(741) /* Float64Array */,
-  JS_ROM_VALUE(2349),
+  JS_ROM_VALUE(2410),
   JS_ROM_VALUE(287) /* parseInt */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 19),
   JS_ROM_VALUE(291) /* parseFloat */,
   JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 20),
   JS_ROM_VALUE(165) /* eval */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 178),
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 193),
   JS_ROM_VALUE(746) /* isNaN */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 179),
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 194),
   JS_ROM_VALUE(749) /* isFinite */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 180),
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 195),
   JS_ROM_VALUE(197) /* Infinity */,
-  JS_ROM_VALUE(2354),
+  JS_ROM_VALUE(2415),
   JS_ROM_VALUE(195) /* NaN */,
-  JS_ROM_VALUE(2357),
+  JS_ROM_VALUE(2418),
   JS_ROM_VALUE(149) /* undefined */,
   JS_UNDEFINED,
   JS_ROM_VALUE(753) /* globalThis */,
   JS_NULL,
   JS_ROM_VALUE(757) /* console */,
-  JS_ROM_VALUE(2367),
+  JS_ROM_VALUE(2428),
   JS_ROM_VALUE(760) /* performance */,
-  JS_ROM_VALUE(2379),
+  JS_ROM_VALUE(2440),
   JS_ROM_VALUE(764) /* print */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 181),
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 196),
   JS_ROM_VALUE(767) /* gpio */,
-  JS_ROM_VALUE(2415),
+  JS_ROM_VALUE(2476),
   JS_ROM_VALUE(795) /* i2c */,
-  JS_ROM_VALUE(2437),
+  JS_ROM_VALUE(2498),
   JS_ROM_VALUE(810) /* mqtt */,
-  JS_ROM_VALUE(2467),
+  JS_ROM_VALUE(2528),
   JS_ROM_VALUE(835) /* ui */,
-  JS_ROM_VALUE(2525),
-  JS_ROM_VALUE(882) /* ssh */,
-  JS_ROM_VALUE(2558),
-  JS_ROM_VALUE(896) /* setTimeout */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 182),
-  JS_ROM_VALUE(900) /* setInterval */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 183),
-  JS_ROM_VALUE(904) /* clearTimeout */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 184),
-  JS_ROM_VALUE(909) /* clearInterval */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 185),
-  JS_ROM_VALUE(914) /* delay */,
-  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 186),
+  JS_ROM_VALUE(2603),
+  JS_ROM_VALUE(892) /* ssh */,
+  JS_ROM_VALUE(2636),
+  JS_ROM_VALUE(906) /* sys */,
+  JS_ROM_VALUE(2648),
+  JS_ROM_VALUE(911) /* UiScreen */,
+  JS_ROM_VALUE(2688),
+  JS_ROM_VALUE(933) /* UiWidget */,
+  JS_ROM_VALUE(2717),
+  JS_ROM_VALUE(942) /* setTimeout */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 197),
+  JS_ROM_VALUE(946) /* setInterval */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 198),
+  JS_ROM_VALUE(950) /* clearTimeout */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 199),
+  JS_ROM_VALUE(955) /* clearInterval */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 200),
+  JS_ROM_VALUE(960) /* delay */,
+  JS_VALUE_MAKE_SPECIAL(JS_TAG_SHORT_FUNC, 201),
 };
 
 static const JSCFunctionDef js_c_function_table[] = {
@@ -3389,6 +3565,15 @@ static const JSCFunctionDef js_c_function_table[] = {
   { { .generic = js_ui_onKey },
     JS_ROM_VALUE(879) /* onKey */,
     JS_CFUNC_generic, 1, 0 },
+  { { .generic = js_ui_screen },
+    JS_ROM_VALUE(882) /* screen */,
+    JS_CFUNC_generic, 1, 0 },
+  { { .generic = js_ui_back },
+    JS_ROM_VALUE(885) /* back */,
+    JS_CFUNC_generic, 0, 0 },
+  { { .generic = js_ui_navigate },
+    JS_ROM_VALUE(888) /* navigate */,
+    JS_CFUNC_generic, 1, 0 },
   { { .generic = js_ssh_connect },
     JS_ROM_VALUE(813) /* connect */,
     JS_CFUNC_generic, 6, 0 },
@@ -3396,19 +3581,55 @@ static const JSCFunctionDef js_c_function_table[] = {
     JS_ROM_VALUE(773) /* write */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_ssh_resize },
-    JS_ROM_VALUE(884) /* resize */,
+    JS_ROM_VALUE(894) /* resize */,
     JS_CFUNC_generic, 2, 0 },
   { { .generic = js_ssh_close },
-    JS_ROM_VALUE(887) /* close */,
+    JS_ROM_VALUE(897) /* close */,
     JS_CFUNC_generic, 0, 0 },
   { { .generic = js_ssh_connected },
     JS_ROM_VALUE(820) /* connected */,
     JS_CFUNC_generic, 0, 0 },
   { { .generic = js_ssh_onData },
-    JS_ROM_VALUE(890) /* onData */,
+    JS_ROM_VALUE(900) /* onData */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_ssh_onClose },
-    JS_ROM_VALUE(893) /* onClose */,
+    JS_ROM_VALUE(903) /* onClose */,
+    JS_CFUNC_generic, 1, 0 },
+  { { .generic = js_sys_heap },
+    JS_ROM_VALUE(908) /* heap */,
+    JS_CFUNC_generic, 0, 0 },
+  { { .constructor = js_ui_no_ctor },
+    JS_ROM_VALUE(911) /* UiScreen */,
+    JS_CFUNC_constructor, 0, JS_CLASS_UI_SCREEN },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(915) /* button */,
+    JS_CFUNC_generic_magic, 2, UIW_K_BUTTON },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(918) /* label */,
+    JS_CFUNC_generic_magic, 1, UIW_K_LABEL },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(921) /* field */,
+    JS_CFUNC_generic_magic, 2, UIW_K_FIELD },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(924) /* list */,
+    JS_CFUNC_generic_magic, 0, UIW_K_LIST },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(927) /* toggle */,
+    JS_CFUNC_generic_magic, 3, UIW_K_TOGGLE },
+  { { .generic_magic = js_uiscreen_create },
+    JS_ROM_VALUE(930) /* slider */,
+    JS_CFUNC_generic_magic, 4, UIW_K_SLIDER },
+  { { .constructor = js_ui_no_ctor },
+    JS_ROM_VALUE(933) /* UiWidget */,
+    JS_CFUNC_constructor, 0, JS_CLASS_UI_WIDGET },
+  { { .generic = js_uiwidget_add },
+    JS_ROM_VALUE(937) /* add */,
+    JS_CFUNC_generic, 2, 0 },
+  { { .generic = js_uiwidget_value },
+    JS_ROM_VALUE(172) /* value */,
+    JS_CFUNC_generic, 0, 0 },
+  { { .generic = js_uiwidget_setText },
+    JS_ROM_VALUE(939) /* setText */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_global_eval },
     JS_ROM_VALUE(165) /* eval */,
@@ -3423,19 +3644,19 @@ static const JSCFunctionDef js_c_function_table[] = {
     JS_ROM_VALUE(764) /* print */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_setTimeout },
-    JS_ROM_VALUE(896) /* setTimeout */,
+    JS_ROM_VALUE(942) /* setTimeout */,
     JS_CFUNC_generic, 2, 0 },
   { { .generic = js_setInterval },
-    JS_ROM_VALUE(900) /* setInterval */,
+    JS_ROM_VALUE(946) /* setInterval */,
     JS_CFUNC_generic, 2, 0 },
   { { .generic = js_clearTimer },
-    JS_ROM_VALUE(904) /* clearTimeout */,
+    JS_ROM_VALUE(950) /* clearTimeout */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_clearTimer },
-    JS_ROM_VALUE(909) /* clearInterval */,
+    JS_ROM_VALUE(955) /* clearInterval */,
     JS_CFUNC_generic, 1, 0 },
   { { .generic = js_delay },
-    JS_ROM_VALUE(914) /* delay */,
+    JS_ROM_VALUE(960) /* delay */,
     JS_CFUNC_generic, 1, 0 },
 };
 
@@ -3444,16 +3665,18 @@ static const JSCFunctionDef js_c_function_table[] = {
 #endif
 
 static const JSCFinalizer js_c_finalizer_table[JS_CLASS_COUNT - JS_CLASS_USER] = {
+  [JS_CLASS_UI_SCREEN - JS_CLASS_USER] = js_ui_handle_finalizer,
+  [JS_CLASS_UI_WIDGET - JS_CLASS_USER] = js_ui_handle_finalizer,
 };
 
 const JSSTDLibraryDef js_stdlib = {
   js_stdlib_table,
   js_c_function_table,
   js_c_finalizer_table,
-  2664,
+  2829,
   64,
-  917,
-  2563,
+  963,
+  2722,
   JS_CLASS_COUNT,
 };
 

@@ -73,6 +73,12 @@ static const lv_font_t *ui_font(void)
     return &jp;
 }
 
+/* same font for the widget layer (ui_widgets.cpp) */
+const lv_font_t *ui_tab5_jp_font(void)
+{
+    return ui_font();
+}
+
 /* Monospace terminal font (HackGen Console, fonts/font_term_mono.c).
  * Fixed cell grid for ui.cells/UI_CMD_CELLS: 9px advance (720/9 = 80 cols),
  * 24px line height. Glyphs are blitted directly (no lv_draw_label) and

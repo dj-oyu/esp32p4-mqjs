@@ -1,7 +1,7 @@
 # Tab5 ウィジェットフレームワーク + マルチセッション 設計書
 
-Status: **設計フェーズ** (2026-06-11)。実装は別セッション。本書はその設計と、
-この場で実施した先行調査(パイロット)の結果を記録する。
+Status: **W1 完了・実機検証済み** (2026-06-11)。W1-1〜W1-4 実装+定量ゲート
+合格(§10 実装ログ・§10.4 実機結果)。残りは目視確認(§10.4-5)と W2。
 
 関連: `docs/ssh-terminal-design.md`(SSH 端末本体・§7 で入力/クリップボード/
 ダイヤルパネルを設計)、[[tab5-platform-vision]](MQTT app-store + マルチタスク
@@ -183,3 +183,108 @@ ssh.write(id, "ls\n");  ssh.onData(id, fn);  ssh.close(id);
 - 複数 SSH セッション **上限 2〜3 本**(定数化)。
 - 初期ウィジェットセットは §3 のもので十分。
 - 画面遷移アニメは `Screen::loadAnim`(lv_screen_load_anim)を使う。
+
+## 10. 実装ログ (2026-06-11, W1 実装セッション)
+
+### 10.1 W1-1: LVGL ヒープ PSRAM 化 — 方式は §2 の未確定案より単純化
+§2 W1-1 の未確定だった「主プール自体を PSRAM にできるのか」は **YES**:
+LVGL builtin malloc には `LV_MEM_POOL_ALLOC` フック(lv_mem_core_builtin.c)が
+あり、`lv_mem_init()` が静的配列の代わりに
+`lv_tlsf_create_with_pool(LV_MEM_POOL_ALLOC(LV_MEM_SIZE), LV_MEM_SIZE)` を呼ぶ。
+→ **`lv_mem_add_pool` の二段構えは不要**。実装:
+- `sdkconfig.defaults`: `CONFIG_LV_USE_BUILTIN_MALLOC=y` +
+  `CONFIG_LV_MEM_SIZE_KILOBYTES=3072`(3MB)。
+- `components/ui_tab5/CMakeLists.txt`: lvgl ターゲットに
+  `LV_MEM_POOL_INCLUDE="esp_heap_caps.h"` /
+  `LV_MEM_POOL_ALLOC(size)=heap_caps_malloc(size, MALLOC_CAP_SPIRAM)` を定義。
+  この define が無いと 3MB が .bss に置かれリンクできないので注意。
+  **罠: CMake の `target_compile_definitions` は関数形式マクロを黙って
+  捨てる** — `LV_MEM_POOL_ALLOC(size)=...` は `target_compile_options` で
+  `-D` として渡すこと(初回ビルドは .bss 3MB あふれで
+  "--enable-non-contiguous-regions discards section" の連発でリンク失敗
+  した。原因はこれ)。
+- Stamp ビルドは LVGL を初期化しないので無害(プール確保は実行時)。
+- ビルド確認済み (2026-06-11): Tab5 (`build_tab5`) と Stamp (`build`) の
+  両方グリーン。ついでに既存バグ修正: トップ CMakeLists の wolfSSH
+  include-override が Stamp の INTERFACE な sshc ターゲットに PRIVATE を
+  付けて configure が落ちていた(TYPE で分岐するよう修正)。
+
+### 10.2 W1-2/3: 実装の形(設計からの意図的な差分 2 点)
+実体: `components/ui_tab5/ui_widgets.cpp`(C コア)+ `mqjs_runtime.c`
+(JS バインド・EV_WIDGET・コールバック表)+ `device_stdlib.c`(ROM クラス)。
+
+1. **コマンドキューではなく lvgl_port_lock 下の同期呼び出し**(§5 の
+   「LVGL ロック下」をキューなしで直接満たす)。理由: `field.value()` 等の
+   同期読みが必須で、ウィジェットはホットパスでない。キャンバスの
+   キューはホットパスなのでそのまま。
+2. **lvgl_cpp ラッパーではなく LVGL C API 直叩き**。lvgl_cpp の Widget は
+   RAII(デストラクタで自分の lv_obj を delete)で、§4④の
+   「`lv_obj_del(root)` で木をまとめて解放」と所有権が衝突する。
+   遷移アニメは `lv_screen_load_anim`(= Screen::loadAnim の中身)を使用。
+   back 時は auto_del=true で「アニメ完了後に旧を解放」をそのまま実現。
+
+機構(設計どおり): id↔obj 表 160 slot + 世代カウンタ(handle =
+gen<<8|slot、screen 破棄で全所属 entry の世代を bump → stale ハンドルは
+無害な no-op)。イベントは LVGL タスク → `mqjs_post_widget(handle,value)`
+→ EV_WIDGET → JS。コールバックは GCRef 48 slot、**screen handle 単位で
+一括 release**(§4④。back / 深さ超過 evict / タスク終了の 3 箇所)。
+タスク終了時は `ui_tab5_w_reset()` が全スクリーンを破棄してコンソール
+画面へ戻す(キャンバスのタスク切替クリアと同型)。
+
+JS API は §3 の形をそのまま実装(mquickjs の user class
+`UiScreen`/`UiWidget`、opaque に handle を持つ。ROM stdlib の制約で
+クラス定義はグローバル直下に置く必要があった)。`sys.heap()` →
+`[internal, psram, lvgl_pool]` も追加(gen/ + gen_pc/ ヘッダ再生成済み、
+`JS_CLASS_COUNT` は mqjs_classes.h で定義)。
+
+W1 で意図的に積み残したもの:
+- `ui.navigate(builderFn)` は「即時実行」のみ(builder 保持なし)。
+  深さ超過で evict されたスクリーンへ back すると**コンソールまで
+  フォールスルー**する。builder 再実行による再構築は W2。
+- §4③ object_pool の行リサイクルは未実装(行はスクリーンの木と一緒に
+  死ぬ。リスト在位のまま再 populate する消費者が現れる W2 で導入)。
+- `.canvas()` / `ui.tabview()` は W3。
+- FIELD はタップでスクリーン内 lv_keyboard(共有 1 枚)が出る。端末用
+  キーボード(ui.keyboard)とは別物。
+
+### 10.3 W1-4: 計測ハーネス
+`examples/settings_demo.js`: 設定ページ骨子(label/field×3(secret 含む)/
+toggle/slider/list 6 行/Save/Cancel)を 5 枚 push(N=3 超え → evict 発生)
+→ コンソールまで pop、を 8 周し、各周で `sys.heap()` を出力。
+**PC ビルドで全周回 OK**(evict・フォールスルー・コールバック解放が設計
+どおり動作、48 slot を超えない)。
+
+### 10.4 実機検証結果 (2026-06-11)
+1. **W1-4 定量ゲート合格**: `settings_demo.js` 41 画面完走(クラッシュなし)。
+   `widget_leak_probe.js`(print を排した 100 画面 churn)を 2 周実行:
+   **lvgl d=0 / psram d=0**。settings_demo で見えた lvgl 減少
+   (-284B/cycle)はコンソール行ラベルの保持(200 行リング、設計どおり)で、
+   ウィジェットのリークではない。
+2. internal RAM は周回中 -21KB 減るが、これは **JsUiHandle opaque の
+   finalizer が GC 実行まで遅延する**ため(mquickjs の仕様)。タスク終了の
+   context 破棄で全回収され、次タスクの開始値は完全に回復(238051 →
+   239611)。有界・回収確認済み。watch 項目: 1 タスク内で数千ウィジェットを
+   GC なしで作る場合のみ内部 RAM を圧迫し得る(必要になれば back() 時に
+   JS_GC を蹴る)。
+3. SSH 回帰 OK: 新ファーム起動時に永続化済み ssh_vt タスクが自動実行され
+   `shell up on sunrise@192.168.1.33:22` を確認(PSRAM プール下で wolfSSH
+   正常)。
+4. **コンソール flood 回帰 OK**(`console_flood.js`): 300 行連続出力後も
+   `sys.heap()` が返る(= LVGL ポートロックが取れる = UI タスク生存。旧
+   64KB プール枯渇はここでフリーズした)。200 行キャップ到達後の lvgl
+   プールはフラット(±100B)。複数周回で安定。
+5. **目視確認(ユーザー実施)**: FIELD キーボード・入力・パスワード
+   マスク OK、toggle/slider OK、リスト行タップはコールバック発火していた
+   が見た目の反応が薄く「仕切り線の長さが変わる」ように見えた(= LVGL
+   デフォルトテーマの押下 transform の副作用。意図した効果ではない)。
+
+### 10.5 目視フィードバック対応 (2026-06-11)
+- FIELD: フォーカス中はアクセント色(#4FC3F7)の太ボーダー + 背景明色化
+  (`LV_STATE_FOCUSED` スタイル)。非フォーカスは細い dim ボーダー。
+- リスト行: 背景を不透明化し、**押下中は青背景(#2E6BD6)+ 白文字**。
+  デフォルトテーマの押下 transform(width/height)を 0 に上書きして
+  「仕切り線が伸び縮みする」錯視を排除。
+- `UiWidget.setText(str)` を追加(LABEL/BUTTON/ITEM の表示文字列、FIELD は
+  内容を置換)。デモはタップ/Save の結果を画面内ステータスラベルに表示する
+  ように変更(コールバック往復が console なしで見える)。Save は back
+  しなくなった(値の確認がしやすいように)。

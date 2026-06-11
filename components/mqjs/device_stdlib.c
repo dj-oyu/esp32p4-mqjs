@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "mquickjs_build.h"
+#include "mqjs_classes.h"
 
 /* defined in mqjs_example.c */
 //#define CONFIG_CLASS_EXAMPLE
@@ -375,6 +376,36 @@ static const JSPropDef js_mqtt[] = {
 static const JSClassDef js_mqtt_obj =
     JS_OBJECT_DEF("MQTT", js_mqtt);
 
+/* ---- device API: ui widget layer (W1, widget-framework-design.md) ----
+   Handle objects: ui.screen(title) returns a UiScreen whose methods
+   create widgets on that screen; back()/navigate() drive the retain
+   stack. The classes are reachable as ui.Screen/ui.Widget only so the
+   ROM build emits their prototypes — they are not constructible. */
+static const JSPropDef js_uiscreen_proto[] = {
+    JS_CFUNC_MAGIC_DEF("button", 2, js_uiscreen_create, UIW_K_BUTTON),
+    JS_CFUNC_MAGIC_DEF("label", 1, js_uiscreen_create, UIW_K_LABEL),
+    JS_CFUNC_MAGIC_DEF("field", 2, js_uiscreen_create, UIW_K_FIELD),
+    JS_CFUNC_MAGIC_DEF("list", 0, js_uiscreen_create, UIW_K_LIST),
+    JS_CFUNC_MAGIC_DEF("toggle", 3, js_uiscreen_create, UIW_K_TOGGLE),
+    JS_CFUNC_MAGIC_DEF("slider", 4, js_uiscreen_create, UIW_K_SLIDER),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_uiscreen_class =
+    JS_CLASS_DEF("UiScreen", 0, js_ui_no_ctor, JS_CLASS_UI_SCREEN, NULL,
+                 js_uiscreen_proto, NULL, js_ui_handle_finalizer);
+
+static const JSPropDef js_uiwidget_proto[] = {
+    JS_CFUNC_DEF("add", 2, js_uiwidget_add),     /* list rows */
+    JS_CFUNC_DEF("value", 0, js_uiwidget_value), /* field/toggle/slider */
+    JS_CFUNC_DEF("setText", 1, js_uiwidget_setText), /* label/button/field */
+    JS_PROP_END,
+};
+
+static const JSClassDef js_uiwidget_class =
+    JS_CLASS_DEF("UiWidget", 0, js_ui_no_ctor, JS_CLASS_UI_WIDGET, NULL,
+                 js_uiwidget_proto, NULL, js_ui_handle_finalizer);
+
 /* ---- device API: ui object (Tab5 on-device canvas; no-op on Stamp) ---- */
 static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("size", 0, js_ui_size),
@@ -391,6 +422,10 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("keyboard", 1, js_ui_keyboard),
     JS_CFUNC_DEF("onTouch", 1, js_ui_onTouch),
     JS_CFUNC_DEF("onKey", 1, js_ui_onKey),
+    /* widget layer (W1) */
+    JS_CFUNC_DEF("screen", 1, js_ui_screen),
+    JS_CFUNC_DEF("back", 0, js_ui_back),
+    JS_CFUNC_DEF("navigate", 1, js_ui_navigate),
     JS_PROP_END,
 };
 
@@ -411,6 +446,15 @@ static const JSPropDef js_ssh[] = {
 
 static const JSClassDef js_ssh_obj =
     JS_OBJECT_DEF("SSH", js_ssh);
+
+/* ---- device API: sys object (heap telemetry, W1-4) ---- */
+static const JSPropDef js_sys[] = {
+    JS_CFUNC_DEF("heap", 0, js_sys_heap),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_sys_obj =
+    JS_OBJECT_DEF("Sys", js_sys);
 
 static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("Object", &js_object_class),
@@ -465,6 +509,12 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
+    JS_PROP_CLASS_DEF("sys", &js_sys_obj),
+    /* widget handle classes (W1): the generator only accepts class defs
+       in the global object, so they live here (not constructible — use
+       ui.screen(); the names just make the ROM protos reachable). */
+    JS_PROP_CLASS_DEF("UiScreen", &js_uiscreen_class),
+    JS_PROP_CLASS_DEF("UiWidget", &js_uiwidget_class),
     JS_CFUNC_DEF("setTimeout", 2, js_setTimeout),
     JS_CFUNC_DEF("setInterval", 2, js_setInterval),
     JS_CFUNC_DEF("clearTimeout", 1, js_clearTimer),

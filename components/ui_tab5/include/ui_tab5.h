@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "sdkconfig.h"
 
 #ifdef __cplusplus
@@ -57,6 +58,28 @@ typedef struct {
                        ui_tab5_cmd() returns false. */
 } ui_cmd_t;
 
+/* ------------------------------------------------------------------ */
+/* W1-2/3 widget layer (docs/widget-framework-design.md).              */
+/* All functions are called on js_task and run synchronously under the */
+/* esp_lvgl_port lock ("LVGL ロック下", design §5). Handles are        */
+/* slot|generation packed uint32 (0 = invalid/stale); a destroyed      */
+/* screen bumps the generation of every entry it owned, so stale JS    */
+/* handles turn into silent no-ops instead of dangling pointers.       */
+/* ------------------------------------------------------------------ */
+
+/* Widget kinds for ui_tab5_w_create(). Values are mirrored in
+ * components/mqjs/mqjs_classes.h (the runtime can't include this header
+ * in PC builds) — keep both lists in sync. */
+typedef enum {
+    UI_WK_BUTTON = 0,
+    UI_WK_LABEL  = 1,
+    UI_WK_FIELD  = 2, /* labelled one-line textarea; a!=0 -> password   */
+    UI_WK_LIST   = 3,
+    UI_WK_ITEM   = 4, /* list row; parent must be a UI_WK_LIST handle   */
+    UI_WK_TOGGLE = 5, /* labelled switch; a!=0 -> initially on          */
+    UI_WK_SLIDER = 6, /* a=min b=max c=initial value                    */
+} ui_widget_kind_t;
+
 #if CONFIG_MQJS_TAB5_UI
 
 /* Initialize panel + LVGL and start the UI task (call once, early). */
@@ -78,6 +101,45 @@ void ui_tab5_text_size(const char *utf8, int *w, int *h);
 /* Cell size (advance width, line height) of the monospace terminal font
  * used by ui.cells/UI_CMD_CELLS. 0x0 when the UI is off. Const tables only. */
 void ui_tab5_cell_size(int *w, int *h);
+
+/* Create a widget screen (flex column + title), retain the previously
+ * active screen on the navigation stack and slide the new one in.
+ * Returns the screen handle (0 if the display is down). When pushing
+ * exceeded the retain depth (UI_NAV_RETAIN), the deepest retained screen
+ * was destroyed and its handle is stored in *evicted (else 0) so the JS
+ * runtime can release that screen's callbacks in one sweep (design §4④). */
+uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted);
+
+/* Pop: destroy the active widget screen (deleted after the slide-back
+ * animation) and re-show the retained one below it — zero rebuild, zero
+ * churn (design §4②). Returns the destroyed screen's handle so the JS
+ * runtime can sweep its callbacks; 0 when the console screen is active. */
+uint32_t ui_tab5_w_back(void);
+
+/* Create one widget on a screen (or list, for UI_WK_ITEM). `text` is the
+ * label/title (may be ""); a/b/c are kind-specific (see ui_widget_kind_t).
+ * Returns the widget handle, 0 on failure/stale parent. */
+uint32_t ui_tab5_w_create(int kind, uint32_t parent, const char *text,
+                          int a, int b, int c);
+
+/* Replace the visible text of a LABEL / BUTTON / ITEM (child label) or
+ * the content of a FIELD. false for stale handles / other kinds. */
+bool ui_tab5_w_set_text(uint32_t handle, const char *text);
+
+/* Current value of a FIELD (UTF-8 into buf, true on success) ... */
+bool ui_tab5_w_value_str(uint32_t handle, char *buf, size_t cap);
+/* ... or of a TOGGLE (0/1) / SLIDER (int). 0 for stale handles. */
+int ui_tab5_w_value_int(uint32_t handle);
+
+/* Destroy every widget screen and return to the console screen. Called
+ * by the JS runtime when a task ends (same role as the canvas clear on
+ * task switch). Safe to call when nothing was ever created. */
+void ui_tab5_w_reset(void);
+
+/* Free bytes in the LVGL heap (builtin tlsf pool; 0 with CLIB malloc or
+ * when the UI is down). Third element of sys.heap() — the W1-4 thrash
+ * metric lives inside the preallocated pool, invisible to heap_caps. */
+size_t ui_tab5_lv_mem_free(void);
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
@@ -109,6 +171,44 @@ static inline void ui_tab5_cell_size(int *w, int *h)
     *w = 0;
     *h = 0;
 }
+static inline uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
+{
+    (void)title;
+    *evicted = 0;
+    return 0;
+}
+static inline uint32_t ui_tab5_w_back(void) { return 0; }
+static inline uint32_t ui_tab5_w_create(int kind, uint32_t parent,
+                                        const char *text, int a, int b, int c)
+{
+    (void)kind;
+    (void)parent;
+    (void)text;
+    (void)a;
+    (void)b;
+    (void)c;
+    return 0;
+}
+static inline bool ui_tab5_w_set_text(uint32_t handle, const char *text)
+{
+    (void)handle;
+    (void)text;
+    return false;
+}
+static inline bool ui_tab5_w_value_str(uint32_t handle, char *buf, size_t cap)
+{
+    (void)handle;
+    if (cap)
+        buf[0] = '\0';
+    return false;
+}
+static inline int ui_tab5_w_value_int(uint32_t handle)
+{
+    (void)handle;
+    return 0;
+}
+static inline void ui_tab5_w_reset(void) {}
+static inline size_t ui_tab5_lv_mem_free(void) { return 0; }
 
 #endif /* CONFIG_MQJS_TAB5_UI */
 

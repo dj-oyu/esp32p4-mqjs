@@ -33,6 +33,7 @@
 #include "cutils.h"
 #include "mquickjs.h"
 #include "mqjs_runtime.h"
+#include "mqjs_classes.h"
 
 #ifdef ESP_PLATFORM
 #include <stdlib.h>
@@ -41,6 +42,7 @@
 #include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
@@ -54,6 +56,7 @@ static const char *TAG = "mqjs";
 
 #define MQJS_MAX_TIMERS       16
 #define MQJS_MAX_GPIO_CB      8
+#define MQJS_MAX_WIDGET_CB    48 /* buttons/list rows/toggles with a JS cb */
 #define MQJS_MAX_MQTT_SUB     8
 #define MQJS_MQTT_TOPIC_MAX   96
 #define MQJS_MQTT_PAYLOAD_MAX 4096
@@ -164,7 +167,7 @@ typedef struct {
    esp-mqtt event task. mqtt strings are heap copies owned by the
    event: the dispatcher (or the drain in reset_slots) frees them. */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
-               EV_SSH_DATA, EV_SSH_CLOSED } MqjsEventType;
+               EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -175,6 +178,7 @@ typedef struct {
         struct { char text[8]; uint8_t len; } key; /* one key as UTF-8 */
         struct { char *data; uint32_t len; } ssh;  /* heap copy (rx)   */
         struct { char reason[24]; } ssh_closed;
+        struct { uint32_t handle; int32_t value; } widget; /* tap/change */
     } u;
 } MqjsEvent;
 
@@ -184,9 +188,22 @@ typedef struct {
     JSGCRef fn;
 } MqttSub;
 
+/* One JS callback per interactive widget (button/list row/toggle/slider).
+   `screen` is the owning screen's handle: when that screen is destroyed
+   (ui.back() / retain-depth eviction / task end) every slot it owned is
+   released in one sweep, so the compacting GC repacks once instead of
+   per-widget (design §4④). */
+typedef struct {
+    bool used;
+    uint32_t handle;  /* widget handle the LVGL side posts with */
+    uint32_t screen;  /* owning screen handle */
+    JSGCRef fn;
+} WidgetCb;
+
 static TimerSlot s_timers[MQJS_MAX_TIMERS];
 static GpioSlot  s_gpio_cb[MQJS_MAX_GPIO_CB];
 static MqttSub   s_mqtt_subs[MQJS_MAX_MQTT_SUB];
+static WidgetCb  s_widget_cbs[MQJS_MAX_WIDGET_CB];
 static bool      s_mqtt_onconn_used;
 static JSGCRef   s_mqtt_onconn;
 static volatile bool s_touch_used; /* read by the UI task (poster) */
@@ -1039,6 +1056,420 @@ static void dispatch_key_event(JSContext *ctx, const MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
+/* ui widgets (W1-2/3, docs/widget-framework-design.md). JS handle     */
+/* objects (UiScreen/UiWidget user classes, ROM protos defined in      */
+/* device_stdlib.c) wrap C-side handles; creation/mutation runs        */
+/* synchronously in ui_tab5_w_* under the LVGL lock, events come back  */
+/* through EV_WIDGET. PC build = handle bookkeeping + print stubs so   */
+/* widget scripts smoke-test on the host.                              */
+/* ------------------------------------------------------------------ */
+
+/* opaque payload of UiScreen/UiWidget JS objects (C heap, freed by the
+   class finalizer; the GC may move the JS object, never this struct) */
+typedef struct {
+    uint32_t handle; /* C-side widget handle (0 = inert: UI-less build) */
+    uint32_t screen; /* handle of the owning screen (== handle for screens) */
+    uint8_t kind;    /* UIW_K_* */
+} JsUiHandle;
+
+void js_ui_handle_finalizer(JSContext *ctx, void *opaque)
+{
+    (void)ctx;
+    free(opaque); /* may be NULL when JS_SetOpaque was never reached */
+}
+
+JSValue js_ui_no_ctor(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return JS_ThrowTypeError(ctx, "use ui.screen()");
+}
+
+#ifndef ESP_PLATFORM
+/* PC model: same navigation semantics as the device (current screen +
+   retain stack of 3 + eviction) so long-running demos exercise the
+   callback-release paths; widgets are just counted handles. */
+#define PCW_RETAIN 3
+static uint32_t s_pcw_next = 1;
+static uint32_t s_pcw_cur;               /* 0 = console */
+static uint32_t s_pcw_stack[PCW_RETAIN + 1];
+static int s_pcw_sp;
+
+static uint32_t pcw_screen(const char *title, uint32_t *evicted)
+{
+    *evicted = 0;
+    if (s_pcw_cur) {
+        if (s_pcw_sp == PCW_RETAIN) { /* full: evict the deepest */
+            *evicted = s_pcw_stack[0];
+            memmove(&s_pcw_stack[0], &s_pcw_stack[1],
+                    (PCW_RETAIN - 1) * sizeof(uint32_t));
+            s_pcw_sp--;
+        }
+        s_pcw_stack[s_pcw_sp++] = s_pcw_cur;
+    }
+    s_pcw_cur = s_pcw_next++;
+    printf("[ui] screen(%s) -> #%u%s\n", title, (unsigned)s_pcw_cur,
+           *evicted ? " (evicted one)" : "");
+    return s_pcw_cur;
+}
+
+static uint32_t pcw_back(void)
+{
+    if (!s_pcw_cur)
+        return 0;
+    uint32_t destroyed = s_pcw_cur;
+    s_pcw_cur = s_pcw_sp ? s_pcw_stack[--s_pcw_sp] : 0;
+    printf("[ui] back: destroyed #%u, now on #%u\n", (unsigned)destroyed,
+           (unsigned)s_pcw_cur);
+    return destroyed;
+}
+
+static void pcw_reset(void)
+{
+    s_pcw_cur = 0;
+    s_pcw_sp = 0;
+}
+#endif /* !ESP_PLATFORM */
+
+/* register a widget callback; returns -1 when all slots are taken */
+static int wcb_add(JSContext *ctx, uint32_t handle, uint32_t screen,
+                   JSValue fn)
+{
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
+        WidgetCb *w = &s_widget_cbs[i];
+        if (w->used)
+            continue;
+        JSValue *pf = JS_AddGCRef(ctx, &w->fn);
+        *pf = fn;
+        w->handle = handle;
+        w->screen = screen;
+        w->used = true;
+        return 0;
+    }
+    return -1;
+}
+
+/* one sweep per destroyed screen: all its callbacks die together, so
+   the compacting GC repacks once (design §4④) */
+static void wcb_release_screen(JSContext *ctx, uint32_t screen)
+{
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
+        WidgetCb *w = &s_widget_cbs[i];
+        if (w->used && w->screen == screen) {
+            w->used = false;
+            JS_DeleteGCRef(ctx, &w->fn);
+        }
+    }
+}
+
+/* called by ui_widgets.cpp from the LVGL task (never an ISR) */
+void mqjs_post_widget(uint32_t handle, int32_t value)
+{
+#ifdef ESP_PLATFORM
+    if (!s_event_queue)
+        return;
+    MqjsEvent ev = {
+        .type = EV_WIDGET,
+        .u.widget = { .handle = handle, .value = value },
+    };
+    xQueueSend(s_event_queue, &ev, 0); /* full queue: drop, never block */
+#else
+    (void)handle;
+    (void)value;
+#endif
+}
+
+static void dispatch_widget_event(JSContext *ctx, const MqjsEvent *ev)
+{
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
+        WidgetCb *w = &s_widget_cbs[i];
+        if (!w->used || w->handle != ev->u.widget.handle)
+            continue;
+        if (JS_StackCheck(ctx, 4)) {
+            dump_error(ctx);
+            return;
+        }
+        JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.widget.value)); /* arg0 */
+        JS_PushArg(ctx, w->fn.val);                            /* func */
+        JS_PushArg(ctx, JS_NULL);                              /* this */
+        arm_watchdog();
+        JSValue ret = JS_Call(ctx, 1);
+        if (JS_IsException(ret))
+            dump_error(ctx);
+        return; /* handles are unique */
+    }
+}
+
+/* build the JS handle object. Runs JS allocation, so every C string
+   must already be copied out before calling this. */
+static JSValue uiw_make(JSContext *ctx, uint32_t handle, uint32_t screen,
+                        int kind, int class_id)
+{
+    JSValue obj = JS_NewObjectClassUser(ctx, class_id);
+    if (JS_IsException(obj))
+        return obj;
+    JsUiHandle *h = malloc(sizeof *h);
+    if (!h)
+        return JS_ThrowOutOfMemory(ctx); /* obj is GC garbage, opaque NULL */
+    h->handle = handle;
+    h->screen = screen;
+    h->kind = (uint8_t)kind;
+    JS_SetOpaque(ctx, obj, h);
+    return obj;
+}
+
+static JsUiHandle *uiw_get(JSContext *ctx, JSValue *this_val, int class_id)
+{
+    if (JS_GetClassID(ctx, *this_val) != class_id)
+        return NULL;
+    return JS_GetOpaque(ctx, *this_val);
+}
+
+/* copy a JS string argument onto the C stack (bounded). The pointer
+   returned by JS_ToCStringLen lives in the GC heap and dies on the next
+   allocation — never keep it across uiw_make/JS_New*. */
+static int uiw_copy_str(JSContext *ctx, JSValue v, char *dst, size_t cap)
+{
+    dst[0] = '\0';
+    if (JS_IsUndefined(v) || JS_IsNull(v))
+        return 0;
+    JSCStringBuf buf;
+    size_t len;
+    const char *s = JS_ToCStringLen(ctx, &len, v, &buf);
+    if (!s)
+        return -1;
+    if (len >= cap)
+        len = cap - 1; /* worst case tears a UTF-8 tail; caps are ample */
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return 0;
+}
+
+static int uiw_truthy(JSContext *ctx, JSValue v)
+{
+    if (JS_IsUndefined(v) || JS_IsNull(v))
+        return 0;
+    if (JS_IsBool(v))
+        return v == JS_NewBool(1);
+    if (JS_IsNumber(ctx, v)) {
+        int i = 0;
+        JS_ToInt32(ctx, &i, v);
+        return i != 0;
+    }
+    return 1; /* objects/strings: truthy enough for an options flag */
+}
+
+/* ui.screen(title) -> UiScreen */
+JSValue js_ui_screen(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char title[64];
+    if (uiw_copy_str(ctx, argv[0], title, sizeof title))
+        return JS_EXCEPTION;
+    uint32_t evicted = 0, h;
+#ifdef ESP_PLATFORM
+    h = ui_tab5_w_screen(title, &evicted);
+#else
+    h = pcw_screen(title, &evicted);
+#endif
+    if (evicted)
+        wcb_release_screen(ctx, evicted);
+    return uiw_make(ctx, h, h, UIW_K_SCREEN, JS_CLASS_UI_SCREEN);
+}
+
+/* ui.back() -> bool (false on the console screen / UI-less build).
+   Also usable directly as a tap callback: s.button("Cancel", ui.back). */
+JSValue js_ui_back(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    uint32_t destroyed;
+#ifdef ESP_PLATFORM
+    destroyed = ui_tab5_w_back();
+#else
+    destroyed = pcw_back();
+#endif
+    if (destroyed)
+        wcb_release_screen(ctx, destroyed);
+    return JS_NewBool(destroyed != 0);
+}
+
+/* ui.navigate(builderFn): run the builder (it is expected to call
+   ui.screen() itself). W1 keeps no builder reference — rebuilding a
+   retain-depth-evicted screen on back() is the W2 follow-up; today an
+   evicted screen just falls through to the console. */
+JSValue js_ui_navigate(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    if (!JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "not a function");
+    if (JS_StackCheck(ctx, 2))
+        return JS_EXCEPTION;
+    JS_PushArg(ctx, argv[0]); /* func */
+    JS_PushArg(ctx, JS_NULL); /* this */
+    return JS_Call(ctx, 0);
+}
+
+/* UiScreen.prototype.{button,label,field,list,toggle,slider} — one
+   implementation, the magic value is the UIW_K_* widget kind.
+     button(text, onTap)         label(text)
+     field(label, {secret:bool}) list()
+     toggle(text, init, onChange) slider(min, max, value, onChange) */
+JSValue js_uiscreen_create(JSContext *ctx, JSValue *this_val, int argc,
+                           JSValue *argv, int magic)
+{
+    JsUiHandle *sh = uiw_get(ctx, this_val, JS_CLASS_UI_SCREEN);
+    if (!sh)
+        return JS_ThrowTypeError(ctx, "not a UiScreen");
+    char text[128] = "";
+    int a = 0, b = 0, c = 0;
+    JSValue cb = JS_UNDEFINED;
+
+    switch (magic) {
+    case UIW_K_BUTTON:
+        if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+            return JS_EXCEPTION;
+        cb = argv[1];
+        break;
+    case UIW_K_LABEL:
+        if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+            return JS_EXCEPTION;
+        break;
+    case UIW_K_FIELD:
+        if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+            return JS_EXCEPTION;
+        if (!JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+            JSValue sec = JS_GetPropertyStr(ctx, argv[1], "secret");
+            if (JS_IsException(sec))
+                return JS_EXCEPTION;
+            a = uiw_truthy(ctx, sec);
+        }
+        break;
+    case UIW_K_LIST:
+        break;
+    case UIW_K_TOGGLE:
+        if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+            return JS_EXCEPTION;
+        a = uiw_truthy(ctx, argv[1]);
+        cb = argv[2];
+        break;
+    case UIW_K_SLIDER:
+        if ((!JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &a, argv[0])) ||
+            (!JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &b, argv[1])) ||
+            (!JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &c, argv[2])))
+            return JS_EXCEPTION;
+        if (b <= a) { /* default range when called as slider() */
+            a = 0;
+            b = 100;
+        }
+        cb = argv[3];
+        break;
+    default:
+        return JS_ThrowInternalError(ctx, "bad widget kind");
+    }
+    if (!JS_IsUndefined(cb) && !JS_IsNull(cb) && !JS_IsFunction(ctx, cb))
+        return JS_ThrowTypeError(ctx, "not a function");
+
+    uint32_t h;
+#ifdef ESP_PLATFORM
+    h = ui_tab5_w_create(magic, sh->handle, text, a, b, c);
+#else
+    h = s_pcw_next++;
+    printf("[ui] widget(kind=%d, \"%s\") -> #%u (stub)\n", magic, text,
+           (unsigned)h);
+#endif
+    if (h && JS_IsFunction(ctx, cb)) {
+        if (wcb_add(ctx, h, sh->screen, cb))
+            return JS_ThrowInternalError(ctx, "too many widget callbacks");
+    }
+    return uiw_make(ctx, h, sh->screen, magic, JS_CLASS_UI_WIDGET);
+}
+
+/* UiWidget.prototype.add(text, onTap) — list rows */
+JSValue js_uiwidget_add(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JsUiHandle *lh = uiw_get(ctx, this_val, JS_CLASS_UI_WIDGET);
+    if (!lh || lh->kind != UIW_K_LIST)
+        return JS_ThrowTypeError(ctx, "not a list");
+    char text[128];
+    if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+        return JS_EXCEPTION;
+    JSValue cb = argv[1];
+    if (!JS_IsUndefined(cb) && !JS_IsNull(cb) && !JS_IsFunction(ctx, cb))
+        return JS_ThrowTypeError(ctx, "not a function");
+    uint32_t h;
+#ifdef ESP_PLATFORM
+    h = ui_tab5_w_create(UIW_K_ITEM, lh->handle, text, 0, 0, 0);
+#else
+    h = s_pcw_next++;
+    printf("[ui] list.add(\"%s\") -> #%u (stub)\n", text, (unsigned)h);
+#endif
+    if (h && JS_IsFunction(ctx, cb)) {
+        if (wcb_add(ctx, h, lh->screen, cb))
+            return JS_ThrowInternalError(ctx, "too many widget callbacks");
+    }
+    return uiw_make(ctx, h, lh->screen, UIW_K_ITEM, JS_CLASS_UI_WIDGET);
+}
+
+/* UiWidget.prototype.setText(str) — label/button/list-row text, or field
+   content. Returns true when the widget accepted it. */
+JSValue js_uiwidget_setText(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JsUiHandle *h = uiw_get(ctx, this_val, JS_CLASS_UI_WIDGET);
+    if (!h)
+        return JS_ThrowTypeError(ctx, "not a widget");
+    char text[256];
+    if (uiw_copy_str(ctx, argv[0], text, sizeof text))
+        return JS_EXCEPTION;
+#ifdef ESP_PLATFORM
+    return JS_NewBool(ui_tab5_w_set_text(h->handle, text));
+#else
+    printf("[ui] setText(#%u, \"%s\") (stub)\n", (unsigned)h->handle, text);
+    return JS_NewBool(1);
+#endif
+}
+
+/* UiWidget.prototype.value() — field: string, toggle: 0/1, slider: int */
+JSValue js_uiwidget_value(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JsUiHandle *h = uiw_get(ctx, this_val, JS_CLASS_UI_WIDGET);
+    if (!h)
+        return JS_ThrowTypeError(ctx, "not a widget");
+    if (h->kind == UIW_K_FIELD) {
+        char buf[256] = "";
+#ifdef ESP_PLATFORM
+        ui_tab5_w_value_str(h->handle, buf, sizeof buf);
+#endif
+        return JS_NewString(ctx, buf);
+    }
+    if (h->kind == UIW_K_TOGGLE || h->kind == UIW_K_SLIDER) {
+#ifdef ESP_PLATFORM
+        return JS_NewInt32(ctx, ui_tab5_w_value_int(h->handle));
+#else
+        return JS_NewInt32(ctx, 0);
+#endif
+    }
+    return JS_UNDEFINED;
+}
+
+/* ------------------------------------------------------------------ */
+/* sys (W1-4): heap telemetry for the navigation-churn measurement     */
+/* ------------------------------------------------------------------ */
+
+/* sys.heap() -> [internal_free, psram_free, lvgl_pool_free] bytes.
+   The third element matters most for widget churn: the LVGL tlsf pool
+   is preallocated from PSRAM (W1-1), so leaks inside it are invisible
+   to the OS heap counters. */
+JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    uint32_t internal = 0, psram = 0, lvgl = 0;
+#ifdef ESP_PLATFORM
+    internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    lvgl = ui_tab5_lv_mem_free();
+#endif
+    JSValue arr = JS_NewArray(ctx, 0);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewUint32(ctx, internal));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewUint32(ctx, psram));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewUint32(ctx, lvgl));
+    return arr;
+}
+
+/* ------------------------------------------------------------------ */
 /* ssh (wolfSSH session task in components/sshc; PC = print stubs).    */
 /* The session task posts EV_SSH_DATA (heap copies, owned by the       */
 /* event) and one EV_SSH_CLOSED; an active session keeps the JS loop   */
@@ -1511,6 +1942,9 @@ static bool anything_pending(void)
         return true;
     if (s_key_used)   /* so does a key handler */
         return true;
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
+        if (s_widget_cbs[i].used) /* a live widget screen, too */
+            return true;
 #ifdef ESP_PLATFORM
     if (s_mqtt)   /* active mqtt session keeps the loop alive */
         return true;
@@ -1584,6 +2018,19 @@ static void reset_slots(JSContext *ctx)
         s_ssh_close_used = false;
         JS_DeleteGCRef(ctx, &s_ssh_close_cb);
     }
+    for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
+        if (s_widget_cbs[i].used) {
+            s_widget_cbs[i].used = false;
+            JS_DeleteGCRef(ctx, &s_widget_cbs[i].fn);
+        }
+    }
+    /* tear down this task's widget screens; the next task starts on the
+       console screen (same hygiene as the canvas clear on task switch) */
+#ifdef ESP_PLATFORM
+    ui_tab5_w_reset();
+#else
+    pcw_reset();
+#endif
 }
 
 void mqjs_runtime_stop(void)
@@ -1600,6 +2047,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     memset(s_timers, 0, sizeof(s_timers));
     memset(s_gpio_cb, 0, sizeof(s_gpio_cb));
     memset(s_mqtt_subs, 0, sizeof(s_mqtt_subs));
+    memset(s_widget_cbs, 0, sizeof(s_widget_cbs));
     s_mqtt_onconn_used = false;
     s_touch_used = false;
     s_key_used = false;
@@ -1657,6 +2105,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
             case EV_KEY:            dispatch_key_event(ctx, &ev);     break;
             case EV_SSH_DATA:       dispatch_ssh_data(ctx, &ev);      break;
             case EV_SSH_CLOSED:     dispatch_ssh_closed(ctx, &ev);    break;
+            case EV_WIDGET:         dispatch_widget_event(ctx, &ev);  break;
             }
         }
 #else
@@ -1667,6 +2116,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
         (void)dispatch_key_event;
         (void)dispatch_ssh_data;
         (void)dispatch_ssh_closed;
+        (void)dispatch_widget_event;
         if (idle > 0)
             usleep((useconds_t)idle * 1000);
 #endif
