@@ -1278,16 +1278,17 @@ static const char *CB_TOK_FN[] = {
 #define CB_ID_ALT  3
 static bool s_mod_ctrl, s_mod_alt;
 
-/* (re)apply checkable + checked to Ctrl/Alt — needed after every
-   set_map, which wipes per-button ctrl flags (Fn flips back and forth) */
+/* Push s_mod_ctrl/s_mod_alt onto the Ctrl/Alt buttons as a manual
+   CHECKED flag. Deliberately NOT CHECKABLE: LVGL toggles a checkable
+   button's CHECKED at RELEASED but fires VALUE_CHANGED at press time,
+   so reading the flag from the event handler races the toggle (seen
+   on device: the latch stuck yellow). Our bools are the only state;
+   the flag is write-only from here. Re-call after every set_map —
+   it wipes per-button ctrl flags (Fn flips back and forth). */
 static void cbar_apply_mods(void)
 {
     if (!s_cbar || s_cbar_fn)
         return;
-    lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_CTRL,
-                                    LV_BUTTONMATRIX_CTRL_CHECKABLE);
-    lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_ALT,
-                                    LV_BUTTONMATRIX_CTRL_CHECKABLE);
     if (s_mod_ctrl)
         lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_CTRL,
                                         LV_BUTTONMATRIX_CTRL_CHECKED);
@@ -1364,12 +1365,11 @@ static void cbar_show(bool show)
                 }
                 ntok = 1 + strlen(tok + 1); /* NUL sentinel + name */
                 if (!s_cbar_fn && id == CB_ID_CTRL) {
-                    /* LVGL already toggled CHECKED: read the new state */
-                    s_mod_ctrl = lv_buttonmatrix_has_button_ctrl(
-                        bm, CB_ID_CTRL, LV_BUTTONMATRIX_CTRL_CHECKED);
+                    s_mod_ctrl = !s_mod_ctrl; /* same one-shot toggle as JS */
+                    cbar_apply_mods();
                 } else if (!s_cbar_fn && id == CB_ID_ALT) {
-                    s_mod_alt = lv_buttonmatrix_has_button_ctrl(
-                        bm, CB_ID_ALT, LV_BUTTONMATRIX_CTRL_CHECKED);
+                    s_mod_alt = !s_mod_alt;
+                    cbar_apply_mods();
                 }
                 mqjs_post_key(tok, ntok);
                 /* any key but Ctrl/Alt themselves consumes the one-shot
