@@ -49,6 +49,10 @@ function build() {
     var s = ui.screen("アプリ");
     var list = s.list();
     var apps = sys.apps();
+    var inst = sys.installed(); /* P4c: [{name, title, perm, icon}] */
+    var icons = {};
+    for (var j0 = 0; j0 < inst.length; j0++)
+        icons[inst[j0].name] = inst[j0].icon || "";
     var running = {};
     for (var i = 0; i < apps.length; i++) {
         running[apps[i].name] = true;
@@ -57,7 +61,8 @@ function build() {
         (function (app) {
             /* 行タップ = 即切替、行末の ✕ = 即停止 (確認ページなし。
                誤タップしても ○ 行 / チップから 1 タップで復活できる) */
-            list.add("● " + app.name + "  (slot " + app.slot + ")",
+            var ic = icons[app.name] ? icons[app.name] + " " : "";
+            list.add("● " + ic + app.name + "  (slot " + app.slot + ")",
                      function () { sys.focus(app.slot); },
                      function () {
                          sys.stop(app.slot);
@@ -74,11 +79,10 @@ function build() {
     if (!devRunning)
         list.add("○ dev タスク (push されたタスクを再開)",
                  function () { openApp("dev"); });
-    var inst = sys.installed(); /* P4c: [{name, title, perm}] */
     for (var j = 0; j < inst.length; j++) {
         if (!running[inst[j].name])
             (function (it) {
-                var label = "○ " + it.title;
+                var label = "○ " + (it.icon ? it.icon + " " : "") + it.title;
                 if (it.perm)
                     label += "  [" + it.perm + "]";
                 /* タップ = 起動、✕ = アンインストール。レジストリ配布の
@@ -99,7 +103,7 @@ function build() {
        起動して開く — open 経路がそのまま面倒を見る) */
     var nts = sys.notices();
     if (nts.length) {
-        s.label("通知");
+        s.label(" 通知"); /* nf-fa-bell (NF 連鎖で全テキスト面に出る) */
         var nl = s.list();
         for (var k2 = 0; k2 < nts.length; k2++) {
             (function (nt) {

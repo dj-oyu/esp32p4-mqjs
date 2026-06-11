@@ -815,18 +815,6 @@ static esp_err_t display_init(ui_panel_variant_t variant,
 #define UI_COL_FLASH 0x2E6BD6 /* highlight behind a fresh event */
 #define UI_COL_DROP  0xE05A4E /* draw-cmd drop counter */
 
-static lv_obj_t *make_dot(lv_obj_t *parent)
-{
-    lv_obj_t *dot = lv_obj_create(parent);
-    lv_obj_remove_style_all(dot);
-    lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE); /* bar tap = focus */
-    lv_obj_set_size(dot, 14, 14);
-    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(UI_COL_DOWN), 0);
-    return dot;
-}
-
 static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color)
 {
     lv_obj_t *lbl = lv_label_create(parent);
@@ -885,11 +873,15 @@ public:
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                               LV_FLEX_ALIGN_CENTER);
 
-        _net_dot = make_dot(row);
+        /* link indicators: NF glyphs colored by state (was: bg-colored
+           circles). wifi = nf-fa-wifi, broker = nf-fa-rss (pub/sub). */
+        _net_dot = make_label(row, UI_COL_DOWN);
+        lv_label_set_text(_net_dot, "");
         _net_lbl = make_label(row, UI_COL_TEXT);
-        lv_label_set_text(_net_lbl, "WiFi 未接続");
+        lv_label_set_text(_net_lbl, "未接続");
 
-        _mqtt_dot = make_dot(row);
+        _mqtt_dot = make_label(row, UI_COL_DOWN);
+        lv_label_set_text(_mqtt_dot, "");
         _mqtt_lbl = make_label(row, UI_COL_TEXT);
         lv_label_set_text(_mqtt_lbl, "MQTT");
 
@@ -907,7 +899,7 @@ public:
         lv_obj_set_style_pad_ver(_chip, 6, 0);
         lv_obj_set_size(_chip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         _chip_lbl = make_label(_chip, UI_COL_DIM);
-        lv_label_set_text(_chip_lbl, "アプリ一覧");
+        lv_label_set_text(_chip_lbl, " アプリ一覧");
 
         lv_obj_t *spacer = lv_obj_create(row);
         lv_obj_remove_style_all(spacer);
@@ -983,7 +975,7 @@ public:
             if (!_armed && held >= UI_HOLD_MS) {
                 _armed = true;
                 lv_obj_set_style_bg_color(_strip, lv_color_hex(UI_COL_OK), 0);
-                lv_label_set_text(_chip_lbl, "離すとランチャー");
+                lv_label_set_text(_chip_lbl, " 離すとランチャー");
                 lv_obj_set_style_text_color(_chip_lbl,
                                             lv_color_hex(UI_COL_OK), 0);
             }
@@ -1055,7 +1047,11 @@ private:
     {
         auto *self = (StatusBar *)lv_event_get_user_data(e);
         const char *t = lv_label_get_text(self->_event_lbl);
-        if (!t || t[0] != '[')
+        if (!t)
+            return;
+        if (!strncmp(t, " ", 4))
+            t += 4; /* the bell prefix apply() adds to notify lines */
+        if (t[0] != '[')
             return; /* not a sys.notify line */
         const char *end = strchr(t, ']');
         if (!end || end == t + 1 || end - t > 32)
@@ -1078,19 +1074,23 @@ private:
 
     void apply(const ui_status_t &st)
     {
-        lv_obj_set_style_bg_color(
+        lv_obj_set_style_text_color(
             _net_dot, lv_color_hex(st.wifi_up ? UI_COL_OK : UI_COL_DOWN), 0);
-        lv_label_set_text_fmt(_net_lbl, "WiFi %s",
-                              st.wifi_up ? (st.ip[0] ? st.ip : "接続中")
-                                         : "未接続");
-        lv_obj_set_style_bg_color(
+        lv_label_set_text(_net_lbl, st.wifi_up ? (st.ip[0] ? st.ip : "接続中")
+                                               : "未接続");
+        lv_obj_set_style_text_color(
             _mqtt_dot, lv_color_hex(st.mqtt_up ? UI_COL_OK : UI_COL_DOWN), 0);
         strlcpy(_st_task, st.task_name, sizeof _st_task);
         strlcpy(_st_origin, st.task_origin, sizeof _st_origin);
         update_task_label();
         if (strcmp(_last_event, st.last_event) != 0) {
             strlcpy(_last_event, st.last_event, sizeof _last_event);
-            lv_label_set_text(_event_lbl, st.last_event);
+            /* sys.notify lines ("[app] ...") get a bell and are tappable
+               (notify_tap_cb skips the bell before parsing the sender) */
+            if (st.last_event[0] == '[')
+                lv_label_set_text_fmt(_event_lbl, " %s", st.last_event);
+            else
+                lv_label_set_text(_event_lbl, st.last_event);
             _flash.teleport(LV_OPA_60);
             _flash.move(0);
         }
@@ -1100,14 +1100,16 @@ private:
     {
         strlcpy(_chip_target, fa.prev, sizeof _chip_target);
         if (fa.prev[0]) {
-            lv_label_set_text(_chip_lbl, fa.prev);
+            /* nf-fa-reply: "go back to <app>" */
+            lv_label_set_text_fmt(_chip_lbl, " %s", fa.prev);
             /* dimmed = stopped: tapping still works (relaunch), but the
                app starts fresh rather than "where you left it" */
             lv_obj_set_style_text_color(
                 _chip_lbl,
                 lv_color_hex(fa.prev_running ? UI_COL_TEXT : UI_COL_DIM), 0);
         } else {
-            lv_label_set_text(_chip_lbl, "アプリ一覧");
+            /* nf-fa-th grid: "app list" */
+            lv_label_set_text(_chip_lbl, " アプリ一覧");
             lv_obj_set_style_text_color(_chip_lbl, lv_color_hex(UI_COL_DIM),
                                         0);
         }

@@ -2143,13 +2143,16 @@ static void manifest_field(const char *buf, size_t n, const char *key,
     }
 }
 
-/* append one {name, title, perm} entry to the installed() array */
+/* append one {name, title, perm, icon} entry to the installed() array.
+   icon = a Nerd Font glyph character from the "// @icon " directive
+   (the ui_font fallback chain renders it anywhere, design §4.5). */
 static int installed_push(JSContext *ctx, JSGCRef *arr_ref, int idx,
                           const char *name, const char *head, size_t hlen)
 {
-    char title[48], perm[64];
+    char title[48], perm[64], icon[12];
     manifest_field(head, hlen, "// @title ", title, sizeof title);
     manifest_field(head, hlen, "// @perm ", perm, sizeof perm);
+    manifest_field(head, hlen, "// @icon ", icon, sizeof icon);
 
     JSGCRef obj_ref;
     JSValue obj = JS_NewObject(ctx);
@@ -2162,6 +2165,8 @@ static int installed_push(JSContext *ctx, JSGCRef *arr_ref, int idx,
     JS_SetPropertyStr(ctx, obj_ref.val, "title", v);
     v = JS_NewString(ctx, perm);
     JS_SetPropertyStr(ctx, obj_ref.val, "perm", v);
+    v = JS_NewString(ctx, icon);
+    JS_SetPropertyStr(ctx, obj_ref.val, "icon", v);
     JS_POP_VALUE(ctx, obj);
     JS_SetPropertyUint32(ctx, arr_ref->val, (uint32_t)idx, obj);
     return 0;
