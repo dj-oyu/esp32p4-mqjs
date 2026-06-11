@@ -1327,6 +1327,18 @@ static void cbar_show(bool show)
         lv_obj_set_style_pad_all(s_cbar, 4, 0);
         lv_obj_set_style_pad_gap(s_cbar, 4, 0);
         lv_obj_set_style_text_font(s_cbar, ui_font(), 0);
+        /* dark system palette (the default light theme reads as a
+           bright flash whenever the destroy-on-switch model re-shows
+           the overlay — user-reported on app switches) */
+        lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_BG), 0);
+        lv_obj_set_style_border_width(s_cbar, 0, 0);
+        lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_BAR),
+                                  LV_PART_ITEMS);
+        lv_obj_set_style_text_color(s_cbar, lv_color_hex(UI_COL_TEXT),
+                                    LV_PART_ITEMS);
+        lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_FLASH),
+                                  (uint32_t)LV_PART_ITEMS |
+                                      (uint32_t)LV_STATE_PRESSED);
         /* armed one-shot Ctrl/Alt latch on the button itself (same
            amber as the terminal's tab-bar badge) */
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(0xFFD479),
@@ -1415,6 +1427,16 @@ static void kb_show(int mode)
     lv_obj_set_size(s_kb, UI_LCD_H_RES, UI_KB_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_text_font(s_kb, ui_font(), 0);
+    /* dark system palette — the default light theme made every
+       keyboard (re)appearance a bright blue-white flash */
+    lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BG), 0);
+    lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BAR),
+                              LV_PART_ITEMS);
+    lv_obj_set_style_text_color(s_kb, lv_color_hex(UI_COL_TEXT),
+                                LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_FLASH),
+                              (uint32_t)LV_PART_ITEMS |
+                                  (uint32_t)LV_STATE_PRESSED);
     lv_obj_add_event_cb(
         s_kb,
         [](lv_event_t *e) {
