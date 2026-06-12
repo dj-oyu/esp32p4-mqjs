@@ -44,6 +44,111 @@ static inline int luma_fast(uint16_t v)
     return (v >> 5) & 0x3F;
 }
 
+/* Per-block structure tensor over the 30x30 interior of a 32x32 block.
+ * base/stride_px address the block's top-left luma sample (RGB565).
+ * out[0..2] = Sxx, Syy, Sxy with 6-bit-green luma (luma_fast).
+ *
+ * This is the host path AND the device C fallback. The PIE assembly
+ * kernel (bc_tensor_p4.S) must match this bit-for-bit; the boot
+ * self-check (below) verifies that on the real silicon. */
+void bc_tensor_block(const uint16_t *base, int stride_px, int32_t out[3])
+{
+    int l[GRID][GRID];
+    for (int sy = 0; sy < GRID; sy++) {
+        const uint16_t *row = base + sy * stride_px;
+        for (int sx = 0; sx < GRID; sx++)
+            l[sy][sx] = luma_fast(row[sx]);
+    }
+    int32_t sxx = 0, syy = 0, sxy = 0;
+    for (int sy = 1; sy < GRID - 1; sy++) {
+        for (int sx = 1; sx < GRID - 1; sx++) {
+            int gx = l[sy][sx + 1] - l[sy][sx - 1];
+            int gy = l[sy + 1][sx] - l[sy - 1][sx];
+            sxx += gx * gx;
+            syy += gy * gy;
+            sxy += gx * gy;
+        }
+    }
+    out[0] = sxx;
+    out[1] = syy;
+    out[2] = sxy;
+}
+
+/* ---- tensor implementation dispatch + boot self-check -------------- */
+
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+/* PIE assembly variant (bc_tensor_p4.S). Same contract as
+ * bc_tensor_block; loads RGB565 unaligned, masks the 6-bit green field
+ * (kept as G<<5), accumulates 1024x-scaled sums in QACC and rescales by
+ * >>10 before returning, so the output matches the C path exactly. */
+extern void bc_tensor_block_p4(const uint16_t *base, int stride_px,
+                               int32_t out[3]);
+
+/* 0 = not yet checked, 1 = PIE OK, 2 = mismatch -> permanent C fallback */
+static int s_tensor_mode;
+
+/* xorshift32 PRNG: fixed seed -> identical synthetic blocks every boot,
+ * so the self-check is fully deterministic (no serial console needed). */
+static uint32_t bc_xs32(uint32_t *st)
+{
+    uint32_t x = *st;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return *st = x;
+}
+
+/* Fill a 32x32 (16B-aligned, stride 32) test block from the PRNG, run
+ * both tensor paths on 8 such blocks, and require all three sums to
+ * agree. On ANY mismatch latch the C fallback permanently. Runs once,
+ * on the first bc_locate() call on device. */
+static void bc_tensor_selfcheck(void)
+{
+    static uint16_t blk[32 * 32] __attribute__((aligned(16)));
+    uint32_t st = 0x1b6f3a9du; /* fixed seed */
+    int mismatch = 0;
+    for (int n = 0; n < 8 && !mismatch; n++) {
+        for (int i = 0; i < 32 * 32; i++)
+            blk[i] = (uint16_t)bc_xs32(&st);
+        int32_t c[3], p[3];
+        bc_tensor_block(blk, 32, c);
+        bc_tensor_block_p4(blk, 32, p);
+        if (c[0] != p[0] || c[1] != p[1] || c[2] != p[2])
+            mismatch = 1;
+    }
+    s_tensor_mode = mismatch ? 2 : 1;
+}
+
+static void bc_tensor_dispatch(const uint16_t *base, int stride_px,
+                               int32_t out[3])
+{
+    if (s_tensor_mode == 0)
+        bc_tensor_selfcheck();
+    if (s_tensor_mode == 1)
+        bc_tensor_block_p4(base, stride_px, out);
+    else
+        bc_tensor_block(base, stride_px, out);
+}
+
+const char *bc_tensor_impl(void)
+{
+    return s_tensor_mode == 1 ? "pie"
+         : s_tensor_mode == 2 ? "c-fallback(mismatch)"
+         : "c"; /* not yet self-checked (no block processed) */
+}
+#else  /* host build / non-P4: plain C only */
+static void bc_tensor_dispatch(const uint16_t *base, int stride_px,
+                               int32_t out[3])
+{
+    bc_tensor_block(base, stride_px, out);
+}
+
+const char *bc_tensor_impl(void)
+{
+    return "c";
+}
+#endif
+
 /* circular distance for orientations with period 180 */
 static int th_dist(int a, int b)
 {
@@ -79,22 +184,9 @@ int bc_locate(const uint16_t *rgb565, int w, int h, int coord_scale,
                biases Sxy toward +45° and mirrors angles beyond 90°.
                Fused load/convert/diff/MAC loop: everything stays in
                registers (see the PIE note at the top of the file). */
-            int l[GRID][GRID];
-            for (int sy = 0; sy < GRID; sy++) {
-                const uint16_t *row = base + sy * w;
-                for (int sx = 0; sx < GRID; sx++)
-                    l[sy][sx] = luma_fast(row[sx]);
-            }
-            int32_t sxx = 0, syy = 0, sxy = 0;
-            for (int sy = 1; sy < GRID - 1; sy++) {
-                for (int sx = 1; sx < GRID - 1; sx++) {
-                    int gx = l[sy][sx + 1] - l[sy][sx - 1];
-                    int gy = l[sy + 1][sx] - l[sy - 1][sx];
-                    sxx += gx * gx;
-                    syy += gy * gy;
-                    sxy += gx * gy;
-                }
-            }
+            int32_t s[3];
+            bc_tensor_dispatch(base, w, s);
+            int32_t sxx = s[0], syy = s[1], sxy = s[2];
             int32_t e = sxx + syy;
             theta[by][bx] = -1;
             energy[by][bx] = e;

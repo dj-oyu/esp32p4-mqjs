@@ -43,6 +43,20 @@ int bc_sample_line(const uint16_t *rgb565, int w, int h, int cx, int cy,
                    int theta, int offset_v, int half_len, uint8_t *out,
                    int max);
 
+/* Structure tensor of one 32x32 block (30x30 interior central diffs of
+ * the 6-bit green luma): out[0..2] = Sxx, Syy, Sxy. base points at the
+ * block's top-left sample, stride_px is the image width in pixels. Pure
+ * C; on the device a PIE-assembly variant may be used after a boot
+ * self-check confirms it matches this bit-for-bit (see bc_tensor_impl). */
+void bc_tensor_block(const uint16_t *base, int stride_px, int32_t out[3]);
+
+/* Which tensor implementation bc_locate() is using:
+ *   "pie"                 - PIE assembly (self-check passed)
+ *   "c-fallback(mismatch)"- PIE disabled, self-check found a mismatch
+ *   "c"                   - plain C (host build, or non-P4 target)
+ * Stable string, safe to append to a status line. */
+const char *bc_tensor_impl(void);
+
 #ifdef __cplusplus
 }
 #endif
