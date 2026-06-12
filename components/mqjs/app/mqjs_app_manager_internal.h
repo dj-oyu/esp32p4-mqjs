@@ -37,6 +37,12 @@ void mqjs_app_record_touch(const char *name, int64_t now_ms);
    doc): the foreground switch updates both sides. */
 void mqjs_app_record_set_view(const char *name, mqjs_app_view_t view);
 
+/* Policy edits (Phase 3): set wins over clear when a bit is in both.
+   Records are created with kind-profile defaults (see default_policy);
+   explicit edits survive stop/start cycles. */
+void mqjs_app_record_set_policy(const char *name, uint32_t set,
+                                uint32_t clear);
+
 /* Read-only record lookup (js_task). Returns NULL when unknown. */
 const mqjs_app_snapshot_t *mqjs_app_record_find(const char *name);
 

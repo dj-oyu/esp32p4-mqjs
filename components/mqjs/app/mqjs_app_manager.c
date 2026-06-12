@@ -65,6 +65,20 @@ static int rec_alloc(void)
     return oldest; /* -1 only if all 24 records are somehow running */
 }
 
+/* Default policy profiles (migration doc "推奨プロファイル"). Phase 3:
+   the launcher's residency/unstoppability and the ordinary app's
+   evictability are POLICY, not worker-index special cases. */
+static uint32_t default_policy(mqjs_app_kind_t kind)
+{
+    if (kind == MQJS_APP_KIND_SYSTEM)
+        return MQJS_APP_AUTOSTART | MQJS_APP_RESTART_ON_EXIT |
+               MQJS_APP_KEEP_ALIVE;
+    if (kind == MQJS_APP_KIND_SERVICE)
+        return MQJS_APP_AUTOSTART | MQJS_APP_RESTART_ON_EXIT |
+               MQJS_APP_KEEP_ALIVE | MQJS_APP_HEADLESS;
+    return MQJS_APP_EVICTABLE | MQJS_APP_STOPPABLE;
+}
+
 void mqjs_app_record_on_start(const char *name, int worker,
                               mqjs_app_kind_t kind, int64_t now_ms)
 {
@@ -77,7 +91,10 @@ void mqjs_app_record_on_start(const char *name, int worker,
         s_used[i] = 1;
         s_records[i].id = s_next_id++;
         snprintf(s_records[i].name, sizeof s_records[i].name, "%s", name);
+        s_records[i].policy.flags = default_policy(kind);
     }
+    /* a reused record keeps its policy: explicit set_policy decisions
+       (dev re-enable, autostart opt-in) survive stop/start cycles */
     s_records[i].state = MQJS_APP_RUNNING;
     s_records[i].kind = kind;
     s_records[i].view = MQJS_APP_VIEW_BACKGROUND; /* fg arrives via touch */
@@ -85,6 +102,14 @@ void mqjs_app_record_on_start(const char *name, int worker,
     /* worker index is internal: the snapshot type deliberately has no
        field for it (mqjs_app_manager.h contract). */
     (void)worker;
+}
+
+void mqjs_app_record_set_policy(const char *name, uint32_t set,
+                                uint32_t clear)
+{
+    int i = rec_find(name);
+    if (i >= 0)
+        s_records[i].policy.flags = (s_records[i].policy.flags & ~clear) | set;
 }
 
 void mqjs_app_record_on_stop(const char *name, mqjs_app_stop_reason_t reason)

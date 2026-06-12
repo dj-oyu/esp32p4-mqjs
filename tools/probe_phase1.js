@@ -10,12 +10,20 @@ var BASE = "esp32p4-mqjs/task/u7q3x9f2";
 function pub(o) { mqtt.publish(BASE + "/proberep", JSON.stringify(o), 0, 0); }
 function kinds() {
     var a = sys.apps(), r = [], i;
-    for (i = 0; i < a.length; i++) r.push(a[i].name + ":" + a[i].kind);
+    for (i = 0; i < a.length; i++)
+        r.push(a[i].name + ":" + a[i].kind + (a[i].evictable ? "+ev" : ""));
     return r.join(",");
 }
 
 mqtt.onConnect(function () {
-    pub({ phase: "p1-pre", apps: kinds(),
+    /* Phase 3: stop permission is policy — the launcher must throw */
+    var launcherStopThrew = false;
+    try {
+        sys.stop("launcher");
+    } catch (eStop) {
+        launcherStopThrew = true;
+    }
+    pub({ phase: "p1-pre", apps: kinds(), launcherStopThrew: launcherStopThrew,
           unknown: [sys.start("nope_x"), sys.open("nope_x"),
                     sys.focus("nope_x"), sys.stop("nope_x")] });
     /* all 4 workers are busy at boot (launcher + dev + 2 autostarts):

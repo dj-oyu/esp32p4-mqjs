@@ -65,6 +65,27 @@ int main(void)
     assert(r && r->state == MQJS_APP_RUNNING);
     printf("ok rename absorbs the stale record\n");
 
+    /* Phase 3: kind-profile policy defaults */
+    r = mqjs_app_record_find("launcher");
+    assert(r->policy.flags & MQJS_APP_KEEP_ALIVE);
+    assert(r->policy.flags & MQJS_APP_RESTART_ON_EXIT);
+    assert(!(r->policy.flags & MQJS_APP_STOPPABLE));
+    assert(!(r->policy.flags & MQJS_APP_EVICTABLE));
+    r = mqjs_app_record_find("circuit");
+    assert((r->policy.flags & MQJS_APP_STOPPABLE) &&
+           (r->policy.flags & MQJS_APP_EVICTABLE));
+    printf("ok policy defaults by kind\n");
+
+    /* set/clear survive a stop/start cycle (the dev-hold pattern) */
+    mqjs_app_record_set_policy("circuit", MQJS_APP_RESTART_ON_EXIT, 0);
+    mqjs_app_record_on_stop("circuit", MQJS_APP_STOP_USER);
+    mqjs_app_record_set_policy("circuit", 0, MQJS_APP_RESTART_ON_EXIT);
+    mqjs_app_record_on_start("circuit", 2, MQJS_APP_KIND_APP, 6000);
+    r = mqjs_app_record_find("circuit");
+    assert(!(r->policy.flags & MQJS_APP_RESTART_ON_EXIT));
+    assert(r->policy.flags & MQJS_APP_STOPPABLE); /* defaults untouched */
+    printf("ok set_policy edits persist across restart\n");
+
     /* fill the table: the longest-stopped record is evicted, running
        records never are */
     for (int i = 0; i < 40; i++) {

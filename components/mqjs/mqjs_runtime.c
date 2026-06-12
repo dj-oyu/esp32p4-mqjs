@@ -256,14 +256,33 @@ typedef struct {
 } AppSource;
 static AppSource s_app_sources[4];
 
-static bool s_dev_hold;          /* explicit sys.stop(dev): no auto-rerun
-                                    until the next push / sys.launch("dev") */
 static int64_t s_dev_retry_at;   /* next time to ask the dev provider */
 static int64_t s_launcher_retry_at;
 static char s_last_dev_name[32]; /* what the dev app called itself: lets
                                     the chip relaunch a stopped dev task
                                     by its real name (sys.launch falls
                                     back to the provider on a match) */
+
+/* Phase 3: the dev task's natural-end auto-rerun is a policy bit on
+   its App record (RESTART_ON_EXIT), not a runtime flag (was
+   s_dev_hold). "Held" = explicitly stopped = record stopped with the
+   bit cleared; a push or sys.start("dev") re-arms it. */
+static bool dev_held(void)
+{
+    if (!s_last_dev_name[0])
+        return false;
+    const mqjs_app_snapshot_t *rec = mqjs_app_record_find(s_last_dev_name);
+    return rec && rec->state == MQJS_APP_STOPPED &&
+           !(rec->policy.flags & MQJS_APP_RESTART_ON_EXIT);
+}
+
+static void dev_rearm(void)
+{
+    if (s_last_dev_name[0])
+        mqjs_app_record_set_policy(s_last_dev_name,
+                                   MQJS_APP_RESTART_ON_EXIT, 0);
+    s_dev_retry_at = 0; /* the scheduler asks the provider next pass */
+}
 
 /* the status-bar chip target: the previous foreground app, kept by NAME
    (a relaunch may land in a different slot) */
@@ -2883,6 +2902,10 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
             : rec && rec->kind == MQJS_APP_KIND_SYSTEM ? "system"
             : "app");
         JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
+        /* Phase 3: policy surfaces (migration table: apps() grows
+           evictable). JS_NewBool is an immediate — no GC hazard. */
+        JS_SetPropertyStr(ctx, obj_ref.val, "evictable",
+            JS_NewBool(rec && (rec->policy.flags & MQJS_APP_EVICTABLE) ? 1 : 0));
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
     }
@@ -3020,6 +3043,9 @@ static void autostart_optin_add(const char *name)
     }
     snprintf(list + l, sizeof list - l, "%s%s", l ? "," : "", name);
     autostart_save(list);
+    /* Phase 3: the record mirrors the NVS roster (the roster stays the
+       reboot-surviving source of truth; records are RAM) */
+    mqjs_app_record_set_policy(name, MQJS_APP_AUTOSTART, 0);
     ESP_LOGI(TAG, "autostart opt-in: '%s'", name);
 }
 
@@ -3045,6 +3071,7 @@ static void autostart_optin_remove(const char *name)
     }
     out[o] = '\0';
     autostart_save(out);
+    mqjs_app_record_set_policy(name, 0, MQJS_APP_AUTOSTART);
 }
 #endif /* ESP_PLATFORM */
 
@@ -3314,8 +3341,7 @@ static int sys_launch_core(const char *arg)
         return -1;
 
     if (!strcmp(arg, "dev")) {
-        s_dev_hold = false;
-        s_dev_retry_at = 0; /* the scheduler asks the provider next pass */
+        dev_rearm(); /* re-arm the rerun policy; provider asked next pass */
         return MQJS_WORKER_DEV;
     }
 
@@ -3339,8 +3365,7 @@ static int sys_launch_core(const char *arg)
        chip remembers "ssh_vt", not "dev"): rerun via the provider */
     if (!s_workers[MQJS_WORKER_DEV].used && s_last_dev_name[0] &&
         !strcmp(name, s_last_dev_name)) {
-        s_dev_hold = false;
-        s_dev_retry_at = 0;
+        dev_rearm();
         return MQJS_WORKER_DEV;
     }
 
@@ -3412,19 +3437,30 @@ JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
             return JS_NewBool(0);
     } else if (JS_ToInt32(ctx, &slot, argv[0]))
         return JS_EXCEPTION;
-    if (slot == MQJS_WORKER_LAUNCHER)
-        return JS_ThrowTypeError(ctx, "the launcher cannot be stopped");
     if (slot < 0 || slot >= MQJS_MAX_WORKERS || !s_workers[slot].used)
-        return JS_NewBool(0);
+        return slot == MQJS_WORKER_LAUNCHER
+            ? JS_ThrowTypeError(ctx, "the launcher cannot be stopped")
+            : JS_NewBool(0);
 
     MqjsWorker *app = &s_workers[slot];
+    /* Phase 3: stop permission is POLICY (the launcher's KIND_SYSTEM
+       profile lacks STOPPABLE), not a worker-index special case. The
+       dev worker stays stoppable regardless of the record: a pushed
+       task could share a protected app's name, and a name collision
+       must never brick the dev flow. */
+    const mqjs_app_snapshot_t *rec = mqjs_app_record_find(app->name);
+    if (rec && !(rec->policy.flags & MQJS_APP_STOPPABLE) &&
+        slot != MQJS_WORKER_DEV)
+        return JS_ThrowTypeError(ctx, "the launcher cannot be stopped");
     char line[96];
     snprintf(line, sizeof line, "sys: stop '%s' (worker %d) by '%s'\n",
              app->name, slot, s_cur_wk ? s_cur_wk->name : "?");
     out_write(line, strlen(line));
 
     if (slot == MQJS_WORKER_DEV)
-        s_dev_hold = true;
+        /* explicit stop disarms the natural-end auto-rerun (was the
+           s_dev_hold flag; the record's policy is the authority now) */
+        mqjs_app_record_set_policy(app->name, 0, MQJS_APP_RESTART_ON_EXIT);
     if (app == s_cur_wk) {
         app->kill_req = true; /* reaper finishes after this dispatch */
         return JS_NewBool(1);
@@ -4428,12 +4464,15 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
 #endif
     if (app->idx == MQJS_WORKER_DEV)
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", app->name);
-    /* App record: find-or-create, state -> RUNNING (Phase 2). The
-       launcher is the only KIND_SYSTEM app until Phase 3 policies. */
+    /* App record: find-or-create, state -> RUNNING (Phase 2). */
     mqjs_app_record_on_start(app->name, app->idx,
                              app->idx == MQJS_WORKER_LAUNCHER
                                  ? MQJS_APP_KIND_SYSTEM : MQJS_APP_KIND_APP,
                              time_ms());
+    /* Phase 3: the dev task's classic natural-end auto-rerun is policy
+       now — every (re)start arms it; an explicit sys.stop clears it. */
+    if (app->idx == MQJS_WORKER_DEV)
+        mqjs_app_record_set_policy(app->name, MQJS_APP_RESTART_ON_EXIT, 0);
     bar_update();
     return 0;
 }
@@ -4624,7 +4663,7 @@ static void reap_idle_apps(void)
             s_stop_req = false;
         }
         if (was_fg && s_workers[MQJS_WORKER_LAUNCHER].used &&
-            (i != MQJS_WORKER_DEV || s_dev_hold))
+            (i != MQJS_WORKER_DEV || dev_held()))
             switch_foreground(MQJS_WORKER_LAUNCHER);
     }
 }
@@ -4750,7 +4789,10 @@ static void autostart_boot(void)
             ESP_LOGW(TAG, "autostart: '%s' failed to start", name);
             continue;
         }
-        ESP_LOGI(TAG, "autostart: '%s' -> slot %d", name, slot);
+        /* roster member, booted: stamp the policy bit on the record
+           (start_from_file's opt-in path is a no-op for known names) */
+        mqjs_app_record_set_policy(name, MQJS_APP_AUTOSTART, 0);
+        ESP_LOGI(TAG, "autostart: '%s' -> worker %d", name, slot);
         if (so < sizeof started - strlen(name) - 3)
             so += snprintf(started + so, sizeof started - so, "%s%s",
                            so ? ", " : "", name);
@@ -4789,23 +4831,29 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
 
     for (;;) {
         /* launcher residency: chrome (chip / open requests) depends on
-           it, so it is restarted if it ever dies (1s backoff) */
+           it. Phase 3: the restart DECISION is the record's policy
+           (RESTART_ON_EXIT, part of the KIND_SYSTEM profile) — clear
+           the bit and residency stops; the first boot start (no record
+           yet) bootstraps it. Worker 0 stays the system app's pinned
+           execution frame (an allocation rule, not policy). */
         if (!s_workers[MQJS_WORKER_LAUNCHER].used &&
             time_ms() >= s_launcher_retry_at) {
-            const AppSource *as = app_source_find("launcher");
-            if (as)
-                app_start_internal(&s_workers[MQJS_WORKER_LAUNCHER], as->src,
-                                   as->len, "launcher");
+            const mqjs_app_snapshot_t *lrec = mqjs_app_record_find("launcher");
+            if (!lrec || (lrec->policy.flags & MQJS_APP_RESTART_ON_EXIT)) {
+                const AppSource *as = app_source_find("launcher");
+                if (as)
+                    app_start_internal(&s_workers[MQJS_WORKER_LAUNCHER],
+                                       as->src, as->len, "launcher");
+            }
             s_launcher_retry_at = time_ms() + 1000;
         }
 
-        /* a push that arrived while the dev slot was idle or held */
+        /* a push that arrived while the dev worker was idle or held */
         if (s_stop_req && !s_workers[MQJS_WORKER_DEV].used) {
             s_stop_req = false;
-            s_dev_hold = false;
-            s_dev_retry_at = 0;
+            dev_rearm(); /* a push always reopens a held dev worker */
         }
-        if (next_dev && !s_workers[MQJS_WORKER_DEV].used && !s_dev_hold &&
+        if (next_dev && !s_workers[MQJS_WORKER_DEV].used && !dev_held() &&
             time_ms() >= s_dev_retry_at) {
             const char *src = NULL, *name = NULL;
             size_t len = 0;

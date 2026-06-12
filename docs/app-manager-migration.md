@@ -1,6 +1,6 @@
 # App Manager 移行設計
 
-Status: Phase 0-2 実装済み・実機 E2E 確認 2026-06-13 (Phase 3 以降は未着手)
+Status: Phase 0-3 実装済み・実機 E2E 確認 2026-06-13 (Phase 4 以降は未着手)
 
 - Phase 0: `app/mqjs_app_manager.h` 追加済み
 - Phase 1: `sys.start/open/focus/stop(name)` 追加、`sys.apps()` に `kind`
@@ -20,6 +20,24 @@ Status: Phase 0-2 実装済み・実機 E2E 確認 2026-06-13 (Phase 3 以降は
   実機 E2E は Phase 1 プローブで回帰なし。worker 内の name は実行中
   キャッシュとして残置 — 権威の移転は Phase 3 (policy / dev の通常 App
   化) と同時に行う。
+- Phase 3: launcher / dev / autostart の特別扱いを policy へ移した。
+  レコード生成時に kind プロファイルの既定 policy が付く (SYSTEM =
+  `AUTOSTART|RESTART_ON_EXIT|KEEP_ALIVE`、APP = `EVICTABLE|STOPPABLE`)。
+  - `sys.stop` の停止可否は `STOPPABLE` 判定 (launcher の worker 番号
+    特例を撤去。dev worker だけは名前衝突対策で常に停止可)
+  - launcher 常駐ループは record の `RESTART_ON_EXIT` を参照 (bit を
+    消せば常駐が止まる; worker 0 固定は割当規則として残置)
+  - `s_dev_hold` フラグを廃止 — dev の自然終了リランは dev レコードの
+    `RESTART_ON_EXIT` が権威 (`dev_held()`/`dev_rearm()`)。明示 stop が
+    bit を消し、push / `sys.start("dev")` が再武装する
+  - autostart の opt-in/revoke が record の `AUTOSTART` bit にミラー
+    される (リブートを跨ぐ正本は従来どおり NVS roster)
+  - `sys.apps()` 行に `evictable` を追加 (Phase 4 の UI/挙動の布石)
+  実機 E2E: stop("launcher") が TypeError、evictable = launcher のみ
+  false、既存ロースター回帰なし。残課題: dev の「source 更新で置換」
+  を要求キュー (`request_*`) 経由へ移すのは Phase 4 以降、サービス
+  (KIND_SERVICE) の実プロファイル適用は @service 相当のマニフェスト
+  導入時。
 
 ## 目的
 
