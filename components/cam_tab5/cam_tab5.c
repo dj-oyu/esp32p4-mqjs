@@ -726,7 +726,10 @@ bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
     snprintf(s_req.prefix, sizeof s_req.prefix, "%s", prefix ? prefix : "");
     s_cancel = false;
     s_busy = true;
-    if (xTaskCreate(scan_task, "cam_scan", 16384, NULL, 4, NULL) != pdPASS) {
+    /* pinned to core 0 (with the JS task, which outranks it at prio 5):
+       unpinned it competed with the core-1 LVGL task for render time */
+    if (xTaskCreatePinnedToCore(scan_task, "cam_scan", 16384, NULL, 4, NULL,
+                                0) != pdPASS) {
         s_busy = false;
         s_req.cb = NULL;
         set_status("task create failed%s", NULL);

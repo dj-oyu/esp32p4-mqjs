@@ -82,7 +82,9 @@ static const char *TAG = "mqjs";
 #define MQJS_MQTT_PAYLOAD_MAX 4096
 #define MQJS_SIGNAL_VAL_MAX   4096
 #define MQJS_MAX_RUN_MS       5000  /* per JS_Eval / callback watchdog */
-#define MQJS_QUEUE_LEN        32
+#define MQJS_QUEUE_LEN        64 /* 32 dropped events under touch-move +
+                                    MQTT bursts; 64 ≈ +1.3KB internal
+                                    (hotspot audit §4) */
 #define MQJS_DEV_RESTART_MS   1000  /* natural-end rerun delay (compat) */
 
 /* ------------------------------------------------------------------ */
@@ -421,30 +423,44 @@ static void out_write(const void *buf, size_t len)
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
     size_t cap = app ? sizeof(app->sink_line) : sizeof(s_orphan_line);
     const char *p = buf;
-    for (size_t i = 0; i < len; i++) {
-        char c = p[i];
-        if (c == '\n') {
+    size_t i = 0;
+    while (i < len) {
+        if (p[i] == '\n') {
             sink_flush();
+            i++;
             continue;
         }
-        if (*plen == cap) {
-            /* split overlong lines at a UTF-8 sequence boundary */
-            size_t cut = *plen;
-            while (cut > 0 && (line[cut - 1] & 0xC0) == 0x80)
-                cut--;
-            if (cut > 0 && (line[cut - 1] & 0x80))
-                cut--; /* drop the lead byte of the split sequence too */
-            if (cut == 0)
-                cut = *plen;
-            size_t rest = *plen - cut;
-            char carry[4];
-            memcpy(carry, line + cut, rest);
-            *plen = cut;
-            sink_flush();
-            memcpy(line, carry, rest);
-            *plen = rest;
+        /* bulk-copy up to the next newline (a per-byte loop here made
+           ANSI-animation apps pay milliseconds per frame — hotspot
+           audit §2.2) */
+        const char *nl = memchr(p + i, '\n', len - i);
+        size_t chunk = nl ? (size_t)(nl - (p + i)) : len - i;
+        while (chunk) {
+            size_t space = cap - *plen;
+            if (space == 0) {
+                /* split overlong lines at a UTF-8 sequence boundary */
+                size_t cut = *plen;
+                while (cut > 0 && (line[cut - 1] & 0xC0) == 0x80)
+                    cut--;
+                if (cut > 0 && (line[cut - 1] & 0x80))
+                    cut--; /* drop the lead byte of the split too */
+                if (cut == 0)
+                    cut = *plen;
+                size_t rest = *plen - cut;
+                char carry[4];
+                memcpy(carry, line + cut, rest);
+                *plen = cut;
+                sink_flush();
+                memcpy(line, carry, rest);
+                *plen = rest;
+                continue;
+            }
+            size_t n = chunk < space ? chunk : space;
+            memcpy(line + *plen, p + i, n);
+            *plen += n;
+            i += n;
+            chunk -= n;
         }
-        line[(*plen)++] = c;
     }
 }
 
@@ -1858,6 +1874,39 @@ static bool store_open(void)
     s_store_open = true;
     return true;
 }
+
+/* Write-behind commit (hotspot audit §1.1): nvs_commit is a FLASH
+   write (ms to tens of ms with page GC) and used to run synchronously
+   ON the JS task — every store.set stalled every app. nvs_set_* only
+   updates the RAM cache and is cheap; the commit is coalesced onto the
+   esp_timer task after a 300ms quiet window (each burst of sets pays
+   one flash commit). Power-loss window = at most ~300ms of writes;
+   NVS itself stays consistent (it journals), worst case the last
+   value reverts. */
+static esp_timer_handle_t s_store_timer;
+
+static void store_commit_cb(void *arg)
+{
+    (void)arg;
+    nvs_commit(s_store); /* NVS API is thread-safe */
+}
+
+static void store_commit_later(void)
+{
+    if (!s_store_timer) {
+        const esp_timer_create_args_t a = {
+            .callback = store_commit_cb,
+            .name = "nvs_commit",
+        };
+        if (esp_timer_create(&a, &s_store_timer) != ESP_OK) {
+            s_store_timer = NULL;
+            nvs_commit(s_store); /* fallback: old synchronous path */
+            return;
+        }
+    }
+    if (!esp_timer_is_active(s_store_timer))
+        esp_timer_start_once(s_store_timer, 300 * 1000);
+}
 #else
 #define MQJS_PC_STORE 16
 static struct {
@@ -1939,8 +1988,9 @@ JSValue js_store_set(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     if (!store_open())
         return JS_NewBool(0);
     /* val points into the JS heap, but nothing below allocates there */
-    bool ok = nvs_set_str(s_store, key, val) == ESP_OK &&
-              nvs_commit(s_store) == ESP_OK;
+    bool ok = nvs_set_str(s_store, key, val) == ESP_OK;
+    if (ok)
+        store_commit_later();
     return JS_NewBool(ok);
 #else
     int i = pc_store_find(key);
@@ -1976,8 +2026,9 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #ifdef ESP_PLATFORM
     if (!store_open())
         return JS_NewBool(0);
-    bool ok = nvs_erase_key(s_store, key) == ESP_OK &&
-              nvs_commit(s_store) == ESP_OK;
+    bool ok = nvs_erase_key(s_store, key) == ESP_OK;
+    if (ok)
+        store_commit_later();
     return JS_NewBool(ok);
 #else
     int i = pc_store_find(key);
@@ -2274,6 +2325,7 @@ JSValue js_camera_scan(JSContext *ctx, JSValue *this_val, int argc,
     s_cam_slot = s_cur_app->slot;
     s_cam_gen = s_cur_app->gen;
     s_cam_active = true;
+    /* (the scan task itself is created inside cam_tab5, pinned there) */
     if (!cam_tab5_scan_start(45000, prefix, cam_done_cb, NULL)) {
         s_cam_active = false;
         s_cur_app->cam_used = false;
@@ -2429,7 +2481,10 @@ JSValue js_http_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     s_http_slot = s_cur_app->slot;
     s_http_gen = s_cur_app->gen;
     s_http_active = true;
-    if (xTaskCreate(http_get_task, "http_get", 8192, NULL, 4, NULL) != pdPASS) {
+    /* pinned to core 0 (with the JS task, which outranks it at prio 5):
+       unpinned it competed with the core-1 LVGL task (audit §3.1) */
+    if (xTaskCreatePinnedToCore(http_get_task, "http_get", 8192, NULL, 4,
+                                NULL, 0) != pdPASS) {
         s_http_active = false;
         s_cur_app->http_used = false;
         JS_DeleteGCRef(ctx, &s_cur_app->http_cb);
