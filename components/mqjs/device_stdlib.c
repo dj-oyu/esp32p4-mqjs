@@ -436,7 +436,7 @@ static const JSClassDef js_ui_obj =
    W3 handle-style: connect() returns a session id (max 3 concurrent),
    every other call takes it as the first argument. ---- */
 static const JSPropDef js_ssh[] = {
-    JS_CFUNC_DEF("connect", 6, js_ssh_connect),
+    JS_CFUNC_DEF("connect", 7, js_ssh_connect),
     JS_CFUNC_DEF("write", 2, js_ssh_write),
     JS_CFUNC_DEF("resize", 3, js_ssh_resize),
     JS_CFUNC_DEF("close", 1, js_ssh_close),
@@ -499,6 +499,18 @@ static const JSPropDef js_store[] = {
 
 static const JSClassDef js_store_obj =
     JS_OBJECT_DEF("Store", js_store);
+
+/* App-scoped write-only secret storage. Values can only be consumed by
+   purpose-built native APIs such as ssh.connect(). */
+static const JSPropDef js_vault[] = {
+    JS_CFUNC_DEF("put", 2, js_vault_put),
+    JS_CFUNC_DEF("has", 1, js_vault_has),
+    JS_CFUNC_DEF("del", 1, js_vault_del),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_vault_obj =
+    JS_OBJECT_DEF("Vault", js_vault);
 
 /* ---- device API: sys object (heap telemetry W1-4; P4a lifecycle +
    app-to-app signals + foreground switching, launcher-multiapp design
@@ -591,6 +603,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
+    JS_PROP_CLASS_DEF("vault", &js_vault_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     JS_PROP_CLASS_DEF("camera", &js_camera_obj),
     JS_PROP_CLASS_DEF("http", &js_http_obj),

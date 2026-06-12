@@ -28,7 +28,7 @@ session data は mqjs event queue を経由して、session を所有する app 
 
 | API | 説明 |
 |---|---|
-| `ssh.connect(host, port, user, pass[, cols, rows])` | 非同期接続を開始し session ID を返す |
+| `ssh.connect(host, port, user, passName, hostKeyName[, cols, rows])` | app 専用 Vault の password と host key を使って接続する |
 | `ssh.write(id, str)` | server へ送信する |
 | `ssh.resize(id, cols, rows)` | pty size を変更する |
 | `ssh.close(id)` | session を閉じる |
@@ -37,7 +37,9 @@ session data は mqjs event queue を経由して、session を所有する app 
 | `ssh.onClose(id, fn)` | `fn(reason)` を登録する |
 
 ```js
-var id = ssh.connect("192.168.1.10", 22, "user", "password", 80, 24);
+vault.put("server-password", "password");
+var id = ssh.connect("192.168.1.10", 22, "user",
+                     "server-password", "server-hostkey", 80, 24);
 
 ssh.onData(id, function (chunk) {
     print(chunk);
@@ -77,8 +79,9 @@ foreground/background ライフサイクルと同じ考え方です。
 
 ## 保存とクリップボード
 
-host 情報は `store` に JSON として保存します。現在は password も平文で NVS に
-保存されるため、信頼できる端末として扱ってください。
+host、port、user は `store` に JSON として保存します。password と承認済み
+host key fingerprint は app 単位で隔離された `vault` に保存され、JS へ読み戻す
+API はありません。`ssh.connect()` が C 内で直接参照します。
 
 clipboard は system 共有値です。
 
@@ -95,11 +98,12 @@ if (clip && clip.type === "text/plain") {
 ## セキュリティ上の制約
 
 - password 認証のみ。
-- host key を検証しないため、中間者攻撃を防げない。
-- password は保存時に暗号化されない。
-- 信頼できる LAN 内での利用を前提とする。
+- host key は初回接続時に認証前で拒否し、画面で承認した SHA-256 fingerprint
+  を次回以降照合する TOFU 方式。
+- Vault は mqjs app 間を隔離するが、NVS / flash 自体の暗号化は別途必要。
+- 正当な配布署名鍵で署名された悪意あるコードは脅威モデル外。
 
-公開ネットワークで使う前に、host key 検証と安全な credential 保存が必要です。
+公開ネットワークでは初回 fingerprint を必ず別経路で確認してください。
 
 ## リソースとバックプレッシャ
 

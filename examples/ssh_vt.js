@@ -2,7 +2,7 @@
 // @title SSHターミナル
 // @icon 
 // @desc VT100 端末エミュレータ (マルチセッション・選択コピー対応)。
-// @perm ssh,clipboard,store
+// @perm ssh,clipboard,store,vault
 /* Tab5 SSH ターミナルエミュレータ (Phase T3 + W3): mquickjs 製 VT100、
  * マルチセッション対応。
  *
@@ -202,9 +202,11 @@ function makeTerm() {
 
     /* ---- エスケープ状態機械 ---- */
     var ST_GROUND = 0, ST_ESC = 1, ST_CSI = 2, ST_OSC = 3, ST_CHARSET = 4;
+    var ST_CSI_IGNORE = 5;
     var state = ST_GROUND;
     var csiParams = "";
     var csiPriv = false;
+    var MAX_CSI_LEN = 64;
     var bracketed = false;  /* DECSET 2004: ブラケットペースト (T3b) */
 
     function params() {
@@ -314,7 +316,7 @@ function makeTerm() {
         else if (fin === "K") { eraseInLine(p[0] || 0); }
         else if (fin === "m") { applySGR(p); }
         else if (fin === "L") { /* 行挿入 */
-            n = param0(p, 1);
+            n = clamp(param0(p, 1), 1, ROWS);
             for (var li = 0; li < n; li++) {
                 if (cy <= scrollBot) {
                     var sb = scrollBot, sct = cy;
@@ -327,7 +329,7 @@ function makeTerm() {
             for (r = cy; r <= scrollBot; r++) markDirty(r);
         }
         else if (fin === "M") { /* 行削除 */
-            n = param0(p, 1);
+            n = clamp(param0(p, 1), 1, ROWS);
             for (var di = 0; di < n; di++) {
                 if (cy <= scrollBot) {
                     var first = rows[cy];
@@ -339,7 +341,7 @@ function makeTerm() {
             for (r = cy; r <= scrollBot; r++) markDirty(r);
         }
         else if (fin === "P") { /* 文字削除 (左詰め) */
-            n = param0(p, 1);
+            n = clamp(param0(p, 1), 1, COLS);
             var row = rows[cy];
             var s = row.ch.slice(0, cx) + row.ch.slice(cx + n) + " ".repeat(n);
             row.ch = s.slice(0, COLS);
@@ -350,7 +352,7 @@ function makeTerm() {
             markDirty(cy);
         }
         else if (fin === "@") { /* 空白挿入 */
-            n = param0(p, 1);
+            n = clamp(param0(p, 1), 1, COLS);
             var row2 = rows[cy];
             var s2 = row2.ch.slice(0, cx) + " ".repeat(n) + row2.ch.slice(cx);
             row2.ch = s2.slice(0, COLS);
@@ -391,6 +393,11 @@ function makeTerm() {
                 state = ST_GROUND;
                 continue;
             }
+            if (state === ST_CSI_IGNORE) {
+                if (code >= 0x40 && code <= 0x7E)
+                    state = ST_GROUND;
+                continue;
+            }
             if (state === ST_ESC) {
                 if (ch === "[") { state = ST_CSI; csiParams = ""; csiPriv = false; }
                 else if (ch === "]") { state = ST_OSC; }
@@ -410,7 +417,15 @@ function makeTerm() {
             }
             if (state === ST_CSI) {
                 if (ch === "?") { csiPriv = true; }
-                else if ((code >= 0x30 && code <= 0x39) || ch === ";") { csiParams += ch; }
+                else if ((code >= 0x30 && code <= 0x39) || ch === ";") {
+                    if (csiParams.length >= MAX_CSI_LEN) {
+                        state = ST_CSI_IGNORE;
+                        csiParams = "";
+                        csiPriv = false;
+                    } else {
+                        csiParams += ch;
+                    }
+                }
                 else if (code >= 0x40 && code <= 0x7E) {
                     csiDispatch(ch);
                     state = ST_GROUND;
@@ -559,13 +574,31 @@ if (SELFTEST) {
     var MAX_SESS = 3;         /* == C 側 SSHC_MAX_SESSIONS */
     var tabHit = [];          /* タブバーのタップ判定 [{x0,x1,idx}] */
 
+    var credName = function (e) {
+        return "ssh-pass:" + e.user + "@" + e.host + ":" + e.port;
+    };
+    var hostKeyName = function (e) {
+        return "ssh-hostkey:" + e.host + ":" + e.port;
+    };
     var loadHosts = function () {
         var s = store.get(HOSTS_KEY);
         if (!s)
             return [];
         try {
             var a = JSON.parse(s);
-            return (a && a.length !== undefined) ? a : [];
+            if (!a || a.length === undefined)
+                return [];
+            var migrated = false;
+            for (var i = 0; i < a.length; i++) {
+                if (a[i].pass) {
+                    vault.put(credName(a[i]), a[i].pass);
+                    delete a[i].pass;
+                    migrated = true;
+                }
+            }
+            if (migrated)
+                store.set(HOSTS_KEY, JSON.stringify(a));
+            return a;
         } catch (e) {
             return [];
         }
@@ -659,10 +692,14 @@ if (SELFTEST) {
                 var clip = clipboard.get();
                 if (clip && clip.data) {
                     var pd = clip.data;
+                    var dangerous = /[\r\n\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(pd);
                     /* サーバが DECSET 2004 を宣言していたら囲む */
                     if (sessions[actIdx].term.bracketed())
                         pd = "\x1b[200~" + pd + "\x1b[201~";
-                    ssh.write(id, pd);
+                    if (dangerous)
+                        confirmPaste(id, pd);
+                    else
+                        ssh.write(id, pd);
                 }
                 return;
             }
@@ -836,6 +873,53 @@ if (SELFTEST) {
         }
     }, 25); /* ~40fps でアクティブ端末のダーティ行を消化 */
 
+    var returnTerminal = function () {
+        inForm = false;
+        unwind();
+        ui.clear(BG);
+        if (actIdx >= 0 && actIdx < sessions.length) {
+            sessions[actIdx].term.markAll();
+            drawTabs();
+            ui.keyboard(2);
+        }
+    };
+
+    var confirmPaste = function (id, data) {
+        inForm = true;
+        ui.keyboard(0);
+        var s = ui.screen("危険な貼り付け");
+        s.label("改行または制御文字を含みます (" + data.length + " 文字)");
+        var preview = data.replace(/[\x00-\x1f\x7f]/g, " ");
+        if (preview.length > 120)
+            preview = preview.slice(0, 120) + "…";
+        s.label(preview);
+        s.button("送信する", function () {
+            ssh.write(id, data);
+            returnTerminal();
+        });
+        s.button("キャンセル", returnTerminal);
+    };
+
+    var trustHostPage = function (e, fingerprint, changed) {
+        inForm = true;
+        ui.keyboard(0);
+        var s = ui.screen(changed ? "ホスト鍵が変更されました" : "ホスト鍵を確認");
+        s.label(e.host + ":" + e.port);
+        s.label("SHA-256: " + fingerprint);
+        s.label(changed ? "MITMの可能性があります。確認できるまで信頼しないでください。"
+                        : "別経路で指紋を確認してから信頼してください。");
+        s.button(changed ? "新しい鍵を信頼して再接続" : "信頼して再接続", function () {
+            vault.put(hostKeyName(e), fingerprint);
+            unwind();
+            startSession(e);
+        });
+        s.button("キャンセル", function () {
+            if (e.transientCred)
+                vault.del(credName(e));
+            hostsPage("接続を中止しました");
+        });
+    };
+
     /* セッションを開く。成功で端末ビューへ。 */
     var startSession = function (e) {
         if (sessions.length >= MAX_SESS) {
@@ -844,7 +928,8 @@ if (SELFTEST) {
         }
         var id;
         try {
-            id = ssh.connect(e.host, e.port, e.user, e.pass, COLS, ROWS);
+            id = ssh.connect(e.host, e.port, e.user, credName(e),
+                             hostKeyName(e), COLS, ROWS);
         } catch (err) {
             hostsPage("接続できない: " + err.message);
             return;
@@ -852,15 +937,40 @@ if (SELFTEST) {
         var term = makeTerm();
         var entry = { id: id, term: term, label: e.user + "@" + e.host };
         sessions.push(entry);
+        var forgetTimer = null;
+        if (e.transientCred) {
+            forgetTimer = setInterval(function () {
+                if (ssh.connected(id)) {
+                    vault.del(credName(e));
+                    clearInterval(forgetTimer);
+                    forgetTimer = null;
+                }
+            }, 100);
+        }
 
         ssh.onData(id, function (chunk) {
             term.feed(chunk);
         });
         ssh.onClose(id, function (reason) {
+            if (forgetTimer !== null) {
+                clearInterval(forgetTimer);
+                forgetTimer = null;
+            }
             /* このセッションのタブを畳む */
             var i = sessions.indexOf(entry);
             if (i >= 0)
                 sessions.splice(i, 1);
+            var changedPrefix = "hostkey-changed:";
+            var firstPrefix = "hostkey:";
+            if (reason.indexOf(changedPrefix) === 0 ||
+                reason.indexOf(firstPrefix) === 0) {
+                actIdx = sessions.length ? Math.min(actIdx, sessions.length - 1) : -1;
+                trustHostPage(e, reason.slice(reason.indexOf(":") + 1),
+                              reason.indexOf(changedPrefix) === 0);
+                return;
+            }
+            if (e.transientCred)
+                vault.del(credName(e));
             if (!sessions.length) {
                 actIdx = -1;
                 ui.keyboard(0);
@@ -892,31 +1002,47 @@ if (SELFTEST) {
         var fu = s.field("User");
         fu.setText(preset.user);
         var fw = s.field("Password", { secret: true });
-        fw.setText(preset.pass || "");
+        fw.setText("");
         var sv = s.toggle("この接続先を保存", 1);
+        var sc = s.toggle("パスワードをVaultに保存", 1);
         var mk = function () {
             var p = parseInt(fp.value(), 10);
             return { host: fh.value(), port: isNaN(p) ? 22 : p,
-                     user: fu.value(), pass: fw.value() };
+                     user: fu.value(), password: fw.value() };
         };
         var put = function (e) {
             if (!sv.value())
                 return;
             var hosts = loadHosts();
+            var saved = { host: e.host, port: e.port, user: e.user };
             if (editIdx >= 0 && editIdx < hosts.length)
-                hosts[editIdx] = e;
+                hosts[editIdx] = saved;
             else
-                hosts.push(e);
+                hosts.push(saved);
             saveHosts(hosts);
         };
         s.button("接続", function () {
             var e = mk();
+            if (e.password)
+                vault.put(credName(e), e.password);
+            delete e.password;
+            e.transientCred = !sc.value();
+            if (!vault.has(credName(e))) {
+                sys.notify("パスワードを入力してください");
+                return;
+            }
             put(e);
             startSession(e);
         });
         if (editIdx >= 0) {
             s.button("保存して一覧へ", function () {
-                put(mk());
+                var e = mk();
+                if (e.password)
+                    vault.put(credName(e), e.password);
+                if (!sc.value())
+                    vault.del(credName(e));
+                delete e.password;
+                put(e);
                 unwind();
                 hostsPage("保存しました");
             });
@@ -930,12 +1056,19 @@ if (SELFTEST) {
             return;
         var e = hosts[idx];
         var s = ui.screen(hostLabel(e));
-        s.button("接続", function () { startSession(e); });
+        s.button("接続", function () {
+            if (vault.has(credName(e)))
+                startSession(e);
+            else
+                connectForm(e, idx);
+        });
         s.button("編集", function () { connectForm(e, idx); });
         s.button("削除", function () {
             var h2 = loadHosts();
             h2.splice(idx, 1);
             saveHosts(h2);
+            vault.del(credName(e));
+            vault.del(hostKeyName(e));
             unwind();
             hostsPage("削除: " + hostLabel(e));
         });

@@ -16,8 +16,9 @@
  * socket recv timeout so it can interleave reads with draining the tx
  * buffer and applying pty resizes.
  *
- * Host-key policy v1: accept any (the fingerprint is logged). Password
- * auth only; public-key auth is a later phase.
+ * Host keys are SHA-256 fingerprint checked before password auth. An empty
+ * expected fingerprint rejects the connection and reports the observed key
+ * for an app-level TOFU confirmation flow.
  */
 #include "sdkconfig.h"
 #if CONFIG_MQJS_SSH
@@ -39,6 +40,7 @@
 #define WOLFSSH_USER_SETTINGS
 #include <wolfssh/ssh.h>
 #include <wolfssh/error.h>
+#include <wolfssl/wolfcrypt/sha256.h>
 
 #include "sshc.h"
 
@@ -61,6 +63,7 @@ typedef struct {
     char host[64];
     char user[32];
     char pass[64];
+    char hostkey[65]; /* lowercase SHA-256 hex; empty = TOFU probe */
     int  port;
     int  cols, rows;
 } ssh_params_t;
@@ -77,6 +80,7 @@ typedef struct {
     ssh_params_t params;
     uint16_t gen;          /* bumped per connect; part of the public id */
     int id;                /* public id while active */
+    char close_reason[96];
 } ssh_sess_t;
 
 static ssh_sess_t s_sess[SSHC_MAX_SESSIONS];
@@ -111,14 +115,39 @@ static int ssh_userauth_cb(byte authType, WS_UserAuthData *authData, void *ctx)
     return WOLFSSH_USERAUTH_FAILURE;
 }
 
-/* host-key check: accept any (v1). The fingerprint is logged. */
+static void secure_zero(void *ptr, size_t len)
+{
+    volatile unsigned char *p = ptr;
+    while (len--)
+        *p++ = 0;
+}
+
+/* Host-key check runs before user authentication. Report an unknown or
+   changed key to JS without ever sending the password to that peer. */
 static int ssh_pubkey_check_cb(const byte *pubKey, word32 pubKeySz, void *ctx)
 {
-    (void)pubKey;
-    (void)ctx;
-    ESP_LOGW(TAG, "accepting server host key (%u bytes) without verification",
-             (unsigned)pubKeySz);
-    return 0;
+    ssh_sess_t *s = ctx;
+    byte digest[WC_SHA256_DIGEST_SIZE];
+    char hex[WC_SHA256_DIGEST_SIZE * 2 + 1];
+    wc_Sha256 sha;
+    if (!s || wc_InitSha256(&sha) != 0)
+        return -1;
+    int sha_rc = wc_Sha256Update(&sha, pubKey, pubKeySz);
+    if (sha_rc == 0)
+        sha_rc = wc_Sha256Final(&sha, digest);
+    wc_Sha256Free(&sha);
+    if (sha_rc != 0)
+        return -1;
+    for (size_t i = 0; i < sizeof digest; i++)
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    hex[sizeof hex - 1] = '\0';
+    if (s->params.hostkey[0] && !strcmp(s->params.hostkey, hex))
+        return 0;
+    snprintf(s->close_reason, sizeof s->close_reason, "%s%s",
+             s->params.hostkey[0] ? "hostkey-changed:" : "hostkey:", hex);
+    ESP_LOGW(TAG, "server host key rejected for %s:%d", s->params.host,
+             s->params.port);
+    return -1;
 }
 
 /* blocking TCP connect with a bounded timeout; returns fd or -1 */
@@ -171,7 +200,7 @@ static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
         goto done;
     }
     wolfSSH_SetUserAuthCtx(ssh, s);
-    wolfSSH_SetPublicKeyCheckCtx(ssh, NULL);
+    wolfSSH_SetPublicKeyCheckCtx(ssh, s);
     if (wolfSSH_SetUsername(ssh, s->params.user) != WS_SUCCESS) {
         reason = "bad username";
         goto done;
@@ -193,7 +222,7 @@ static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
               wolfSSH_get_error(ssh) == WS_WANT_WRITE) && !s->stop);
     if (rc != WS_SUCCESS) {
         ESP_LOGE(TAG, "wolfSSH_connect: %s", wolfSSH_get_error_name(ssh));
-        reason = "auth/handshake failed";
+        reason = s->close_reason[0] ? s->close_reason : "auth/handshake failed";
         goto done;
     }
 
@@ -280,6 +309,7 @@ done:
         close(fd);
     s->up = false;
     mqjs_post_ssh_closed(s->id, reason);
+    secure_zero(s->params.pass, sizeof s->params.pass);
 }
 
 /* one-time library init: wolfSSH_Init/Cleanup pairs are refcounted in
@@ -317,15 +347,17 @@ static void ssh_task(void *arg)
 cleanup:
     if (ctx)
         wolfSSH_CTX_free(ctx);
+    secure_zero(s->params.pass, sizeof s->params.pass);
     s->up = false;
     s->active = false; /* last: frees the slot for reuse */
     vTaskDelete(NULL);
 }
 
 int mqjs_ssh_connect(const char *host, int port, const char *user,
-                     const char *pass, int cols, int rows)
+                     const char *pass, const char *hostkey, int cols,
+                     int rows)
 {
-    if (!host || !user || !pass)
+    if (!host || !user || !pass || !hostkey)
         return 0;
     int slot = -1;
     for (int i = 0; i < SSHC_MAX_SESSIONS; i++) {
@@ -342,6 +374,7 @@ int mqjs_ssh_connect(const char *host, int port, const char *user,
     strlcpy(s->params.host, host, sizeof s->params.host);
     strlcpy(s->params.user, user, sizeof s->params.user);
     strlcpy(s->params.pass, pass, sizeof s->params.pass);
+    strlcpy(s->params.hostkey, hostkey, sizeof s->params.hostkey);
     s->params.port = (port > 0) ? port : 22;
     s->params.cols = cols;
     s->params.rows = rows;
@@ -359,6 +392,7 @@ int mqjs_ssh_connect(const char *host, int port, const char *user,
     s->stop = false;
     s->up = false;
     s->resize_req = false;
+    s->close_reason[0] = '\0';
     s->active = true;
     char name[8];
     snprintf(name, sizeof name, "ssh%d", slot);
