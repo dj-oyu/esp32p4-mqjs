@@ -1,14 +1,25 @@
 # App Manager 移行設計
 
-Status: Phase 0-1 実装済み・実機 E2E 確認 2026-06-13 (Phase 2 以降は未着手)
+Status: Phase 0-2 実装済み・実機 E2E 確認 2026-06-13 (Phase 3 以降は未着手)
 
-- Phase 0: `app/mqjs_app_manager.h` 追加済み (未配線)
+- Phase 0: `app/mqjs_app_manager.h` 追加済み
 - Phase 1: `sys.start/open/focus/stop(name)` 追加、`sys.apps()` に `kind`
   ("system" / "dev" / "app")、launcher / examples から slot 参照を削除。
   旧 slot API は互換のため受理を継続 (`sys.launch` / 数値 focus/stop)。
   実機 E2E: 名前での start→focus→stop→復帰、未知名は false、self-stop
   (reaper 経路) まで確認。worker 満杯時の start は false (eviction は
   Phase 4 のスコープ)。
+- Phase 2: 内部から slot 語を排除 — `AppSlot` → `MqjsWorker`、
+  `MQJS_SLOT_*` → `MQJS_WORKER_*`、イベントの stale 判定は文字どおり
+  `worker + generation` に。App record テーブルを `app/mqjs_app_manager.c`
+  に新設し、start/stop/setAppName/foreground 切替から js_task 上で更新
+  (single-writer 維持)。停止後もレコードは STOPPED で残存 (Phase 4 の
+  LRU 基盤: `last_active_ms`、満杯時は最古の STOPPED を回収)。
+  `sys.apps()` の `kind` はレコード由来に切替済み (出力は不変)。
+  ホスト単体テスト `components/mqjs/tools/app_manager_test.c` ALL PASS、
+  実機 E2E は Phase 1 プローブで回帰なし。worker 内の name は実行中
+  キャッシュとして残置 — 権威の移転は Phase 3 (policy / dev の通常 App
+  化) と同時に行う。
 
 ## 目的
 

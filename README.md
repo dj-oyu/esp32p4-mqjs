@@ -488,8 +488,8 @@ mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h
 /tmp/stdlib_tool -m64 > gen_pc/device_stdlib.h
 gcc -O2 -I. -Igen_pc -Imquickjs -o /tmp/run_pc tools/run_pc.c \
-  mqjs_runtime.c mquickjs/mquickjs.c mquickjs/cutils.c \
-  mquickjs/dtoa.c mquickjs/libm.c -lm
+  mqjs_runtime.c app/mqjs_app_manager.c mquickjs/mquickjs.c \
+  mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c -lm
 
 /tmp/run_pc ../../examples/bench.js
 timeout 3 /tmp/run_pc ../../examples/life.js

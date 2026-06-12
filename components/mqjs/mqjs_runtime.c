@@ -48,6 +48,7 @@
 #include "mquickjs.h"
 #include "mqjs_runtime.h"
 #include "mqjs_classes.h"
+#include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
 #include <stdlib.h>
@@ -2837,6 +2838,7 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
             !strcmp(s_workers[i].name, name))
             return JS_NewBool(0);
     }
+    mqjs_app_record_on_rename(s_cur_wk->name, name);
     snprintf(s_cur_wk->name, sizeof s_cur_wk->name, "%s", name);
     if (s_cur_wk->idx == MQJS_WORKER_DEV)
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", name);
@@ -2870,12 +2872,16 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
         /* Phase 1: launcher/dev specialness exposed as a kind string,
            not a slot number (the slot key is compat-only from here).
+           Phase 2: the kind comes from the App record; "dev" stays a
+           worker-position fact until Phase 3 turns it into policy.
            Allocate the string into a local FIRST: the compacting GC can
            move obj during JS_NewString, and a nested call may read
            obj_ref.val before the allocation runs (eval order). */
-        JSValue kind = JS_NewString(ctx, i == MQJS_WORKER_LAUNCHER ? "system"
-                                       : i == MQJS_WORKER_DEV ? "dev"
-                                       : "app");
+        const mqjs_app_snapshot_t *rec = mqjs_app_record_find(s_workers[i].name);
+        JSValue kind = JS_NewString(ctx,
+            i == MQJS_WORKER_DEV ? "dev"
+            : rec && rec->kind == MQJS_APP_KIND_SYSTEM ? "system"
+            : "app");
         JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
@@ -4343,6 +4349,8 @@ static void app_stop_internal(MqjsWorker *app)
     app->kill_req = false;
     free(app->src_owned);      /* sys.launch file source, if any */
     app->src_owned = NULL;
+    /* the App record outlives the worker: state -> STOPPED (Phase 2) */
+    mqjs_app_record_on_stop(app->name, MQJS_APP_STOP_USER);
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "app '%s' (worker %d) stopped", app->name, app->idx);
 #endif
@@ -4420,6 +4428,12 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
 #endif
     if (app->idx == MQJS_WORKER_DEV)
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", app->name);
+    /* App record: find-or-create, state -> RUNNING (Phase 2). The
+       launcher is the only KIND_SYSTEM app until Phase 3 policies. */
+    mqjs_app_record_on_start(app->name, app->idx,
+                             app->idx == MQJS_WORKER_LAUNCHER
+                                 ? MQJS_APP_KIND_SYSTEM : MQJS_APP_KIND_APP,
+                             time_ms());
     bar_update();
     return 0;
 }
@@ -4448,14 +4462,17 @@ static void switch_foreground(int new_slot)
 #endif
         /* the outgoing app becomes the status-bar chip target */
         snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
+        mqjs_app_record_set_view(old->name, MQJS_APP_VIEW_BACKGROUND);
     }
 
     s_fg_worker = new_slot;
     MqjsWorker *nw = &s_workers[new_slot];
+    mqjs_app_record_set_view(nw->name, MQJS_APP_VIEW_FOREGROUND);
+    mqjs_app_record_touch(nw->name, time_ms());
 #ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "foreground -> '%s' (slot %d)", nw->name, new_slot);
+    ESP_LOGI(TAG, "foreground -> '%s' (worker %d)", nw->name, new_slot);
 #else
-    printf("[sys] foreground -> '%s' (slot %d)\n", nw->name, new_slot);
+    printf("[sys] foreground -> '%s' (worker %d)\n", nw->name, new_slot);
 #endif
     bar_update();
     if (nw->fg_used)
@@ -4618,6 +4635,7 @@ static void reap_idle_apps(void)
 
 void mqjs_rt_init(void)
 {
+    mqjs_apps_init(); /* App record table (manager Phase 2) */
     for (int i = 0; i < MQJS_MAX_WORKERS; i++)
         s_workers[i].idx = (uint8_t)i;
 #ifdef ESP_PLATFORM
