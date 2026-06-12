@@ -2274,7 +2274,7 @@ JSValue js_camera_scan(JSContext *ctx, JSValue *this_val, int argc,
     s_cam_slot = s_cur_app->slot;
     s_cam_gen = s_cur_app->gen;
     s_cam_active = true;
-    if (!cam_tab5_scan_start(15000, prefix, cam_done_cb, NULL)) {
+    if (!cam_tab5_scan_start(45000, prefix, cam_done_cb, NULL)) {
         s_cam_active = false;
         s_cur_app->cam_used = false;
         JS_DeleteGCRef(ctx, &s_cur_app->cam_cb);

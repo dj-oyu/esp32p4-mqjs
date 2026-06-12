@@ -4,7 +4,7 @@
 // @desc バーコードスキャナのデモ。スキャン中は画面上部にファインダーが出る。
 //
 // camera.* API の最小デモ:
-//   camera.scan(fn[, prefix]) - 15 秒間スキャン。読めたら fn(コード)、
+//   camera.scan(fn[, prefix]) - 45 秒間スキャン。読めたら fn(コード)、
 //                               だめなら fn(undefined)。prefix "97" で
 //                               ISBN (978/979) だけに絞れる
 //   camera.cancel()           - 実行中のスキャンを中断
@@ -39,12 +39,12 @@ function build() {
     }
     s.button("スキャン (ISBN だけ: 978/979)", function () {
         var ok = camera.scan(onCode, "97");
-        status.setText(ok ? "スキャン中 (15 秒)... バーコードをかざして"
+        status.setText(ok ? "スキャン中 (45 秒)... バーコードをかざして"
                           : "開始できず: " + camera.status());
     });
     s.button("スキャン (どの EAN-13 でも)", function () {
         var ok = camera.scan(onCode);
-        status.setText(ok ? "スキャン中 (15 秒)... 食品の JAN なども OK"
+        status.setText(ok ? "スキャン中 (45 秒)... 食品の JAN なども OK"
                           : "開始できず: " + camera.status());
     });
     s.button("キャンセル", function () {

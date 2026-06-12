@@ -2316,6 +2316,9 @@ void ui_tab5_cam_overlay_text(const char *utf8)
         s_cam_lbl = lv_label_create(lv_layer_top());
         lv_obj_set_width(s_cam_lbl, 560);
         lv_label_set_long_mode(s_cam_lbl, LV_LABEL_LONG_WRAP);
+        /* default LVGL font has no JP glyphs (tofu) — use the Noto
+           chain like every other label */
+        lv_obj_set_style_text_font(s_cam_lbl, ui_font(), 0);
         lv_obj_set_style_text_color(s_cam_lbl, lv_color_hex(0xE0E6EA), 0);
         lv_obj_set_style_bg_color(s_cam_lbl, lv_color_hex(0x101820), 0);
         lv_obj_set_style_bg_opa(s_cam_lbl, LV_OPA_80, 0);

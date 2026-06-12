@@ -421,7 +421,7 @@ function buildAdd() {
             status.setText("読み取り: " + code);
             ndlQuery();
         }, "97");
-        status.setText(ok ? "スキャン中 (15 秒)... 本の裏の上段バーコード " +
+        status.setText(ok ? "スキャン中 (45 秒)... 本の裏の上段バーコード " +
                             "(978〜) をカメラにかざして"
                           : "カメラを使えません: " + camera.status());
     });
