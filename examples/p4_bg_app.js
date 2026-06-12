@@ -66,7 +66,7 @@ sys.onForeground(function () {
     stTick = s.label("tick: " + ticks + " (fg " + fgCount + "回目)");
     stRx = s.label("rx#" + rxCount + ": " + lastRx);
     stSig = s.label("signal: " + lastSig);
-    s.button("dev タスクへ切替", function () { sys.focus(1); });
+    s.button("dev タスクへ切替", function () { sys.focus("dev"); });
 });
 
 sys.onBackground(function () {

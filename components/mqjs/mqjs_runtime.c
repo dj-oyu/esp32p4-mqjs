@@ -2622,12 +2622,39 @@ JSValue js_sys_signal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     return JS_NewBool(1);
 }
 
-/* sys.focus(slot): request a foreground switch (queued — the switch
-   never happens in the middle of the caller's own callback). P4a: any
-   app may call it; restricting it to the launcher is a P4b/P4c rule. */
+/* App-manager migration Phase 1: stable app names are the public
+   identity; slot numbers stay internal (Worker index). Resolve a name
+   to its live slot. "dev" answers the dev slot whatever its setAppName
+   identity is, so callers need not know the pushed task's name. */
+static int app_slot_by_name(const char *name)
+{
+    for (int i = 0; i < MQJS_MAX_APPS; i++)
+        if (s_apps[i].used && !strcmp(s_apps[i].name, name))
+            return i;
+    if (!strcmp(name, "dev") && s_apps[MQJS_SLOT_DEV].used)
+        return MQJS_SLOT_DEV;
+    return -1;
+}
+
+/* sys.focus(name) -> bool / sys.focus(slot) [compat]: request a
+   foreground switch (queued — the switch never happens in the middle
+   of the caller's own callback). P4a: any app may call it; restricting
+   it to the launcher is a P4b/P4c rule. The name form returns false
+   for an unknown/stopped app instead of throwing. */
 JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int slot;
+    if (JS_IsString(ctx, argv[0])) {
+        char name[32];
+        if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+            return JS_EXCEPTION;
+        slot = app_slot_by_name(name);
+        if (slot < 0)
+            return JS_NewBool(0);
+        MqjsEvent ev = { .type = EV_FOCUS };
+        ev.u.focus.target = (uint8_t)slot;
+        return JS_NewBool(ev_post(&ev, 0));
+    }
     if (JS_ToInt32(ctx, &slot, argv[0]))
         return JS_EXCEPTION;
     if (slot < 0 || slot >= MQJS_MAX_APPS)
@@ -2696,6 +2723,15 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         JS_SetPropertyStr(ctx, obj_ref.val, "name", name);
         JS_SetPropertyStr(ctx, obj_ref.val, "slot", JS_NewInt32(ctx, i));
         JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
+        /* Phase 1: launcher/dev specialness exposed as a kind string,
+           not a slot number (the slot key is compat-only from here).
+           Allocate the string into a local FIRST: the compacting GC can
+           move obj during JS_NewString, and a nested call may read
+           obj_ref.val before the allocation runs (eval order). */
+        JSValue kind = JS_NewString(ctx, i == MQJS_SLOT_LAUNCHER ? "system"
+                                       : i == MQJS_SLOT_DEV ? "dev"
+                                       : "app");
+        JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
     }
@@ -3115,24 +3151,21 @@ static int start_from_file(int slot, const char *arg, const char *name)
     return slot;
 }
 
-/* sys.launch(nameOrPath) -> slot (>= 0) or -1. Open semantics live in
-   the launcher (focus-or-launch); this only starts things. Resolution:
+/* Start-by-name core shared by sys.launch (slot compat), sys.start and
+   sys.open (Phase 1 name API). Returns the slot (>= 0) or -1. Resolution:
    "dev" re-enables the dev provider; a running app returns its slot;
    then the embedded registry; then /littlefs/apps/<name>.js (or the
    verbatim path when it contains '/'). File sources are owned by the
    slot and freed at stop. */
-JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+static int sys_launch_core(const char *arg)
 {
-    char arg[96];
-    if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
-        return JS_EXCEPTION;
     if (!arg[0])
-        return JS_NewInt32(ctx, -1);
+        return -1;
 
     if (!strcmp(arg, "dev")) {
         s_dev_hold = false;
         s_dev_retry_at = 0; /* the scheduler asks the provider next pass */
-        return JS_NewInt32(ctx, MQJS_SLOT_DEV);
+        return MQJS_SLOT_DEV;
     }
 
     /* app name = basename without .js (also the path case) */
@@ -3148,42 +3181,85 @@ JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 
     for (int i = 0; i < MQJS_MAX_APPS; i++)
         if (s_apps[i].used && !strcmp(s_apps[i].name, name))
-            return JS_NewInt32(ctx, i); /* already running */
+            return i; /* already running */
     if (!strcmp(name, "launcher")) /* resident in slot 0, never elsewhere */
-        return JS_NewInt32(ctx, -1);
+        return -1;
     /* the stopped dev task addressed by its setAppName identity (the
        chip remembers "ssh_vt", not "dev"): rerun via the provider */
     if (!s_apps[MQJS_SLOT_DEV].used && s_last_dev_name[0] &&
         !strcmp(name, s_last_dev_name)) {
         s_dev_hold = false;
         s_dev_retry_at = 0;
-        return JS_NewInt32(ctx, MQJS_SLOT_DEV);
+        return MQJS_SLOT_DEV;
     }
 
     int slot = app_free_slot();
     if (slot < 0 || !app_ensure_mem(&s_apps[slot]))
-        return JS_NewInt32(ctx, -1);
+        return -1;
 
     const AppSource *as = app_source_find(name);
     if (as) {
         if (app_start_internal(&s_apps[slot], as->src, as->len, as->name))
-            return JS_NewInt32(ctx, -1);
-        return JS_NewInt32(ctx, slot);
+            return -1;
+        return slot;
     }
 
-    return JS_NewInt32(ctx, start_from_file(slot, arg, name));
+    return start_from_file(slot, arg, name);
 }
 
-/* sys.stop(slot) -> bool. Open to every app (the signing gate is the
-   trust boundary); the C invariants hold regardless of caller: the
-   launcher is unstoppable, an explicitly stopped dev slot stays down
-   until the next push / sys.launch("dev"), and every stop is
-   attributed on the console. Self-stop is deferred to the reaper (the
-   context cannot be freed under its own running JS frame). */
+/* sys.launch(nameOrPath) -> slot or -1 [compat]. Prefer sys.start /
+   sys.open: new code should never need the returned worker index. */
+JSValue js_sys_launch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char arg[96];
+    if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, sys_launch_core(arg));
+}
+
+/* sys.start(name) -> bool: start (or confirm running) by name, without
+   exposing the worker index (Phase 1 name API). */
+JSValue js_sys_start(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char arg[96];
+    if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
+        return JS_EXCEPTION;
+    return JS_NewBool(sys_launch_core(arg) >= 0);
+}
+
+/* sys.open(name) -> bool: the launcher's focus-or-launch staple as one
+   call — start if stopped, then bring to the foreground (queued). */
+JSValue js_sys_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    char arg[96];
+    if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
+        return JS_EXCEPTION;
+    int slot = sys_launch_core(arg);
+    if (slot < 0)
+        return JS_NewBool(0);
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = (uint8_t)slot;
+    return JS_NewBool(ev_post(&ev, 0));
+}
+
+/* sys.stop(name) -> bool (slot form kept for compat). Open to every
+   app (the signing gate is the trust boundary); the C invariants hold
+   regardless of caller: the launcher is unstoppable, an explicitly
+   stopped dev slot stays down until the next push / sys.start("dev"),
+   and every stop is attributed on the console. Self-stop is deferred
+   to the reaper (the context cannot be freed under its own running JS
+   frame). The name form returns false for an unknown/stopped app. */
 JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int slot;
-    if (JS_ToInt32(ctx, &slot, argv[0]))
+    if (JS_IsString(ctx, argv[0])) {
+        char name[32];
+        if (uiw_copy_str(ctx, argv[0], name, sizeof name))
+            return JS_EXCEPTION;
+        slot = app_slot_by_name(name);
+        if (slot < 0)
+            return JS_NewBool(0);
+    } else if (JS_ToInt32(ctx, &slot, argv[0]))
         return JS_EXCEPTION;
     if (slot == MQJS_SLOT_LAUNCHER)
         return JS_ThrowTypeError(ctx, "the launcher cannot be stopped");

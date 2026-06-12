@@ -518,6 +518,10 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("apps", 0, js_sys_apps),
     JS_CFUNC_DEF("installed", 0, js_sys_installed),
     JS_CFUNC_DEF("launch", 1, js_sys_launch),
+    /* Phase 1 name API (app-manager migration): start/open/focus/stop
+       by app name; launch + slot numbers remain as compat only */
+    JS_CFUNC_DEF("start", 1, js_sys_start),
+    JS_CFUNC_DEF("open", 1, js_sys_open),
     JS_CFUNC_DEF("stop", 1, js_sys_stop),
     JS_CFUNC_DEF("notify", 1, js_sys_notify),
     /* P4c registry: uninstall + per-app latest notifications */

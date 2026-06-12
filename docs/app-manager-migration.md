@@ -1,6 +1,14 @@
 # App Manager 移行設計
 
-Status: proposal / implementation not started
+Status: Phase 0-1 実装済み・実機 E2E 確認 2026-06-13 (Phase 2 以降は未着手)
+
+- Phase 0: `app/mqjs_app_manager.h` 追加済み (未配線)
+- Phase 1: `sys.start/open/focus/stop(name)` 追加、`sys.apps()` に `kind`
+  ("system" / "dev" / "app")、launcher / examples から slot 参照を削除。
+  旧 slot API は互換のため受理を継続 (`sys.launch` / 数値 focus/stop)。
+  実機 E2E: 名前での start→focus→stop→復帰、未知名は false、self-stop
+  (reaper 経路) まで確認。worker 満杯時の start は false (eviction は
+  Phase 4 のスコープ)。
 
 ## 目的
 
