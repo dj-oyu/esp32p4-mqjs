@@ -160,16 +160,16 @@ static bool prefix_ok(const char code[14])
 static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
                        char out[14])
 {
-    for (int r = 0; r < 24; r++) {
-        int y = h * (20 + r * 60 / 23) / 100; /* rows across 20%..80% */
+    for (int r = 0; r < 32; r++) {
+        int y = h * (15 + r * 70 / 31) / 100; /* rows across 15%..85% */
         const uint16_t *row = px + y * w;
         for (int x = 0; x < w; x++)
             line[x] = luma565(row[x]);
         if (ean13_decode_gray_line(line, w, out) && prefix_ok(out))
             return true;
     }
-    for (int c = 0; c < 16; c++) { /* rotated 90°: columns 15%..85% */
-        int x = w * (15 + c * 70 / 15) / 100;
+    for (int c = 0; c < 24; c++) { /* rotated 90°: columns 10%..90% */
+        int x = w * (10 + c * 80 / 23) / 100;
         for (int y = 0; y < h; y++)
             line[y] = luma565(px[y * w + x]);
         if (ean13_decode_gray_line(line, h, out) && prefix_ok(out))
@@ -307,7 +307,9 @@ static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
         },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,
+        /* 270 + mirror == the transpose the user approved; 90 showed
+           the world upside down (PPA's rotation sense vs our math) */
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
         .scale_x = 0.5,
         .scale_y = 0.5,
         .mirror_x = true,

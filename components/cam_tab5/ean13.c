@@ -93,7 +93,9 @@ static int try_decode_at(const int *runs, int nruns, int i, char out[14])
         return 0;
 
     int g = runs[i] + runs[i + 1] + runs[i + 2];
-    if (g < 6) /* < 2px per module: optically hopeless */
+    if (g < 5) /* under ~1.7px per module: optically hopeless (checksum
+                  + parity + guards keep false positives out even at
+                  this gate — see the noise test in tools/) */
         return 0;
     if (!guard_ok(runs + i, 3, g))
         return 0;
