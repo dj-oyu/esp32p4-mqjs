@@ -1,9 +1,19 @@
 # PIE 手書き融合カーネル計画 — bc_locate 構造テンソル
 
-ステータス: **実装ブランチあり (検証待ち)**。`bc_tensor_p4.S` を実装し
-ホスト検証 + ファーム・クロスコンパイル + 逆アセンブルまで完了。デバイス
-実機での起動セルフチェック結果 (`bc_tensor_impl()`) と loc テレメトリ比較
-が残り (フラッシュは別セッション)。
+ステータス: **実機検証 PASS (2026-06-13)**。起動セルフチェック一致 →
+`pie` パスで稼働、loc **13-15ms → 6-7ms/フレーム** (目標 4-7ms 達成)。
+実本の ISBN (9784065419526) も PIE 経路でデコード完走。
+初版から 2 つの実機修正が必要だった (どちらもセルフチェックが検出):
+
+1. **QACC → XACC**: 初版は `esp.vmulas.s16.qacc` で QACC に積みながら
+   `esp.srs.s.xacc` (XACC を読む) で抽出していた — 積む先と読む先が別。
+   esp-dsp `dsps_dotprod_s16_arp4` の逆アセンブルが正解: reduce-sum
+   内積は `esp.zero.xacc` + `esp.vmulas.s16.xacc` + `esp.srs.s.xacc` の
+   XACC (スカラ 40bit) 系で揃える。
+2. **hwlp 終端ラベルは「含む」規約**: `esp.lp.setupi` の終端ラベルは
+   本体最後の命令の上に置く (esp-dsp f32 版 `.dotprod_loop` と同じ)。
+   本体の直後に置くと次の命令 (行カウンタ addi) がループへ取り込まれ、
+   30 行中 8 行しか処理されない。
 関連: `components/cam_tab5/bc_locate.c` 冒頭の計測コメント、コミット 242665f。
 
 ## 0. §6 解決結果 (2026-06-13、xesppie ツールチェーンで確認)
@@ -15,13 +25,14 @@
 
 - **レーン別シフト命令**: 不要だった。`esp.andq` で 0x07E0 を全レーンに
   マスクし緑フィールドを `G<<5` (=32×) のまま使う §4 案を採用。勾配 32×・
-  積 1024× を QACC に積み、抽出時 `esp.srs.s.xacc rd, 10` の算術右シフト
+  積 1024× を XACC に積み、抽出時 `esp.srs.s.xacc rd, 10` の算術右シフト
   で正確に復元 (整数和×2^10 なので丸めゼロ)。ホスト・エミュレーションで
   C 基準とビット一致を確認 (負の Sxy 含む 8 ブロック)。
-- **QACC 本数と退避/抽出**: 1 系統 (256bit, H/L)。3 和を共有できないので
-  **3 パス**構成。各パス頭で `esp.zero.qacc`、`esp.vmulas.s16.qacc q,q`
-  (内積リダクション = dsps_dotprod_s16_arp4 と同じ意味論) で積和、末尾で
-  `esp.srs.s.xacc t, t(=10)` により下位 32bit を GPR へ取り出して store。
+- **アキュムレータと退避/抽出**: reduce-sum 内積は **XACC** (スカラ 40bit、
+  実機検証で確定 — 冒頭ステータス参照)。1 本しかなく 3 和を共有できない
+  ので **3 パス**構成。各パス頭で `esp.zero.xacc`、`esp.vmulas.s16.xacc q,q`
+  (= dsps_dotprod_s16_arp4 と同じ意味論) で積和、末尾で
+  `esp.srs.s.xacc t, t(=10)` により 32bit を GPR へ取り出して store。
   ブロック 2KB は 3 パス間 L2 常駐なので追加読みは安価。
 - **アンアラインド `esp.vld.128`**: 可。cfg レジスタの bit1 を立てて有効化
   (`esp.movx.r.cfg` / `ori ,2` / `esp.movx.w.cfg`)。dsps_dotprod_s16_arp4

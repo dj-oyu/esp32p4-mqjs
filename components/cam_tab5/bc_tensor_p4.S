@@ -15,14 +15,18 @@
  * G6 extraction WITHOUT a lane-shift instruction: mask each 16-bit lane
  * with 0x07E0 (esp.andq against a splatted constant). That leaves the
  * green field as G<<5 = 32*G, so every gradient is 32x and every product
- * is 1024x. We accumulate the 1024x sums in QACC and arithmetic-right-
+ * is 1024x. We accumulate the 1024x sums in XACC and arithmetic-right-
  * shift the extracted 32-bit result by 10 (esp.srs.s.xacc, shift=10) to
  * undo it EXACTLY (the true sum is an integer; the scale is an exact
  * power of two, so >>10 loses nothing). No per-lane vector shift needed.
  *
- * QACC: the P4 has a single (256-bit, H/L) accumulator, so the three
- * sums cannot share it. We make three passes over the block's rows,
- * zeroing QACC before each and extracting the 32-bit total after. The
+ * XACC, not QACC: esp.vmulas.s16.xacc reduce-sums all 8 lane products
+ * into the scalar 40-bit XACC each MAC — the accumulator esp-dsp's
+ * dsps_dotprod_s16_arp4 uses and the one esp.srs.s.xacc extracts from.
+ * (The first cut of this kernel accumulated into QACC and extracted
+ * XACC; the boot self-check caught the mismatch on real silicon.)
+ * XACC is single, so the three sums cannot share it: three passes over
+ * the block's rows, zeroing XACC before each and extracting after. The
  * block is 2 KB and stays L2-resident across the passes, so the extra
  * memory reads are cheap; gradients are recomputed (one esp.vsub each)
  * rather than spilled to memory.
@@ -102,14 +106,17 @@ bc_tensor_block_p4:
 
     /* =============================== Sxx (pass 0) =============== */
     li      a3, 0
-    esp.zero.qacc
+    esp.zero.xacc
     li      t1, 1
     add     t2, a0, t0               /* row 1 */
 .Lrow_xx:
     mv      t3, t2                   /* left  = col 0 */
     addi    t4, t2, 4                /* right = col 2 */
     la      t5, .Lvalid
-    esp.lp.setupi  0, 4, .Lend_xx
+    /* NB: the hwlp end label is INCLUSIVE — it must sit ON the last
+       instruction of the body (esp-dsp's .dotprod_loop does the same);
+       a label placed after the body pulls the next instruction in. */
+    esp.lp.setupi  0, 4, .Lmac_xx
         esp.vld.128.ip  q2, t3, 16
         esp.vld.128.ip  q3, t4, 16
         esp.vld.128.ip  q1, t5, 16   /* per-chunk mask, auto-advance */
@@ -117,8 +124,8 @@ bc_tensor_block_p4:
         esp.andq        q3, q3, q0
         esp.vsub.s16    q4, q3, q2   /* gx*32 */
         esp.andq        q4, q4, q1
-        esp.vmulas.s16.qacc  q4, q4  /* += gx*gx (1024x) */
-.Lend_xx:
+.Lmac_xx:
+        esp.vmulas.s16.xacc  q4, q4  /* += gx*gx (1024x) */
     addi    t1, t1, 1
     add     t2, t2, t0
     li      t5, 31
@@ -128,7 +135,7 @@ bc_tensor_block_p4:
     sw      t5, 0(a2)                /* out[0] = Sxx */
 
     /* =============================== Syy (pass 1) =============== */
-    esp.zero.qacc
+    esp.zero.xacc
     li      t1, 1
     add     t2, a0, t0               /* row 1 */
 .Lrow_yy:
@@ -137,7 +144,7 @@ bc_tensor_block_p4:
     addi    t3, t3, 2                /* col 1 */
     addi    t4, t4, 2
     la      t5, .Lvalid
-    esp.lp.setupi  0, 4, .Lend_yy
+    esp.lp.setupi  0, 4, .Lmac_yy
         esp.vld.128.ip  q2, t3, 16
         esp.vld.128.ip  q3, t4, 16
         esp.vld.128.ip  q1, t5, 16
@@ -145,8 +152,8 @@ bc_tensor_block_p4:
         esp.andq        q3, q3, q0
         esp.vsub.s16    q4, q3, q2   /* gy*32 */
         esp.andq        q4, q4, q1
-        esp.vmulas.s16.qacc  q4, q4  /* += gy*gy (1024x) */
-.Lend_yy:
+.Lmac_yy:
+        esp.vmulas.s16.xacc  q4, q4  /* += gy*gy (1024x) */
     addi    t1, t1, 1
     add     t2, t2, t0
     li      t5, 31
@@ -156,7 +163,7 @@ bc_tensor_block_p4:
     sw      t5, 4(a2)                /* out[1] = Syy */
 
     /* =============================== Sxy (pass 2) =============== */
-    esp.zero.qacc
+    esp.zero.xacc
     li      t1, 1
     add     t2, a0, t0               /* row 1 */
 .Lrow_xy:
@@ -167,7 +174,7 @@ bc_tensor_block_p4:
     add     a5, t2, t0
     addi    a5, a5, 2                /* gy down = row sy+1, col 1 */
     la      t5, .Lvalid
-    esp.lp.setupi  0, 4, .Lend_xy
+    esp.lp.setupi  0, 4, .Lmac_xy
         esp.vld.128.ip  q2, t3, 16   /* gx left  */
         esp.vld.128.ip  q3, t4, 16   /* gx right */
         esp.andq        q2, q2, q0
@@ -181,8 +188,8 @@ bc_tensor_block_p4:
         esp.vld.128.ip  q1, t5, 16   /* per-chunk mask */
         esp.andq        q4, q4, q1
         esp.andq        q5, q5, q1
-        esp.vmulas.s16.qacc  q4, q5  /* += gx*gy (1024x) */
-.Lend_xy:
+.Lmac_xy:
+        esp.vmulas.s16.xacc  q4, q5  /* += gx*gy (1024x) */
     addi    t1, t1, 1
     add     t2, t2, t0
     li      t5, 31
