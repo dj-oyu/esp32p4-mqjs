@@ -1,321 +1,122 @@
-# Tab5 SSH ターミナル 設計書
+# SSH クライアントと `ssh_vt.js`
 
-Status: **Phase T3 完了・実機確認済み** (2026-06-11)。SSH ターミナルが実用速度で Tab5 で動作。
-- T1 (素朴な行端末): 実機 SSH ログイン成功。
-- T2 (VT100 パーサ+固定グリッド): SELFTEST の grid が PC 基準と完全一致、REPORT デモ目視確認。
-- T3 (描画パイプライン再設計 + 等幅フォント + pty 動的リサイズ + 画面導出ジオメトリ):
-  等幅セル描画 (HackGen 9x24、グリフ直接ブリット、バッファスクロール) で**実機が軽快に**。
-  80x33 ジオメトリは画面から導出 (向き非依存)、pty も wolfSSH_ChangeTerminalSize で追従。
-  **実機 SSH で `whoami`/`date` 実行・出力をユーザー確認** (2026-06-11)。
-  タッチ検出リトライで暗転 (パネル誤判定) も解消。
-- 残: 実機で `stty size`=33 と TUI (vim/htop) の最終目視は任意の追加確認。
-対象: M5Stack Tab5 (ESP32-P4 + C6 WiFi)。ユーザー目標「JS でターミナルエミュレータ」の本命。
+Tab5 は、C の wolfSSH client と JS の terminal emulator を組み合わせて SSH
+クライアントとして動作します。暗号、socket、session task は C が担当し、
+画面、VT parser、タブ、入力処理は更新可能な mqjs app が担当します。
 
-## 0. ゴール / 非ゴール
+実用 app は [`examples/ssh_vt.js`](../examples/ssh_vt.js) です。
 
-**ゴール**
+## アーキテクチャ
 
-- Tab5 が**本物の SSH クライアント**になり、LAN 上のサーバのシェルに繋がる
-- JS だけでターミナル UI を実装できる (グリッド描画・キーボード入力・VT 解釈は JS、
-  暗号と通信は C の `ssh.*`)
-- Tab5 UI Phase 4a (`ui.keyboard` / `ui.onKey` / `ui.textSize`) の上に乗る
-- Stamp-P4 ビルドへの影響ゼロ (SSH は `CONFIG_MQJS_SSH` オプトイン)
-
-**非ゴール (v1)**
-
-- 公開鍵認証 (v1 はパスワードのみ。鍵は後続)
-- ホスト鍵の検証・TOFU 保存 (v1 は accept-any + fingerprint をログ)
-- 複数同時セッション (1 本のみ)
-- 完全な VT100/xterm エミュレーション (JS 側で段階的に。T1 は印字 + 改行 + BS)
-
-## 1. 技術スタック (確定)
-
-```
-JS (examples/ssh_term.js)   端末本体: グリッド状態・VT パース・ui.* 描画・ui.onKey
-  ssh.connect/write/resize/close + ssh.onData/onClose   ← device_stdlib.c に追加
-───────────────── ここまで JS。下は C ─────────────────
-components/sshc/sshc.c   wolfSSH セッションタスク (socket + WOLFSSH を専有)
-wolfSSL/wolfSSH          レジストリ部品 wolfssl/wolfssh + wolfssl/wolfssl
-LWIP                     TCP
+```mermaid
+flowchart LR
+    App["ssh_vt.js"] -->|"ssh.write / resize"| Runtime["mqjs runtime"]
+    Runtime --> Session["sshc session task"]
+    Session --> Server["SSH server"]
+    Server --> Session
+    Session -->|"EV_SSH_DATA / CLOSED"| Runtime
+    Runtime --> App
+    App -->|"ui.cells / scroll"| UI["Tab5 Canvas"]
 ```
 
-### 選定理由
+各 SSH session は独立した task、socket、wolfSSH state、送信 buffer を持ちます。
+session data は mqjs event queue を経由して、session を所有する app へ配送されます。
 
-- **wolfSSH vs libssh2**: libssh2 の mbedTLS バックエンドは IDF 6 の **mbedTLS 4
-  (PSA)** でレガシー crypto API が消えて動かない。wolfSSH は自前 crypto
-  (wolfCrypt) を持ちレジストリ部品として配布されているので IDF6 に一番素直。
-- **ホスト鍵 ECC/ed25519**: P4 では wolfSSL の `MY_USE_RSA=0` がデフォルト
-  (user_settings.h)。host key は ECC/ECDSA/ed25519 のみ。RSA-only の古い
-  サーバには現状繋がらない (必要なら RSA を有効化する)。
+## JavaScript API
 
-## 2. アーキテクチャ (既存の不変条件を踏襲)
-
-```
-js_task (Core0)                         ssh_task (専用, prio 5, 8KB stack)
-  ssh.connect() ──spawn──────────────►  socket → wolfSSH handshake → pty+shell
-  ssh.write(s) ──StreamBuffer(2KB)───►  wolfSSH_stream_send
-  ssh.onData(fn) ◄─EV_SSH_DATA──heap──  wolfSSH_stream_read (50ms recv tmo)
-  ssh.onClose(fn)◄─EV_SSH_CLOSED──────  終了時に必ず 1 回
-  ssh.resize(c,r)─volatile flag──────►  wolfSSH_ChangeTerminalSize
-```
-
-**不変条件 (gpio/mqtt/touch と同型)**
-
-1. JS コンテキストに触れるのは js_task のみ。ssh_task → JS は既存の MqjsEvent
-   キュー (EV_SSH_DATA / EV_SSH_CLOSED) 経由。
-2. タスク間で渡す文字列は必ず heap コピー (受信データ) か値型 (StreamBuffer)。
-3. ssh セッションが生きている間はイベントループが終了しない
-   (`mqjs_ssh_active()` を `anything_pending()` が見る。mqtt と同じ作法)。
-4. スクリプト入れ替え (`reset_slots`) で `mqjs_ssh_close()` を呼びセッション破棄。
-
-**RX のバックプレッシャ**: 端末出力は落とせない (画面が壊れる) ので、
-`mqjs_post_ssh_data()` は満杯時 100ms ブロックしてから諦める (TCP が上流を
-止める)。touch/key の「満杯なら捨てる」とは逆の方針。諦めたらセッションを切る。
-
-## 3. JS API (device_stdlib.c の `ssh` オブジェクト)
+現在の API はすべて session ID を第 1 引数に取ります。
 
 | API | 説明 |
 |---|---|
-| `ssh.connect(host, port, user, pass[, cols, rows])` | セッションタスク起動 (非ブロッキング)。二重接続は例外 |
-| `ssh.write(str)` | キー入力をサーバへ。戻り値 1=投函成功 0=tx バッファ満杯 |
-| `ssh.resize(cols, rows)` | pty サイズ変更 (非同期)。**組込み設定では現状 no-op** (下記 §5.7) |
-| `ssh.close()` | セッション破棄 (タスク終了まで bounded ブロック) |
-| `ssh.connected()` | シェル確立後 1、それ以外 0 |
-| `ssh.onData(fn)` | `fn(chunk)` サーバ出力 (UTF-8 文字列、生バイト列) |
-| `ssh.onClose(fn)` | `fn(reason)` 終了通知 ("remote closed" / "auth/handshake failed" 等) |
+| `ssh.connect(host, port, user, pass[, cols, rows])` | 非同期接続を開始し session ID を返す |
+| `ssh.write(id, str)` | server へ送信する |
+| `ssh.resize(id, cols, rows)` | pty size を変更する |
+| `ssh.close(id)` | session を閉じる |
+| `ssh.connected(id)` | shell 接続済みなら true |
+| `ssh.onData(id, fn)` | `fn(chunk)` を登録する |
+| `ssh.onClose(id, fn)` | `fn(reason)` を登録する |
 
-PC ビルドでは全て print スタブ (接続しない)。画面なし機体でも同じスクリプトが
-走る (onData/onClose は登録のみ)。
+```js
+var id = ssh.connect("192.168.1.10", 22, "user", "password", 80, 24);
 
-## 4. フェーズ計画
+ssh.onData(id, function (chunk) {
+    print(chunk);
+});
 
-| Phase | 内容 | 受け入れ基準 |
-|---|---|---|
-| **T0. スパイク** (T1 に統合) | wolfSSH × IDF6 ビルド検証 | wolfssl/wolfssh が IDF 6.0.1 で通る |
-| **T1. 接続 + 素朴な端末 ✅** (2026-06-11 実機確認済み) | sshc セッションタスク、ssh.* バインディング、examples/ssh_term.js (印字+改行+BS の行バッファ) | JS だけで SSH シェルに繋ぎ、コマンド出力が画面に流れる (実機ログイン成功) |
-| **T2. VT100 パーサ ✅** (2026-06-11 実機確認済み) | `examples/ssh_vt.js`: 80x24 セルグリッド + エスケープ状態機械 (チャンク跨ぎ)。CSI カーソル移動 (A/B/C/D/G/d/H/f)、消去 (J/K)、SGR 16 色+bold+inverse、スクロール領域 (r)、行/文字 挿入削除 (L/M/P/@)、ESC index/reverse-index/save-restore。固定セル幅でグリッド描画、行ダーティ + **コマンド予算制フラッシュ** (~40fps, 1 tick ≤110 コマンドで深さ 128 のキュー溢れ=描画ドロップを回避) | JS だけで色付きターミナルが動く (実機確認済み) |
-| **T3. 仕上げ** | **横画面化 or 小フォントで 80 桁を全部出す** (実機実測で 1 桁 16px → 720px に 45 桁しか入らない、§4b)、制御キー行 (Esc/Tab/Ctrl/矢印) をキーボードに追加、ホスト鍵 TOFU 保存、公開鍵認証、接続情報の設定 UI | 実用的に使える |
+ssh.onClose(id, function (reason) {
+    print("closed:", reason);
+});
 
-### 4c. 描画パイプライン再設計 (Phase T3, 2026-06-11)
+var wait = setInterval(function () {
+    if (ssh.connected(id)) {
+        clearInterval(wait);
+        ssh.resize(id, 80, 30);
+        ssh.write(id, "uname -a\n");
+    }
+}, 100);
+```
 
-per-cell `ui.text` は重すぎた (グリフ毎に `lv_draw_label` レイヤを起こす →
-全画面 ~1000 サイクル/フレーム + スクロール毎の全面再描画)。**等幅セルグリッド
-パイプライン**に作り直した:
+session は全 app 合計で最大 3 本です。古い session ID は世代番号で検出され、
+別 session を誤操作しません。
 
-- **等幅フォント** `fonts/font_term_mono.c` = HackGen Console (size17 bpp4,
-  ASCII + 罫線/ブロック)。**9x24 セル → 720px に 80 桁**ぴったり (クリップ無し)。
-  proportional な Noto を縮小するのではなく、端末用の monospace を別途積んだ。
-- **C プリミティブ** (`ui_tab5` の CanvasApp):
-  - `ui.cells(col,row,str,fg,bg)` — 等幅グリフを **生 4bpp ビットマップから
-    直接 RGB565 へ fg/bg ブレンド** (lv_draw_label を通さない)。セルにクリップ
-    するので罫線のはみ出し (box_w 最大 11) もタイリングで繋がる。
-  - `ui.scroll(top,bot,n,bg)` — バッファを memmove (**O(1)、全面再描画が消える**)。
-  - `ui.cellSize()` — セル寸法を JS に公開。
-- **JS** はダーティ行を同色ランに分けて `ui.cells` (白文字行なら 1 行 = 1 命令)、
-  scrollUp/Down を `ui.scroll` に。**全画面 ~24-50 命令 / スクロール 1 命令**
-  (旧 ~1000)。実機でスムーズになったとユーザー確認。
-- **グリフ取得の罠**: 公開 `lv_font_get_glyph_bitmap()` は呼ぶ前に
-  `req_raw_bitmap` を 0 に戻し、A8 デコードのため渡した NULL draw_buf を
-  参照 → load fault。`resolved_font->get_glyph_bitmap()` を直接呼ぶ。
-  4bpp は行パディング無しの連続ビットストリーム・MSB ニブル先 (ホスト検証
-  `fonts/decode_test.py`)。
-- **テスト手順** (重要、[[test-new-modules-in-isolation]]): 新プリミティブは
-  ① ホストでビット詰め検証 → ② `examples/cells_test.js` で最小デバイススモーク
-  (端末抜き) → ③ 全統合、の順。いきなり UI 経由で実機テストして crash-loop
-  させたのが教訓。
+## `ssh_vt.js` の機能
 
-### 4d. 桁数/行数は画面から導出 (向き非依存, T3)
+- 保存済み host の一覧と接続 form
+- 最大 3 session の同時接続と canvas 上のタブ切替
+- VT100 系の cursor、erase、SGR 16 色、scroll region など
+- `ui.cells()` と `ui.scroll()` による高速な 80 桁描画
+- screen size と keyboard 高さから terminal geometry を導出
+- pty resize
+- Esc、Tab、Ctrl、Alt、Fn、矢印、F1–F12 の control bar
+- 長押し選択による clipboard copy
+- bracketed paste
 
-桁数・行数をハードコードせず `ui.size()` / `ui.cellSize()` から導出する
-(`COLS = W/CW`, `ROWS = (H - キーボード高)/LH`)。**pty もその値に
-`wolfSSH_ChangeTerminalSize` で合わせる**ので、サーバが画面ぴったりの行数を使う。
-向き・解像度・キーボード高が変わっても、また将来 横画面化 (1280幅 → 142桁) しても
-グリッドと pty が自動追従する。現状: ポートレート + キーボード常時表示で 80x33。
+背景タブは pixel buffer を持ちません。terminal model と SSH connection だけを
+保持し、foreground へ戻ったときに model から再描画します。これは app 全体の
+foreground/background ライフサイクルと同じ考え方です。
 
-**wolfSSH_ChangeTerminalSize の有効化** (§5.8): `SendChannelTerminalResize` は
-ウィンドウ変更パケットを送るだけだが `!NO_FILESYSTEM` でゲートされ未コンパイル
-だった。`components/sshc/wolfssl_override/user_settings.h` が managed user_settings
-を `#include_next` してから `NO_FILESYSTEM` を undef (+ termios コードを切るため
-`NO_TERMIOS` を define)、root CMakeLists が wolfssl/wolfssh/sshc の include パス
-先頭に差し込む。`-Wno-error=maybe-uninitialized` も追加 (有効化で露出する upstream 警告)。
+## 保存とクリップボード
 
-### 4b. 旧メモ (Phase T2, per-cell ui.text。T3 で置換済み)
+host 情報は `store` に JSON として保存します。現在は password も平文で NVS に
+保存されるため、信頼できる端末として扱ってください。
 
-- per-cell `ui.text` 時代は実機 45 桁・スクロール全面再描画でコマンド予算制が
-  必須だった。T3 (§4c) でセルグリッド化して解消。
-- **検証/デモ用フラグはコメントを 1 行に**。`var REPORT = false; /* ... */` の
-  コメントを複数行にすると、push 時に `sed` でフラグを書き換えた瞬間に
-  2 行目以降が宙に浮いて `SyntaxError` → 永続タスクが毎秒リスタートする
-  ループになった (フリーズではない。シリアルログで一発判明)。
-- **シリアル接続自体がリブートを起こす**。Tab5 の COM8 を開くと
-  `CHIP_USB_UART_RESET` で再起動する (= 画面が一瞬暗転)。デバッグ中の
-  「暗転」「ソフトリセット」はこれが原因で、JS タスクのクラッシュではない。
-  実行中の表示を見たいときはシリアルを開かない。
-- **JS の `mqtt.*` はタスク配信クライアントと client-id が衝突**しうる
-  (両方デフォルト ID)。自己検証の結果報告に JS mqtt を使うと publish が
-  不安定。代わりに SELFTEST モードの `print()` を COM8 シリアルで読むのが
-  確実 (実機エンジンの grid を PC 基準と突き合わせられる)。
+clipboard は system 共有値です。
 
-## 5. wolfSSH × IDF 6 のハマりどころ (T1 で解決)
+```js
+var clip = clipboard.get();
+if (clip && clip.type === "text/plain") {
+    ssh.write(id, clip.data);
+}
+```
 
-1. **wolfSSL 5.8.2 の `esp_sdk_mem_lib.c` が C23 予約語 `thread_local` を
-   enum メンバ名に使う**。IDF 6 は `-std=gnu23` でコンパイルするため
-   `expected identifier before 'thread_local'` で落ちる。対策: プロジェクト
-   ルートの CMakeLists.txt で wolfssl/wolfssh コンポーネントだけ
-   `-std=gnu17` を追記 (GCC は最後の -std が勝つ。C17 では `thread_local`
-   は予約語でない)。Stamp/Tab5 両方に効く。
-2. **wolfssh の REQUIRES が `wolfssl` (素の名前) を要求**。idf_component.yml に
-   `wolfssl/wolfssl` を明示依存として足す (wolfssh だけだと
-   「unknown component 'wolfssl'」)。
-3. **user_settings.h は managed のものを使う**。`components/wolfssl/` を作ると
-   wolfssl の CMakeLists が「managed と両方ある」とエラーにする。プロジェクト
-   コピーは置かない。wolfSSH の有効化は `CONFIG_ESP_ENABLE_WOLFSSH=y`
-   (WOLFSSH_TERM 等を user_settings が有効化)。
-4. **RSA スタック #warning が -Werror=cpp で fatal**。SSH は専用 8KB タスクで
-   走り main タスクスタック (3.5KB) は無関係なので
-   `CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y` で黙らせる。
-5. **コンシューマ側 (sshc.c) は `WOLFSSL_USER_SETTINGS` を define** してから
-   `<wolfssh/ssh.h>` を include する。これが無いと ssh.h が
-   `wolfssl/options.h` (生成されない) を探して fatal。
-6. **mqjs ↔ sshc の循環依存回避**: mqjs が sshc.h に依存するので、sshc は
-   mqjs を REQUIRES せず `mqjs_post_ssh_data/_closed` を extern 宣言で呼ぶ
-   (ui_tab5 / wifi.c と同じ流儀)。
+`clip_mirror.js` を起動すると clipboard を MQTT 経由で別端末と同期できます。
+ブローカーが停止していても、ローカル clipboard と SSH は動き続けます。
 
-7. **pty サイズは 80x24 固定 (T1 の制約)**。`NO_FILESYSTEM` 設定では
-   `wolfSSH_ChangeTerminalSize` がコンパイルされず、クライアントの pty-req
-   も `GetTerminalInfo()` が termios を持たないため既定の 80x24 を送る。
-   よって `ssh.resize()` は現状 no-op、`ssh.connect()` の cols/rows も
-   プロトコル上は無視される。JS 端末はグリッドを 80x24 に固定して
-   サーバの stty と合わせる (examples/ssh_term.js)。可変サイズは T3 で
-   wolfSSL 設定を見直す (filesystem スタブ or 別 API)。
+## セキュリティ上の制約
 
-これらの設定はマシンローカルの sdkconfig.tab5.defaults と、コミットされる
-ルート CMakeLists.txt / components/sshc/ に入っている。
+- password 認証のみ。
+- host key を検証しないため、中間者攻撃を防げない。
+- password は保存時に暗号化されない。
+- 信頼できる LAN 内での利用を前提とする。
 
-## 6. セキュリティ注記
+公開ネットワークで使う前に、host key 検証と安全な credential 保存が必要です。
 
-- v1 はホスト鍵を**検証しない** (中間者攻撃に無防備)。信頼できる LAN 内専用。
-  fingerprint はシリアルログに出る。T3 で TOFU 保存を入れる。
-- パスワードは ssh.connect の引数として JS ソースに書く想定。タスクは署名付きで
-  push される (Ed25519 ゲート) ので配送経路は保護されるが、LittleFS 上の
-  task.js は平文。本番運用では公開鍵認証 (T3) に移行すべき。
+## リソースとバックプレッシャ
 
-## 7. 入力・クリップボード・システムパネル設計 (T3a-c + P4、2026-06-11 合意)
+- session 上限は全 app 合計 3。
+- 各 session は専用 task、socket、wolfSSH state、2 KiB TX buffer を持つ。
+- RX event queue が詰まると短時間待ち、terminal output の破損を避ける。
+- app が停止すると、その app が所有する session だけを閉じる。
+- app が background でも接続と受信は継続する。
 
-ユーザーと詰めた次フェーズの設計。**方針: キーボード/パネルは汎用キートークン源 +
-システム UI(C)、端末や app の意味付けは JS(push 可能)。**
+## トラブルシュート
 
-### キートークン規約 (キーボード → JS `ui.onKey`)
-- 印字キー → そのままのバイト ("a", "あ")
-- 特殊キー → `"\x00name"` センチネル (NUL 始まり)。
-  `esc tab ctrl alt fn f1..f12 up down left right home end pgup pgdn del ins copy paste`
-- C 側は「ボタン → トークン」対応を持つだけ。端末の意味は全部 JS で解釈。
+| 症状 | 確認する点 |
+|---|---|
+| `ssh.connect` が失敗する | session 上限、host、port、password、server の host key algorithm |
+| terminal が崩れる | server/app が未対応の escape sequence を出していないか |
+| 描画が遅い | `ui.text` の per-cell 描画ではなく `ui.cells` を使っているか |
+| `stty size` が合わない | `ssh.resize(id, cols, rows)` が呼ばれているか |
+| 接続後すぐ閉じる | serial log の wolfSSH handshake/auth reason を確認 |
 
-### T3a: コントロールバー + 特殊/修飾キー (価値最大、Tab 補完解禁)
-
-**実装済み 2026-06-11** (実機目視は次の flash で):
-- `ui.keyboard(mode)`: 0=隠す / 1=キーボード / 2=キーボード+control bar。
-  返り値 = 画面下部の予約高さ px (0/400/480) — ssh_vt は
-  `KB_H = ui.keyboard(2)` で問い合わせてグリッドを導出 (§4d の
-  ハードコード排除を維持。80×28 になる)。
-- control bar (`lv_buttonmatrix`, ui_tab5.cpp):
-  `[Esc][Tab][Ctrl][Alt][Fn][←][↓][↑][→][Copy][Paste]`、Fn でバーが
-  F1-F12 マップに切替 (C ローカル、トークンなし)。ボタンは
-  `"\x00name"` トークンを `mqjs_post_key` で送るだけ (C 文字列では
-  `"\0esc"` — `\x00e` は hex エスケープが 'e' を食うため octal で書く)。
-- **修飾キーは one-shot sticky** (押した次の 1 キーだけ効く、再タップで
-  解除)。JS (ssh_vt) の `ui.onKey` 状態機械で変換: Ctrl → `c & 0x1F`
-  (Ctrl+Space=NUL)、Alt → `"\x1b" + c`。F キー/矢印/Home… は xterm
-  シーケンス表 TOKSEQ。武装中はタブバー右端に CTRL/ALT バッジ。
-- Paste = `ssh.write(clipboard.get().data)` (P4d の最初の消費者)。
-  Copy は選択 UI (T3b) まで通知のみ。
-- **Tab 補完はこれだけで使える** (Tab=`\t` をサーバへ送るだけ、補完はサーバ側
-  readline、結果は既存 VT パーサが描画)。受信 `\t` のタブストップ8展開を
-  `feed()` に足すかは任意。
-
-### T3b: コピー&ペースト — **実装済み 2026-06-11** (選択の実機目視は残)
-- **クリップボードは型付き・システム共有の C プリミティブ** (層1):
-  `clipboard.set(data, type)` / `clipboard.get()` → `{data, type}` /
-  `clipboard.onChange(fn)`。JS コンテキスト外の C バッファなのでタスク切替を
-  跨いで生存、将来のマルチタスクで全 app が共有 = **アプリ間 IPC の最初の一手**。
-  型 (`text/plain` `text/csv` `application/json` `number` …) で受け手が判別。
-  → **層1 = P4d 実装済み** (`docs/launcher-multiapp-design.md` §7:
-  NVS 永続 / EV_CLIP setter 除外 / onChange(data, type))。
-- **選択 (実装済み)**: 端末領域 500ms 長押しで選択モード、ドラッグで
-  読み順セル範囲 (単色反転ハイライト)、離した瞬間にグリッドモデルから
-  抽出 (行毎 trimEnd) → `clipboard.set(text, "text/plain")` + 通知。
-  受信出力に上書きされたハイライトは flush 間隔 (25ms) の再適用で
-  自己修復。12px 以上動いたら長押しキャンセル。短タップ = キーボード
-  呼び戻し (従来) は up 時判定に移動。Copy ボタンは使い方ガイド通知に
-  変更 (選択即コピー方式のため)。
-- **Paste (実装済み)**: `ssh.write(clipboard.get().data)`。パーサが
-  DECSET/DECRST **?2004** を追従し、宣言サーバには `\x1b[200~`…`\x1b[201~`
-  で囲んで送る (SELFTEST に bracketed=false/true/false を追加)。
-- **MQTT ミラー (層2、実装済み) = examples/clip_mirror.js** (API に
-  焼き込まず外付け、@app 配布)。`clipboard.onChange→publish retained` /
-  `subscribe→clipboard.set`。echo は sender ID (`store` 永続の乱数 id) で
-  無視、受信・送信とも同一値スキップの冪等ガード (EV_CLIP は latest-wins
-  なので連続 set は同じ最終値を複数回見せてくる)。ローカルファースト:
-  ブローカー不在時は `mqtt.connected()` ゲートで黙ってローカル動作。
-  **リモート実機検証済み 2026-06-11**: PC→デバイス (retained csv →
-  boot-get=text/csv) / デバイス→PC (probe set → retained mirror publish)
-  / echo ループなし。注意: 受信ペイロード上限 4096B — 4000B 級クリップは
-  JSON の包みで超えて同期が落ちうる (割り切り)。
-
-### T3c: キーボード背面の隠し stats パネル (C 所有、実装 + 実機確認済み 2026-06-12)
-
-**コンセプト (ユーザー発案)**: キーボードを「持ち上げると裏に計器盤がある」
-物理メタファ。キーボードを出すアプリ = 長時間セッション (端末) なので、
-一休みと本体の安定性確認のための隠し要素として置く。ステータスバーと
-同格の C 所有システム UI。アプリは関与しない (JS API 追加なし)。
-
-- **キーボード状態機械** (C 側、ui.keyboard の mode に直交):
-  `SHOWN / COLLAPSED / OFF` の 3 状態。
-  - キーボードの「閉じる」キー → **COLLAPSED**: 同じ予約領域 (480px)
-    に stats パネルが現れる。**端末グリッドは不変** — アプリは再レイアウト
-    不要で、一休み中も出力は流れ続ける。
-  - パネルの ⌨ ボタン / 端末領域タップ (既存の呼び戻し) → SHOWN。
-  - アプリの `ui.keyboard(0)` / UI_CMD_RESET (アプリ切替) → **OFF**
-    (パネルも出ない — ページ系アプリの邪魔をしない)。
-- **内容** (720×480 を左右分割、1 秒更新の LVGL タイマー):
-  - 左 = stats: 前面アプリ名 / uptime / heap 3 種 (internal・PSRAM・
-    LVGL プール) / WiFi SSID・RSSI・IP / MQTT 状態。ui_status スナップ
-    ショット + heap_caps 直読み。
-  - 左下 = **クリップボードプレビュー** (型 + 先頭 ~80 文字)。P4d の
-    C バッファを LVGL タスクから覗くため、mqjs_runtime に
-    `mqjs_clipboard_peek()` (mutex 保護) を追加 — set/peek だけ守る
-    小ロック。型は extern 宣言流儀 (sshc と同じ、循環依存回避)。
-  - 右 = **明るさ lv_arc ダイヤル**: 中央 % 表示 + 5% スナップ +
-    `[−][+]` nudge → `backlight_set()` 直結。相対ドラッグ + 吸着で
-    絶対位置ジャンプを回避。**音量ダイヤルは枠だけ先行** (コーデック
-    未駆動、駆動は後続)。
-- 配色 = システム暗色パレット (UI_COL_*)。
-
-### Phase 4: マルチタスク + ランチャー + app-store (別スコープ・大改修)
-ビジョン: MQTT broker を app-store 化し、複数 mquickjs app をマルチタスク
-(例: SSH + 関数電卓 + CSV 可視化 を同時起動、電卓の結果を SSH 編集に使い、
-SSH で取った CSV を可視化に渡す)。要素:
-- 複数 JS コンテキスト/タスクの同時実行 (今は 1 タスクずつ。メモリ予算 256KB×1
-  を分割 or 動的)。
-- mooncake ランチャーで画面スロット切替 (設計書 §6 の構想)。
-- MQTT トピック = アプリ ID。app-store 化したら topic → manifest(name/icon/権限)。
-- IPC バス = 型付きクリップボード (層2 ミラー) を皮切りにローカル MQTT トピック。
-
-### 7.1 原則: ローカルファースト、ブローカーは日和見 (2026-06-11)
-
-MQTT ブローカーは PC 上で動いており **24/365 ではない**。よって **Tab5 は
-ブローカー無しで完結して動く**こと。MQTT は「アプリ配信 + クロスデバイス同期」
-専用で、動作の必須依存にしない。
-
-クリップボードの「残す範囲」を 3 分離し、ブローカー依存を最小化:
-- **タスク切替を跨ぐ**: C の RAM バッファ (層1)。ブローカー非依存。
-- **再起動後も残す**: **ローカル NVS/LittleFS に永続化**。retained MQTT には
-  頼らない (ブローカーが落ちてると消えるため)。ブローカー非依存。
-- **別デバイスと共有**: MQTT ミラー (層2)。ブローカーが居るときだけの日和見同期。
-  落ちていれば静かにローカルのみで動き、復帰時に再同期 (echo 無視 + 接続状態で
-  best-effort)。
-
-アプリ配信も同原則: タスクは MQTT で push されるが受理後 LittleFS に永続化され、
-ブローカーが落ちても単独で走る。Phase 4 のマルチタスク/ランチャーも
-「**アプリはローカル永続、ブローカーは配信/更新時だけ**」を貫く。将来 常時起動の
-ブローカー (home server 等) に移せば層2の信頼性は上がるが、設計はそれを前提にしない。
+PC 上で parser だけを確認するときは、`ssh_vt.js` の `SELFTEST` モードを使えます。
