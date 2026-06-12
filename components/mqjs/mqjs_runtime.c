@@ -1182,7 +1182,7 @@ JSValue js_ui_cellSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
    Private-use/Nerd Font glyphs intentionally remain width 1. */
 JSValue js_ui_cellWidth(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    int32_t v;
+    int v; /* JS_ToInt32 takes int* — int32_t is long on riscv32 */
     if (JS_ToInt32(ctx, &v, argv[0]))
         return JS_EXCEPTION;
     uint32_t cp = (uint32_t)v;

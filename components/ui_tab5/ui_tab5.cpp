@@ -2252,8 +2252,8 @@ extern "C" void ui_tab5_start(void)
 
 /* ---- camera viewfinder overlay (cam_tab5) ----
    An lv_canvas on the top layer whose RGB565 buffer the cam_scan task
-   writes downscaled frames into. Created once and kept (460KB PSRAM
-   for 640x360); hidden between scans. All entry points take the LVGL
+   writes final-size frames into. Created once and kept (960KB PSRAM
+   for 600x800); hidden between scans. All entry points take the LVGL
    port lock — they are called from the cam_scan task. */
 static lv_obj_t *s_cam_cv;
 static uint16_t *s_cam_cv_buf;
@@ -2273,15 +2273,17 @@ void *ui_tab5_cam_canvas(int w, int h)
         if (s_cam_cv_buf) {
             lv_canvas_set_buffer(s_cam_cv = lv_canvas_create(lv_layer_top()),
                                  s_cam_cv_buf, w, h, LV_COLOR_FORMAT_RGB565);
-            /* small buffer (PPA-pixel-rate economy on the scan side),
-               displayed 2x — the transform renders on the LVGL task */
-            lv_image_set_pivot(s_cam_cv, 0, 0);
-            lv_image_set_scale(s_cam_cv, 512);
+            /* 1:1 presentation: the PPA already produced the final
+               on-screen size (cam_tab5 PV_SCALE). The earlier
+               lv_image_set_scale(512) 2x path made LVGL bilinear-
+               resample the whole window per frame on the CPU — that
+               WAS the sluggish viewfinder (UserDemo pattern: hardware
+               makes the pixels, LVGL only blends them). */
             lv_obj_align(s_cam_cv, LV_ALIGN_TOP_LEFT,
-                         (UI_LCD_H_RES - w * 2) / 2, UI_STATUSBAR_H + 24);
+                         (UI_LCD_H_RES - w) / 2, UI_STATUSBAR_H + 24);
             lv_obj_set_style_border_width(s_cam_cv, 2, 0);
             lv_obj_set_style_border_color(s_cam_cv, lv_color_hex(0x2ECC71), 0);
-            s_cam_cv_h = h * 2;
+            s_cam_cv_h = h;
         }
     }
     if (s_cam_cv)

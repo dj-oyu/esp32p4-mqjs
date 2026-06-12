@@ -452,12 +452,17 @@ static bool mid_blit(const uint16_t *px)
 }
 
 /* Viewfinder = the rotated analysis image (sensor sits 90° to the
- * portrait panel; mirror keeps selfie-natural aiming). 300x400 in the
- * buffer, displayed 2x by LVGL on the other core. */
-#define PV_W MID_H /* 300 */
-#define PV_H MID_W /* 400 */
-/* viewfinder = rotate the (already half-res) s_mid; the rotated read
- * pattern only touches 0.96MB now instead of the full frame */
+ * portrait panel; mirror keeps selfie-natural aiming). The PPA scales
+ * it to the FINAL on-screen size (600x800) here, so LVGL blends the
+ * canvas 1:1 — its software bilinear transform (lv_image_set_scale)
+ * was the viewfinder bottleneck: per-pixel CPU resampling of the whole
+ * window on every frame (UserDemo does the same: PPA makes the pixels,
+ * LVGL only presents them). PPA cost is INPUT-pixel bound, and the
+ * input (s_mid 400x300) is unchanged — only the PSRAM write grows. */
+#define PV_SCALE 2
+#define PV_W (MID_H * PV_SCALE) /* 600 */
+#define PV_H (MID_W * PV_SCALE) /* 800 */
+/* viewfinder = rotate + 2x upscale of the (already half-res) s_mid */
 static bool preview_blit(uint16_t *dst)
 {
     ppa_srm_oper_config_t srm = {
@@ -483,8 +488,8 @@ static bool preview_blit(uint16_t *dst)
         /* 270 + mirror == the transpose the user approved; 90 showed
            the world upside down (PPA's rotation sense vs our math) */
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
-        .scale_x = 1,
-        .scale_y = 1,
+        .scale_x = PV_SCALE,
+        .scale_y = PV_SCALE,
         .mirror_x = true,
         .mirror_y = false,
         .rgb_swap = false,
@@ -496,12 +501,14 @@ static bool preview_blit(uint16_t *dst)
 
 /* ---- viewfinder overlay drawing (into the preview RGB565 buffer,
  * after the PPA blit so it survives exactly one frame) ----
- * Geometry: preview = transpose of the frame at 1/2 scale, so a frame
- * point (col=cx, row=ry) lands at preview (x=ry/2, y=cx/2). A frame-ROW
- * scanline therefore shows as a VERTICAL preview segment and a frame-
- * COLUMN scanline as a horizontal one. The "underline" sits 6px beside
- * the scanline; the leader (ひげ線) runs to the bottom edge where the
- * telemetry label box hangs. */
+ * Geometry: preview = transpose of the frame at PV_SCALE/2 scale (the
+ * crop is half-res in s_mid, the PPA doubles it back), so a frame point
+ * (col=cx, row=ry) lands at preview (x=PV_MAP(ry-CROP_Y),
+ * y=PV_MAP(cx-CROP_X)). A frame-ROW scanline therefore shows as a
+ * VERTICAL preview segment and a frame-COLUMN scanline as a horizontal
+ * one. The "underline" sits beside the scanline; the leader (ひげ線)
+ * runs to the bottom edge where the telemetry label box hangs. */
+#define PV_MAP(v) ((v) * PV_SCALE / 2)
 #define PV_GREEN 0x07E0
 #define PV_AMBER 0xFE60
 
@@ -519,9 +526,11 @@ static void pv_seg(uint16_t *pv, int x0, int y0, int x1, int y1, uint16_t c)
     int sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
     for (;;) {
-        pv_px(pv, x0, y0, c);
-        pv_px(pv, x0 + 1, y0, c); /* 2px thick */
-        pv_px(pv, x0, y0 + 1, c);
+        /* ~3px thick: the buffer is 1:1 on screen now (was displayed
+           2x), so the old 2px stroke would look half as bold */
+        for (int ty = 0; ty <= PV_SCALE; ty++)
+            for (int tx = 0; tx <= PV_SCALE; tx++)
+                pv_px(pv, x0 + tx, y0 + ty, c);
         if (x0 == x1 && y0 == y1)
             break;
         int e2 = 2 * err;
@@ -543,8 +552,8 @@ static void pv_seg(uint16_t *pv, int x0, int y0, int x1, int y1, uint16_t c)
  * coordinates simply clip at the preview edges) */
 static void draw_region(uint16_t *pv, const bc_region_t *rg)
 {
-    int px0 = (rg->y0 - CROP_Y) / 2, px1 = (rg->y1 - CROP_Y) / 2 - 1;
-    int py0 = (rg->x0 - CROP_X) / 2, py1 = (rg->x1 - CROP_X) / 2 - 1;
+    int px0 = PV_MAP(rg->y0 - CROP_Y), px1 = PV_MAP(rg->y1 - CROP_Y) - 1;
+    int py0 = PV_MAP(rg->x0 - CROP_X), py1 = PV_MAP(rg->x1 - CROP_X) - 1;
     pv_seg(pv, px0, py0, px1, py0, PV_CYAN);
     pv_seg(pv, px0, py1, px1, py1, PV_CYAN);
     pv_seg(pv, px0, py0, px0, py1, PV_CYAN);
@@ -554,9 +563,10 @@ static void draw_region(uint16_t *pv, const bc_region_t *rg)
 static void draw_overlay(uint16_t *pv, const FrameHit *hit)
 {
     uint16_t col = hit->kind == 2 ? PV_GREEN : PV_AMBER;
-    /* same transpose + crop mapping; underline shifted 6px */
-    int x0 = (hit->ay - CROP_Y) / 2 + 6, y0 = (hit->ax - CROP_X) / 2;
-    int x1 = (hit->by - CROP_Y) / 2 + 6, y1 = (hit->bx - CROP_X) / 2;
+    /* same transpose + crop mapping; underline shifted beside the line */
+    int off = 6 * PV_SCALE;
+    int x0 = PV_MAP(hit->ay - CROP_Y) + off, y0 = PV_MAP(hit->ax - CROP_X);
+    int x1 = PV_MAP(hit->by - CROP_Y) + off, y1 = PV_MAP(hit->bx - CROP_X);
     pv_seg(pv, x0, y0, x1, y1, col);
     pv_seg(pv, (x0 + x1) / 2, (y0 + y1) / 2, PV_W / 2, PV_H - 2,
            col); /* ひげ線 → ラベルへ */
