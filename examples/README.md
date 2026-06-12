@@ -129,8 +129,10 @@ clipboard.onChange(function (data, type) {
 });
 ```
 
-現在のランタイムには固定 slot の制約があります。常駐サービスを増やす設計は
-[`docs/app-manager-migration.md`](../docs/app-manager-migration.md) を参照してください。
+実行枠 (worker) は 4 本固定です。空きが無いときは背面の evictable な
+アプリが LRU で自動停止して枠を譲ります。停止直前には `sys.onStop(reason)`
+が呼ばれるので、状態は `store.set()` へ保存して次回起動時に復元してください。
+詳細は [`docs/app-manager-migration.md`](../docs/app-manager-migration.md) を参照してください。
 
 ## mquickjs で書くときの注意
 
