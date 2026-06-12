@@ -61,6 +61,8 @@
 #include "esp_log.h"
 #include <dirent.h>
 #include "mqtt_client.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "ui_tab5.h"
@@ -130,7 +132,7 @@ typedef struct {
    (also when it drops the event because its owner died). */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
-               EV_FOCUS, EV_CLIP, EV_CAM } MqjsEventType;
+               EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -151,6 +153,9 @@ typedef struct {
         struct { uint8_t target; } focus;
         struct { char code[14]; uint8_t ok; } cam; /* camera.scan result
                        (13 digits inline: no heap ownership to manage) */
+        struct { char *body; uint32_t len; int16_t status; } http; /* http.get
+                       result: heap body owned by the event (dispatcher
+                       frees it), status<=0 = request failed */
     } u;
 } MqjsEvent;
 
@@ -214,6 +219,7 @@ typedef struct {
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
     bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
+    bool http_used; JSGCRef http_cb; /* http.get one-shot result */
 
 #ifdef ESP_PLATFORM
     esp_mqtt_client_handle_t mqtt;  /* per-app client: "mqjs-app-<slot>" */
@@ -2338,6 +2344,140 @@ static void dispatch_cam(AppSlot *app, const MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
+/* http: one-shot GET (http.get, esp_http_client + esp_crt_bundle)     */
+/* One request system-wide. A short-lived FreeRTOS task runs the        */
+/* blocking esp_http_client and marshals the body into the shared       */
+/* queue as a slot-addressed EV_HTTP; the registering app's one-shot    */
+/* callback fires with (body_string|undefined, status_int). Mirrors the */
+/* camera scanner pattern. LAN-first: http:// and https:// both allowed.*/
+/* ------------------------------------------------------------------ */
+
+#define MQJS_HTTP_MAX_URL  512
+#define MQJS_HTTP_MAX_BODY 49152
+
+#ifdef ESP_PLATFORM
+static volatile bool s_http_active;
+static uint8_t s_http_slot;
+static uint16_t s_http_gen;
+static char s_http_url[MQJS_HTTP_MAX_URL];
+
+/* runs on the http_get task: blocking client, then post one EV_HTTP */
+static void http_get_task(void *arg)
+{
+    (void)arg;
+    MqjsEvent ev = { .type = EV_HTTP, .slot = s_http_slot, .gen = s_http_gen };
+    ev.u.http.body = NULL;
+    ev.u.http.len = 0;
+    ev.u.http.status = -1;
+
+    esp_http_client_config_t cfg = {
+        .url = s_http_url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 20000,
+        .disable_auto_redirect = false,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (cli) {
+        esp_err_t err = esp_http_client_open(cli, 0);
+        if (err == ESP_OK) {
+            int hdr = esp_http_client_fetch_headers(cli); /* <0 on error */
+            (void)hdr;
+            char *body = malloc(MQJS_HTTP_MAX_BODY);
+            int total = 0;
+            if (body) {
+                while (total < MQJS_HTTP_MAX_BODY) {
+                    int r = esp_http_client_read(cli, body + total,
+                                                 MQJS_HTTP_MAX_BODY - total);
+                    if (r <= 0) /* 0 = done, <0 = chunk-decode/transport end */
+                        break;
+                    total += r;
+                }
+                ev.u.http.body = body;
+                ev.u.http.len = (uint32_t)total;
+            }
+            ev.u.http.status = (int16_t)esp_http_client_get_status_code(cli);
+        } else {
+            ESP_LOGW(TAG, "http.get open failed: %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(cli);
+    }
+    s_http_active = false;
+    if (!ev_post(&ev, 100))
+        free(ev.u.http.body); /* queue full: don't leak the body */
+    vTaskDelete(NULL);
+}
+#endif
+
+/* http.get(url, fn) -> 1 request started / 0 busy-or-unavailable.
+   fn(body_string | undefined, status_int) fires exactly once. status<=0
+   means the request never produced a response (connect/TLS/timeout). */
+JSValue js_http_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    (void)this_val;
+    (void)argc;
+    if (s_http_active)
+        return JS_NewBool(0);
+    if (uiw_copy_str(ctx, argv[0], s_http_url, sizeof s_http_url))
+        return JS_EXCEPTION;
+    if (!s_http_url[0])
+        return JS_NewBool(0);
+    JSValue r = register_cb(ctx, argv[1], &s_cur_app->http_used,
+                            &s_cur_app->http_cb);
+    if (JS_IsException(r))
+        return r;
+    s_http_slot = s_cur_app->slot;
+    s_http_gen = s_cur_app->gen;
+    s_http_active = true;
+    if (xTaskCreate(http_get_task, "http_get", 8192, NULL, 4, NULL) != pdPASS) {
+        s_http_active = false;
+        s_cur_app->http_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_app->http_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_NewBool(0);
+#endif
+}
+
+static void dispatch_http(AppSlot *app, MqjsEvent *ev)
+{
+    JSContext *ctx = app->ctx;
+    if (!app->http_used) {
+        free(ev->u.http.body);
+        ev->u.http.body = NULL;
+        return;
+    }
+    if (JS_StackCheck(ctx, 4)) {
+        dump_error(ctx);
+        free(ev->u.http.body);
+        ev->u.http.body = NULL;
+        return;
+    }
+    JS_PushArg(ctx, JS_NewInt32(ctx, ev->u.http.status));            /* arg1 */
+    JS_PushArg(ctx, ev->u.http.body ? JS_NewStringLen(ctx, ev->u.http.body,
+                                                      ev->u.http.len)
+                                    : JS_UNDEFINED);                 /* arg0 */
+    JS_PushArg(ctx, app->http_cb.val);                               /* func */
+    JS_PushArg(ctx, JS_NULL);                                        /* this */
+    /* one-shot: release before the call (the arg stack roots the fn) so
+       the handler can immediately http.get() again */
+    app->http_used = false;
+    JS_DeleteGCRef(ctx, &app->http_cb);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 2);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+    free(ev->u.http.body);
+    ev->u.http.body = NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* sys: heap telemetry (W1-4) + P4a lifecycle / signals                */
 /* ------------------------------------------------------------------ */
 
@@ -3771,6 +3911,8 @@ static bool anything_pending(const AppSlot *app)
                         alive (§3.8: "sleep until something happens") */
     if (app->cam_used)
         return true; /* a camera.scan in flight: its result must land */
+    if (app->http_used)
+        return true; /* an http.get in flight: its result must land */
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
         if (app->widget_cbs[i].used) /* a live widget screen, too */
             return true;
@@ -3859,6 +4001,12 @@ static void app_reset_bindings(AppSlot *app)
     if (app->cam_used) {
         JS_DeleteGCRef(ctx, &app->cam_cb);
         app->cam_used = false;
+    }
+    if (app->http_used) {
+        JS_DeleteGCRef(ctx, &app->http_cb);
+        app->http_used = false;
+        /* a request in flight cannot be cancelled mid-flight; its result
+           event dies on the gen check and frees its own body (§3.2) */
     }
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
     if (s_cam_active && s_cam_slot == app->slot)
@@ -4044,6 +4192,9 @@ static void free_event_payload(MqjsEvent *ev)
     case EV_SIGNAL:
         free(ev->u.signal.value);
         break;
+    case EV_HTTP:
+        free(ev->u.http.body);
+        break;
     default:
         break;
     }
@@ -4068,7 +4219,8 @@ static AppSlot *event_owner(const MqjsEvent *ev)
     case EV_MQTT_DATA:
     case EV_SIGNAL:
     case EV_CLIP:
-    case EV_CAM: {
+    case EV_CAM:
+    case EV_HTTP: {
         AppSlot *app = &s_apps[ev->slot];
         return (app->used && app->gen == ev->gen) ? app : NULL;
     }
@@ -4107,6 +4259,7 @@ static void dispatch_event(AppSlot *app, MqjsEvent *ev)
     case EV_SIGNAL:         dispatch_signal(app, ev);        break;
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
+    case EV_HTTP:           dispatch_http(app, ev);          break;
     }
     s_cur_app = prev;
 }

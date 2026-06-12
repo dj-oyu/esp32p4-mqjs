@@ -477,6 +477,18 @@ static const JSPropDef js_camera[] = {
 static const JSClassDef js_camera_obj =
     JS_OBJECT_DEF("Camera", js_camera);
 
+/* ---- device API: http object (one-shot GET over esp_http_client) ----
+   get(url, fn) -> 1/0: one request system-wide, fn(body|undefined,
+   status). https:// validates against the cert bundle; http:// allowed
+   (LAN-first). Stub (get -> 0) without ESP. ---- */
+static const JSPropDef js_http[] = {
+    JS_CFUNC_DEF("get", 2, js_http_get),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_http_obj =
+    JS_OBJECT_DEF("Http", js_http);
+
 /* ---- device API: store object (NVS-backed key-value, W2) ---- */
 static const JSPropDef js_store[] = {
     JS_CFUNC_DEF("get", 1, js_store_get),
@@ -577,6 +589,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("store", &js_store_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     JS_PROP_CLASS_DEF("camera", &js_camera_obj),
+    JS_PROP_CLASS_DEF("http", &js_http_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
        ui.screen(); the names just make the ROM protos reachable). */
