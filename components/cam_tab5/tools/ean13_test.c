@@ -202,6 +202,19 @@ int main(void)
     expect(n && !ean13_decode_gray_line(line, n, got),
            "bad checksum rejected");
 
+    /* weak contrast (barcode in shadow / AWB washout): squeeze the
+       rendered 40..210 range into 110..150 — must still decode */
+    for (int scale = 3; scale <= 5; scale++) {
+        with_checksum(isbn12[0], code);
+        n = render(code, line, sizeof line, scale, 4, 0, 11);
+        for (int i = 0; i < n; i++)
+            line[i] = (uint8_t)(110 + (line[i] - 40) * 40 / 170);
+        snprintf(name, sizeof name, "weak contrast scale=%d", scale);
+        expect(ean13_decode_gray_line(line, n, got) &&
+                   strcmp(got, code) == 0,
+               name);
+    }
+
     /* extended telemetry API: found -> digits 13 + sane span */
     {
         ean13_scan_t st;

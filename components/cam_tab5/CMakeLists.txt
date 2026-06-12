@@ -6,7 +6,7 @@
 # like LVGL is on the Stamp: its sources compile to ~nothing without the
 # CSI/ISP kconfig options that sdkconfig.tab5.defaults enables.
 if(CONFIG_MQJS_CAMERA)
-    set(CAM_SRCS "cam_tab5.c" "ean13.c")
+    set(CAM_SRCS "cam_tab5.c" "ean13.c" "bc_locate.c")
 else()
     set(CAM_SRCS "cam_tab5.c")
 endif()

@@ -218,7 +218,11 @@ int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
         if (line[i] > mx)
             mx = line[i];
     }
-    if (mx - mn < 48) /* flat line: no barcode contrast at all */
+    if (mx - mn < 24) /* flat line: no barcode contrast at all. The
+                         gate is deliberately low — a barcode in shadow
+                         or washed out by AWB easily drops under the
+                         old 48; checksum+parity absorb the extra noise
+                         candidates this lets through */
         return 0;
 
     /* Local adaptive binarization: threshold at the midpoint of the
@@ -233,7 +237,12 @@ int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
      * the quiet zone the average sits near white and swallowed the
      * start guard's narrow spaces. min/max midpoint centers correctly
      * as soon as the window touches the first bar. */
-    enum { W = 64, FLAT = 30 };
+    enum { W = 64 };
+    /* "no local contrast" threshold scales with what the line actually
+       has — an absolute 30 treated a whole shadowed barcode as flat */
+    int flat = (mx - mn) / 5;
+    if (flat < 12)
+        flat = 12;
     static uint8_t pmin[MAX_RUNS], smin[MAX_RUNS];
     static uint8_t pmax[MAX_RUNS], smax[MAX_RUNS];
     static int runs[MAX_RUNS];     /* static scratch: see note above */
@@ -271,7 +280,7 @@ int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
         uint8_t lmin = smin[l] < pmin[r] ? smin[l] : pmin[r];
         uint8_t lmax = smax[l] > pmax[r] ? smax[l] : pmax[r];
         int b;
-        if (lmax - lmin < FLAT)
+        if (lmax - lmin < flat)
             b = cur < 0 ? line[i] < gth : cur; /* flat: extend state */
         else
             b = line[i] < (lmin + lmax) / 2;

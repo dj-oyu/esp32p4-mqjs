@@ -18,6 +18,7 @@
 #if CONFIG_MQJS_CAMERA
 
 #include <fcntl.h>
+#include <math.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -26,6 +27,7 @@
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/ppa.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_video_device.h"
@@ -34,6 +36,7 @@
 #include "freertos/task.h"
 #include "linux/videodev2.h"
 
+#include "bc_locate.h"
 #include "ean13.h"
 #include "ui_tab5.h"
 
@@ -162,21 +165,21 @@ static bool prefix_ok(const char code[14])
 
 /* what the viewfinder overlay should show for one frame: the decoded
  * code (ANY EAN-13, prefix ignored on purpose — the user wants to see
- * everything the camera reads) or the best near-miss with its scanline
- * position. kind: 0 none, 1 near-miss, 2 decoded. */
+ * everything the camera reads) or the best near-miss, with the
+ * candidate span as ENDPOINTS in frame px (scanlines can run at any
+ * angle now). kind: 0 none, 1 near-miss, 2 decoded. */
 typedef struct {
     int kind;
     char code[14];
     int digits;
-    int is_row;     /* 1 = horizontal scanline (frame row) */
-    int coord;      /* frame row (is_row) or frame column */
-    int x0, x1;     /* span along the scanline, frame px */
+    int theta;          /* scanline angle (deg) or -1 for grid lines */
+    int ax, ay, bx, by; /* candidate span endpoints, frame px */
 } FrameHit;
 
 #define HIT_MIN_DIGITS 4 /* below this, "near-misses" are just noise */
 
-static void hit_record(FrameHit *disp, const ean13_scan_t *st, int is_row,
-                       int coord)
+static void hit_record(FrameHit *disp, const ean13_scan_t *st, int theta,
+                       int ax, int ay, int bx, int by)
 {
     if (st->found) {
         if (disp->kind == 2)
@@ -191,47 +194,84 @@ static void hit_record(FrameHit *disp, const ean13_scan_t *st, int is_row,
         disp->kind = 1;
         disp->digits = st->digits;
     }
-    disp->is_row = is_row;
-    disp->coord = coord;
-    disp->x0 = st->x0;
-    disp->x1 = st->x1;
+    disp->theta = theta;
+    disp->ax = ax;
+    disp->ay = ay;
+    disp->bx = bx;
+    disp->by = by;
 }
 
-/* sample a grid of scanlines; true when a PREFIX-MATCHING code hit
- * (ends the scan). disp collects the overlay info either way. */
+/* Dense pass across the localized barcode region: 16 scanlines through
+ * the region center ALONG the gradient direction theta (so tilt and
+ * orientation no longer matter), offset across the bar direction, each
+ * with ±1px binning along the bars (bc_sample_line) — this is what
+ * reads the weak-contrast/shadowed codes the coarse grid misses. */
+static bool scan_region(const uint16_t *px, int w, int h,
+                        const bc_region_t *rg, uint8_t *line, char out[14],
+                        FrameHit *disp)
+{
+    ean13_scan_t st;
+    float th = rg->theta * (float)M_PI / 180.0f;
+    float ux = cosf(th), uy = sinf(th);
+    float vx = -uy, vy = ux;
+    int dx = rg->x1 - rg->x0, dy = rg->y1 - rg->y0;
+    int half = (int)(sqrtf((float)(dx * dx + dy * dy)) * 0.5f) + 48;
+    if (half > CAM_W / 2)
+        half = CAM_W / 2; /* line buffer is CAM_W bytes */
+    int vext = (dx < dy ? dx : dy) / 2; /* bar extent ~ smaller bbox side */
+    if (vext < 16)
+        vext = 16;
+    for (int k = 0; k < 16; k++) {
+        int off = vext * (2 * k + 1 - 16) / 16;
+        int n = bc_sample_line(px, w, h, rg->cx, rg->cy, rg->theta, off,
+                               half, line, CAM_W);
+        int hit = ean13_scan_gray_line(line, n, &st);
+        float sx = rg->cx + vx * off - ux * (n / 2);
+        float sy = rg->cy + vy * off - uy * (n / 2);
+        hit_record(disp, &st, rg->theta,
+                   (int)(sx + ux * st.x0), (int)(sy + uy * st.x0),
+                   (int)(sx + ux * st.x1), (int)(sy + uy * st.x1));
+        if (hit && prefix_ok(st.code)) {
+            memcpy(out, st.code, 14);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* region pass first (when the localizer found one), then the fixed
+ * grid as insurance; true when a PREFIX-MATCHING code hit (ends the
+ * scan). disp collects the overlay info either way. */
 static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
-                       char out[14], FrameHit *disp)
+                       char out[14], FrameHit *disp,
+                       const bc_region_t *rg)
 {
     ean13_scan_t st;
     disp->kind = 0;
     disp->digits = 0;
+    if (rg->found && scan_region(px, w, h, rg, line, out, disp))
+        return true;
     for (int r = 0; r < 32; r++) {
         int y = h * (15 + r * 70 / 31) / 100; /* rows across 15%..85% */
         const uint16_t *row = px + y * w;
         for (int x = 0; x < w; x++)
             line[x] = luma565(row[x]);
-        if (ean13_scan_gray_line(line, w, &st)) {
-            hit_record(disp, &st, 1, y);
-            if (prefix_ok(st.code)) {
-                memcpy(out, st.code, 14);
-                return true;
-            }
-        } else {
-            hit_record(disp, &st, 1, y);
+        int hit = ean13_scan_gray_line(line, w, &st);
+        hit_record(disp, &st, -1, st.x0, y, st.x1, y);
+        if (hit && prefix_ok(st.code)) {
+            memcpy(out, st.code, 14);
+            return true;
         }
     }
     for (int c = 0; c < 24; c++) { /* rotated 90°: columns 10%..90% */
         int x = w * (10 + c * 80 / 23) / 100;
         for (int y = 0; y < h; y++)
             line[y] = luma565(px[y * w + x]);
-        if (ean13_scan_gray_line(line, h, &st)) {
-            hit_record(disp, &st, 0, x);
-            if (prefix_ok(st.code)) {
-                memcpy(out, st.code, 14);
-                return true;
-            }
-        } else {
-            hit_record(disp, &st, 0, x);
+        int hit = ean13_scan_gray_line(line, h, &st);
+        hit_record(disp, &st, -1, x, st.x0, x, st.x1);
+        if (hit && prefix_ok(st.code)) {
+            memcpy(out, st.code, 14);
+            return true;
         }
     }
     return false;
@@ -332,6 +372,66 @@ static bool pipeline_once(void)
     return true;
 }
 
+/* Half-res analysis copy for the barcode localizer, produced by the
+ * PPA in hardware: bc_locate needs an anti-aliased image (sharp bars
+ * alias into bogus diagonal orientations), and the box-filtered
+ * downscale is exactly that. 960KB PSRAM, allocated once. */
+static uint16_t *s_ana;
+
+static bool ppa_once(void)
+{
+    if (s_ppa)
+        return true;
+    ppa_client_config_t cfg = {
+        .oper_type = PPA_OPERATION_SRM,
+        .max_pending_trans_num = 1,
+    };
+    return ppa_register_client(&cfg, &s_ppa) == ESP_OK;
+}
+
+static bool analysis_blit(const uint16_t *px)
+{
+    if (!s_ana) {
+        s_ana = heap_caps_aligned_alloc(
+            64, (size_t)(CAM_W / 2) * (CAM_H / 2) * 2,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        if (!s_ana)
+            return false;
+    }
+    if (!ppa_once())
+        return false;
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer = (void *)px,
+            .pic_w = CAM_W,
+            .pic_h = CAM_H,
+            .block_w = CAM_W,
+            .block_h = CAM_H,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = s_ana,
+            .buffer_size = (uint32_t)(CAM_W / 2) * (CAM_H / 2) * 2,
+            .pic_w = CAM_W / 2,
+            .pic_h = CAM_H / 2,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = 0.5,
+        .scale_y = 0.5,
+        .mirror_x = false,
+        .mirror_y = false,
+        .rgb_swap = false,
+        .byte_swap = false,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
+}
+
 /* Viewfinder blit 1280x720 -> portrait 360x640 via the PPA (the sensor
  * is mounted 90° relative to the portrait panel; mirror keeps the
  * selfie-natural aiming). A CPU transpose here was ~1 cache miss per
@@ -341,14 +441,8 @@ static bool pipeline_once(void)
 #define PV_H (CAM_W / 2) /* 640 */
 static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
 {
-    if (!s_ppa) {
-        ppa_client_config_t cfg = {
-            .oper_type = PPA_OPERATION_SRM,
-            .max_pending_trans_num = 1,
-        };
-        if (ppa_register_client(&cfg, &s_ppa) != ESP_OK)
-            return false;
-    }
+    if (!ppa_once())
+        return false;
     ppa_srm_oper_config_t srm = {
         .in = {
             .buffer = (void *)px,
@@ -425,22 +519,28 @@ static void pv_seg(uint16_t *pv, int x0, int y0, int x1, int y1, uint16_t c)
     }
 }
 
+#define PV_CYAN 0x07FF
+
+/* localized barcode region as a cyan box (same transpose mapping) */
+static void draw_region(uint16_t *pv, const bc_region_t *rg)
+{
+    int px0 = rg->y0 / 2, px1 = rg->y1 / 2 - 1;
+    int py0 = rg->x0 / 2, py1 = rg->x1 / 2 - 1;
+    pv_seg(pv, px0, py0, px1, py0, PV_CYAN);
+    pv_seg(pv, px0, py1, px1, py1, PV_CYAN);
+    pv_seg(pv, px0, py0, px0, py1, PV_CYAN);
+    pv_seg(pv, px1, py0, px1, py1, PV_CYAN);
+}
+
 static void draw_overlay(uint16_t *pv, const FrameHit *hit)
 {
     uint16_t col = hit->kind == 2 ? PV_GREEN : PV_AMBER;
-    int mx, my;
-    if (hit->is_row) {
-        int x = hit->coord / 2 + 6;
-        pv_seg(pv, x, hit->x0 / 2, x, hit->x1 / 2, col);
-        mx = x;
-        my = (hit->x0 + hit->x1) / 4;
-    } else {
-        int y = hit->coord / 2 + 6;
-        pv_seg(pv, hit->x0 / 2, y, hit->x1 / 2, y, col);
-        mx = (hit->x0 + hit->x1) / 4;
-        my = y;
-    }
-    pv_seg(pv, mx, my, PV_W / 2, PV_H - 2, col); /* ひげ線 → ラベルへ */
+    /* frame (fx,fy) → preview (fy/2, fx/2); underline shifted 6px */
+    int x0 = hit->ay / 2 + 6, y0 = hit->ax / 2;
+    int x1 = hit->by / 2 + 6, y1 = hit->bx / 2;
+    pv_seg(pv, x0, y0, x1, y1, col);
+    pv_seg(pv, (x0 + x1) / 2, (y0 + y1) / 2, PV_W / 2, PV_H - 2,
+           col); /* ひげ線 → ラベルへ */
 }
 
 static void scan_task(void *pv)
@@ -493,8 +593,15 @@ static void scan_task(void *pv)
             const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
             bool pv_ok = preview && s_frame_w == CAM_W &&
                          preview_blit(px, preview);
-            found = scan_frame(px, s_frame_w, s_frame_h, line, code, &disp);
+            bc_region_t rg;
+            rg.found = 0;
+            if (s_frame_w == CAM_W && analysis_blit(px))
+                bc_locate(s_ana, CAM_W / 2, CAM_H / 2, 2, &rg);
+            found = scan_frame(px, s_frame_w, s_frame_h, line, code, &disp,
+                               &rg);
             ioctl(s_fd, VIDIOC_QBUF, &buf);
+            if (pv_ok && rg.found)
+                draw_region(preview, &rg);
 
             /* overlay: keep the last hit on screen ~2/3s (the PPA blit
                wiped the previous frame's drawing) */
@@ -504,18 +611,20 @@ static void scan_task(void *pv)
             }
             if (pv_ok && hit_ttl > 0) {
                 draw_overlay(preview, &last_hit);
+                int mx = (last_hit.ax + last_hit.bx) / 2;
+                int my = (last_hit.ay + last_hit.by) / 2;
+                char tht[24] = "";
+                if (last_hit.theta >= 0)
+                    snprintf(tht, sizeof tht, " θ=%d°", last_hit.theta);
                 if (last_hit.kind == 2)
-                    snprintf(lbl, sizeof lbl, "%s%s   %s=%d  %d..%d px",
+                    snprintf(lbl, sizeof lbl, "%s%s   (%d,%d)px%s",
                              last_hit.code,
                              prefix_ok(last_hit.code) ? "" : " (ISBN以外)",
-                             last_hit.is_row ? "y" : "x", last_hit.coord,
-                             last_hit.x0, last_hit.x1);
+                             mx, my, tht);
                 else
                     snprintf(lbl, sizeof lbl,
-                             "惜しい %d/13 桁   %s=%d  %d..%d px",
-                             last_hit.digits,
-                             last_hit.is_row ? "y" : "x", last_hit.coord,
-                             last_hit.x0, last_hit.x1);
+                             "惜しい %d/13 桁   (%d,%d)px%s",
+                             last_hit.digits, mx, my, tht);
                 if (strcmp(lbl, lbl_cache) != 0) {
                     snprintf(lbl_cache, sizeof lbl_cache, "%s", lbl);
                     ui_tab5_cam_overlay_text(lbl);
