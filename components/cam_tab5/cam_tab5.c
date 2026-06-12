@@ -688,10 +688,10 @@ static void scan_task(void *pv)
     char done[96];
     char perf[48] = "";
     if (n_frames)
-        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f]",
+        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f %s]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(n_loc ? t_loc / n_loc / 1000 : 0),
-                 (int)(t_scan / n_frames / 1000));
+                 (int)(t_scan / n_frames / 1000), bc_tensor_impl());
     if (found)
         snprintf(done, sizeof done, "found %s%s", code, perf);
     else if (fail)
