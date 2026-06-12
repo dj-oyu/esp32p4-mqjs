@@ -168,6 +168,7 @@ function pct(b) { return b.tp > 0 ? Math.floor(100 * b.cp / b.tp) : 0; }
 /* ===== 画面 (ウィジェットモード) ===== */
 var gen = 0;       /* 画面世代: NDL 応答が古い画面の widget を触らない用 */
 var ndlWait = null;
+var ndlTimer = 0;  /* 応答タイムアウト (ブリッジ不在をユーザーに見せる) */
 
 /* モデルが変わったら home から作り直す (動的リストの標準パターン) */
 function goHome() {
@@ -266,6 +267,14 @@ function buildAdd() {
                     t: fTitle, a: fAuthor, p: fPages };
         mqtt.publish(REQ_T, isbn);
         status.setText("NDL サーチに問い合わせ中...");
+        if (ndlTimer) clearTimeout(ndlTimer);
+        ndlTimer = setTimeout(function () {
+            ndlTimer = 0;
+            if (!ndlWait || ndlWait.gen !== gen) return;
+            ndlWait.status.setText(
+                "応答なし: PC で tools/ndl_bridge.py が動いているか確認 (手入力も可)");
+            ndlWait = null;
+        }, 10000);
     });
     s.button("追加", function () {
         if (books.length >= MAX_BOOKS) {
@@ -316,6 +325,7 @@ function ndlReply(t, payload) {
     var m;
     try { m = JSON.parse(payload); } catch (e) { return; }
     if (!m || m.isbn !== ndlWait.isbn) return;
+    if (ndlTimer) { clearTimeout(ndlTimer); ndlTimer = 0; }
     if (!m.ok) {
         ndlWait.status.setText("NDL: 見つかりませんでした。手入力してください");
         ndlWait = null;
