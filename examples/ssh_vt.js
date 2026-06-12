@@ -7,7 +7,7 @@
  * マルチセッション対応。
  *
  * 等幅セルグリッドを持ち、サーバから来る ANSI/VT100 エスケープ
- * (カーソル移動・消去・SGR 16 色・スクロール領域) を解釈して、C 側の
+ * (カーソル移動・消去・SGR 16 色近似・スクロール領域) を解釈して、C 側の
  * ui.cells (グリフ直接ブリット) と ui.scroll (バッファスクロール) で
  * 高速に描画する。ls --color / vi / top が軽く動く。
  *
@@ -84,15 +84,72 @@ function colorOf(idx, deflt) {
     return idx === 0 ? deflt : PALETTE[idx - 1];
 }
 
-var SP = " ".repeat(COLS);
+function nearestPalette(r, g, b) {
+    var best = 1, bestDist = 0x7fffffff;
+    for (var i = 0; i < 16; i++) {
+        var rgb = PALETTE[i];
+        var dr = r - ((rgb >> 16) & 255);
+        var dg = g - ((rgb >> 8) & 255);
+        var db = b - (rgb & 255);
+        /* 緑の差を強めた整数距離。SGR受信時だけ計算する。 */
+        var dist = (dr * dr << 1) + (dg * dg << 2) + db * db;
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = i + 1;
+        }
+    }
+    return best;
+}
+
+function xtermColor(idx) {
+    if (idx !== (idx | 0) || idx < 0 || idx > 255)
+        return 0;
+    if (idx < 16)
+        return idx + 1;
+    var r, g, b;
+    if (idx < 232) {
+        var n = idx - 16;
+        var ri = (n / 36) | 0;
+        var rem = n - ri * 36;
+        var gi = (rem / 6) | 0;
+        var bi = rem - gi * 6;
+        r = ri === 0 ? 0 : 55 + ri * 40;
+        g = gi === 0 ? 0 : 55 + gi * 40;
+        b = bi === 0 ? 0 : 55 + bi * 40;
+    } else {
+        r = g = b = 8 + (idx - 232) * 10;
+    }
+    return nearestPalette(r, g, b);
+}
+
+var CONT = ""; /* 幅2文字の後半セル */
+
+function cellsText(row, from, to, copy) {
+    var out = "";
+    for (var c = from; c < to; c++) {
+        if (row.ch[c] === CONT) {
+            if (!copy) out += " ";
+        } else {
+            out += row.ch[c];
+        }
+    }
+    return out;
+}
 
 /* ---- 端末 1 本ぶんの状態 + パーサ + 描画 (W3: セッション毎に独立) ----
  * 描画はアクティブな端末だけが行う (self.act ゲート)。非アクティブ中も
  * モデルと dirty フラグは更新され、切替時の markAll + flush で追い付く。
  * 画面上の行 = 端末行 + TAB_ROWS (タブバーの下)。 */
-function makeTerm() {
+function makeTerm(reply) {
+    if (!reply)
+        reply = function () {};
+    function blankChars() {
+        var out = new Array(COLS);
+        for (var c = 0; c < COLS; c++) out[c] = " ";
+        return out;
+    }
     function newRow() {
-        return { ch: SP, fg: new Uint8Array(COLS), bg: new Uint8Array(COLS) };
+        return { ch: blankChars(), fg: new Uint8Array(COLS), bg: new Uint8Array(COLS) };
     }
     var rows = new Array(ROWS);
     var i;
@@ -104,7 +161,6 @@ function makeTerm() {
     var scrollTop = 0, scrollBot = ROWS - 1;
     var curFg = 0, curBg = 0, bold = false, inverse = false;
     var prevCurRow = 0;
-
     /* dirty[r] = 要再描画。dirtySeq[r] = 最後にダーティ化した順序番号。 */
     var dirty = new Array(ROWS);
     var dirtySeq = new Array(ROWS);
@@ -125,9 +181,32 @@ function makeTerm() {
             markDirty(r);
     }
 
-    function setCell(r, c, chr) {
+    function detachCell(row, c) {
+        if (c < 0 || c >= COLS)
+            return;
+        if (row.ch[c] === CONT && c > 0) {
+            row.ch[c - 1] = " ";
+            row.fg[c - 1] = 0; row.bg[c - 1] = 0;
+        }
+        if (c + 1 < COLS && row.ch[c + 1] === CONT) {
+            row.ch[c + 1] = " ";
+            row.fg[c + 1] = 0; row.bg[c + 1] = 0;
+        }
+        row.ch[c] = " ";
+        row.fg[c] = 0; row.bg[c] = 0;
+    }
+
+    function detachBoundary(row, c) {
+        if (c > 0 && c < COLS && row.ch[c] === CONT)
+            detachCell(row, c);
+    }
+
+    function setCell(r, c, chr, width) {
         var row = rows[r];
-        row.ch = row.ch.slice(0, c) + chr + row.ch.slice(c + 1);
+        detachCell(row, c);
+        if (width === 2)
+            detachCell(row, c + 1);
+        row.ch[c] = chr;
         var f = curFg, b = curBg;
         if (bold && f >= 1 && f <= 8)
             f += 8;
@@ -138,12 +217,18 @@ function makeTerm() {
         }
         row.fg[c] = f;
         row.bg[c] = b;
+        if (width === 2 && c + 1 < COLS) {
+            row.ch[c + 1] = CONT;
+            row.fg[c + 1] = f;
+            row.bg[c + 1] = b;
+        }
         markDirty(r);
     }
 
     function blankCell(r, c) {
         var row = rows[r];
-        row.ch = row.ch.slice(0, c) + " " + row.ch.slice(c + 1);
+        detachCell(row, c);
+        row.ch[c] = " ";
         row.fg[c] = 0;
         row.bg[c] = inverse ? (curFg === 0 ? 8 : curFg) : 0;
         markDirty(r);
@@ -158,7 +243,7 @@ function makeTerm() {
             dirty[r] = dirty[r + 1];
             dirtySeq[r] = dirtySeq[r + 1];
         }
-        first.ch = SP;
+        first.ch = blankChars();
         first.fg = new Uint8Array(COLS);
         first.bg = new Uint8Array(COLS);
         rows[scrollBot] = first;
@@ -180,7 +265,7 @@ function makeTerm() {
             dirty[r] = dirty[r - 1];
             dirtySeq[r] = dirtySeq[r - 1];
         }
-        last.ch = SP;
+        last.ch = blankChars();
         last.fg = new Uint8Array(COLS);
         last.bg = new Uint8Array(COLS);
         rows[scrollTop] = last;
@@ -202,7 +287,7 @@ function makeTerm() {
 
     /* ---- エスケープ状態機械 ---- */
     var ST_GROUND = 0, ST_ESC = 1, ST_CSI = 2, ST_OSC = 3, ST_CHARSET = 4;
-    var ST_CSI_IGNORE = 5;
+    var ST_CSI_IGNORE = 5, ST_DCS = 6, ST_DCS_ESC = 7;
     var state = ST_GROUND;
     var csiParams = "";
     var csiPriv = false;
@@ -289,10 +374,18 @@ function makeTerm() {
             } else if (v === 38 || v === 48) {
                 if (p[k + 1] === 5) {
                     var idx = p[k + 2];
-                    var col = idx < 16 ? idx + 1 : (idx < 244 ? 8 : 16);
-                    if (v === 38) curFg = col; else curBg = col;
+                    var col = xtermColor(idx);
+                    if (col !== 0) {
+                        if (v === 38) curFg = col; else curBg = col;
+                    }
                     k += 2;
                 } else if (p[k + 1] === 2) {
+                    var r = p[k + 2], g = p[k + 3], b = p[k + 4];
+                    if (r >= 0 && r <= 255 && g >= 0 && g <= 255 &&
+                        b >= 0 && b <= 255) {
+                        var rgbCol = nearestPalette(r, g, b);
+                        if (v === 38) curFg = rgbCol; else curBg = rgbCol;
+                    }
                     k += 4;
                 }
             }
@@ -315,6 +408,15 @@ function makeTerm() {
         else if (fin === "J") { eraseInDisplay(p[0] || 0); }
         else if (fin === "K") { eraseInLine(p[0] || 0); }
         else if (fin === "m") { applySGR(p); }
+        else if (fin === "n" && !csiPriv) {
+            if (p[0] === 5)
+                reply("\x1b[0n"); /* DSR: terminal is ready */
+            else if (p[0] === 6)
+                reply("\x1b[" + (cy + 1) + ";" + (cx + 1) + "R");
+        }
+        else if (fin === "c" && !csiPriv) {
+            reply("\x1b[?1;2c"); /* primary DA: VT100 + advanced video */
+        }
         else if (fin === "L") { /* 行挿入 */
             n = clamp(param0(p, 1), 1, ROWS);
             for (var li = 0; li < n; li++) {
@@ -322,7 +424,7 @@ function makeTerm() {
                     var sb = scrollBot, sct = cy;
                     var last = rows[sb];
                     for (r = sb; r > sct; r--) rows[r] = rows[r - 1];
-                    last.ch = SP; last.fg = new Uint8Array(COLS); last.bg = new Uint8Array(COLS);
+                    last.ch = blankChars(); last.fg = new Uint8Array(COLS); last.bg = new Uint8Array(COLS);
                     rows[sct] = last;
                 }
             }
@@ -334,17 +436,19 @@ function makeTerm() {
                 if (cy <= scrollBot) {
                     var first = rows[cy];
                     for (r = cy; r < scrollBot; r++) rows[r] = rows[r + 1];
-                    first.ch = SP; first.fg = new Uint8Array(COLS); first.bg = new Uint8Array(COLS);
+                    first.ch = blankChars(); first.fg = new Uint8Array(COLS); first.bg = new Uint8Array(COLS);
                     rows[scrollBot] = first;
                 }
             }
             for (r = cy; r <= scrollBot; r++) markDirty(r);
         }
         else if (fin === "P") { /* 文字削除 (左詰め) */
-            n = clamp(param0(p, 1), 1, COLS);
+            n = clamp(param0(p, 1), 1, COLS - cx);
             var row = rows[cy];
-            var s = row.ch.slice(0, cx) + row.ch.slice(cx + n) + " ".repeat(n);
-            row.ch = s.slice(0, COLS);
+            detachBoundary(row, cx);
+            detachBoundary(row, cx + n);
+            row.ch.splice(cx, n);
+            while (row.ch.length < COLS) row.ch.push(" ");
             for (c = cx; c < COLS; c++) {
                 row.fg[c] = c + n < COLS ? row.fg[c + n] : 0;
                 row.bg[c] = c + n < COLS ? row.bg[c + n] : 0;
@@ -352,15 +456,24 @@ function makeTerm() {
             markDirty(cy);
         }
         else if (fin === "@") { /* 空白挿入 */
-            n = clamp(param0(p, 1), 1, COLS);
+            n = clamp(param0(p, 1), 1, COLS - cx);
             var row2 = rows[cy];
-            var s2 = row2.ch.slice(0, cx) + " ".repeat(n) + row2.ch.slice(cx);
-            row2.ch = s2.slice(0, COLS);
+            detachBoundary(row2, cx);
+            detachBoundary(row2, COLS - n);
+            var blanks = [];
+            for (c = 0; c < n; c++) blanks.push(" ");
+            row2.ch.splice.apply(row2.ch, [cx, 0].concat(blanks));
+            row2.ch.length = COLS;
             for (c = COLS - 1; c >= cx; c--) {
                 row2.fg[c] = c - n >= cx ? row2.fg[c - n] : 0;
                 row2.bg[c] = c - n >= cx ? row2.bg[c - n] : 0;
             }
             markDirty(cy);
+        }
+        else if (fin === "X") { /* 文字消去 (カーソルは移動しない) */
+            n = clamp(param0(p, 1), 1, COLS - cx);
+            for (c = cx; c < cx + n && c < COLS; c++)
+                blankCell(cy, c);
         }
         else if (fin === "r") { /* スクロール領域 DECSTBM */
             scrollTop = clamp((p[0] || 1) - 1, 0, ROWS - 1);
@@ -384,6 +497,15 @@ function makeTerm() {
             var ch = s[i2];
             var code = s.charCodeAt(i2);
 
+            if (state === ST_DCS) {
+                if (code === 27)
+                    state = ST_DCS_ESC;
+                continue;
+            }
+            if (state === ST_DCS_ESC) {
+                state = ch === "\\" ? ST_GROUND : ST_DCS;
+                continue;
+            }
             if (state === ST_OSC) {
                 if (code === 7) state = ST_GROUND;
                 else if (code === 27) state = ST_ESC;
@@ -401,6 +523,9 @@ function makeTerm() {
             if (state === ST_ESC) {
                 if (ch === "[") { state = ST_CSI; csiParams = ""; csiPriv = false; }
                 else if (ch === "]") { state = ST_OSC; }
+                else if (ch === "P" || ch === "X" || ch === "^" || ch === "_") {
+                    state = ST_DCS;
+                }
                 else if (ch === "(" || ch === ")") { state = ST_CHARSET; }
                 else if (ch === "M") {
                     if (cy === scrollTop) scrollDown(); else if (cy > 0) cy--;
@@ -426,6 +551,14 @@ function makeTerm() {
                         csiParams += ch;
                     }
                 }
+                else if (ch === ":" || ch === ">" ||
+                         (code >= 0x20 && code <= 0x2F)) {
+                    /* 未対応の subparameter/private/intermediate を含む CSI
+                       は、別の対応済み CSI と誤解釈せず終端まで捨てる。 */
+                    state = ST_CSI_IGNORE;
+                    csiParams = "";
+                    csiPriv = false;
+                }
                 else if (code >= 0x40 && code <= 0x7E) {
                     csiDispatch(ch);
                     state = ST_GROUND;
@@ -444,8 +577,32 @@ function makeTerm() {
             else if (code < 32) { /* C0 */ }
             else {
                 if (cx >= COLS) { cx = 0; lineFeed(); }
-                setCell(cy, cx, ch);
-                cx++;
+                var cp = code;
+                if (code >= 0xD800 && code <= 0xDBFF && i2 + 1 < s.length) {
+                    var lo = s.charCodeAt(i2 + 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                        ch += s[++i2];
+                    }
+                }
+                var width = ui.cellWidth(cp);
+                if (width === 0) {
+                    /* VS16 は直前のtext-presentation文字をemoji幅へ昇格。
+                       combining mark / ZWJ は位置を進めず、この軽量モデル
+                       では描画しない。 */
+                    if (cp === 0xFE0F && cx > 0 && cx < COLS &&
+                        rows[cy].ch[cx - 1] !== CONT) {
+                        rows[cy].ch[cx] = CONT;
+                        rows[cy].fg[cx] = rows[cy].fg[cx - 1];
+                        rows[cy].bg[cx] = rows[cy].bg[cx - 1];
+                        cx++;
+                        markDirty(cy);
+                    }
+                    continue;
+                }
+                if (width === 2 && cx === COLS - 1) { cx = 0; lineFeed(); }
+                setCell(cy, cx, ch, width);
+                cx += width;
             }
         }
         markDirty(prevCurRow);
@@ -455,7 +612,7 @@ function makeTerm() {
 
     function resetTerm() {
         for (var r = 0; r < ROWS; r++) {
-            rows[r].ch = SP;
+            rows[r].ch = blankChars();
             rows[r].fg = new Uint8Array(COLS);
             rows[r].bg = new Uint8Array(COLS);
         }
@@ -475,7 +632,7 @@ function makeTerm() {
             var c2 = c + 1;
             while (c2 < COLS && row.fg[c2] === f && row.bg[c2] === b)
                 c2++;
-            ui.cells(c, r + TAB_ROWS, row.ch.slice(c, c2),
+            ui.cells(c, r + TAB_ROWS, cellsText(row, c, c2, false),
                      colorOf(f, FG), colorOf(b, BG));
             cmds++;
             c = c2;
@@ -524,7 +681,7 @@ function makeTerm() {
 function gridLines(t) {
     var out = [];
     for (var r = 0; r < ROWS; r++) {
-        var line = t.rows[r].ch;
+        var line = cellsText(t.rows[r], 0, COLS, true);
         var e = line.length;
         while (e > 0 && line[e - 1] === " ") e--;
         if (e > 0)
@@ -698,8 +855,9 @@ if (SELFTEST) {
                         pd = "\x1b[200~" + pd + "\x1b[201~";
                     if (dangerous)
                         confirmPaste(id, pd);
-                    else
+                    else {
                         ssh.write(id, pd);
+                    }
                 }
                 return;
             }
@@ -759,7 +917,7 @@ if (SELFTEST) {
         for (var r = f.r; r <= to.r; r++) {
             var c0 = (r === f.r) ? f.c : 0;
             var c1 = (r === to.r) ? to.c : COLS - 1;
-            ui.cells(c0, r + TAB_ROWS, t.rows[r].ch.slice(c0, c1 + 1),
+            ui.cells(c0, r + TAB_ROWS, cellsText(t.rows[r], c0, c1 + 1, false),
                      SEL_FG, SEL_BG);
         }
     };
@@ -779,7 +937,7 @@ if (SELFTEST) {
         for (var r = f.r; r <= to.r; r++) {
             var c0 = (r === f.r) ? f.c : 0;
             var c1 = (r === to.r) ? to.c : COLS - 1;
-            out.push(t.rows[r].ch.slice(c0, c1 + 1).trimEnd());
+            out.push(cellsText(t.rows[r], c0, c1 + 1, true).trimEnd());
         }
         return out.join("\n");
     };
@@ -934,7 +1092,9 @@ if (SELFTEST) {
             hostsPage("接続できない: " + err.message);
             return;
         }
-        var term = makeTerm();
+        var term = makeTerm(function (data) {
+            ssh.write(id, data);
+        });
         var entry = { id: id, term: term, label: e.user + "@" + e.host };
         sessions.push(entry);
         var forgetTimer = null;

@@ -43,6 +43,98 @@ CASES = [
     ),
 ]
 
+DISPLAY_CASES = [
+    (
+        "dcs-is-not-rendered",
+        '    t.feed("\\x1b[H\\x1b[2Jbefore\\x1bP$qm\\x1b\\\\after");\n',
+        "00|beforeafter",
+        None,
+    ),
+    (
+        "csi-subparameter-is-not-misparsed",
+        '    t.feed("\\x1b[H\\x1b[2Jok\\x1b[4:3m!");\n',
+        "00|ok!",
+        None,
+    ),
+    (
+        "erase-character",
+        '    t.feed("\\x1b[H\\x1b[2Jabcdef\\x1b[1;3H\\x1b[2X");\n',
+        "00|ab  ef",
+        None,
+    ),
+    (
+        "wide-character-cursor",
+        '    t.feed("\\x1b[H\\x1b[2JＡx");\n'
+        '    print("WIDE cursor=" + t.cursor()[0]);\n',
+        "WIDE cursor=3",
+        None,
+    ),
+    (
+        "zero-width-character-cursor",
+        '    t.feed("\\x1b[H\\x1b[2Je\\u0301x");\n'
+        '    print("COMBINING cursor=" + t.cursor()[0]);\n',
+        "COMBINING cursor=2",
+        None,
+    ),
+    (
+        "private-use-character-is-narrow",
+        '    t.feed("\\x1b[H\\x1b[2J\\uf120x");\n'
+        '    print("PRIVATE cursor=" + t.cursor()[0]);\n',
+        "PRIVATE cursor=2",
+        None,
+    ),
+    (
+        "emoji-variation-width",
+        '    t.feed("\\x1b[H\\x1b[2J⚠️x");\n'
+        '    print("EMOJI cursor=" + t.cursor()[0]);\n',
+        "EMOJI cursor=3",
+        None,
+    ),
+    (
+        "delete-through-wide-character",
+        '    t.feed("\\x1b[H\\x1b[2JＡx\\x1b[1;2H\\x1b[P");\n',
+        "00| x",
+        "00|Ａ",
+    ),
+    (
+        "insert-through-wide-character",
+        '    t.feed("\\x1b[H\\x1b[2JＡx\\x1b[1;2H\\x1b[@");\n',
+        "00|   x",
+        "00|Ａ",
+    ),
+    (
+        "large-insert-preserves-prefix",
+        '    t.feed("\\x1b[H\\x1b[2JabＡx\\x1b[1;3H\\x1b[999@");\n',
+        "00|ab",
+        "00|Ａ",
+    ),
+    (
+        "xterm-256-color-is-approximated",
+        '    t.feed("\\x1b[H\\x1b[2J\\x1b[38;5;196mR");\n'
+        '    print("XTERM fg=" + t.rows[0].fg[0]);\n',
+        "XTERM fg=2",
+        None,
+    ),
+    (
+        "true-color-is-approximated",
+        '    t.feed("\\x1b[H\\x1b[2J\\x1b[48;2;79;195;247mB");\n'
+        '    print("TRUECOLOR bg=" + t.rows[0].bg[0]);\n',
+        "TRUECOLOR bg=5",
+        None,
+    ),
+]
+
+REPLY_CASES = [
+    (
+        "device-status-report",
+        '    var replies = [];\n'
+        '    var tr = makeTerm(function (s) { replies.push(s); });\n'
+        '    tr.feed("\\x1b[4;7H\\x1b[5n\\x1b[6n\\x1b[c");\n'
+        '    print("REPLIES " + replies.join("|"));\n',
+        "REPLIES \x1b[0n|\x1b[4;7R|\x1b[?1;2c",
+    ),
+]
+
 
 def make_case(source: str, injection: str) -> str:
     if SELFTEST_FLAG not in source or INJECT_POINT not in source:
@@ -109,10 +201,45 @@ def main() -> int:
             else:
                 print(f"PASS {name}")
 
+        for name, injection, expected, forbidden in DISPLAY_CASES:
+            path = Path(tmp) / f"{name}.js"
+            path.write_text(make_case(source, injection), encoding="utf-8")
+            result = subprocess.run(
+                [str(RUN_PC), str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=2,
+            )
+            if (result.returncode != 0 or expected not in result.stdout or (
+                forbidden is not None and forbidden in result.stdout
+            )):
+                print(f"VULNERABLE {name}: terminal model output mismatch")
+                vulnerable += 1
+            else:
+                print(f"PASS {name}")
+
+        for name, injection, expected in REPLY_CASES:
+            path = Path(tmp) / f"{name}.js"
+            path.write_text(make_case(source, injection), encoding="utf-8")
+            result = subprocess.run(
+                [str(RUN_PC), str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode != 0 or expected not in result.stdout:
+                print(f"VULNERABLE {name}: terminal reply mismatch")
+                vulnerable += 1
+            else:
+                print(f"PASS {name}")
+
+    total = len(CASES) + len(DISPLAY_CASES) + len(REPLY_CASES)
     if vulnerable:
-        print(f"{vulnerable}/{len(CASES)} adversarial cases disrupted ssh_vt.js")
+        print(f"{vulnerable}/{total} cases disrupted ssh_vt.js")
         return 1
-    print(f"PASS: all {len(CASES)} adversarial cases were bounded")
+    print(f"PASS: all {total} cases passed")
     return 0
 
 

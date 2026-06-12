@@ -187,6 +187,8 @@ typedef struct {
     bool used;
     int32_t id;
     bool data_used, close_used;
+    uint8_t utf8_tail[3];
+    uint8_t utf8_tail_len;
     JSGCRef data_fn, close_fn;
 } SshCb;
 
@@ -1150,6 +1152,41 @@ JSValue js_ui_cellSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, w));
     JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, h));
     return arr;
+}
+
+/* ui.cellWidth(codePoint): compact wcwidth-like classification for grid UIs.
+   Private-use/Nerd Font glyphs intentionally remain width 1. */
+JSValue js_ui_cellWidth(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    int32_t v;
+    if (JS_ToInt32(ctx, &v, argv[0]))
+        return JS_EXCEPTION;
+    uint32_t cp = (uint32_t)v;
+    int width = 1;
+    if (cp == 0 || cp < 0x20 || (cp >= 0x7F && cp < 0xA0) ||
+        cp == 0x200D ||
+        (cp >= 0x0300 && cp <= 0x036F) ||
+        (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+        (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+        (cp >= 0x20D0 && cp <= 0x20FF) ||
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||
+        (cp >= 0xFE20 && cp <= 0xFE2F) ||
+        (cp >= 0xE0100 && cp <= 0xE01EF)) {
+        width = 0;
+    } else if ((cp >= 0x1100 && cp <= 0x115F) ||
+               (cp >= 0x2329 && cp <= 0x232A) ||
+               (cp >= 0x2E80 && cp <= 0xA4CF) ||
+               (cp >= 0xAC00 && cp <= 0xD7A3) ||
+               (cp >= 0xF900 && cp <= 0xFAFF) ||
+               (cp >= 0xFE10 && cp <= 0xFE19) ||
+               (cp >= 0xFE30 && cp <= 0xFE6F) ||
+               (cp >= 0xFF01 && cp <= 0xFF60) ||
+               (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+               (cp >= 0x1F300 && cp <= 0x1FAFF) ||
+               (cp >= 0x20000 && cp <= 0x3FFFD)) {
+        width = 2;
+    }
+    return JS_NewInt32(ctx, width);
 }
 
 /* ui.cells(col, row, str, fg, bg): draw a monospace run of cells with a
@@ -3845,24 +3882,64 @@ void mqjs_post_ssh_closed(int id, const char *reason)
 #endif
 }
 
+static size_t ssh_utf8_complete_prefix(const char *buf, size_t len)
+{
+    if (!len)
+        return 0;
+    size_t start = len;
+    while (start > 0 && len - start < 3 &&
+           (((uint8_t)buf[start - 1] & 0xC0) == 0x80))
+        start--;
+    if (start < len && start > 0)
+        start--; /* move from the first continuation byte to its lead */
+    else if (start == len)
+        start--; /* final byte may itself be a lead */
+
+    uint8_t lead = (uint8_t)buf[start];
+    size_t need = (lead & 0xE0) == 0xC0 ? 2 :
+                  (lead & 0xF0) == 0xE0 ? 3 :
+                  (lead & 0xF8) == 0xF0 ? 4 : 1;
+    return len - start < need ? start : len;
+}
+
 static void dispatch_ssh_data(AppSlot *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     SshCb *c = sshcb_find(app, ev->u.ssh.id);
     if (c && c->data_used) {
-        if (JS_StackCheck(ctx, 3)) {
-            dump_error(ctx);
-        } else {
-            JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.ssh.data,
-                                            ev->u.ssh.len));  /* arg0 */
-            JS_PushArg(ctx, c->data_fn.val);                  /* func */
-            JS_PushArg(ctx, JS_NULL);                         /* this */
-            arm_watchdog();
-            JSValue ret = JS_Call(ctx, 1);
-            if (JS_IsException(ret))
-                dump_error(ctx);
+        size_t n = c->utf8_tail_len + ev->u.ssh.len;
+        char *buf = malloc(n);
+        if (!buf)
+            goto done;
+        memcpy(buf, c->utf8_tail, c->utf8_tail_len);
+        memcpy(buf + c->utf8_tail_len, ev->u.ssh.data, ev->u.ssh.len);
+        c->utf8_tail_len = 0;
+
+        /* SSH stream reads may split a UTF-8 codepoint. JS_NewStringLen
+           decodes each call independently, so retain an incomplete suffix
+           and deliver it with the next event instead of corrupting it. */
+        size_t cut = ssh_utf8_complete_prefix(buf, n);
+        if (cut < n) {
+            c->utf8_tail_len = (uint8_t)(n - cut);
+            memcpy(c->utf8_tail, buf + cut, c->utf8_tail_len);
         }
+
+        if (cut > 0) {
+            if (JS_StackCheck(ctx, 3)) {
+                dump_error(ctx);
+            } else {
+                JS_PushArg(ctx, JS_NewStringLen(ctx, buf, cut));  /* arg0 */
+                JS_PushArg(ctx, c->data_fn.val);                  /* func */
+                JS_PushArg(ctx, JS_NULL);                         /* this */
+                arm_watchdog();
+                JSValue ret = JS_Call(ctx, 1);
+                if (JS_IsException(ret))
+                    dump_error(ctx);
+            }
+        }
+        free(buf);
     }
+done:
     free(ev->u.ssh.data);
     ev->u.ssh.data = NULL;
 }

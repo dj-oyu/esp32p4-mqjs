@@ -417,6 +417,7 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("pixel", 3, js_ui_pixel),
     JS_CFUNC_DEF("textSize", 1, js_ui_textSize),
     JS_CFUNC_DEF("cellSize", 0, js_ui_cellSize),
+    JS_CFUNC_DEF("cellWidth", 1, js_ui_cellWidth),
     JS_CFUNC_DEF("cells", 5, js_ui_cells),
     JS_CFUNC_DEF("scroll", 4, js_ui_scroll),
     JS_CFUNC_DEF("keyboard", 1, js_ui_keyboard),
