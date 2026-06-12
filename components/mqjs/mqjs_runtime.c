@@ -222,6 +222,10 @@ typedef struct {
     bool fg_used;  JSGCRef fg_cb;   /* sys.onForeground */
     bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
+    bool stop_used; JSGCRef stop_cb; /* sys.onStop(reason) — last words;
+                                        does NOT keep an idle app alive */
+    bool stopping;            /* app_stop in progress: bars re-entry and
+                                 marks the worker unavailable to evict */
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
     bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
@@ -2742,6 +2746,17 @@ JSValue js_sys_onSignal(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
     return register_cb(ctx, argv[0], &s_cur_wk->sig_used, &s_cur_wk->sig_cb);
 }
 
+/* sys.onStop(fn(reason)): last-words hook (Phase 4) — fires once while
+   the app is being stopped (reason "user" | "idle" | "updated" |
+   "evicted" | "error"), before the bindings are torn down: the place
+   to store.set state for the restore-on-next-start pattern (store.set
+   is a RAM-cache write, safe in a dying app). Registering it does NOT
+   keep an idle app alive, and the 5s watchdog bounds the handler. */
+JSValue js_sys_onStop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    return register_cb(ctx, argv[0], &s_cur_wk->stop_used, &s_cur_wk->stop_cb);
+}
+
 /* sys.signal(appName, value) -> bool: queue a signal for the named app
    (value is stringified; JSON is the convention for structures). False
    when no such app is running or the queue is full. */
@@ -2835,6 +2850,7 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
                               const char *name);
 static void app_stop_internal(MqjsWorker *app);
+static void app_stop_internal_r(MqjsWorker *app, mqjs_app_stop_reason_t reason);
 static void switch_foreground(int new_slot);
 
 /* sys.setAppName(name) -> bool: the app's identity for sys.signal, the
@@ -3329,6 +3345,54 @@ static int start_from_file(int slot, const char *arg, const char *name)
     return slot;
 }
 
+/* Phase 4 eviction (doc: 空きWorkerなし -> evictableなbackground App
+   からLRUを選択). Candidates must be: running, not mid-stop, not the
+   foreground, not the caller, EVICTABLE by policy — and not the dev
+   worker (that frame belongs to the developer; reusing it would also
+   inherit the dev rerun flow). Returns the freed worker index or -1. */
+static int app_evict_lru(void)
+{
+    int victim = -1;
+    int64_t oldest = 0;
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        MqjsWorker *w = &s_workers[i];
+        if (!w->used || w->stopping || i == s_fg_worker ||
+            i == MQJS_WORKER_DEV || w == s_cur_wk)
+            continue;
+        const mqjs_app_snapshot_t *rec = mqjs_app_record_find(w->name);
+        if (!rec || !(rec->policy.flags & MQJS_APP_EVICTABLE))
+            continue;
+        if (victim < 0 || rec->last_active_ms < oldest) {
+            victim = i;
+            oldest = rec->last_active_ms;
+        }
+    }
+    if (victim < 0)
+        return -1;
+    /* visible trace: console line + per-app notice ("what happened to
+       my app?" stays answerable from the launcher) */
+    char line[96];
+    snprintf(line, sizeof line, "sys: evict '%s' (worker %d, LRU)\n",
+             s_workers[victim].name, victim);
+    out_write(line, strlen(line));
+    Notice *n = &s_notices[0];
+    for (int i = 1; i < (int)(sizeof s_notices / sizeof s_notices[0]); i++)
+        if (s_notices[i].seq < n->seq)
+            n = &s_notices[i];
+    snprintf(n->app, sizeof n->app, "system");
+    snprintf(n->text, sizeof n->text, "evicted: %.60s (枠を譲りました)",
+             s_workers[victim].name);
+    n->seq = ++s_notice_seq;
+    if (s_notify_sink) {
+        char msg[96];
+        snprintf(msg, sizeof msg, "[system] evicted: %s",
+                 s_workers[victim].name);
+        s_notify_sink(msg);
+    }
+    app_stop_internal_r(&s_workers[victim], MQJS_APP_STOP_EVICTED);
+    return victim;
+}
+
 /* Start-by-name core shared by sys.launch (slot compat), sys.start and
    sys.open (Phase 1 name API). Returns the slot (>= 0) or -1. Resolution:
    "dev" re-enables the dev provider; a running app returns its slot;
@@ -3370,6 +3434,8 @@ static int sys_launch_core(const char *arg)
     }
 
     int slot = app_free_slot();
+    if (slot < 0)
+        slot = app_evict_lru(); /* Phase 4: trade the LRU background app */
     if (slot < 0 || !app_ensure_mem(&s_workers[slot]))
         return -1;
 
@@ -4326,6 +4392,10 @@ static void app_reset_bindings(MqjsWorker *app)
         JS_DeleteGCRef(ctx, &app->sig_cb);
         app->sig_used = false;
     }
+    if (app->stop_used) {
+        JS_DeleteGCRef(ctx, &app->stop_cb);
+        app->stop_used = false;
+    }
     if (app->clip_used) {
         JS_DeleteGCRef(ctx, &app->clip_cb);
         app->clip_used = false;
@@ -4370,10 +4440,43 @@ static void app_reset_bindings(MqjsWorker *app)
     }
 }
 
-static void app_stop_internal(MqjsWorker *app)
+static const char *stop_reason_str(mqjs_app_stop_reason_t r)
 {
-    if (!app->used)
+    switch (r) {
+    case MQJS_APP_STOP_IDLE:    return "idle";
+    case MQJS_APP_STOP_UPDATED: return "updated";
+    case MQJS_APP_STOP_EVICTED: return "evicted";
+    case MQJS_APP_STOP_ERROR:   return "error";
+    default:                    return "user";
+    }
+}
+
+static void app_stop_internal_r(MqjsWorker *app, mqjs_app_stop_reason_t reason)
+{
+    if (!app->used || app->stopping)
         return;
+    app->stopping = true;
+    /* last words first (doc lifecycle: app_stop -> onStop -> release ->
+       destroy): the app may persist state via the store. Errors are
+       dumped and ignored; the watchdog bounds the handler. Anything it
+       registers is torn down right below. */
+    if (app->stop_used && app->ctx) {
+        JSContext *sctx = app->ctx;
+        MqjsWorker *prev = s_cur_wk;
+        s_cur_wk = app;
+        if (JS_StackCheck(sctx, 3)) {
+            dump_error(sctx);
+        } else {
+            JS_PushArg(sctx, JS_NewString(sctx, stop_reason_str(reason)));
+            JS_PushArg(sctx, app->stop_cb.val);
+            JS_PushArg(sctx, JS_NULL);
+            arm_watchdog();
+            JSValue ret = JS_Call(sctx, 1);
+            if (JS_IsException(ret))
+                dump_error(sctx);
+        }
+        s_cur_wk = prev;
+    }
     /* a dying foreground app becomes the chip target: "tap to bring it
        back" survives the stop (design §4: open = focus-or-relaunch) */
     if (app->idx == s_fg_worker)
@@ -4386,11 +4489,18 @@ static void app_stop_internal(MqjsWorker *app)
     free(app->src_owned);      /* sys.launch file source, if any */
     app->src_owned = NULL;
     /* the App record outlives the worker: state -> STOPPED (Phase 2) */
-    mqjs_app_record_on_stop(app->name, MQJS_APP_STOP_USER);
+    mqjs_app_record_on_stop(app->name, reason);
 #ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "app '%s' (worker %d) stopped", app->name, app->idx);
+    ESP_LOGI(TAG, "app '%s' (worker %d) stopped (%s)", app->name, app->idx,
+             stop_reason_str(reason));
 #endif
+    app->stopping = false;
     bar_update();
+}
+
+static void app_stop_internal(MqjsWorker *app)
+{
+    app_stop_internal_r(app, MQJS_APP_STOP_USER);
 }
 
 static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
@@ -4410,6 +4520,8 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     app->touch_used = false;
     app->key_used = false;
     app->fg_used = app->bg_used = app->sig_used = false;
+    app->stop_used = false;
+    app->stopping = false;
     app->clip_used = false;
     app->sink_len = 0;
     snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
@@ -4456,7 +4568,7 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     s_cur_wk = prev;
 
     if (failed) {
-        app_stop_internal(app);
+        app_stop_internal_r(app, MQJS_APP_STOP_ERROR);
         return -1;
     }
 #ifdef ESP_PLATFORM
@@ -4654,8 +4766,13 @@ static void reap_idle_apps(void)
                     !anything_pending(app);
         if (!stop)
             continue;
+        /* Phase 4: the stop reason reaches onStop + the App record */
+        mqjs_app_stop_reason_t reason =
+            app->kill_req ? MQJS_APP_STOP_USER
+            : (i == MQJS_WORKER_DEV && s_stop_req) ? MQJS_APP_STOP_UPDATED
+            : MQJS_APP_STOP_IDLE;
         bool was_fg = (i == s_fg_worker);
-        app_stop_internal(app);
+        app_stop_internal_r(app, reason);
         if (i == MQJS_WORKER_DEV) {
             /* push-replace = ask the provider right away; natural end =
                the classic 1s-rerun (unless an explicit stop holds it) */

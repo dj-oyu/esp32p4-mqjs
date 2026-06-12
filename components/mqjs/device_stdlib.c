@@ -520,6 +520,8 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("heap", 0, js_sys_heap),
     JS_CFUNC_DEF("onForeground", 1, js_sys_onForeground),
     JS_CFUNC_DEF("onBackground", 1, js_sys_onBackground),
+    /* Phase 4: last-words hook (reason: user/idle/updated/evicted/error) */
+    JS_CFUNC_DEF("onStop", 1, js_sys_onStop),
     JS_CFUNC_DEF("signal", 2, js_sys_signal),
     JS_CFUNC_DEF("onSignal", 1, js_sys_onSignal),
     JS_CFUNC_DEF("focus", 1, js_sys_focus),

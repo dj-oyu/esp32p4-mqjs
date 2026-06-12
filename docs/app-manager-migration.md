@@ -1,6 +1,7 @@
 # App Manager 移行設計
 
-Status: Phase 0-3 実装済み・実機 E2E 確認 2026-06-13 (Phase 4 以降は未着手)
+Status: Phase 0-4 実装済み・実機 E2E 確認 2026-06-13 (Phase 5 suspend は
+実ユースケース待ち — 設計どおり実装しない)
 
 - Phase 0: `app/mqjs_app_manager.h` 追加済み
 - Phase 1: `sys.start/open/focus/stop(name)` 追加、`sys.apps()` に `kind`
@@ -38,6 +39,22 @@ Status: Phase 0-3 実装済み・実機 E2E 確認 2026-06-13 (Phase 4 以降は
   を要求キュー (`request_*`) 経由へ移すのは Phase 4 以降、サービス
   (KIND_SERVICE) の実プロファイル適用は @service 相当のマニフェスト
   導入時。
+- Phase 4: LRU eviction + `sys.onStop(reason)`。
+  - `sys_launch_core` で空き worker が無いとき `app_evict_lru()` が
+    「実行中 ∧ 非 foreground ∧ 非 caller ∧ 非 dev worker ∧ policy
+    EVICTABLE」から `last_active_ms` 最古を選び `stop(EVICTED)` →
+    枠を再利用。候補なしは従来どおり起動失敗。evict はコンソール行 +
+    "evicted: <name>" 通知で可視化 (ランチャー通知欄から復帰可能)。
+  - `sys.onStop(fn(reason))`: 停止理由 ("user" / "idle" / "updated" /
+    "evicted" / "error") 付きの last-words フック。teardown 前に呼ばれ、
+    store.set (write-behind) で状態保存 → 次回起動時に復元するパターン
+    の置き場。登録してもアプリは idle 延命しない。watchdog 適用。
+    stop 理由は reaper でも分類 (kill_req=user / dev push=updated /
+    自然終了=idle / 起動失敗=error) され App record にも届く。
+  実機 E2E: 4/4 満杯から start("circuit") = true、victim=clip_mirror
+  (LRU 正解 — 直前起動の ssh_vt より古い)、復元後ロースター一致、
+  self-stop の onStop("user") が MQTT publish まで完走 (dying context
+  からの送信も outbox が間に合う)。
 
 ## 目的
 

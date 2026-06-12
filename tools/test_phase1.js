@@ -11,6 +11,8 @@ function ok(c, m) {
     else { fails++; print("FAIL " + m); }
 }
 
+ok(typeof sys.onStop === "function", "sys.onStop exists (Phase 4)");
+
 /* unknown names: every name form answers false, never throws */
 ok(sys.start("no_such_app_x") === false, "start(unknown) -> false");
 ok(sys.open("no_such_app_x") === false, "open(unknown) -> false");
