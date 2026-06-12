@@ -26,6 +26,14 @@ static inline int luma(uint16_t v)
     return (77 * (r << 3) + 150 * (g << 2) + 29 * (b << 3)) >> 8;
 }
 
+/* tensor-only luma: the green channel alone (59% of luminance, and
+ * barcodes are achromatic anyway) — one shift+mask instead of three
+ * multiplies, in the hottest per-pixel loop we own */
+static inline int luma_fast(uint16_t v)
+{
+    return (v >> 3) & 0xFC;
+}
+
 /* circular distance for orientations with period 180 */
 static int th_dist(int a, int b)
 {
@@ -63,7 +71,7 @@ int bc_locate(const uint16_t *rgb565, int w, int h, int coord_scale,
             for (int sy = 0; sy < GRID; sy++) {
                 const uint16_t *row = base + sy * w;
                 for (int sx = 0; sx < GRID; sx++)
-                    l[sy][sx] = luma(row[sx]);
+                    l[sy][sx] = luma_fast(row[sx]);
             }
             int32_t sxx = 0, syy = 0, sxy = 0;
             for (int sy = 1; sy < GRID - 1; sy++) {
@@ -174,15 +182,19 @@ int bc_sample_line(const uint16_t *f, int w, int h, int cx, int cy,
         n = max;
     if (n < 1)
         return 0;
-    float sx = cx + vx * offset_v - ux * (n / 2);
-    float sy = cy + vy * offset_v - uy * (n / 2);
-    for (int i = 0; i < n; i++) {
-        float x = sx + ux * i;
-        float y = sy + uy * i;
+    /* float only for setup; the inner loop steps in 16.16 fixed point
+       (frame coords < 2048 fit comfortably) */
+    int32_t fux = (int32_t)(ux * 65536.0f);
+    int32_t fuy = (int32_t)(uy * 65536.0f);
+    int32_t bx = (int32_t)(vx * 65536.0f);
+    int32_t by = (int32_t)(vy * 65536.0f);
+    int32_t x = (int32_t)((cx + vx * offset_v - ux * (n / 2)) * 65536.0f);
+    int32_t y = (int32_t)((cy + vy * offset_v - uy * (n / 2)) * 65536.0f);
+    for (int i = 0; i < n; i++, x += fux, y += fuy) {
         int acc = 0;
         for (int b = -1; b <= 1; b++) {
-            int xi = (int)(x + vx * b + 0.5f);
-            int yi = (int)(y + vy * b + 0.5f);
+            int xi = (x + b * bx + 32768) >> 16;
+            int yi = (y + b * by + 32768) >> 16;
             if (xi < 0)
                 xi = 0;
             if (xi > w - 1)

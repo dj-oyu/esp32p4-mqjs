@@ -389,38 +389,34 @@ static bool ppa_once(void)
     return ppa_register_client(&cfg, &s_ppa) == ESP_OK;
 }
 
-/* bc_locate runs directly on the (transposed) viewfinder buffer — ONE
- * PPA pass serves display AND analysis, saving a full 3.8MB frame read
- * plus a 1MB write per frame on the shared PSRAM bus. The preview is a
- * pure transpose of the frame at 1:2, so the result maps back by
- * swapping axes and reflecting theta to 90-theta. */
-static void region_from_preview(const bc_region_t *pr, bc_region_t *rg)
-{
-    rg->found = pr->found;
-    rg->x0 = pr->y0 * 2;
-    rg->x1 = pr->y1 * 2;
-    rg->y0 = pr->x0 * 2;
-    rg->y1 = pr->x1 * 2;
-    rg->cx = (rg->x0 + rg->x1) / 2;
-    rg->cy = (rg->y0 + rg->y1) / 2;
-    int th = 90 - pr->theta;
-    while (th < 0)
-        th += 180;
-    while (th >= 180)
-        th -= 180;
-    rg->theta = th;
-    rg->vertical_bars = th < 45 || th > 135;
-}
+/* Telemetry on device showed the single rotate+scale PPA pass of the
+ * full 3.84MB frame costing 111ms/frame: ROTATED reads wreck the PSRAM
+ * access pattern (~43MB/s effective). Split it: pass 1 scales 0.5 with
+ * NO rotation (sequential, fast) into s_mid; pass 2 rotates s_mid —
+ * only 0.96MB — into the viewfinder. bc_locate analyzes s_mid, which
+ * is frame-oriented, so no coordinate gymnastics are needed at all. */
+/* The PPA engine is INPUT-PIXEL bound (~17.5Mpx/s measured: a full
+ * 1.92Mpx frame costs ~110ms whatever the operation). So the finder
+ * pipeline only eats the CENTER 800x600 crop — hardware-cropped by the
+ * PPA, 0.48Mpx ≈ 27ms — which is where the user aims anyway. The
+ * decoder still sees the FULL-RES frame (region scan + grid). */
+#define CROP_X (CAM_W / 4)
+#define CROP_Y (CAM_H / 4)
+#define CROP_W (CAM_W / 2)
+#define CROP_H (CAM_H / 2)
+#define MID_W (CROP_W / 2) /* 400x300 frame-oriented analysis image */
+#define MID_H (CROP_H / 2)
 
-/* Viewfinder blit 1280x720 -> portrait 360x640 via the PPA (the sensor
- * is mounted 90° relative to the portrait panel; mirror keeps the
- * selfie-natural aiming). A CPU transpose here was ~1 cache miss per
- * pixel on PSRAM and dragged the preview to a slideshow — the PPA does
- * rotate+scale+mirror in hardware in a few ms. */
-#define PV_W (CAM_H / 2) /* 360 */
-#define PV_H (CAM_W / 2) /* 640 */
-static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
+static uint16_t *s_mid;
+
+static bool mid_blit(const uint16_t *px)
 {
+    if (!s_mid) {
+        s_mid = heap_caps_aligned_alloc(64, (size_t)MID_W * MID_H * 2,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        if (!s_mid)
+            return false;
+    }
     if (!ppa_once())
         return false;
     ppa_srm_oper_config_t srm = {
@@ -428,8 +424,49 @@ static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
             .buffer = (void *)px,
             .pic_w = CAM_W,
             .pic_h = CAM_H,
-            .block_w = CAM_W,
-            .block_h = CAM_H,
+            .block_w = CROP_W,
+            .block_h = CROP_H,
+            .block_offset_x = CROP_X,
+            .block_offset_y = CROP_Y,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = s_mid,
+            .buffer_size = (uint32_t)MID_W * MID_H * 2,
+            .pic_w = MID_W,
+            .pic_h = MID_H,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = 0.5,
+        .scale_y = 0.5,
+        .mirror_x = false,
+        .mirror_y = false,
+        .rgb_swap = false,
+        .byte_swap = false,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
+}
+
+/* Viewfinder = the rotated analysis image (sensor sits 90° to the
+ * portrait panel; mirror keeps selfie-natural aiming). 300x400 in the
+ * buffer, displayed 2x by LVGL on the other core. */
+#define PV_W MID_H /* 300 */
+#define PV_H MID_W /* 400 */
+/* viewfinder = rotate the (already half-res) s_mid; the rotated read
+ * pattern only touches 0.96MB now instead of the full frame */
+static bool preview_blit(uint16_t *dst)
+{
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer = s_mid,
+            .pic_w = MID_W,
+            .pic_h = MID_H,
+            .block_w = MID_W,
+            .block_h = MID_H,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
@@ -446,8 +483,8 @@ static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
         /* 270 + mirror == the transpose the user approved; 90 showed
            the world upside down (PPA's rotation sense vs our math) */
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_270,
-        .scale_x = 0.5,
-        .scale_y = 0.5,
+        .scale_x = 1,
+        .scale_y = 1,
         .mirror_x = true,
         .mirror_y = false,
         .rgb_swap = false,
@@ -501,11 +538,13 @@ static void pv_seg(uint16_t *pv, int x0, int y0, int x1, int y1, uint16_t c)
 
 #define PV_CYAN 0x07FF
 
-/* localized barcode region as a cyan box (same transpose mapping) */
+/* localized barcode region as a cyan box (transpose + crop mapping:
+ * frame (fx,fy) -> preview ((fy-CROP_Y)/2, (fx-CROP_X)/2); off-crop
+ * coordinates simply clip at the preview edges) */
 static void draw_region(uint16_t *pv, const bc_region_t *rg)
 {
-    int px0 = rg->y0 / 2, px1 = rg->y1 / 2 - 1;
-    int py0 = rg->x0 / 2, py1 = rg->x1 / 2 - 1;
+    int px0 = (rg->y0 - CROP_Y) / 2, px1 = (rg->y1 - CROP_Y) / 2 - 1;
+    int py0 = (rg->x0 - CROP_X) / 2, py1 = (rg->x1 - CROP_X) / 2 - 1;
     pv_seg(pv, px0, py0, px1, py0, PV_CYAN);
     pv_seg(pv, px0, py1, px1, py1, PV_CYAN);
     pv_seg(pv, px0, py0, px0, py1, PV_CYAN);
@@ -515,9 +554,9 @@ static void draw_region(uint16_t *pv, const bc_region_t *rg)
 static void draw_overlay(uint16_t *pv, const FrameHit *hit)
 {
     uint16_t col = hit->kind == 2 ? PV_GREEN : PV_AMBER;
-    /* frame (fx,fy) → preview (fy/2, fx/2); underline shifted 6px */
-    int x0 = hit->ay / 2 + 6, y0 = hit->ax / 2;
-    int x1 = hit->by / 2 + 6, y1 = hit->bx / 2;
+    /* same transpose + crop mapping; underline shifted 6px */
+    int x0 = (hit->ay - CROP_Y) / 2 + 6, y0 = (hit->ax - CROP_X) / 2;
+    int x1 = (hit->by - CROP_Y) / 2 + 6, y1 = (hit->bx - CROP_X) / 2;
     pv_seg(pv, x0, y0, x1, y1, col);
     pv_seg(pv, (x0 + x1) / 2, (y0 + y1) / 2, PV_W / 2, PV_H - 2,
            col); /* ひげ線 → ラベルへ */
@@ -535,6 +574,10 @@ static void scan_task(void *pv)
     bool found = false;
     const char *fail = NULL;
     bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+    /* per-stage averages, surfaced through camera.status() at scan end
+       — the remote optimization telemetry (no serial in the field) */
+    int64_t t_pv = 0, t_loc = 0, t_scan = 0;
+    int n_loc = 0, n_frames = 0;
 
     lbl_cache[0] = '\0';
     last_hit.kind = 0;
@@ -574,21 +617,35 @@ static void scan_task(void *pv)
                 break;
             }
             const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
-            bool pv_ok = preview && s_frame_w == CAM_W &&
-                         preview_blit(px, preview);
+            int64_t t0 = esp_timer_get_time();
+            bool mid_ok = s_frame_w == CAM_W && mid_blit(px);
+            bool pv_ok = preview && mid_ok && preview_blit(preview);
+            t_pv += esp_timer_get_time() - t0;
             /* localize on every 3rd frame (regions move at hand speed,
                not frame speed) and reuse the cached result between */
-            if (pv_ok && (frame_no % 3) == 0) {
-                bc_region_t pr;
-                if (bc_locate(preview, PV_W, PV_H, 1, &pr))
-                    region_from_preview(&pr, &cached);
-                else
+            if (mid_ok && (frame_no % 3) == 0) {
+                t0 = esp_timer_get_time();
+                if (bc_locate(s_mid, MID_W, MID_H, 2, &cached)) {
+                    /* s_mid is the center crop: shift into frame px */
+                    cached.x0 += CROP_X;
+                    cached.x1 += CROP_X;
+                    cached.cx += CROP_X;
+                    cached.y0 += CROP_Y;
+                    cached.y1 += CROP_Y;
+                    cached.cy += CROP_Y;
+                } else {
                     cached.found = 0;
+                }
+                t_loc += esp_timer_get_time() - t0;
+                n_loc++;
             }
             frame_no++;
+            n_frames++;
             bool allow_grid = !cached.found || (frame_no % 5) == 0;
+            t0 = esp_timer_get_time();
             found = scan_frame(px, s_frame_w, s_frame_h, line, code, &disp,
                                &cached, allow_grid);
+            t_scan += esp_timer_get_time() - t0;
             ioctl(s_fd, VIDIOC_QBUF, &buf);
             if (pv_ok && cached.found)
                 draw_region(preview, &cached);
@@ -628,12 +685,22 @@ static void scan_task(void *pv)
         /* the pipeline stays up and streaming (see pipeline_once) */
     }
 
+    char done[96];
+    char perf[48] = "";
+    if (n_frames)
+        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f]",
+                 (int)(t_pv / n_frames / 1000),
+                 (int)(n_loc ? t_loc / n_loc / 1000 : 0),
+                 (int)(t_scan / n_frames / 1000));
     if (found)
-        set_status("found %s", code);
+        snprintf(done, sizeof done, "found %s%s", code, perf);
     else if (fail)
-        set_status("%s", fail);
-    else if (pipe_ok)
-        set_status(s_cancel ? "cancelled%s" : "timeout (no code)%s", NULL);
+        snprintf(done, sizeof done, "%s%s", fail, perf);
+    else
+        snprintf(done, sizeof done, "%s%s",
+                 s_cancel ? "cancelled" : "timeout (no code)", perf);
+    if (pipe_ok || fail)
+        set_status("%s", done);
 
     cam_tab5_cb_t cb = s_req.cb;
     void *arg = s_req.arg;

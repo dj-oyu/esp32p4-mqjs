@@ -2273,10 +2273,15 @@ void *ui_tab5_cam_canvas(int w, int h)
         if (s_cam_cv_buf) {
             lv_canvas_set_buffer(s_cam_cv = lv_canvas_create(lv_layer_top()),
                                  s_cam_cv_buf, w, h, LV_COLOR_FORMAT_RGB565);
-            lv_obj_align(s_cam_cv, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_H + 24);
+            /* small buffer (PPA-pixel-rate economy on the scan side),
+               displayed 2x — the transform renders on the LVGL task */
+            lv_image_set_pivot(s_cam_cv, 0, 0);
+            lv_image_set_scale(s_cam_cv, 512);
+            lv_obj_align(s_cam_cv, LV_ALIGN_TOP_LEFT,
+                         (UI_LCD_H_RES - w * 2) / 2, UI_STATUSBAR_H + 24);
             lv_obj_set_style_border_width(s_cam_cv, 2, 0);
             lv_obj_set_style_border_color(s_cam_cv, lv_color_hex(0x2ECC71), 0);
-            s_cam_cv_h = h;
+            s_cam_cv_h = h * 2;
         }
     }
     if (s_cam_cv)
