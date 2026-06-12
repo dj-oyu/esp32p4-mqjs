@@ -3641,14 +3641,6 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc,
     return JS_NewInt32(ctx, id);
 }
 
-/* Temporary source compatibility for already-generated stdlib headers.
-   Regeneration removes this alias and the connectVault property. */
-JSValue js_ssh_connectVault(JSContext *ctx, JSValue *this_val, int argc,
-                            JSValue *argv)
-{
-    return js_ssh_connect(ctx, this_val, argc, argv);
-}
-
 JSValue js_ssh_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int id;
