@@ -160,24 +160,79 @@ static bool prefix_ok(const char code[14])
     return n == 0 || strncmp(code, s_req.prefix, n) == 0;
 }
 
-/* sample a grid of scanlines; true when a (prefix-matching) code hit */
-static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
-                       char out[14])
+/* what the viewfinder overlay should show for one frame: the decoded
+ * code (ANY EAN-13, prefix ignored on purpose — the user wants to see
+ * everything the camera reads) or the best near-miss with its scanline
+ * position. kind: 0 none, 1 near-miss, 2 decoded. */
+typedef struct {
+    int kind;
+    char code[14];
+    int digits;
+    int is_row;     /* 1 = horizontal scanline (frame row) */
+    int coord;      /* frame row (is_row) or frame column */
+    int x0, x1;     /* span along the scanline, frame px */
+} FrameHit;
+
+#define HIT_MIN_DIGITS 4 /* below this, "near-misses" are just noise */
+
+static void hit_record(FrameHit *disp, const ean13_scan_t *st, int is_row,
+                       int coord)
 {
+    if (st->found) {
+        if (disp->kind == 2)
+            return; /* keep the first decode of the frame */
+        disp->kind = 2;
+        memcpy(disp->code, st->code, sizeof disp->code);
+        disp->digits = 13;
+    } else {
+        if (disp->kind == 2 || st->digits < HIT_MIN_DIGITS ||
+            st->digits <= disp->digits)
+            return;
+        disp->kind = 1;
+        disp->digits = st->digits;
+    }
+    disp->is_row = is_row;
+    disp->coord = coord;
+    disp->x0 = st->x0;
+    disp->x1 = st->x1;
+}
+
+/* sample a grid of scanlines; true when a PREFIX-MATCHING code hit
+ * (ends the scan). disp collects the overlay info either way. */
+static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
+                       char out[14], FrameHit *disp)
+{
+    ean13_scan_t st;
+    disp->kind = 0;
+    disp->digits = 0;
     for (int r = 0; r < 32; r++) {
         int y = h * (15 + r * 70 / 31) / 100; /* rows across 15%..85% */
         const uint16_t *row = px + y * w;
         for (int x = 0; x < w; x++)
             line[x] = luma565(row[x]);
-        if (ean13_decode_gray_line(line, w, out) && prefix_ok(out))
-            return true;
+        if (ean13_scan_gray_line(line, w, &st)) {
+            hit_record(disp, &st, 1, y);
+            if (prefix_ok(st.code)) {
+                memcpy(out, st.code, 14);
+                return true;
+            }
+        } else {
+            hit_record(disp, &st, 1, y);
+        }
     }
     for (int c = 0; c < 24; c++) { /* rotated 90°: columns 10%..90% */
         int x = w * (10 + c * 80 / 23) / 100;
         for (int y = 0; y < h; y++)
             line[y] = luma565(px[y * w + x]);
-        if (ean13_decode_gray_line(line, h, out) && prefix_ok(out))
-            return true;
+        if (ean13_scan_gray_line(line, h, &st)) {
+            hit_record(disp, &st, 0, x);
+            if (prefix_ok(st.code)) {
+                memcpy(out, st.code, 14);
+                return true;
+            }
+        } else {
+            hit_record(disp, &st, 0, x);
+        }
     }
     return false;
 }
@@ -328,13 +383,79 @@ static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
     return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
 }
 
+/* ---- viewfinder overlay drawing (into the preview RGB565 buffer,
+ * after the PPA blit so it survives exactly one frame) ----
+ * Geometry: preview = transpose of the frame at 1/2 scale, so a frame
+ * point (col=cx, row=ry) lands at preview (x=ry/2, y=cx/2). A frame-ROW
+ * scanline therefore shows as a VERTICAL preview segment and a frame-
+ * COLUMN scanline as a horizontal one. The "underline" sits 6px beside
+ * the scanline; the leader (ひげ線) runs to the bottom edge where the
+ * telemetry label box hangs. */
+#define PV_GREEN 0x07E0
+#define PV_AMBER 0xFE60
+
+static void pv_px(uint16_t *pv, int x, int y, uint16_t c)
+{
+    if (x >= 0 && x < PV_W && y >= 0 && y < PV_H)
+        pv[y * PV_W + x] = c;
+}
+
+static void pv_seg(uint16_t *pv, int x0, int y0, int x1, int y1, uint16_t c)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0; /* -abs */
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        pv_px(pv, x0, y0, c);
+        pv_px(pv, x0 + 1, y0, c); /* 2px thick */
+        pv_px(pv, x0, y0 + 1, c);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+static void draw_overlay(uint16_t *pv, const FrameHit *hit)
+{
+    uint16_t col = hit->kind == 2 ? PV_GREEN : PV_AMBER;
+    int mx, my;
+    if (hit->is_row) {
+        int x = hit->coord / 2 + 6;
+        pv_seg(pv, x, hit->x0 / 2, x, hit->x1 / 2, col);
+        mx = x;
+        my = (hit->x0 + hit->x1) / 4;
+    } else {
+        int y = hit->coord / 2 + 6;
+        pv_seg(pv, hit->x0 / 2, y, hit->x1 / 2, y, col);
+        mx = (hit->x0 + hit->x1) / 4;
+        my = y;
+    }
+    pv_seg(pv, mx, my, PV_W / 2, PV_H - 2, col); /* ひげ線 → ラベルへ */
+}
+
 static void scan_task(void *pv)
 {
     static uint8_t line[CAM_W]; /* one scanner task at a time (s_busy) */
     char code[14];
+    char lbl[112], lbl_cache[112];
+    FrameHit disp, last_hit;
+    int hit_ttl = 0;
     bool found = false;
     const char *fail = NULL;
     bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+
+    lbl_cache[0] = '\0';
+    last_hit.kind = 0;
 
     if (pipe_ok) {
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
@@ -356,6 +477,9 @@ static void scan_task(void *pv)
                 ioctl(s_fd, VIDIOC_QBUF, &buf);
         }
 
+        if (preview)
+            ui_tab5_cam_overlay_text("スキャン中 (緑=読取 黄=惜しい)");
+
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         while (!s_cancel && esp_timer_get_time() < deadline && !found) {
@@ -367,11 +491,39 @@ static void scan_task(void *pv)
                 break;
             }
             const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
-            if (preview && s_frame_w == CAM_W &&
-                preview_blit(px, preview))
-                ui_tab5_cam_canvas_update();
-            found = scan_frame(px, s_frame_w, s_frame_h, line, code);
+            bool pv_ok = preview && s_frame_w == CAM_W &&
+                         preview_blit(px, preview);
+            found = scan_frame(px, s_frame_w, s_frame_h, line, code, &disp);
             ioctl(s_fd, VIDIOC_QBUF, &buf);
+
+            /* overlay: keep the last hit on screen ~2/3s (the PPA blit
+               wiped the previous frame's drawing) */
+            if (disp.kind) {
+                last_hit = disp;
+                hit_ttl = 20;
+            }
+            if (pv_ok && hit_ttl > 0) {
+                draw_overlay(preview, &last_hit);
+                if (last_hit.kind == 2)
+                    snprintf(lbl, sizeof lbl, "%s%s   %s=%d  %d..%d px",
+                             last_hit.code,
+                             prefix_ok(last_hit.code) ? "" : " (ISBN以外)",
+                             last_hit.is_row ? "y" : "x", last_hit.coord,
+                             last_hit.x0, last_hit.x1);
+                else
+                    snprintf(lbl, sizeof lbl,
+                             "惜しい %d/13 桁   %s=%d  %d..%d px",
+                             last_hit.digits,
+                             last_hit.is_row ? "y" : "x", last_hit.coord,
+                             last_hit.x0, last_hit.x1);
+                if (strcmp(lbl, lbl_cache) != 0) {
+                    snprintf(lbl_cache, sizeof lbl_cache, "%s", lbl);
+                    ui_tab5_cam_overlay_text(lbl);
+                }
+                hit_ttl--;
+            }
+            if (pv_ok)
+                ui_tab5_cam_canvas_update();
         }
         ui_tab5_cam_canvas_hide();
         /* the pipeline stays up and streaming (see pipeline_once) */

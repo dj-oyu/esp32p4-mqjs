@@ -202,6 +202,36 @@ int main(void)
     expect(n && !ean13_decode_gray_line(line, n, got),
            "bad checksum rejected");
 
+    /* extended telemetry API: found -> digits 13 + sane span */
+    {
+        ean13_scan_t st;
+        with_checksum(isbn12[0], code);
+        n = render(code, line, sizeof line, 4, 8, 0, 5);
+        int quiet = 12 * 4, span = 95 * 4;
+        expect(ean13_scan_gray_line(line, n, &st) && st.found &&
+                   st.digits == 13 && strcmp(st.code, code) == 0,
+               "scan_ex found digits=13");
+        expect(st.x0 > quiet - 12 && st.x0 < quiet + 12 &&
+                   st.x1 > quiet + span - 12 && st.x1 < quiet + span + 12,
+               "scan_ex span position");
+
+        /* corrupted checksum -> near-miss with digits == 12 and span */
+        with_checksum(isbn12[0], code);
+        code[12] = code[12] == '9' ? '0' : (char)(code[12] + 1);
+        n = render(code, line, sizeof line, 4, 5, 0, 9);
+        expect(!ean13_scan_gray_line(line, n, &st) && !st.found &&
+                   st.digits == 12 && st.x1 > st.x0,
+               "scan_ex near-miss digits=12");
+
+        /* reversed direction still maps the span to original coords */
+        with_checksum(isbn12[0], code);
+        n = render(code, line, sizeof line, 4, 8, 1, 5);
+        expect(ean13_scan_gray_line(line, n, &st) && st.found &&
+                   st.x0 > quiet - 12 && st.x1 < quiet + span + 12 &&
+                   st.x1 > st.x0,
+               "scan_ex reversed span");
+    }
+
     if (fails) {
         printf("ean13 selftest: %d FAILED\n", fails);
         return 1;

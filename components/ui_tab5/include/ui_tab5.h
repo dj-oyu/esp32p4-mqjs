@@ -187,6 +187,9 @@ void *ui_tab5_i2c_bus(void);
 void *ui_tab5_cam_canvas(int w, int h);
 void ui_tab5_cam_canvas_update(void);
 void ui_tab5_cam_canvas_hide(void);
+/* Telemetry label below the viewfinder (decode/near-miss readout);
+ * shown on first call, hidden together with the canvas. */
+void ui_tab5_cam_overlay_text(const char *utf8);
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
@@ -284,6 +287,10 @@ static inline void *ui_tab5_cam_canvas(int w, int h)
 }
 static inline void ui_tab5_cam_canvas_update(void) {}
 static inline void ui_tab5_cam_canvas_hide(void) {}
+static inline void ui_tab5_cam_overlay_text(const char *utf8)
+{
+    (void)utf8;
+}
 
 #endif /* CONFIG_MQJS_TAB5_UI */
 

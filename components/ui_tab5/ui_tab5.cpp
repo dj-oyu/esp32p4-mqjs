@@ -2257,6 +2257,8 @@ extern "C" void ui_tab5_start(void)
    port lock — they are called from the cam_scan task. */
 static lv_obj_t *s_cam_cv;
 static uint16_t *s_cam_cv_buf;
+static lv_obj_t *s_cam_lbl;
+static int s_cam_cv_h;
 
 void *ui_tab5_cam_canvas(int w, int h)
 {
@@ -2274,6 +2276,7 @@ void *ui_tab5_cam_canvas(int w, int h)
             lv_obj_align(s_cam_cv, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_H + 24);
             lv_obj_set_style_border_width(s_cam_cv, 2, 0);
             lv_obj_set_style_border_color(s_cam_cv, lv_color_hex(0x2ECC71), 0);
+            s_cam_cv_h = h;
         }
     }
     if (s_cam_cv)
@@ -2297,6 +2300,31 @@ void ui_tab5_cam_canvas_hide(void)
         return;
     lvgl_port_lock(0);
     lv_obj_add_flag(s_cam_cv, LV_OBJ_FLAG_HIDDEN);
+    if (s_cam_lbl)
+        lv_obj_add_flag(s_cam_lbl, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
+}
+
+/* decode/near-miss readout under the viewfinder (the cam_scan task's
+ * "ひげ線" callout box; the line itself is drawn into the canvas) */
+void ui_tab5_cam_overlay_text(const char *utf8)
+{
+    if (!s_root_scr || !s_cam_cv)
+        return;
+    lvgl_port_lock(0);
+    if (!s_cam_lbl) {
+        s_cam_lbl = lv_label_create(lv_layer_top());
+        lv_obj_set_width(s_cam_lbl, 560);
+        lv_label_set_long_mode(s_cam_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(s_cam_lbl, lv_color_hex(0xE0E6EA), 0);
+        lv_obj_set_style_bg_color(s_cam_lbl, lv_color_hex(0x101820), 0);
+        lv_obj_set_style_bg_opa(s_cam_lbl, LV_OPA_80, 0);
+        lv_obj_set_style_pad_all(s_cam_lbl, 8, 0);
+        lv_obj_align(s_cam_lbl, LV_ALIGN_TOP_MID, 0,
+                     UI_STATUSBAR_H + 24 + s_cam_cv_h + 6);
+    }
+    lv_label_set_text(s_cam_lbl, utf8);
+    lv_obj_clear_flag(s_cam_lbl, LV_OBJ_FLAG_HIDDEN);
     lvgl_port_unlock();
 }
 

@@ -87,8 +87,13 @@ static int guard_ok(const int *runs, int n, int total)
     return 1;
 }
 
-static int try_decode_at(const int *runs, int nruns, int i, char out[14])
+/* one full decode attempt at start-guard candidate i. *prog = how far
+ * it got, in matched digits: 12 = everything read but the parity table
+ * or checksum said no (the "almost!" case), 13 = valid (out filled). */
+static int try_decode_at(const int *runs, int nruns, int i, char out[14],
+                         int *prog)
 {
+    *prog = 0;
     if (i + 59 > nruns)
         return 0;
 
@@ -114,6 +119,7 @@ static int try_decode_at(const int *runs, int nruns, int i, char out[14])
         if (dig < 0)
             return 0;
         digits[d + 1] = dig;
+        *prog = d + 1;
     }
 
     int mg = runs[pos] + runs[pos + 1] + runs[pos + 2] + runs[pos + 3] +
@@ -128,6 +134,7 @@ static int try_decode_at(const int *runs, int nruns, int i, char out[14])
         if (dig < 0)
             return 0;
         digits[d + 7] = dig;
+        *prog = d + 7;
     }
 
     int eg = runs[pos] + runs[pos + 1] + runs[pos + 2];
@@ -156,25 +163,51 @@ static int try_decode_at(const int *runs, int nruns, int i, char out[14])
     for (int k = 0; k < 13; k++)
         out[k] = (char)('0' + digits[k]);
     out[13] = '\0';
+    *prog = 13;
     return 1;
 }
 
-/* walk every bar run as a candidate start guard */
-static int scan_runs(const int *runs, int nruns, int first_black,
-                     char out[14])
+/* walk every bar run as a candidate start guard, remembering the best
+ * near-miss (most matched digits) with its pixel span. pos[k] = start
+ * pixel of run k, pos[nruns] = line length; reversed flips spans back
+ * into original line coordinates. */
+static int scan_runs(const int *runs, const int *pos, int nruns,
+                     int first_black, int npx, int reversed,
+                     ean13_scan_t *st)
 {
+    char code[14];
     for (int i = 0; i + 59 <= nruns; i++) {
         int is_bar = first_black ? !(i & 1) : (i & 1);
         if (!is_bar)
             continue;
-        if (try_decode_at(runs, nruns, i, out))
-            return 1;
+        int prog;
+        int hit = try_decode_at(runs, nruns, i, code, &prog);
+        if (hit || prog > st->digits) {
+            int end = i + 59;
+            if (end > nruns)
+                end = nruns;
+            int a = pos[i], b = pos[end];
+            if (reversed) {
+                int t = a;
+                a = npx - b;
+                b = npx - t;
+            }
+            st->x0 = a;
+            st->x1 = b;
+            st->digits = prog;
+            if (hit) {
+                memcpy(st->code, code, 14);
+                st->found = 1;
+                return 1;
+            }
+        }
     }
     return 0;
 }
 
-int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
+int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
 {
+    memset(st, 0, sizeof *st);
     if (n < 120)
         return 0;
 
@@ -203,6 +236,8 @@ int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
     enum { W = 64, FLAT = 30 };
     static uint8_t pmin[MAX_RUNS], smin[MAX_RUNS];
     static uint8_t pmax[MAX_RUNS], smax[MAX_RUNS];
+    static int runs[MAX_RUNS];     /* static scratch: see note above */
+    static int pos[MAX_RUNS + 1];  /* run k starts at pixel pos[k] */
     if (n > MAX_RUNS)
         return 0;
     for (int i = 0; i < n; i++) {
@@ -222,7 +257,6 @@ int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
         }
     }
     int gth = (mn + mx) / 2;
-    int runs[MAX_RUNS];
     int nruns = 0;
     int cur = -1;
     int first_black = 0;
@@ -261,7 +295,11 @@ int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
         return 0;
     runs[nruns++] = len;
 
-    if (scan_runs(runs, nruns, first_black, out))
+    pos[0] = 0;
+    for (int i = 0; i < nruns; i++)
+        pos[i + 1] = pos[i] + runs[i];
+
+    if (scan_runs(runs, pos, nruns, first_black, n, 0, st))
         return 1;
 
     /* reversed direction (camera upside down / right-to-left sweep) */
@@ -270,6 +308,18 @@ int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
         runs[i] = runs[j];
         runs[j] = t;
     }
+    pos[0] = 0;
+    for (int i = 0; i < nruns; i++)
+        pos[i + 1] = pos[i] + runs[i];
     int first_black_rev = first_black ^ ((nruns - 1) & 1);
-    return scan_runs(runs, nruns, first_black_rev, out);
+    return scan_runs(runs, pos, nruns, first_black_rev, n, 1, st);
+}
+
+int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
+{
+    ean13_scan_t st;
+    if (!ean13_scan_gray_line(line, n, &st))
+        return 0;
+    memcpy(out, st.code, 14);
+    return 1;
 }
