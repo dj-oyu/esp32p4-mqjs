@@ -172,6 +172,12 @@ void ui_tab5_w_commit(void);
  * metric lives inside the preallocated pool, invisible to heap_caps. */
 size_t ui_tab5_lv_mem_free(void);
 
+/* The touch controller's I2C master bus handle (port 1, SDA31/SCL32) —
+ * the internal bus the camera's SCCB also lives on. void* so this
+ * header stays IDF-type-free; cast to i2c_master_bus_handle_t. NULL
+ * until touch_init ran (or when it failed). */
+void *ui_tab5_i2c_bus(void);
+
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
 static inline void ui_tab5_start(void) {}
@@ -259,6 +265,7 @@ static inline int ui_tab5_w_value_int(uint32_t handle)
 static inline void ui_tab5_w_reset(void) {}
 static inline void ui_tab5_w_commit(void) {}
 static inline size_t ui_tab5_lv_mem_free(void) { return 0; }
+static inline void *ui_tab5_i2c_bus(void) { return 0; }
 
 #endif /* CONFIG_MQJS_TAB5_UI */
 

@@ -1,0 +1,13 @@
+menu "mqjs Tab5 camera"
+
+config MQJS_CAMERA
+    bool "Tab5 camera barcode scanning (camera.scan JS API)"
+    default n
+    depends on IDF_TARGET_ESP32P4
+    help
+        SC2356 over MIPI-CSI via esp_video; EAN-13 scanline decoding
+        for ISBN input. Needs the Tab5 UI build (shares the touch
+        controller's I2C bus for SCCB) and the esp_video kconfig
+        options from sdkconfig.tab5.defaults.
+
+endmenu

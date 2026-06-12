@@ -25,6 +25,7 @@
 #include "task_source.h"
 #include "ui_status.h"
 #include "ui_tab5.h"
+#include "cam_tab5.h"
 #include "wifi.h"
 
 static const char *TAG = "app";
@@ -98,6 +99,8 @@ void app_main(void)
        itself: pixel loops ~2x, JS ~20% vs -Og. */
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
+    cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus
+                                            (no-op stubs elsewhere) */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */

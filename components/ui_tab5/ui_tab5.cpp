@@ -588,6 +588,12 @@ static ui_panel_variant_t panel_reset_and_detect(void)
  * claims pins 31/32 itself would steal them from the touch controller.
  */
 static lv_indev_t *s_touch_indev;
+static i2c_master_bus_handle_t s_touch_bus; /* shared with camera SCCB */
+
+void *ui_tab5_i2c_bus(void)
+{
+    return s_touch_bus;
+}
 
 static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
 {
@@ -604,6 +610,7 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
         ESP_LOGE(TAG, "touch i2c bus failed (no touch)");
         return;
     }
+    s_touch_bus = bus;
 
     /* both controllers use 16-bit register addresses, no control
        phase; only the device address differs (the GT911 config macro
@@ -685,7 +692,11 @@ static esp_err_t backlight_init(void)
     timer_cfg.duty_resolution = LEDC_TIMER_12_BIT;
     timer_cfg.timer_num = LEDC_TIMER_0;
     timer_cfg.freq_hz = 5000;
-    timer_cfg.clk_cfg = LEDC_AUTO_CLK;
+    /* P4: every LEDC timer shares ONE global clock mux. AUTO would pick
+       the XTAL here, and the camera XCLK (cam_tab5, 24MHz on TIMER_2)
+       cannot be derived from 40MHz XTAL — pin both to PLL_F80M or the
+       second ledc_timer_config fails with "timer clock conflict". */
+    timer_cfg.clk_cfg = LEDC_USE_PLL_DIV_CLK;
     esp_err_t err = ledc_timer_config(&timer_cfg);
     if (err != ESP_OK)
         return err;

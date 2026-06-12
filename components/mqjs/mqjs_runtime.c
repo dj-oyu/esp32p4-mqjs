@@ -65,6 +65,7 @@
 #include "nvs_flash.h"
 #include "ui_tab5.h"
 #include "sshc.h"
+#include "cam_tab5.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -129,7 +130,7 @@ typedef struct {
    (also when it drops the event because its owner died). */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
-               EV_FOCUS, EV_CLIP } MqjsEventType;
+               EV_FOCUS, EV_CLIP, EV_CAM } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -148,6 +149,8 @@ typedef struct {
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to AppSlot.name */
         struct { uint8_t target; } focus;
+        struct { char code[14]; uint8_t ok; } cam; /* camera.scan result
+                       (13 digits inline: no heap ownership to manage) */
     } u;
 } MqjsEvent;
 
@@ -210,6 +213,7 @@ typedef struct {
     bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
+    bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
 
 #ifdef ESP_PLATFORM
     esp_mqtt_client_handle_t mqtt;  /* per-app client: "mqjs-app-<slot>" */
@@ -2218,6 +2222,122 @@ static void dispatch_clip(AppSlot *app, const MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
+/* camera: Tab5 barcode scan (camera.scan/cancel/status, cam_tab5)     */
+/* One scanner system-wide. The scan task's callback marshals into the */
+/* shared queue as a slot-addressed EV_CAM; the registering app's      */
+/* one-shot callback fires with the code string (or undefined).        */
+/* ------------------------------------------------------------------ */
+
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
+static volatile bool s_cam_active;
+static uint8_t s_cam_slot;
+static uint16_t s_cam_gen;
+
+/* runs on the cam_scan task */
+static void cam_done_cb(const char *code, void *arg)
+{
+    (void)arg;
+    MqjsEvent ev = { .type = EV_CAM, .slot = s_cam_slot, .gen = s_cam_gen };
+    if (code) {
+        snprintf(ev.u.cam.code, sizeof ev.u.cam.code, "%s", code);
+        ev.u.cam.ok = 1;
+    }
+    s_cam_active = false;
+    ev_post(&ev, 0);
+}
+#endif
+
+/* camera.scan(fn[, prefix]) -> 1 scan started / 0 busy-or-unavailable.
+   fn(code_string | undefined) fires exactly once. prefix filters codes
+   in C ("97" = ISBN Bookland 978/979 — Japanese books carry a second
+   192... JAN right below the ISBN barcode, which this rejects). */
+JSValue js_camera_scan(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
+    char prefix[8] = "";
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) &&
+        uiw_copy_str(ctx, argv[1], prefix, sizeof prefix))
+        return JS_EXCEPTION;
+    if (s_cam_active)
+        return JS_NewBool(0);
+    JSValue r = register_cb(ctx, argv[0], &s_cur_app->cam_used,
+                            &s_cur_app->cam_cb);
+    if (JS_IsException(r))
+        return r;
+    s_cam_slot = s_cur_app->slot;
+    s_cam_gen = s_cur_app->gen;
+    s_cam_active = true;
+    if (!cam_tab5_scan_start(15000, prefix, cam_done_cb, NULL)) {
+        s_cam_active = false;
+        s_cur_app->cam_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_app->cam_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_NewBool(0);
+#endif
+}
+
+/* camera.cancel(): abort the running scan; its callback still fires
+   (with undefined) through the normal event path. */
+JSValue js_camera_cancel(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
+    cam_tab5_cancel();
+#endif
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_UNDEFINED;
+}
+
+/* camera.status() -> last init/scan state string (remote diagnosis:
+   the Tab5 has no usable serial in the field). */
+JSValue js_camera_status(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+#ifdef ESP_PLATFORM
+    return JS_NewString(ctx, cam_tab5_status());
+#else
+    return JS_NewString(ctx, "no camera on PC");
+#endif
+}
+
+static void dispatch_cam(AppSlot *app, const MqjsEvent *ev)
+{
+    JSContext *ctx = app->ctx;
+    if (!app->cam_used)
+        return;
+    if (JS_StackCheck(ctx, 3)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, ev->u.cam.ok ? JS_NewString(ctx, ev->u.cam.code)
+                                 : JS_UNDEFINED);                /* arg0 */
+    JS_PushArg(ctx, app->cam_cb.val);                            /* func */
+    JS_PushArg(ctx, JS_NULL);                                    /* this */
+    /* one-shot: release before the call (the arg stack roots the fn) so
+       the handler can immediately camera.scan() again */
+    app->cam_used = false;
+    JS_DeleteGCRef(ctx, &app->cam_cb);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 1);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+}
+
+/* ------------------------------------------------------------------ */
 /* sys: heap telemetry (W1-4) + P4a lifecycle / signals                */
 /* ------------------------------------------------------------------ */
 
@@ -3649,6 +3769,8 @@ static bool anything_pending(const AppSlot *app)
     if (app->fg_used || app->bg_used || app->sig_used || app->clip_used)
         return true; /* lifecycle/signal/clipboard sinks keep the app
                         alive (§3.8: "sleep until something happens") */
+    if (app->cam_used)
+        return true; /* a camera.scan in flight: its result must land */
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
         if (app->widget_cbs[i].used) /* a live widget screen, too */
             return true;
@@ -3734,6 +3856,14 @@ static void app_reset_bindings(AppSlot *app)
         JS_DeleteGCRef(ctx, &app->clip_cb);
         app->clip_used = false;
     }
+    if (app->cam_used) {
+        JS_DeleteGCRef(ctx, &app->cam_cb);
+        app->cam_used = false;
+    }
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
+    if (s_cam_active && s_cam_slot == app->slot)
+        cam_tab5_cancel(); /* its result event dies on the gen check */
+#endif
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
         if (app->ssh_cbs[i].used)
             sshcb_release(ctx, &app->ssh_cbs[i]);
@@ -3937,7 +4067,8 @@ static AppSlot *event_owner(const MqjsEvent *ev)
     case EV_MQTT_CONNECTED:
     case EV_MQTT_DATA:
     case EV_SIGNAL:
-    case EV_CLIP: {
+    case EV_CLIP:
+    case EV_CAM: {
         AppSlot *app = &s_apps[ev->slot];
         return (app->used && app->gen == ev->gen) ? app : NULL;
     }
@@ -3975,6 +4106,7 @@ static void dispatch_event(AppSlot *app, MqjsEvent *ev)
     case EV_WIDGET:         dispatch_widget_event(app, ev);  break;
     case EV_SIGNAL:         dispatch_signal(app, ev);        break;
     case EV_CLIP:           dispatch_clip(app, ev);          break;
+    case EV_CAM:            dispatch_cam(app, ev);           break;
     }
     s_cur_app = prev;
 }

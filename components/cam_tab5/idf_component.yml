@@ -1,0 +1,4 @@
+dependencies:
+  # MIPI-CSI capture + ISP via V4L2-style /dev/video0 (pulls
+  # esp_cam_sensor with the SC202CS/SC2356 driver transitively)
+  espressif/esp_video: "^2.2.0"

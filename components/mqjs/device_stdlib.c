@@ -463,6 +463,20 @@ static const JSPropDef js_clipboard[] = {
 static const JSClassDef js_clipboard_obj =
     JS_OBJECT_DEF("Clipboard", js_clipboard);
 
+/* ---- device API: camera object (Tab5 barcode scan over MIPI-CSI) ----
+   scan(fn[, prefix]) -> 1/0: one-shot EAN-13 scan, fn(code|undefined);
+   prefix "97" = ISBN only. cancel() aborts; status() = last state
+   string (remote diagnosis). Stub (scan -> 0) without a camera. ---- */
+static const JSPropDef js_camera[] = {
+    JS_CFUNC_DEF("scan", 2, js_camera_scan),
+    JS_CFUNC_DEF("cancel", 0, js_camera_cancel),
+    JS_CFUNC_DEF("status", 0, js_camera_status),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_camera_obj =
+    JS_OBJECT_DEF("Camera", js_camera);
+
 /* ---- device API: store object (NVS-backed key-value, W2) ---- */
 static const JSPropDef js_store[] = {
     JS_CFUNC_DEF("get", 1, js_store_get),
@@ -562,6 +576,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
+    JS_PROP_CLASS_DEF("camera", &js_camera_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
        ui.screen(); the names just make the ROM protos reachable). */

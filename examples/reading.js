@@ -291,7 +291,7 @@ function buildAdd() {
     var fTitle = s.field("タイトル (必須)");
     var fAuthor = s.field("著者");
     var fPages = s.field("総ページ数 (必須)");
-    s.button("NDL サーチで自動入力 (要 PC ブリッジ)", function () {
+    function ndlQuery() {
         var isbn = (fIsbn.value() || "").replaceAll("-", "").replaceAll(" ", "");
         if (isbn.length < 10) {
             status.setText("ISBN (10 桁か 13 桁) を入れてください");
@@ -313,7 +313,30 @@ function buildAdd() {
                 "応答なし: PC で tools/ndl_bridge.py が動いているか確認 (手入力も可)");
             ndlWait = null;
         }, 10000);
+    }
+    /* カメラで ISBN バーコードを読む (camera.* が生えた Tab5 ファーム
+     * のみ)。"97" プレフィックスで下段の書籍JAN (192...) は C 側で除外。
+     * 成功したらそのまま NDL 検索まで自動で進む */
+    s.button("バーコードをスキャン (カメラ)", function () {
+        if (typeof camera === "undefined") {
+            status.setText("このファームはカメラ非対応です (手入力を)");
+            return;
+        }
+        var ok = camera.scan(function (code) {
+            if (!code) {
+                status.setText("読み取れませんでした (" + camera.status() +
+                               ")。明るい所でもう一度");
+                return;
+            }
+            fIsbn.setText(code);
+            status.setText("読み取り: " + code);
+            ndlQuery();
+        }, "97");
+        status.setText(ok ? "スキャン中 (15 秒)... 本の裏の上段バーコード " +
+                            "(978〜) をカメラにかざして"
+                          : "カメラを使えません: " + camera.status());
     });
+    s.button("NDL サーチで自動入力 (要 PC ブリッジ)", ndlQuery);
     s.button("追加", function () {
         if (books.length >= MAX_BOOKS) {
             status.setText("登録は " + MAX_BOOKS + " 冊まで (読了本を削除してください)");
