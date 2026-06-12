@@ -340,6 +340,22 @@ static void scan_task(void *pv)
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
         set_status("scanning%s", NULL);
 
+        /* The pipeline keeps streaming between scans, but with both
+         * buffers DONE and nobody dequeuing, the driver stalls on the
+         * first two frames captured right AFTER the previous scan
+         * ended — typically the user still aiming at the book. Without
+         * this flush those ghosts decode instantly on the next scan
+         * ("face in view, yet it found the ISBN of the last book"). */
+        for (int i = 0; i < CAM_BUFS && !fail; i++) {
+            struct v4l2_buffer buf = { 0 };
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0)
+                fail = "DQBUF failed (flush)";
+            else
+                ioctl(s_fd, VIDIOC_QBUF, &buf);
+        }
+
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         while (!s_cancel && esp_timer_get_time() < deadline && !found) {
