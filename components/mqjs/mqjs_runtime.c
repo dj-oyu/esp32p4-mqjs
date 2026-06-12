@@ -9,9 +9,9 @@
  *   - Date / performance.now
  *
  * Design notes (docs/launcher-multiapp-design.md §3):
- *   - Up to MQJS_MAX_APPS cooperative contexts live on ONE FreeRTOS
- *     task. All per-app binding state is bundled in AppSlot; dispatch
- *     is serial, so a single global `s_cur_app` tells every binding
+ *   - Up to MQJS_MAX_WORKERS cooperative contexts live on ONE FreeRTOS
+ *     task. All per-app binding state is bundled in MqjsWorker; dispatch
+ *     is serial, so a single global `s_cur_wk` tells every binding
  *     which app is calling — no TLS, no locks.
  *   - Ownership invariant: events carry (or resolve to) slot +
  *     generation. app_stop never drains the shared queue; the
@@ -138,7 +138,7 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
 
 typedef struct {
     uint8_t type;
-    uint8_t slot;   /* owner slot for slot-addressed events (EV_MQTT_*,
+    uint8_t worker; /* owner worker for worker-addressed events (EV_MQTT_*,
                        EV_SIGNAL); other types resolve their owner at
                        dispatch time (§3.2 routing table) */
     uint16_t gen;   /* owner generation: stale events are dropped */
@@ -151,7 +151,7 @@ typedef struct {
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
         struct { char *value; char from[32]; } signal; /* sys.signal;
-                       from[] sized to AppSlot.name */
+                       from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
         struct { char code[14]; uint8_t ok; } cam; /* camera.scan result
                        (13 digits inline: no heap ownership to manage) */
@@ -197,7 +197,7 @@ typedef struct {
     bool kill_req;            /* deferred sys.stop (self-stop must not free
                                  the context under its own active JS frame:
                                  the reaper does it after the dispatch) */
-    uint8_t slot;             /* own index (for s_fg_slot comparisons) */
+    uint8_t idx;              /* own index (for s_fg_worker comparisons) */
     uint16_t gen;             /* bumped on every start: stale-event filter */
     char name[32];
     char vault_id[32];        /* immutable source identity; setAppName cannot
@@ -235,13 +235,13 @@ typedef struct {
        CJK or 256 ASCII glyphs, comfortably past one 720px row). */
     char sink_line[256];
     size_t sink_len;
-} AppSlot;
+} MqjsWorker;
 
-static AppSlot s_apps[MQJS_MAX_APPS];
-static AppSlot *s_cur_app;        /* app whose JS is on the C stack — the
+static MqjsWorker s_workers[MQJS_MAX_WORKERS];
+static MqjsWorker *s_cur_wk;        /* app whose JS is on the C stack — the
                                      single biggest dividend of the serial
                                      model: every binding reads it */
-static volatile int s_fg_slot = MQJS_SLOT_DEV; /* boot: dev app in front */
+static volatile int s_fg_worker = MQJS_WORKER_DEV; /* boot: dev app in front */
 static volatile bool s_stop_req; /* dev-slot stop (task push / PC ^C) */
 static int64_t s_run_deadline;   /* JS watchdog */
 
@@ -315,10 +315,10 @@ static const AppSource *app_source_find(const char *name)
 static void bar_update(void)
 {
 #ifdef ESP_PLATFORM
-    AppSlot *fg = &s_apps[s_fg_slot];
+    MqjsWorker *fg = &s_workers[s_fg_worker];
     bool prev_running = false;
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        if (s_apps[i].used && !strcmp(s_apps[i].name, s_prev_name)) {
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        if (s_workers[i].used && !strcmp(s_workers[i].name, s_prev_name)) {
             prev_running = true;
             break;
         }
@@ -399,11 +399,11 @@ void mqjs_set_uninstall_hook(void (*fn)(const char *name))
    prefix so the shared console stays attributable (§3.5). */
 static void sink_flush(void)
 {
-    AppSlot *app = s_cur_app;
+    MqjsWorker *app = s_cur_wk;
     char *line = app ? app->sink_line : s_orphan_line;
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
     if (s_print_sink && *plen) {
-        if (app && app->slot != MQJS_SLOT_DEV && app->name[0]) {
+        if (app && app->idx != MQJS_WORKER_DEV && app->name[0]) {
             char buf[sizeof(app->sink_line) + sizeof(app->name) + 4];
             int n = snprintf(buf, sizeof buf, "[%s] ", app->name);
             memcpy(buf + n, line, *plen);
@@ -420,7 +420,7 @@ static void out_write(const void *buf, size_t len)
     fwrite(buf, 1, len, stdout);
     if (!s_print_sink)
         return;
-    AppSlot *app = s_cur_app;
+    MqjsWorker *app = s_cur_wk;
     char *line = app ? app->sink_line : s_orphan_line;
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
     size_t cap = app ? sizeof(app->sink_line) : sizeof(s_orphan_line);
@@ -517,10 +517,10 @@ static JSValue register_cb(JSContext *ctx, JSValue fn, bool *used,
 }
 
 /* call a no-arg persistent callback on `app` (lifecycle hooks) */
-static void app_call0(AppSlot *app, JSGCRef *fn)
+static void app_call0(MqjsWorker *app, JSGCRef *fn)
 {
-    AppSlot *prev = s_cur_app;
-    s_cur_app = app;
+    MqjsWorker *prev = s_cur_wk;
+    s_cur_wk = app;
     if (JS_StackCheck(app->ctx, 2)) {
         dump_error(app->ctx);
     } else {
@@ -531,7 +531,7 @@ static void app_call0(AppSlot *app, JSGCRef *fn)
         if (JS_IsException(ret))
             dump_error(app->ctx);
     }
-    s_cur_app = prev;
+    s_cur_wk = prev;
 }
 
 /* ------------------------------------------------------------------ */
@@ -605,7 +605,7 @@ static JSValue set_timer(JSContext *ctx, JSValue *argv, bool repeat)
         delay = 1;
 
     for (int i = 0; i < MQJS_MAX_TIMERS; i++) {
-        TimerSlot *t = &s_cur_app->timers[i];
+        TimerSlot *t = &s_cur_wk->timers[i];
         if (!t->used) {
             JSValue *pf = JS_AddGCRef(ctx, &t->fn);
             *pf = argv[0];
@@ -634,9 +634,9 @@ JSValue js_clearTimer(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     int id;
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
-    if (id >= 0 && id < MQJS_MAX_TIMERS && s_cur_app->timers[id].used) {
-        JS_DeleteGCRef(ctx, &s_cur_app->timers[id].fn);
-        s_cur_app->timers[id].used = false;
+    if (id >= 0 && id < MQJS_MAX_TIMERS && s_cur_wk->timers[id].used) {
+        JS_DeleteGCRef(ctx, &s_cur_wk->timers[id].fn);
+        s_cur_wk->timers[id].used = false;
     }
     return JS_UNDEFINED;
 }
@@ -660,7 +660,7 @@ JSValue js_delay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 
 /* Run all expired timers of ONE app. Returns the delay in ms until its
    next timer (or `idle_max` if none is pending sooner). */
-static int run_timers(AppSlot *app, int idle_max)
+static int run_timers(MqjsWorker *app, int idle_max)
 {
     JSContext *ctx = app->ctx;
     int64_t now = time_ms();
@@ -712,12 +712,12 @@ static int run_timers(AppSlot *app, int idle_max)
 static int run_all_timers(int idle_max)
 {
     int min_delay = idle_max;
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        if (!s_apps[i].used)
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        if (!s_workers[i].used)
             continue;
-        s_cur_app = &s_apps[i];
-        int d = run_timers(&s_apps[i], idle_max);
-        s_cur_app = NULL;
+        s_cur_wk = &s_workers[i];
+        int d = run_timers(&s_workers[i], idle_max);
+        s_cur_wk = NULL;
         if (d < min_delay)
             min_delay = d;
     }
@@ -806,17 +806,17 @@ JSValue js_gpio_onChange(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
         return JS_ThrowTypeError(ctx, "not a function");
 
     /* a pin has one owner across ALL apps (shared hardware) */
-    for (int a = 0; a < MQJS_MAX_APPS; a++) {
-        if (!s_apps[a].used)
+    for (int a = 0; a < MQJS_MAX_WORKERS; a++) {
+        if (!s_workers[a].used)
             continue;
         for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-            GpioSlot *g = &s_apps[a].gpio_cb[i];
+            GpioSlot *g = &s_workers[a].gpio_cb[i];
             if (g->used && g->pin == pin)
                 return JS_ThrowTypeError(ctx, "pin already has a handler");
         }
     }
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
-        GpioSlot *g = &s_cur_app->gpio_cb[i];
+        GpioSlot *g = &s_cur_wk->gpio_cb[i];
         if (!g->used) {
             JSValue *pf = JS_AddGCRef(ctx, &g->fn);
             *pf = argv[1];
@@ -838,7 +838,7 @@ JSValue js_gpio_onChange(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return JS_ThrowInternalError(ctx, "too many gpio handlers");
 }
 
-static void dispatch_gpio_event(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_gpio_event(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_GPIO_CB; i++) {
@@ -1049,7 +1049,7 @@ typedef enum {
    stack = runtime-internal call: allowed.) */
 static bool ui_is_fg(void)
 {
-    return !s_cur_app || s_cur_app->slot == s_fg_slot;
+    return !s_cur_wk || s_cur_wk->idx == s_fg_worker;
 }
 
 /* Post one drawing command. Takes ownership of `text` (heap copy) in
@@ -1273,11 +1273,11 @@ JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 {
     if (!JS_IsFunction(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "not a function");
-    if (s_cur_app->touch_used)
-        JS_DeleteGCRef(ctx, &s_cur_app->touch_cb); /* re-register replaces */
-    JSValue *pf = JS_AddGCRef(ctx, &s_cur_app->touch_cb);
+    if (s_cur_wk->touch_used)
+        JS_DeleteGCRef(ctx, &s_cur_wk->touch_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_cur_wk->touch_cb);
     *pf = argv[0];
-    s_cur_app->touch_used = true;
+    s_cur_wk->touch_used = true;
 #ifndef ESP_PLATFORM
     printf("[ui] onTouch registered (stub: never fires on PC)\n");
 #endif
@@ -1287,7 +1287,7 @@ JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 void mqjs_post_touch(int x, int y, int kind)
 {
 #ifdef ESP_PLATFORM
-    AppSlot *fg = &s_apps[s_fg_slot]; /* touch always goes to the fg app */
+    MqjsWorker *fg = &s_workers[s_fg_worker]; /* touch always goes to the fg app */
     if (!s_event_queue || !fg->used || !fg->touch_used)
         return;
     MqjsEvent ev = {
@@ -1302,7 +1302,7 @@ void mqjs_post_touch(int x, int y, int kind)
 #endif
 }
 
-static void dispatch_touch_event(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_touch_event(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     if (!app->touch_used)
@@ -1362,11 +1362,11 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     if (!JS_IsFunction(ctx, argv[0]))
         return JS_ThrowTypeError(ctx, "not a function");
-    if (s_cur_app->key_used)
-        JS_DeleteGCRef(ctx, &s_cur_app->key_cb); /* re-register replaces */
-    JSValue *pf = JS_AddGCRef(ctx, &s_cur_app->key_cb);
+    if (s_cur_wk->key_used)
+        JS_DeleteGCRef(ctx, &s_cur_wk->key_cb); /* re-register replaces */
+    JSValue *pf = JS_AddGCRef(ctx, &s_cur_wk->key_cb);
     *pf = argv[0];
-    s_cur_app->key_used = true;
+    s_cur_wk->key_used = true;
 #ifndef ESP_PLATFORM
     printf("[ui] onKey registered (stub: never fires on PC)\n");
 #endif
@@ -1377,7 +1377,7 @@ void mqjs_post_key(const char *utf8, size_t len)
 {
 #ifdef ESP_PLATFORM
     MqjsEvent ev = { .type = EV_KEY };
-    AppSlot *fg = &s_apps[s_fg_slot]; /* keys always go to the fg app */
+    MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
     if (!s_event_queue || !fg->used || !fg->key_used || !utf8)
         return;
     if (len == 0 || len > sizeof(ev.u.key.text))
@@ -1391,7 +1391,7 @@ void mqjs_post_key(const char *utf8, size_t len)
 #endif
 }
 
-static void dispatch_key_event(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_key_event(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     if (!app->key_used)
@@ -1491,7 +1491,7 @@ static int wcb_add(JSContext *ctx, uint32_t handle, uint32_t screen,
                    JSValue fn)
 {
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
-        WidgetCb *w = &s_cur_app->widget_cbs[i];
+        WidgetCb *w = &s_cur_wk->widget_cbs[i];
         if (w->used)
             continue;
         JSValue *pf = JS_AddGCRef(ctx, &w->fn);
@@ -1506,7 +1506,7 @@ static int wcb_add(JSContext *ctx, uint32_t handle, uint32_t screen,
 
 /* one sweep per destroyed screen: all its callbacks die together, so
    the compacting GC repacks once (design §4④) */
-static void wcb_release_screen(AppSlot *app, uint32_t screen)
+static void wcb_release_screen(MqjsWorker *app, uint32_t screen)
 {
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
         WidgetCb *w = &app->widget_cbs[i];
@@ -1518,7 +1518,7 @@ static void wcb_release_screen(AppSlot *app, uint32_t screen)
 }
 
 /* all screens of an app died at once (foreground switch / app stop) */
-static void wcb_release_all(AppSlot *app)
+static void wcb_release_all(MqjsWorker *app)
 {
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
         WidgetCb *w = &app->widget_cbs[i];
@@ -1546,7 +1546,7 @@ void mqjs_post_widget(uint32_t handle, int32_t value)
 #endif
 }
 
-static void dispatch_widget_event(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_widget_event(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++) {
@@ -1641,7 +1641,7 @@ JSValue js_ui_screen(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         h = pcw_screen(title, &evicted);
 #endif
         if (evicted)
-            wcb_release_screen(s_cur_app, evicted);
+            wcb_release_screen(s_cur_wk, evicted);
     }
     return uiw_make(ctx, h, h, UIW_K_SCREEN, JS_CLASS_UI_SCREEN);
 }
@@ -1659,7 +1659,7 @@ JSValue js_ui_back(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     destroyed = pcw_back();
 #endif
     if (destroyed)
-        wcb_release_screen(s_cur_app, destroyed);
+        wcb_release_screen(s_cur_wk, destroyed);
     return JS_NewBool(destroyed != 0);
 }
 
@@ -1998,7 +1998,7 @@ JSValue js_vault_has(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     JSCStringBuf nbuf;
     const char *name = JS_ToCString(ctx, argv[0], &nbuf);
     char value[MQJS_VAULT_VAL_MAX + 1];
-    bool ok = name && vault_read(s_cur_app->vault_id, name, value, sizeof value);
+    bool ok = name && vault_read(s_cur_wk->vault_id, name, value, sizeof value);
     memset(value, 0, sizeof value);
     return name ? JS_NewBool(ok) : JS_EXCEPTION;
 }
@@ -2011,7 +2011,7 @@ JSValue js_vault_put(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     if (!name)
         return JS_EXCEPTION;
     char key[16];
-    if (!vault_key(s_cur_app->vault_id, name, key))
+    if (!vault_key(s_cur_wk->vault_id, name, key))
         return JS_ThrowRangeError(ctx, "vault name must be 1-%d chars",
                                   MQJS_VAULT_NAME_MAX);
     const char *value = JS_ToCStringLen(ctx, &vlen, argv[1], &vbuf);
@@ -2050,7 +2050,7 @@ JSValue js_vault_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     if (!name)
         return JS_EXCEPTION;
     char key[16];
-    if (!vault_key(s_cur_app->vault_id, name, key))
+    if (!vault_key(s_cur_wk->vault_id, name, key))
         return JS_NewBool(0);
 #ifdef ESP_PLATFORM
     bool ok = vault_open() && nvs_erase_key(s_vault, key) == ESP_OK;
@@ -2329,11 +2329,11 @@ JSValue js_clipboard_set(JSContext *ctx, JSValue *this_val, int argc,
 
     /* wake the other listeners (best effort: a full queue drops the
        nudge, the value itself is never lost) */
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        AppSlot *app = &s_apps[i];
-        if (!app->used || !app->clip_used || app == s_cur_app)
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        MqjsWorker *app = &s_workers[i];
+        if (!app->used || !app->clip_used || app == s_cur_wk)
             continue;
-        MqjsEvent ev = { .type = EV_CLIP, .slot = app->slot,
+        MqjsEvent ev = { .type = EV_CLIP, .worker = app->idx,
                          .gen = app->gen };
         ev_post(&ev, 0);
     }
@@ -2398,11 +2398,11 @@ JSValue js_clipboard_get(JSContext *ctx, JSValue *this_val, int argc,
 JSValue js_clipboard_onChange(JSContext *ctx, JSValue *this_val, int argc,
                               JSValue *argv)
 {
-    return register_cb(ctx, argv[0], &s_cur_app->clip_used,
-                       &s_cur_app->clip_cb);
+    return register_cb(ctx, argv[0], &s_cur_wk->clip_used,
+                       &s_cur_wk->clip_cb);
 }
 
-static void dispatch_clip(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_clip(MqjsWorker *app, const MqjsEvent *ev)
 {
     (void)ev; /* no payload: the handler reads the current value */
     JSContext *ctx = app->ctx;
@@ -2432,14 +2432,14 @@ static void dispatch_clip(AppSlot *app, const MqjsEvent *ev)
 
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
 static volatile bool s_cam_active;
-static uint8_t s_cam_slot;
+static uint8_t s_cam_worker;
 static uint16_t s_cam_gen;
 
 /* runs on the cam_scan task */
 static void cam_done_cb(const char *code, void *arg)
 {
     (void)arg;
-    MqjsEvent ev = { .type = EV_CAM, .slot = s_cam_slot, .gen = s_cam_gen };
+    MqjsEvent ev = { .type = EV_CAM, .worker = s_cam_worker, .gen = s_cam_gen };
     if (code) {
         snprintf(ev.u.cam.code, sizeof ev.u.cam.code, "%s", code);
         ev.u.cam.ok = 1;
@@ -2463,18 +2463,18 @@ JSValue js_camera_scan(JSContext *ctx, JSValue *this_val, int argc,
         return JS_EXCEPTION;
     if (s_cam_active)
         return JS_NewBool(0);
-    JSValue r = register_cb(ctx, argv[0], &s_cur_app->cam_used,
-                            &s_cur_app->cam_cb);
+    JSValue r = register_cb(ctx, argv[0], &s_cur_wk->cam_used,
+                            &s_cur_wk->cam_cb);
     if (JS_IsException(r))
         return r;
-    s_cam_slot = s_cur_app->slot;
-    s_cam_gen = s_cur_app->gen;
+    s_cam_worker = s_cur_wk->idx;
+    s_cam_gen = s_cur_wk->gen;
     s_cam_active = true;
     /* (the scan task itself is created inside cam_tab5, pinned there) */
     if (!cam_tab5_scan_start(45000, prefix, cam_done_cb, NULL)) {
         s_cam_active = false;
-        s_cur_app->cam_used = false;
-        JS_DeleteGCRef(ctx, &s_cur_app->cam_cb);
+        s_cur_wk->cam_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->cam_cb);
         return JS_NewBool(0);
     }
     return JS_NewBool(1);
@@ -2517,7 +2517,7 @@ JSValue js_camera_status(JSContext *ctx, JSValue *this_val, int argc,
 #endif
 }
 
-static void dispatch_cam(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     if (!app->cam_used)
@@ -2554,7 +2554,7 @@ static void dispatch_cam(AppSlot *app, const MqjsEvent *ev)
 
 #ifdef ESP_PLATFORM
 static volatile bool s_http_active;
-static uint8_t s_http_slot;
+static uint8_t s_http_worker;
 static uint16_t s_http_gen;
 static char s_http_url[MQJS_HTTP_MAX_URL];
 
@@ -2562,7 +2562,7 @@ static char s_http_url[MQJS_HTTP_MAX_URL];
 static void http_get_task(void *arg)
 {
     (void)arg;
-    MqjsEvent ev = { .type = EV_HTTP, .slot = s_http_slot, .gen = s_http_gen };
+    MqjsEvent ev = { .type = EV_HTTP, .worker = s_http_worker, .gen = s_http_gen };
     ev.u.http.body = NULL;
     ev.u.http.len = 0;
     ev.u.http.status = -1;
@@ -2619,20 +2619,20 @@ JSValue js_http_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_EXCEPTION;
     if (!s_http_url[0])
         return JS_NewBool(0);
-    JSValue r = register_cb(ctx, argv[1], &s_cur_app->http_used,
-                            &s_cur_app->http_cb);
+    JSValue r = register_cb(ctx, argv[1], &s_cur_wk->http_used,
+                            &s_cur_wk->http_cb);
     if (JS_IsException(r))
         return r;
-    s_http_slot = s_cur_app->slot;
-    s_http_gen = s_cur_app->gen;
+    s_http_worker = s_cur_wk->idx;
+    s_http_gen = s_cur_wk->gen;
     s_http_active = true;
     /* pinned to core 0 (with the JS task, which outranks it at prio 5):
        unpinned it competed with the core-1 LVGL task (audit §3.1) */
     if (xTaskCreatePinnedToCore(http_get_task, "http_get", 8192, NULL, 4,
                                 NULL, 0) != pdPASS) {
         s_http_active = false;
-        s_cur_app->http_used = false;
-        JS_DeleteGCRef(ctx, &s_cur_app->http_cb);
+        s_cur_wk->http_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->http_cb);
         return JS_NewBool(0);
     }
     return JS_NewBool(1);
@@ -2645,7 +2645,7 @@ JSValue js_http_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #endif
 }
 
-static void dispatch_http(AppSlot *app, MqjsEvent *ev)
+static void dispatch_http(MqjsWorker *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     if (!app->http_used) {
@@ -2705,21 +2705,21 @@ JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
    Registering any lifecycle/signal handler keeps the app alive. */
 JSValue js_sys_onForeground(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    return register_cb(ctx, argv[0], &s_cur_app->fg_used, &s_cur_app->fg_cb);
+    return register_cb(ctx, argv[0], &s_cur_wk->fg_used, &s_cur_wk->fg_cb);
 }
 
 /* sys.onBackground(fn): called right BEFORE the app's screens are
    destroyed on a foreground switch (last chance to snapshot UI state). */
 JSValue js_sys_onBackground(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    return register_cb(ctx, argv[0], &s_cur_app->bg_used, &s_cur_app->bg_cb);
+    return register_cb(ctx, argv[0], &s_cur_wk->bg_used, &s_cur_wk->bg_cb);
 }
 
 /* sys.onSignal(fn(value, fromName)): minimal app-to-app IPC sink (§3.8).
    Waiting for a signal counts as pending — "sleep until signalled". */
 JSValue js_sys_onSignal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    return register_cb(ctx, argv[0], &s_cur_app->sig_used, &s_cur_app->sig_cb);
+    return register_cb(ctx, argv[0], &s_cur_wk->sig_used, &s_cur_wk->sig_cb);
 }
 
 /* sys.signal(appName, value) -> bool: queue a signal for the named app
@@ -2739,10 +2739,10 @@ JSValue js_sys_signal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
         return JS_ThrowRangeError(ctx, "signal value too large (max %d)",
                                   MQJS_SIGNAL_VAL_MAX);
 
-    AppSlot *target = NULL;
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        if (s_apps[i].used && !strcmp(s_apps[i].name, name)) {
-            target = &s_apps[i];
+    MqjsWorker *target = NULL;
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        if (s_workers[i].used && !strcmp(s_workers[i].name, name)) {
+            target = &s_workers[i];
             break;
         }
     }
@@ -2755,11 +2755,11 @@ JSValue js_sys_signal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     memcpy(copy, val, vlen);
     copy[vlen] = '\0';
 
-    MqjsEvent ev = { .type = EV_SIGNAL, .slot = target->slot,
+    MqjsEvent ev = { .type = EV_SIGNAL, .worker = target->idx,
                      .gen = target->gen };
     ev.u.signal.value = copy;
     snprintf(ev.u.signal.from, sizeof ev.u.signal.from, "%s",
-             s_cur_app ? s_cur_app->name : "");
+             s_cur_wk ? s_cur_wk->name : "");
     if (!ev_post(&ev, 0)) {
         free(copy);
         return JS_NewBool(0);
@@ -2773,11 +2773,11 @@ JSValue js_sys_signal(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
    identity is, so callers need not know the pushed task's name. */
 static int app_slot_by_name(const char *name)
 {
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        if (s_apps[i].used && !strcmp(s_apps[i].name, name))
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        if (s_workers[i].used && !strcmp(s_workers[i].name, name))
             return i;
-    if (!strcmp(name, "dev") && s_apps[MQJS_SLOT_DEV].used)
-        return MQJS_SLOT_DEV;
+    if (!strcmp(name, "dev") && s_workers[MQJS_WORKER_DEV].used)
+        return MQJS_WORKER_DEV;
     return -1;
 }
 
@@ -2802,7 +2802,7 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     }
     if (JS_ToInt32(ctx, &slot, argv[0]))
         return JS_EXCEPTION;
-    if (slot < 0 || slot >= MQJS_MAX_APPS)
+    if (slot < 0 || slot >= MQJS_MAX_WORKERS)
         return JS_ThrowRangeError(ctx, "bad app slot");
     MqjsEvent ev = { .type = EV_FOCUS };
     ev.u.focus.target = (uint8_t)slot;
@@ -2812,9 +2812,9 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 
 /* ---- P4b: launcher support (apps/launch/stop/setAppName/notify) ---- */
 
-static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
+static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
                               const char *name);
-static void app_stop_internal(AppSlot *app);
+static void app_stop_internal(MqjsWorker *app);
 static void switch_foreground(int new_slot);
 
 /* sys.setAppName(name) -> bool: the app's identity for sys.signal, the
@@ -2832,13 +2832,13 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
         if ((unsigned char)*p < 0x20 || *p == '"' || *p == '\\')
             return JS_NewBool(0);
     }
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        if (s_apps[i].used && &s_apps[i] != s_cur_app &&
-            !strcmp(s_apps[i].name, name))
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        if (s_workers[i].used && &s_workers[i] != s_cur_wk &&
+            !strcmp(s_workers[i].name, name))
             return JS_NewBool(0);
     }
-    snprintf(s_cur_app->name, sizeof s_cur_app->name, "%s", name);
-    if (s_cur_app->slot == MQJS_SLOT_DEV)
+    snprintf(s_cur_wk->name, sizeof s_cur_wk->name, "%s", name);
+    if (s_cur_wk->idx == MQJS_WORKER_DEV)
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", name);
     bar_update();
     return JS_NewBool(1);
@@ -2855,8 +2855,8 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return arr;
     JS_PUSH_VALUE(ctx, arr);
     int n = 0;
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        if (!s_apps[i].used)
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        if (!s_workers[i].used)
             continue;
         JSValue obj = JS_NewObject(ctx);
         if (JS_IsException(obj)) {
@@ -2864,7 +2864,7 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
             return obj;
         }
         JS_PUSH_VALUE(ctx, obj);
-        JSValue name = JS_NewString(ctx, s_apps[i].name);
+        JSValue name = JS_NewString(ctx, s_workers[i].name);
         JS_SetPropertyStr(ctx, obj_ref.val, "name", name);
         JS_SetPropertyStr(ctx, obj_ref.val, "slot", JS_NewInt32(ctx, i));
         JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
@@ -2873,8 +2873,8 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
            Allocate the string into a local FIRST: the compacting GC can
            move obj during JS_NewString, and a nested call may read
            obj_ref.val before the allocation runs (eval order). */
-        JSValue kind = JS_NewString(ctx, i == MQJS_SLOT_LAUNCHER ? "system"
-                                       : i == MQJS_SLOT_DEV ? "dev"
+        JSValue kind = JS_NewString(ctx, i == MQJS_WORKER_LAUNCHER ? "system"
+                                       : i == MQJS_WORKER_DEV ? "dev"
                                        : "app");
         JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
         JS_POP_VALUE(ctx, obj);
@@ -3230,14 +3230,14 @@ JSValue js_sys_install(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
 static int app_free_slot(void)
 {
     /* 0 = launcher, 1 = dev: launched apps live in the user slots */
-    for (int i = MQJS_SLOT_DEV + 1; i < MQJS_MAX_APPS; i++)
-        if (!s_apps[i].used)
+    for (int i = MQJS_WORKER_DEV + 1; i < MQJS_MAX_WORKERS; i++)
+        if (!s_workers[i].used)
             return i;
     return -1;
 }
 
 /* ESP arenas come from mqjs_rt_init; the PC build allocates lazily */
-static bool app_ensure_mem(AppSlot *app)
+static bool app_ensure_mem(MqjsWorker *app)
 {
 #ifndef ESP_PLATFORM
     if (!app->mem) {
@@ -3284,11 +3284,11 @@ static int start_from_file(int slot, const char *arg, const char *name)
     }
     fclose(f);
     buf[flen] = '\0';
-    if (app_start_internal(&s_apps[slot], buf, (size_t)flen, name)) {
+    if (app_start_internal(&s_workers[slot], buf, (size_t)flen, name)) {
         free(buf);
         return -1;
     }
-    s_apps[slot].src_owned = buf;
+    s_workers[slot].src_owned = buf;
 #ifdef ESP_PLATFORM
     if (manifest_has(buf, (size_t)flen, "// @autostart"))
         autostart_optin_add(name);
@@ -3310,7 +3310,7 @@ static int sys_launch_core(const char *arg)
     if (!strcmp(arg, "dev")) {
         s_dev_hold = false;
         s_dev_retry_at = 0; /* the scheduler asks the provider next pass */
-        return MQJS_SLOT_DEV;
+        return MQJS_WORKER_DEV;
     }
 
     /* app name = basename without .js (also the path case) */
@@ -3324,27 +3324,27 @@ static int sys_launch_core(const char *arg)
     if (dot && dot != name)
         *dot = '\0';
 
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        if (s_apps[i].used && !strcmp(s_apps[i].name, name))
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        if (s_workers[i].used && !strcmp(s_workers[i].name, name))
             return i; /* already running */
     if (!strcmp(name, "launcher")) /* resident in slot 0, never elsewhere */
         return -1;
     /* the stopped dev task addressed by its setAppName identity (the
        chip remembers "ssh_vt", not "dev"): rerun via the provider */
-    if (!s_apps[MQJS_SLOT_DEV].used && s_last_dev_name[0] &&
+    if (!s_workers[MQJS_WORKER_DEV].used && s_last_dev_name[0] &&
         !strcmp(name, s_last_dev_name)) {
         s_dev_hold = false;
         s_dev_retry_at = 0;
-        return MQJS_SLOT_DEV;
+        return MQJS_WORKER_DEV;
     }
 
     int slot = app_free_slot();
-    if (slot < 0 || !app_ensure_mem(&s_apps[slot]))
+    if (slot < 0 || !app_ensure_mem(&s_workers[slot]))
         return -1;
 
     const AppSource *as = app_source_find(name);
     if (as) {
-        if (app_start_internal(&s_apps[slot], as->src, as->len, as->name))
+        if (app_start_internal(&s_workers[slot], as->src, as->len, as->name))
             return -1;
         return slot;
     }
@@ -3406,27 +3406,27 @@ JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
             return JS_NewBool(0);
     } else if (JS_ToInt32(ctx, &slot, argv[0]))
         return JS_EXCEPTION;
-    if (slot == MQJS_SLOT_LAUNCHER)
+    if (slot == MQJS_WORKER_LAUNCHER)
         return JS_ThrowTypeError(ctx, "the launcher cannot be stopped");
-    if (slot < 0 || slot >= MQJS_MAX_APPS || !s_apps[slot].used)
+    if (slot < 0 || slot >= MQJS_MAX_WORKERS || !s_workers[slot].used)
         return JS_NewBool(0);
 
-    AppSlot *app = &s_apps[slot];
+    MqjsWorker *app = &s_workers[slot];
     char line[96];
-    snprintf(line, sizeof line, "sys: stop '%s' (slot %d) by '%s'\n",
-             app->name, slot, s_cur_app ? s_cur_app->name : "?");
+    snprintf(line, sizeof line, "sys: stop '%s' (worker %d) by '%s'\n",
+             app->name, slot, s_cur_wk ? s_cur_wk->name : "?");
     out_write(line, strlen(line));
 
-    if (slot == MQJS_SLOT_DEV)
+    if (slot == MQJS_WORKER_DEV)
         s_dev_hold = true;
-    if (app == s_cur_app) {
+    if (app == s_cur_wk) {
         app->kill_req = true; /* reaper finishes after this dispatch */
         return JS_NewBool(1);
     }
-    bool was_fg = (slot == s_fg_slot);
+    bool was_fg = (slot == s_fg_worker);
     app_stop_internal(app);
-    if (was_fg && s_apps[MQJS_SLOT_LAUNCHER].used)
-        switch_foreground(MQJS_SLOT_LAUNCHER);
+    if (was_fg && s_workers[MQJS_WORKER_LAUNCHER].used)
+        switch_foreground(MQJS_WORKER_LAUNCHER);
     return JS_NewBool(1);
 }
 
@@ -3439,7 +3439,7 @@ JSValue js_sys_notify(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     const char *text = JS_ToCStringLen(ctx, &len, argv[0], &buf);
     if (!text)
         return JS_EXCEPTION;
-    const char *app = s_cur_app ? s_cur_app->name : "?";
+    const char *app = s_cur_wk ? s_cur_wk->name : "?";
 
     /* keep the latest notice per app: reuse the sender's entry, else
        the oldest one */
@@ -3536,7 +3536,7 @@ JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
    request. */
 void mqjs_request_open(const char *name)
 {
-    AppSlot *l = &s_apps[MQJS_SLOT_LAUNCHER];
+    MqjsWorker *l = &s_workers[MQJS_WORKER_LAUNCHER];
     if (!name || !name[0] || !l->used)
         return;
     size_t n = strlen(name);
@@ -3546,7 +3546,7 @@ void mqjs_request_open(const char *name)
     if (!val)
         return;
     snprintf(val, n + 32, "{\"op\":\"open\",\"app\":\"%s\"}", name);
-    MqjsEvent ev = { .type = EV_SIGNAL, .slot = MQJS_SLOT_LAUNCHER,
+    MqjsEvent ev = { .type = EV_SIGNAL, .worker = MQJS_WORKER_LAUNCHER,
                      .gen = l->gen };
     ev.u.signal.value = val;
     snprintf(ev.u.signal.from, sizeof ev.u.signal.from, "system");
@@ -3554,7 +3554,7 @@ void mqjs_request_open(const char *name)
         free(val);
 }
 
-static void dispatch_signal(AppSlot *app, MqjsEvent *ev)
+static void dispatch_signal(MqjsWorker *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     if (app->sig_used) {
@@ -3586,7 +3586,7 @@ static void dispatch_signal(AppSlot *app, MqjsEvent *ev)
 /* (all apps together), sshc does not know about apps (§3.5).          */
 /* ------------------------------------------------------------------ */
 
-static SshCb *sshcb_find(AppSlot *app, int32_t id)
+static SshCb *sshcb_find(MqjsWorker *app, int32_t id)
 {
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++)
         if (app->ssh_cbs[i].used && app->ssh_cbs[i].id == id)
@@ -3594,7 +3594,7 @@ static SshCb *sshcb_find(AppSlot *app, int32_t id)
     return NULL;
 }
 
-static SshCb *sshcb_get(AppSlot *app, int32_t id)
+static SshCb *sshcb_get(MqjsWorker *app, int32_t id)
 {
     SshCb *c = sshcb_find(app, id);
     if (c)
@@ -3625,7 +3625,7 @@ static void sshcb_release(JSContext *ctx, SshCb *c)
 typedef struct {
     bool used;
     int16_t id;
-    uint8_t slot;
+    uint8_t worker;
 } SshOwner;
 static SshOwner s_ssh_owner[MQJS_MAX_SSH_CB * 2];
 
@@ -3635,7 +3635,7 @@ static void ssh_owner_add(int id, int slot)
         if (!s_ssh_owner[i].used) {
             s_ssh_owner[i].used = true;
             s_ssh_owner[i].id = (int16_t)id;
-            s_ssh_owner[i].slot = (uint8_t)slot;
+            s_ssh_owner[i].worker = (uint8_t)slot;
             return;
         }
     }
@@ -3696,9 +3696,9 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc,
         return JS_EXCEPTION;
     if (argc >= 7 && JS_ToInt32(ctx, &rows, argv[6]))
         return JS_EXCEPTION;
-    if (!vault_read(s_cur_app->vault_id, pass_name, pass, sizeof pass))
+    if (!vault_read(s_cur_wk->vault_id, pass_name, pass, sizeof pass))
         return JS_ThrowTypeError(ctx, "vault password not found");
-    if (!vault_read(s_cur_app->vault_id, key_name, hostkey, sizeof hostkey))
+    if (!vault_read(s_cur_wk->vault_id, key_name, hostkey, sizeof hostkey))
         hostkey[0] = '\0';
 
 #ifdef ESP_PLATFORM
@@ -3707,7 +3707,7 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc,
     if (!id)
         return JS_ThrowTypeError(ctx, "no free ssh session (max %d)",
                                  SSHC_MAX_SESSIONS);
-    ssh_owner_add(id, s_cur_app->slot);
+    ssh_owner_add(id, s_cur_wk->idx);
 #else
     memset(pass, 0, sizeof pass);
     int id = s_pc_ssh_next++;
@@ -3784,7 +3784,7 @@ static JSValue ssh_register(JSContext *ctx, JSValue *argv, bool close_cb)
         return JS_EXCEPTION;
     if (!JS_IsFunction(ctx, argv[1]))
         return JS_ThrowTypeError(ctx, "not a function");
-    SshCb *c = sshcb_get(s_cur_app, id);
+    SshCb *c = sshcb_get(s_cur_wk, id);
     if (!c)
         return JS_ThrowInternalError(ctx, "too many ssh callbacks");
     JSGCRef *ref = close_cb ? &c->close_fn : &c->data_fn;
@@ -3845,7 +3845,7 @@ void mqjs_post_ssh_closed(int id, const char *reason)
 #endif
 }
 
-static void dispatch_ssh_data(AppSlot *app, MqjsEvent *ev)
+static void dispatch_ssh_data(MqjsWorker *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     SshCb *c = sshcb_find(app, ev->u.ssh.id);
@@ -3867,7 +3867,7 @@ static void dispatch_ssh_data(AppSlot *app, MqjsEvent *ev)
     ev->u.ssh.data = NULL;
 }
 
-static void dispatch_ssh_closed(AppSlot *app, const MqjsEvent *ev)
+static void dispatch_ssh_closed(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
 #ifdef ESP_PLATFORM
@@ -3942,16 +3942,16 @@ static void mqtt_event_cb(void *arg, esp_event_base_t base,
     uintptr_t packed = (uintptr_t)arg;
     uint8_t slot = (uint8_t)(packed & 0xFF);
     uint16_t gen = (uint16_t)(packed >> 8);
-    MqjsEvent ev = { .slot = slot, .gen = gen };
+    MqjsEvent ev = { .worker = slot, .gen = gen };
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        s_apps[slot].mqtt_up = true;
+        s_workers[slot].mqtt_up = true;
         ev.type = EV_MQTT_CONNECTED;
         xQueueSend(s_event_queue, &ev, 0);
         break;
     case MQTT_EVENT_DISCONNECTED:
-        s_apps[slot].mqtt_up = false;   /* esp-mqtt auto-reconnects */
+        s_workers[slot].mqtt_up = false;   /* esp-mqtt auto-reconnects */
         break;
     case MQTT_EVENT_DATA: {
         /* fragmented payloads (> internal rx buffer) are not supported */
@@ -3995,14 +3995,14 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
 
 #ifdef ESP_PLATFORM
-    AppSlot *app = s_cur_app;
+    MqjsWorker *app = s_cur_wk;
     if (app->mqtt)
         return JS_ThrowTypeError(ctx, "mqtt already started");
     /* distinct client id per app AND distinct from the task-delivery
        client (task_source.c): same-id clients kick each other off the
        broker (found the hard way, 2026-06-11) */
     char client_id[16];
-    snprintf(client_id, sizeof client_id, "mqjs-app-%d", app->slot);
+    snprintf(client_id, sizeof client_id, "mqjs-app-%d", app->idx);
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = uri,   /* copied by esp_mqtt_client_init */
         .credentials.client_id = client_id,
@@ -4011,7 +4011,7 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
     if (!app->mqtt)
         return JS_ThrowInternalError(ctx, "mqtt init failed (bad uri?)");
     esp_mqtt_client_register_event(app->mqtt, ESP_EVENT_ANY_ID, mqtt_event_cb,
-                                   MQTT_ARG_PACK(app->slot, app->gen));
+                                   MQTT_ARG_PACK(app->idx, app->gen));
     if (esp_mqtt_client_start(app->mqtt) != ESP_OK) {
         esp_mqtt_client_destroy(app->mqtt);
         app->mqtt = NULL;
@@ -4026,7 +4026,7 @@ JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 JSValue js_mqtt_disconnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
-    AppSlot *app = s_cur_app;
+    MqjsWorker *app = s_cur_wk;
     if (app->mqtt) {
         esp_mqtt_client_stop(app->mqtt);
         esp_mqtt_client_destroy(app->mqtt);
@@ -4042,7 +4042,7 @@ JSValue js_mqtt_disconnect(JSContext *ctx, JSValue *this_val, int argc, JSValue 
 JSValue js_mqtt_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
-    return JS_NewInt32(ctx, s_cur_app->mqtt_up ? 1 : 0);
+    return JS_NewInt32(ctx, s_cur_wk->mqtt_up ? 1 : 0);
 #else
     return JS_NewInt32(ctx, 0);
 #endif
@@ -4050,8 +4050,8 @@ JSValue js_mqtt_connected(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 
 JSValue js_mqtt_onConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
-    return register_cb(ctx, argv[0], &s_cur_app->mqtt_onconn_used,
-                       &s_cur_app->mqtt_onconn);
+    return register_cb(ctx, argv[0], &s_cur_wk->mqtt_onconn_used,
+                       &s_cur_wk->mqtt_onconn);
 }
 
 JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -4072,9 +4072,9 @@ JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
         return JS_EXCEPTION;
 
 #ifdef ESP_PLATFORM
-    if (!s_cur_app->mqtt)
+    if (!s_cur_wk->mqtt)
         return JS_ThrowTypeError(ctx, "mqtt not connected");
-    int id = esp_mqtt_client_publish(s_cur_app->mqtt, topic, payload,
+    int id = esp_mqtt_client_publish(s_cur_wk->mqtt, topic, payload,
                                      (int)plen, qos, retain);
     return JS_NewInt32(ctx, id);
 #else
@@ -4097,12 +4097,12 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
         return JS_ThrowTypeError(ctx, "not a function");
 
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        MqttSub *s = &s_cur_app->mqtt_subs[i];
+        MqttSub *s = &s_cur_wk->mqtt_subs[i];
         if (s->used && !strcmp(s->topic, topic))
             return JS_ThrowTypeError(ctx, "topic already subscribed");
     }
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
-        MqttSub *s = &s_cur_app->mqtt_subs[i];
+        MqttSub *s = &s_cur_wk->mqtt_subs[i];
         if (s->used)
             continue;
         memcpy(s->topic, topic, tlen + 1);
@@ -4110,8 +4110,8 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
         *pf = argv[1];
         s->used = true;
 #ifdef ESP_PLATFORM
-        if (s_cur_app->mqtt && s_cur_app->mqtt_up)
-            esp_mqtt_client_subscribe(s_cur_app->mqtt, s->topic, 0);
+        if (s_cur_wk->mqtt && s_cur_wk->mqtt_up)
+            esp_mqtt_client_subscribe(s_cur_wk->mqtt, s->topic, 0);
         /* not connected yet: dispatch_mqtt_connected() subscribes later */
 #else
         printf("[mqtt] subscribe(%s) registered (stub: never fires on PC)\n",
@@ -4122,7 +4122,7 @@ JSValue js_mqtt_subscribe(JSContext *ctx, JSValue *this_val, int argc, JSValue *
     return JS_ThrowInternalError(ctx, "too many mqtt subscriptions");
 }
 
-static void dispatch_mqtt_connected(AppSlot *app)
+static void dispatch_mqtt_connected(MqjsWorker *app)
 {
     JSContext *ctx = app->ctx;
 #ifdef ESP_PLATFORM
@@ -4147,7 +4147,7 @@ static void dispatch_mqtt_connected(AppSlot *app)
         dump_error(ctx);
 }
 
-static void dispatch_mqtt_data(AppSlot *app, MqjsEvent *ev)
+static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
@@ -4186,7 +4186,7 @@ static void dispatch_mqtt_data(AppSlot *app, MqjsEvent *ev)
 
 /* Does this app still have a reason to live? (§3.2: an app with no
    timers, handlers or sessions is reaped.) */
-static bool anything_pending(const AppSlot *app)
+static bool anything_pending(const MqjsWorker *app)
 {
     for (int i = 0; i < MQJS_MAX_TIMERS; i++)
         if (app->timers[i].used)
@@ -4210,7 +4210,7 @@ static bool anything_pending(const AppSlot *app)
     if (app->mqtt)   /* active mqtt session keeps the app alive */
         return true;
     for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++)
-        if (s_ssh_owner[i].used && s_ssh_owner[i].slot == app->slot)
+        if (s_ssh_owner[i].used && s_ssh_owner[i].worker == app->idx)
             return true; /* so does an ssh session it owns */
 #endif
     return false;
@@ -4219,7 +4219,7 @@ static bool anything_pending(const AppSlot *app)
 /* Release everything one app holds (per-app version of the old
    reset_slots). The shared event queue is NOT drained: in-flight
    events of this app die in the dispatcher (slot+gen check). */
-static void app_reset_bindings(AppSlot *app)
+static void app_reset_bindings(MqjsWorker *app)
 {
     JSContext *ctx = app->ctx;
 
@@ -4248,7 +4248,7 @@ static void app_reset_bindings(AppSlot *app)
     /* close only the ssh sessions THIS app opened (§3.6: shared-resource
        ownership); other apps' sessions stay untouched */
     for (int i = 0; i < (int)(sizeof s_ssh_owner / sizeof s_ssh_owner[0]); i++) {
-        if (s_ssh_owner[i].used && s_ssh_owner[i].slot == app->slot) {
+        if (s_ssh_owner[i].used && s_ssh_owner[i].worker == app->idx) {
             mqjs_ssh_close(s_ssh_owner[i].id);
             s_ssh_owner[i].used = false;
         }
@@ -4299,7 +4299,7 @@ static void app_reset_bindings(AppSlot *app)
            event dies on the gen check and frees its own body (§3.2) */
     }
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
-    if (s_cam_active && s_cam_slot == app->slot)
+    if (s_cam_active && s_cam_worker == app->idx)
         cam_tab5_cancel(); /* its result event dies on the gen check */
 #endif
     for (int i = 0; i < MQJS_MAX_SSH_CB; i++) {
@@ -4310,14 +4310,14 @@ static void app_reset_bindings(AppSlot *app)
 
     /* flush a half-assembled console line so it is not attributed to
        whichever app prints next */
-    AppSlot *prev = s_cur_app;
-    s_cur_app = app;
+    MqjsWorker *prev = s_cur_wk;
+    s_cur_wk = app;
     sink_flush();
-    s_cur_app = prev;
+    s_cur_wk = prev;
 
     /* the foreground app owned the screen: tear it down. The next
        foreground app rebuilds in its sys.onForeground. */
-    if (app->slot == s_fg_slot) {
+    if (app->idx == s_fg_worker) {
 #ifdef ESP_PLATFORM
         ui_tab5_w_reset();
         ui_cmd_t c = { .op = UI_CMD_RESET };
@@ -4328,13 +4328,13 @@ static void app_reset_bindings(AppSlot *app)
     }
 }
 
-static void app_stop_internal(AppSlot *app)
+static void app_stop_internal(MqjsWorker *app)
 {
     if (!app->used)
         return;
     /* a dying foreground app becomes the chip target: "tap to bring it
        back" survives the stop (design §4: open = focus-or-relaunch) */
-    if (app->slot == s_fg_slot)
+    if (app->idx == s_fg_worker)
         snprintf(s_prev_name, sizeof s_prev_name, "%s", app->name);
     app_reset_bindings(app);
     JS_FreeContext(app->ctx);  /* runs user-object finalizers */
@@ -4344,12 +4344,12 @@ static void app_stop_internal(AppSlot *app)
     free(app->src_owned);      /* sys.launch file source, if any */
     app->src_owned = NULL;
 #ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "app '%s' (slot %d) stopped", app->name, app->slot);
+    ESP_LOGI(TAG, "app '%s' (worker %d) stopped", app->name, app->idx);
 #endif
     bar_update();
 }
 
-static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
+static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
                               const char *name)
 {
     if (app->used || !app->mem)
@@ -4380,8 +4380,8 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
     JS_SetInterruptHandler(ctx, js_interrupt_handler);
 
     /* compile + run the top level (registers callbacks) */
-    AppSlot *prev = s_cur_app;
-    s_cur_app = app;
+    MqjsWorker *prev = s_cur_wk;
+    s_cur_wk = app;
     arm_watchdog();
     bool failed = false;
     if (JS_IsBytecode((const uint8_t *)src, src_len)) {
@@ -4409,16 +4409,16 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
             failed = true;
         }
     }
-    s_cur_app = prev;
+    s_cur_wk = prev;
 
     if (failed) {
         app_stop_internal(app);
         return -1;
     }
 #ifdef ESP_PLATFORM
-    ESP_LOGI(TAG, "app '%s' started in slot %d", app->name, app->slot);
+    ESP_LOGI(TAG, "app '%s' started in worker %d", app->name, app->idx);
 #endif
-    if (app->slot == MQJS_SLOT_DEV)
+    if (app->idx == MQJS_WORKER_DEV)
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", app->name);
     bar_update();
     return 0;
@@ -4429,11 +4429,11 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
    with other dispatches. */
 static void switch_foreground(int new_slot)
 {
-    if (new_slot < 0 || new_slot >= MQJS_MAX_APPS || new_slot == s_fg_slot ||
-        !s_apps[new_slot].used)
+    if (new_slot < 0 || new_slot >= MQJS_MAX_WORKERS || new_slot == s_fg_worker ||
+        !s_workers[new_slot].used)
         return;
 
-    AppSlot *old = &s_apps[s_fg_slot];
+    MqjsWorker *old = &s_workers[s_fg_worker];
     if (old->used) {
         if (old->bg_used)
             app_call0(old, &old->bg_cb); /* may snapshot UI state */
@@ -4450,8 +4450,8 @@ static void switch_foreground(int new_slot)
         snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
     }
 
-    s_fg_slot = new_slot;
-    AppSlot *nw = &s_apps[new_slot];
+    s_fg_worker = new_slot;
+    MqjsWorker *nw = &s_workers[new_slot];
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "foreground -> '%s' (slot %d)", nw->name, new_slot);
 #else
@@ -4465,7 +4465,7 @@ static void switch_foreground(int new_slot)
 
 static void focus_apply(int target)
 {
-    if (target < MQJS_MAX_APPS)
+    if (target < MQJS_MAX_WORKERS)
         switch_foreground(target);
 }
 
@@ -4493,17 +4493,17 @@ static void free_event_payload(MqjsEvent *ev)
 
 /* §3.2 routing table: which app owns this event? NULL = drop it.
    Slot-addressed events also check the generation (stale = drop). */
-static AppSlot *event_owner(const MqjsEvent *ev)
+static MqjsWorker *event_owner(const MqjsEvent *ev)
 {
     switch (ev->type) {
     case EV_GPIO:
-        for (int a = 0; a < MQJS_MAX_APPS; a++) {
-            if (!s_apps[a].used)
+        for (int a = 0; a < MQJS_MAX_WORKERS; a++) {
+            if (!s_workers[a].used)
                 continue;
             for (int i = 0; i < MQJS_MAX_GPIO_CB; i++)
-                if (s_apps[a].gpio_cb[i].used &&
-                    s_apps[a].gpio_cb[i].pin == ev->u.gpio.pin)
-                    return &s_apps[a];
+                if (s_workers[a].gpio_cb[i].used &&
+                    s_workers[a].gpio_cb[i].pin == ev->u.gpio.pin)
+                    return &s_workers[a];
         }
         return NULL;
     case EV_MQTT_CONNECTED:
@@ -4512,7 +4512,7 @@ static AppSlot *event_owner(const MqjsEvent *ev)
     case EV_CLIP:
     case EV_CAM:
     case EV_HTTP: {
-        AppSlot *app = &s_apps[ev->slot];
+        MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
     }
 #ifdef ESP_PLATFORM
@@ -4520,13 +4520,13 @@ static AppSlot *event_owner(const MqjsEvent *ev)
     case EV_SSH_CLOSED: {
         int id = ev->type == EV_SSH_DATA ? ev->u.ssh.id : ev->u.ssh_closed.id;
         SshOwner *o = ssh_owner_find(id);
-        return (o && s_apps[o->slot].used) ? &s_apps[o->slot] : NULL;
+        return (o && s_workers[o->worker].used) ? &s_workers[o->worker] : NULL;
     }
 #endif
     case EV_TOUCH:
     case EV_KEY:
     case EV_WIDGET: {
-        AppSlot *fg = &s_apps[s_fg_slot]; /* input is foreground-only */
+        MqjsWorker *fg = &s_workers[s_fg_worker]; /* input is foreground-only */
         return fg->used ? fg : NULL;
     }
     default:
@@ -4534,10 +4534,10 @@ static AppSlot *event_owner(const MqjsEvent *ev)
     }
 }
 
-static void dispatch_event(AppSlot *app, MqjsEvent *ev)
+static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
 {
-    AppSlot *prev = s_cur_app;
-    s_cur_app = app;
+    MqjsWorker *prev = s_cur_wk;
+    s_cur_wk = app;
     switch (ev->type) {
     case EV_GPIO:           dispatch_gpio_event(app, ev);    break;
     case EV_MQTT_CONNECTED: dispatch_mqtt_connected(app);    break;
@@ -4552,7 +4552,7 @@ static void dispatch_event(AppSlot *app, MqjsEvent *ev)
     case EV_CAM:            dispatch_cam(app, ev);           break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
     }
-    s_cur_app = prev;
+    s_cur_wk = prev;
 }
 
 /* receive + dispatch one event, waiting up to `idle` ms. Returns true
@@ -4575,7 +4575,7 @@ static bool pump_one_event(int idle)
         focus_apply(ev.u.focus.target);
         return true;
     }
-    AppSlot *owner = event_owner(&ev);
+    MqjsWorker *owner = event_owner(&ev);
     if (!owner)
         free_event_payload(&ev); /* dead-slot leftovers: drop (§3.2) */
     else
@@ -4589,26 +4589,26 @@ static bool pump_one_event(int idle)
    except a dev natural end, which auto-reruns and keeps the screen. */
 static void reap_idle_apps(void)
 {
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        AppSlot *app = &s_apps[i];
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        MqjsWorker *app = &s_workers[i];
         if (!app->used)
             continue;
         bool stop = app->kill_req ||
-                    (i == MQJS_SLOT_DEV && s_stop_req) ||
+                    (i == MQJS_WORKER_DEV && s_stop_req) ||
                     !anything_pending(app);
         if (!stop)
             continue;
-        bool was_fg = (i == s_fg_slot);
+        bool was_fg = (i == s_fg_worker);
         app_stop_internal(app);
-        if (i == MQJS_SLOT_DEV) {
+        if (i == MQJS_WORKER_DEV) {
             /* push-replace = ask the provider right away; natural end =
                the classic 1s-rerun (unless an explicit stop holds it) */
             s_dev_retry_at = s_stop_req ? 0 : time_ms() + MQJS_DEV_RESTART_MS;
             s_stop_req = false;
         }
-        if (was_fg && s_apps[MQJS_SLOT_LAUNCHER].used &&
-            (i != MQJS_SLOT_DEV || s_dev_hold))
-            switch_foreground(MQJS_SLOT_LAUNCHER);
+        if (was_fg && s_workers[MQJS_WORKER_LAUNCHER].used &&
+            (i != MQJS_WORKER_DEV || s_dev_hold))
+            switch_foreground(MQJS_WORKER_LAUNCHER);
     }
 }
 
@@ -4618,8 +4618,8 @@ static void reap_idle_apps(void)
 
 void mqjs_rt_init(void)
 {
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        s_apps[i].slot = (uint8_t)i;
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        s_workers[i].idx = (uint8_t)i;
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
         s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
@@ -4628,8 +4628,8 @@ void mqjs_rt_init(void)
     clip_load(); /* eager: the T3c panel peeks before any app touches it */
     /* fixed arenas, allocated once and kept (design §3.6): app_start can
        never fail with OOM and the PSRAM heap is not churned */
-    for (int i = 0; i < MQJS_MAX_APPS; i++) {
-        if (s_apps[i].mem)
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        if (s_workers[i].mem)
             continue;
         uint8_t *m = heap_caps_malloc(MQJS_APP_MEM_SIZE, MALLOC_CAP_SPIRAM);
         if (!m) {
@@ -4641,8 +4641,8 @@ void mqjs_rt_init(void)
             ESP_LOGE(TAG, "no arena for app slot %d", i);
             continue;
         }
-        s_apps[i].mem = m;
-        s_apps[i].mem_size = MQJS_APP_MEM_SIZE;
+        s_workers[i].mem = m;
+        s_workers[i].mem_size = MQJS_APP_MEM_SIZE;
     }
 #endif
 }
@@ -4650,29 +4650,29 @@ void mqjs_rt_init(void)
 int mqjs_app_start(int slot, const char *src, size_t src_len,
                    const char *name)
 {
-    if (slot < 0 || slot >= MQJS_MAX_APPS)
+    if (slot < 0 || slot >= MQJS_MAX_WORKERS)
         return -1;
-    s_apps[slot].slot = (uint8_t)slot;
-    if (!app_ensure_mem(&s_apps[slot]))
+    s_workers[slot].idx = (uint8_t)slot;
+    if (!app_ensure_mem(&s_workers[slot]))
         return -1;
-    return app_start_internal(&s_apps[slot], src, src_len, name);
+    return app_start_internal(&s_workers[slot], src, src_len, name);
 }
 
 void mqjs_app_stop(int slot)
 {
-    if (slot < 0 || slot >= MQJS_MAX_APPS)
+    if (slot < 0 || slot >= MQJS_MAX_WORKERS)
         return;
-    app_stop_internal(&s_apps[slot]);
+    app_stop_internal(&s_workers[slot]);
 }
 
 bool mqjs_app_running(int slot)
 {
-    return slot >= 0 && slot < MQJS_MAX_APPS && s_apps[slot].used;
+    return slot >= 0 && slot < MQJS_MAX_WORKERS && s_workers[slot].used;
 }
 
 void mqjs_focus(int slot)
 {
-    if (slot < 0 || slot >= MQJS_MAX_APPS)
+    if (slot < 0 || slot >= MQJS_MAX_WORKERS)
         return;
     MqjsEvent ev = { .type = EV_FOCUS };
     ev.u.focus.target = (uint8_t)slot;
@@ -4772,28 +4772,28 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
     for (;;) {
         /* launcher residency: chrome (chip / open requests) depends on
            it, so it is restarted if it ever dies (1s backoff) */
-        if (!s_apps[MQJS_SLOT_LAUNCHER].used &&
+        if (!s_workers[MQJS_WORKER_LAUNCHER].used &&
             time_ms() >= s_launcher_retry_at) {
             const AppSource *as = app_source_find("launcher");
             if (as)
-                app_start_internal(&s_apps[MQJS_SLOT_LAUNCHER], as->src,
+                app_start_internal(&s_workers[MQJS_WORKER_LAUNCHER], as->src,
                                    as->len, "launcher");
             s_launcher_retry_at = time_ms() + 1000;
         }
 
         /* a push that arrived while the dev slot was idle or held */
-        if (s_stop_req && !s_apps[MQJS_SLOT_DEV].used) {
+        if (s_stop_req && !s_workers[MQJS_WORKER_DEV].used) {
             s_stop_req = false;
             s_dev_hold = false;
             s_dev_retry_at = 0;
         }
-        if (next_dev && !s_apps[MQJS_SLOT_DEV].used && !s_dev_hold &&
+        if (next_dev && !s_workers[MQJS_WORKER_DEV].used && !s_dev_hold &&
             time_ms() >= s_dev_retry_at) {
             const char *src = NULL, *name = NULL;
             size_t len = 0;
             s_stop_req = false;
             if (next_dev(&src, &len, &name, user) && src) {
-                if (mqjs_app_start(MQJS_SLOT_DEV, src, len, name) != 0)
+                if (mqjs_app_start(MQJS_WORKER_DEV, src, len, name) != 0)
                     s_dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
             } else {
                 s_dev_retry_at = time_ms() + MQJS_DEV_RESTART_MS;
@@ -4814,13 +4814,13 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
 int mqjs_run_script(const char *src, size_t src_len, const char *name,
                     void *mem_buf, size_t mem_size)
 {
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        s_apps[i].slot = (uint8_t)i;
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        s_workers[i].idx = (uint8_t)i;
 #ifdef ESP_PLATFORM
     if (!s_event_queue)
         s_event_queue = xQueueCreate(MQJS_QUEUE_LEN, sizeof(MqjsEvent));
 #endif
-    AppSlot *dev = &s_apps[MQJS_SLOT_DEV];
+    MqjsWorker *dev = &s_workers[MQJS_WORKER_DEV];
     if (dev->used)
         return -1;
     dev->mem = mem_buf;
@@ -4832,21 +4832,21 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
 
     for (;;) {
         bool any = false;
-        for (int i = 0; i < MQJS_MAX_APPS; i++)
-            any |= s_apps[i].used;
+        for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+            any |= s_workers[i].used;
         if (!any || s_stop_req)
             break;
         int idle = run_all_timers(50 /* ms */);
         pump_one_event(idle);
         ui_tab5_w_commit();
-        for (int i = 0; i < MQJS_MAX_APPS; i++) {
-            AppSlot *app = &s_apps[i];
+        for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+            MqjsWorker *app = &s_workers[i];
             if (app->used && (app->kill_req || !anything_pending(app)))
                 app_stop_internal(app);
         }
     }
-    for (int i = 0; i < MQJS_MAX_APPS; i++)
-        app_stop_internal(&s_apps[i]);
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        app_stop_internal(&s_workers[i]);
 #ifdef ESP_PLATFORM
     ESP_LOGI(TAG, "task '%s' finished", name ? name : "<task>");
 #endif
