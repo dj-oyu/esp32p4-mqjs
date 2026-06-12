@@ -7,7 +7,7 @@
 # CSI/ISP kconfig options that sdkconfig.tab5.defaults enables.
 if(CONFIG_MQJS_CAMERA)
     set(CAM_SRCS "cam_tab5.c" "ean13.c" "bc_locate.c")
-    # PIE (xesppie) hand-fused structure-tensor kernel: P4-only. The .S
+    # PIE (xespv2p1) hand-fused structure-tensor kernel: P4-only. The .S
     # is fully guarded internally (CONFIG_IDF_TARGET_ESP32P4) so it is
     # harmless on other targets, but we only add it to the build on P4.
     if(CONFIG_IDF_TARGET_ESP32P4)
