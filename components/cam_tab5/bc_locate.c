@@ -5,15 +5,25 @@
 #include <math.h>
 #include <string.h>
 
+/* NOTE on PIE: the tensor sums were tried as three esp-dsp dot
+ * products (dsps_dotprod_s16_arp4, PIE-accelerated, 16B-aligned
+ * buffers). Measured ON DEVICE it was ~2x SLOWER than this fused
+ * scalar loop (loc 22-23ms vs 11-20ms): 324 library calls per frame
+ * plus materializing the gradient arrays (write+reread) cost more
+ * than the vector MACs saved. A win here would need hand-fused PIE
+ * assembly (load+convert+diff+MAC in one pass) — not worth it while
+ * the PPA pixel rate dominates the pipeline. */
+
 #define BLK 32        /* block size in ANALYSIS-image px (x2 in frame) */
 #define GRID BLK      /* every pixel of the downscaled image */
 #define MAX_BX 32     /* up to 1024px-wide analysis images */
 #define MAX_BY 24
 
 /* energy floor: a barcode block (even in shadow, ~40 gray levels of
- * contrast) accumulates squared edge gradients in the 1e5 range;
- * sensor noise and smooth lighting stay an order of magnitude lower */
-#define E_MIN 60000
+ * contrast) accumulates squared 6-bit-luma gradients in the 1e4-1e5
+ * range; sensor noise and smooth lighting stay an order of magnitude
+ * lower. (Was 60000 with 8-bit luma; 6-bit products are 16x smaller.) */
+#define E_MIN 3750
 /* coherence floor 0.6: (Sxx-Syy)^2 + 4Sxy^2 > (0.6 * energy)^2 */
 #define COH_NUM 36
 #define COH_DEN 100
@@ -26,12 +36,12 @@ static inline int luma(uint16_t v)
     return (77 * (r << 3) + 150 * (g << 2) + 29 * (b << 3)) >> 8;
 }
 
-/* tensor-only luma: the green channel alone (59% of luminance, and
+/* tensor-only luma: the raw 6-bit green field (59% of luminance, and
  * barcodes are achromatic anyway) — one shift+mask instead of three
  * multiplies, in the hottest per-pixel loop we own */
 static inline int luma_fast(uint16_t v)
 {
-    return (v >> 3) & 0xFC;
+    return (v >> 5) & 0x3F;
 }
 
 /* circular distance for orientations with period 180 */
@@ -66,7 +76,9 @@ int bc_locate(const uint16_t *rgb565, int w, int h, int coord_scale,
             const uint16_t *base = rgb565 + (by * BLK) * w + bx * BLK;
             /* central differences, both centered on the SAME sample —
                forward diffs put gx and gy half a step apart, which
-               biases Sxy toward +45° and mirrors angles beyond 90° */
+               biases Sxy toward +45° and mirrors angles beyond 90°.
+               Fused load/convert/diff/MAC loop: everything stays in
+               registers (see the PIE note at the top of the file). */
             int l[GRID][GRID];
             for (int sy = 0; sy < GRID; sy++) {
                 const uint16_t *row = base + sy * w;
