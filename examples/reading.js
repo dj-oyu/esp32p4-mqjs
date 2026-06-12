@@ -1,8 +1,8 @@
 // @app reading
 // @title 読書記録
 // @icon 
-// @desc ページ進捗を記録して XP・連続日数・バッジで読書を後押し。ISBN は NDL サーチ (PC ブリッジ) で自動入力。
-// @perm mqtt
+// @desc ページ進捗を記録して XP・連続日数・バッジで読書を後押し。ISBN は NDL サーチで自動入力。
+// @perm mqtt,http
 //
 // 読書記録: 蔵書管理ではなく「読書の支援」のためのアプリ。
 //
@@ -10,9 +10,10 @@
 //  - ゲーミフィケーション: 読んだページ = XP、毎日読むと連続日数ボーナス、
 //    読了ボーナス、8 種のバッジ (実績画面で確認)
 //  - 本の追加は ISBN を入れて NDL サーチから自動入力 (タイトル/著者/
-//    ページ数)。本体に HTTP は無いので、PC 側の tools/ndl_bridge.py が
-//    MQTT (esp32p4-mqjs/ndl/req → res) で代理検索する。ブリッジ不在でも
-//    手入力で全機能が使える (ローカルファースト)
+//    ページ数)。http.get があれば本体から直接 NDL の OpenSearch API を
+//    叩く。http が無い (または失敗した) ファームでは PC 側の
+//    tools/ndl_bridge.py が MQTT (esp32p4-mqjs/ndl/req → res) で代理検索
+//    する。どちらも不在でも手入力で全機能が使える (ローカルファースト)
 //  - カメラバーコード読取はランタイム未対応 (カメラバインディングなし)。
 //    将来 C 側に camera.* が生えたらここに足す
 //  - データは NVS (rd_books / rd_game)。microSD 不要、最大 25 冊
@@ -165,6 +166,53 @@ function bar(cur, max, w) {
 }
 function pct(b) { return b.tp > 0 ? Math.floor(100 * b.cp / b.tp) : 0; }
 
+/* ===== NDL OpenSearch (RSS XML) パーサ (純粋ロジック) =====
+ * tools/ndl_bridge.py と同じ抽出規則を JS の正規表現で再現する。
+ * 1 件 = {title, author, pages}。ページ数が分かる item を優先。 */
+function cleanAuthor(a) {
+    a = a.replace(/^\s+|\s+$/g, "");
+    /* 典拠形 "夏目, 漱石, 1867-1916" の生没年を落とす */
+    a = a.replace(/,?\s*\d{4}-(\d{4})?$/, "");
+    /* 末尾の役割語 (著/作/訳/編著/編/監修) を落とす */
+    a = a.replace(/\s*(著|作|訳|編著|編|監修)$/, "");
+    /* 非 ASCII 同士の間のカンマを詰める ("夏目, 漱石" → "夏目漱石") */
+    a = a.replace(/([^\x00-\x7f]),\s*([^\x00-\x7f])/g, "$1$2");
+    return a.replace(/^\s+|\s+$/g, "");
+}
+
+/* <tag>...</tag> の最初の中身 (タグ無しテキスト) を 1 個返す。無ければ "" */
+function firstTag(xml, tag) {
+    var re = new RegExp("<" + tag + "[^>]*>([^<]*)</" + tag + ">");
+    var m = re.exec(xml);
+    return m ? m[1] : "";
+}
+
+function parseNdl(xml) {
+    if (!xml) return null;
+    var itemRe = /<item>([\s\S]*?)<\/item>/g;
+    var best = null;
+    var m;
+    while ((m = itemRe.exec(xml)) !== null) {
+        var item = m[1];
+        var title = firstTag(item, "title").replace(/^\s+|\s+$/g, "");
+        if (!title) continue;
+        var author = cleanAuthor(firstTag(item, "dc:creator"));
+        /* <dc:extent> は複数あり得る。"610p" 形式から数値を拾う */
+        var pages = 0;
+        var extRe = /<dc:extent[^>]*>([^<]*)<\/dc:extent>/g;
+        var em;
+        while ((em = extRe.exec(item)) !== null) {
+            var pm = /(\d+)\s*[pｐ頁]/.exec(em[1]);
+            if (pm) { pages = Number(pm[1]); break; }
+        }
+        var cand = { title: title, author: author, pages: pages };
+        /* ページ数を知っている record を優先 */
+        if (best === null || (pages && !best.pages)) best = cand;
+        if (best.pages) break;
+    }
+    return best;
+}
+
 /* ===== 画面 (ウィジェットモード) ===== */
 var gen = 0;       /* 画面世代: NDL 応答が古い画面の widget を触らない用 */
 var ndlWait = null;
@@ -291,12 +339,17 @@ function buildAdd() {
     var fTitle = s.field("タイトル (必須)");
     var fAuthor = s.field("著者");
     var fPages = s.field("総ページ数 (必須)");
-    function ndlQuery() {
-        var isbn = (fIsbn.value() || "").replaceAll("-", "").replaceAll(" ", "");
-        if (isbn.length < 10) {
-            status.setText("ISBN (10 桁か 13 桁) を入れてください");
-            return;
-        }
+    /* 解析済みレコードでフィールドを埋める (HTTP/MQTT 両経路で共通) */
+    function fillBook(rec) {
+        if (rec.title) fTitle.setText(cap(rec.title, 40));
+        if (rec.author) fAuthor.setText(cap(rec.author, 24));
+        if (rec.pages) fPages.setText("" + rec.pages);
+        status.setText("取得: " + cap(rec.title || "?", 18) +
+                       (rec.pages ? " (" + rec.pages + "p)"
+                                  : " (ページ数は手入力)"));
+    }
+    /* PC ブリッジ経路 (MQTT)。http.get が使えない/失敗したときの保険 */
+    function ndlViaMqtt(isbn) {
         if (!mqtt.connected()) {
             status.setText("ブローカー未接続: 手入力してください");
             return;
@@ -304,7 +357,7 @@ function buildAdd() {
         ndlWait = { gen: myGen, isbn: isbn, status: status,
                     t: fTitle, a: fAuthor, p: fPages };
         mqtt.publish(REQ_T, isbn);
-        status.setText("NDL サーチに問い合わせ中...");
+        status.setText("NDL サーチに問い合わせ中 (PC ブリッジ)...");
         if (ndlTimer) clearTimeout(ndlTimer);
         ndlTimer = setTimeout(function () {
             ndlTimer = 0;
@@ -313,6 +366,42 @@ function buildAdd() {
                 "応答なし: PC で tools/ndl_bridge.py が動いているか確認 (手入力も可)");
             ndlWait = null;
         }, 10000);
+    }
+    function ndlQuery() {
+        var isbn = (fIsbn.value() || "").replaceAll("-", "").replaceAll(" ", "");
+        if (isbn.length < 10) {
+            status.setText("ISBN (10 桁か 13 桁) を入れてください");
+            return;
+        }
+        /* まず本体から直接 NDL の OpenSearch API を叩く (http.get があれば)。
+         * C 側タイムアウト (20 秒) がハングを見張るので JS タイマーは不要。
+         * 失敗 (起動できない / 非 200 / 空応答) なら MQTT ブリッジへ落ちる */
+        if (typeof http !== "undefined") {
+            var started = http.get(
+                "https://ndlsearch.ndl.go.jp/api/opensearch?isbn=" + isbn,
+                function (body, st) {
+                    if (myGen !== gen) return; /* 画面が変わっていたら無視 */
+                    if (st !== 200 || !body) {
+                        status.setText("NDL 直接取得に失敗 (" + st +
+                                       ")。ブリッジを試します...");
+                        ndlViaMqtt(isbn);
+                        return;
+                    }
+                    var rec = parseNdl(body);
+                    if (!rec) {
+                        status.setText(
+                            "NDL: 見つかりませんでした。手入力してください");
+                        return;
+                    }
+                    fillBook(rec);
+                });
+            if (started) {
+                status.setText("NDL サーチに問い合わせ中 (本体 HTTP)...");
+                return;
+            }
+        }
+        /* http が無い / 取り込み中: ブリッジ経路へ */
+        ndlViaMqtt(isbn);
     }
     /* カメラで ISBN バーコードを読む (camera.* が生えた Tab5 ファーム
      * のみ)。"97" プレフィックスで下段の書籍JAN (192...) は C 側で除外。
@@ -336,7 +425,7 @@ function buildAdd() {
                             "(978〜) をカメラにかざして"
                           : "カメラを使えません: " + camera.status());
     });
-    s.button("NDL サーチで自動入力 (要 PC ブリッジ)", ndlQuery);
+    s.button("NDL サーチで自動入力", ndlQuery);
     s.button("追加", function () {
         if (books.length >= MAX_BOOKS) {
             status.setText("登録は " + MAX_BOOKS + " 冊まで (読了本を削除してください)");
@@ -453,6 +542,28 @@ function selftest() {
 
     ok(bar(5, 10, 10) === "[#####.....]", "bar render");
     ok(pct({ cp: 45, tp: 90 }) === 50, "pct");
+
+    /* NDL OpenSearch XML パーサ (実 API の応答を縮めたサンプル)。
+     * item は 2 件: 1 件目はページ数なし、2 件目が "610p" を持つので
+     * ページ数を知っている 2 件目が選ばれる。著者は典拠形 */
+    var xml =
+        '<rss><channel>' +
+        '<item><title>吾輩は猫である</title>' +
+        '<dc:creator>夏目, 漱石, 1867-1916</dc:creator>' +
+        '<dc:extent>2冊</dc:extent></item>' +
+        '<item><title>吾輩は猫である</title>' +
+        '<dc:creator>夏目, 漱石, 1867-1916</dc:creator>' +
+        '<dc:extent>610p ; 19cm</dc:extent></item>' +
+        '</channel></rss>';
+    var rec = parseNdl(xml);
+    ok(rec !== null, "ndl parse: found");
+    ok(rec.title === "吾輩は猫である", "ndl title: " + rec.title);
+    ok(rec.author === "夏目漱石", "ndl author: " + rec.author);
+    ok(rec.pages === 610, "ndl pages: " + rec.pages);
+    /* 著者クリーニングの個別ケース */
+    ok(cleanAuthor("夏目漱石 著") === "夏目漱石", "author drop 著");
+    ok(cleanAuthor("村上, 春樹") === "村上春樹", "author drop comma");
+    ok(parseNdl("<rss></rss>") === null, "ndl parse: empty");
 
     /* 永続化ラウンドトリップ (PC の store はセッション内テーブル) */
     save();
