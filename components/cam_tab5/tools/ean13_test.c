@@ -152,6 +152,32 @@ int main(void)
                strcmp(got, code) == 0,
            "noisy scale=5");
 
+    /* real-photo conditions: the barcode embedded mid-line with cover
+       art (dark/bright blocks) outside the quiet zones plus a strong
+       illumination ramp — a global threshold fails this, the local
+       adaptive one must not */
+    for (int scale = 3; scale <= 5; scale++) {
+        with_checksum(isbn12[1], code);
+        static uint8_t big[4096];
+        int bn = 1600;
+        unsigned rnd2 = 1234u + (unsigned)scale;
+        for (int i = 0; i < bn; i++) { /* cover clutter */
+            rnd2 = rnd2 * 1103515245u + 12345u;
+            big[i] = (uint8_t)(((rnd2 >> 16) & 1) ? 30 : 235);
+        }
+        n = render(code, line, sizeof line, scale, 10, 0, 7);
+        int off = (bn - n) / 2;
+        memcpy(big + off, line, (size_t)n);
+        for (int i = 0; i < bn; i++) { /* +60 ramp across the line */
+            int v = big[i] + i * 60 / bn;
+            big[i] = (uint8_t)(v > 255 ? 255 : v);
+        }
+        snprintf(name, sizeof name, "clutter+ramp scale=%d", scale);
+        expect(ean13_decode_gray_line(big, bn, got) &&
+                   strcmp(got, code) == 0,
+               name);
+    }
+
     /* negatives: random noise lines must never decode */
     unsigned rnd = 7;
     int false_pos = 0;

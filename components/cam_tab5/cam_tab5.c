@@ -41,8 +41,12 @@ static const char *TAG = "cam_tab5";
 
 #define CAM_XCLK_GPIO   36
 #define CAM_XCLK_HZ     24000000
-#define CAM_W           1280
-#define CAM_H           720
+/* full sensor resolution (SC2356 UXGA): +25% pixels per barcode module
+ * vs 720p — the fixed-focus lens limits how close the book can get, so
+ * resolution is the lever we have. Needs the 1600X1200 format selected
+ * in the sensor kconfig (sdkconfig.tab5.defaults). */
+#define CAM_W           1600
+#define CAM_H           1200
 #define CAM_BUFS        2
 
 static i2c_master_bus_handle_t s_bus;
@@ -267,6 +271,9 @@ static bool pipeline_once(void)
         return false;
     }
     s_fd = fd;
+    char dims[20];
+    snprintf(dims, sizeof dims, "%dx%d", s_frame_w, s_frame_h);
+    set_status("video ready %s", dims);
     return true;
 }
 
@@ -385,7 +392,7 @@ bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
     snprintf(s_req.prefix, sizeof s_req.prefix, "%s", prefix ? prefix : "");
     s_cancel = false;
     s_busy = true;
-    if (xTaskCreate(scan_task, "cam_scan", 12288, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(scan_task, "cam_scan", 16384, NULL, 4, NULL) != pdPASS) {
         s_busy = false;
         s_req.cb = NULL;
         set_status("task create failed%s", NULL);

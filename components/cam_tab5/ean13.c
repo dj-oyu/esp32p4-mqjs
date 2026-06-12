@@ -11,7 +11,7 @@
 
 #include <string.h>
 
-#define MAX_RUNS 1024
+#define MAX_RUNS 2048
 
 /* run widths in modules for L-codes, runs read space-first.
  * G(d) = the same row reversed; R(d) = same row read bar-first. */
@@ -185,17 +185,68 @@ int ean13_decode_gray_line(const uint8_t *line, int n, char out[14])
         if (line[i] > mx)
             mx = line[i];
     }
-    if (mx - mn < 48) /* flat line: no barcode contrast */
+    if (mx - mn < 48) /* flat line: no barcode contrast at all */
         return 0;
-    int th = (mn + mx) / 2;
 
+    /* Local adaptive binarization: threshold at the midpoint of the
+     * sliding-window min/max (window 64, van Herk O(n)). A global
+     * midpoint gets wrecked by real photos — cover art and lighting
+     * gradients elsewhere on the scanline pull it out of the barcode's
+     * local black/white range. Flat windows (no local contrast, e.g.
+     * the quiet zone) extend the current state instead of chattering
+     * on noise. NOTE: static scratch makes this non-reentrant — there
+     * is exactly one scanner (cam_tab5's single scan task).
+     * A moving-AVERAGE threshold was tried first and failed: next to
+     * the quiet zone the average sits near white and swallowed the
+     * start guard's narrow spaces. min/max midpoint centers correctly
+     * as soon as the window touches the first bar. */
+    enum { W = 64, FLAT = 30 };
+    static uint8_t pmin[MAX_RUNS], smin[MAX_RUNS];
+    static uint8_t pmax[MAX_RUNS], smax[MAX_RUNS];
+    if (n > MAX_RUNS)
+        return 0;
+    for (int i = 0; i < n; i++) {
+        if (i % W) {
+            pmin[i] = line[i] < pmin[i - 1] ? line[i] : pmin[i - 1];
+            pmax[i] = line[i] > pmax[i - 1] ? line[i] : pmax[i - 1];
+        } else {
+            pmin[i] = pmax[i] = line[i];
+        }
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        if (i % W == W - 1 || i == n - 1) {
+            smin[i] = smax[i] = line[i];
+        } else {
+            smin[i] = line[i] < smin[i + 1] ? line[i] : smin[i + 1];
+            smax[i] = line[i] > smax[i + 1] ? line[i] : smax[i + 1];
+        }
+    }
+    int gth = (mn + mx) / 2;
     int runs[MAX_RUNS];
     int nruns = 0;
-    int cur = line[0] < th;
-    int len = 1;
-    int first_black = cur;
-    for (int i = 1; i < n; i++) {
-        int b = line[i] < th;
+    int cur = -1;
+    int first_black = 0;
+    int len = 0;
+    for (int i = 0; i < n; i++) {
+        int l = i - W / 2;
+        int r = i + W / 2 - 1;
+        if (l < 0)
+            l = 0;
+        if (r > n - 1)
+            r = n - 1;
+        uint8_t lmin = smin[l] < pmin[r] ? smin[l] : pmin[r];
+        uint8_t lmax = smax[l] > pmax[r] ? smax[l] : pmax[r];
+        int b;
+        if (lmax - lmin < FLAT)
+            b = cur < 0 ? line[i] < gth : cur; /* flat: extend state */
+        else
+            b = line[i] < (lmin + lmax) / 2;
+        if (cur < 0) {
+            cur = b;
+            first_black = b;
+            len = 1;
+            continue;
+        }
         if (b == cur) {
             len++;
             continue;
