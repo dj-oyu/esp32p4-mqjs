@@ -11,6 +11,8 @@ function ok(c, m) {
     else { fails++; print("FAIL " + m); }
 }
 
+ok(typeof sys.onStop === "function", "sys.onStop exists (Phase 4)");
+
 /* unknown names: every name form answers false, never throws */
 ok(sys.start("no_such_app_x") === false, "start(unknown) -> false");
 ok(sys.open("no_such_app_x") === false, "open(unknown) -> false");
@@ -23,9 +25,12 @@ ok(a.length >= 2, "apps() sees this app + peer");
 var peer = null;
 for (var i = 0; i < a.length; i++) {
     ok(typeof a[i].kind === "string", "kind on '" + a[i].name + "'");
+    ok(typeof a[i].evictable === "boolean",
+       "evictable on '" + a[i].name + "'");
     if (a[i].name === "test_phase1_peer") peer = a[i];
 }
 ok(!!peer, "peer visible by name");
+ok(peer && peer.evictable === true, "plain app is evictable (policy)");
 
 if (peer) {
     ok(sys.start("test_phase1_peer") === true, "start(running) idempotent");

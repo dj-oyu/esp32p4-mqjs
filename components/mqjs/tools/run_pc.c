@@ -1,7 +1,7 @@
 /* PC runner for example scripts (no hardware needed).
    gpio.* are stubs that print; timers run for real.
 
-   P4a: an optional second script runs as a concurrent app in slot 2,
+   P4a: an optional second script runs as a concurrent app in worker 2,
    so the multi-app scheduler (timers across contexts, sys.signal /
    sys.onSignal, sys.focus + lifecycle callbacks) is testable on the
    host before touching hardware:

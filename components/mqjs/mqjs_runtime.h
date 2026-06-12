@@ -2,7 +2,7 @@
  * mqjs_runtime.h - MicroQuickJS runtime for ESP32-P4 (Stamp-P4 / Tab5)
  *
  * P4a multi-app runtime (docs/launcher-multiapp-design.md): one JS task
- * owns up to MQJS_MAX_APPS cooperative mquickjs contexts. Events and
+ * owns up to MQJS_MAX_WORKERS cooperative mquickjs contexts. Events and
  * timers are dispatched serially to the owning app's context; UI is
  * exclusive to the foreground app (background ui.* calls are no-ops).
  */
@@ -18,9 +18,9 @@ extern "C" {
 /* App slots. Slot 0 is reserved for the resident launcher (P4b); the
  * dev slot keeps the single-task development flow (push -> replace ->
  * auto-rerun) of the pre-P4 runtime. */
-#define MQJS_MAX_APPS      4
-#define MQJS_SLOT_LAUNCHER 0
-#define MQJS_SLOT_DEV      1
+#define MQJS_MAX_WORKERS     4
+#define MQJS_WORKER_LAUNCHER 0
+#define MQJS_WORKER_DEV      1
 
 /* Fixed per-app context arena (PSRAM), allocated once by mqjs_rt_init
  * and never returned: app_start can then never fail with OOM and the
@@ -41,7 +41,7 @@ void mqjs_rt_init(void);
  * success, -1 when the slot is busy / init failed / the top level threw
  * (the slot is clean again in that case).
  */
-int mqjs_app_start(int slot, const char *src, size_t src_len,
+int mqjs_app_start(int worker, const char *src, size_t src_len,
                    const char *name);
 
 /*

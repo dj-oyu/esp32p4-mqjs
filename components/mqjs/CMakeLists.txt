@@ -15,6 +15,7 @@ file(MAKE_DIRECTORY ${GEN_DIR})
 
 idf_component_register(
     SRCS "device_stdlib.c" "mqjs_runtime.c"
+         "app/mqjs_app_manager.c"
          "${MQJS_DIR}/mquickjs.c"
          "${MQJS_DIR}/cutils.c"
          "${MQJS_DIR}/dtoa.c"

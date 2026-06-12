@@ -1,14 +1,60 @@
 # App Manager 移行設計
 
-Status: Phase 0-1 実装済み・実機 E2E 確認 2026-06-13 (Phase 2 以降は未着手)
+Status: Phase 0-4 実装済み・実機 E2E 確認 2026-06-13 (Phase 5 suspend は
+実ユースケース待ち — 設計どおり実装しない)
 
-- Phase 0: `app/mqjs_app_manager.h` 追加済み (未配線)
+- Phase 0: `app/mqjs_app_manager.h` 追加済み
 - Phase 1: `sys.start/open/focus/stop(name)` 追加、`sys.apps()` に `kind`
   ("system" / "dev" / "app")、launcher / examples から slot 参照を削除。
   旧 slot API は互換のため受理を継続 (`sys.launch` / 数値 focus/stop)。
   実機 E2E: 名前での start→focus→stop→復帰、未知名は false、self-stop
   (reaper 経路) まで確認。worker 満杯時の start は false (eviction は
   Phase 4 のスコープ)。
+- Phase 2: 内部から slot 語を排除 — `AppSlot` → `MqjsWorker`、
+  `MQJS_SLOT_*` → `MQJS_WORKER_*`、イベントの stale 判定は文字どおり
+  `worker + generation` に。App record テーブルを `app/mqjs_app_manager.c`
+  に新設し、start/stop/setAppName/foreground 切替から js_task 上で更新
+  (single-writer 維持)。停止後もレコードは STOPPED で残存 (Phase 4 の
+  LRU 基盤: `last_active_ms`、満杯時は最古の STOPPED を回収)。
+  `sys.apps()` の `kind` はレコード由来に切替済み (出力は不変)。
+  ホスト単体テスト `components/mqjs/tools/app_manager_test.c` ALL PASS、
+  実機 E2E は Phase 1 プローブで回帰なし。worker 内の name は実行中
+  キャッシュとして残置 — 権威の移転は Phase 3 (policy / dev の通常 App
+  化) と同時に行う。
+- Phase 3: launcher / dev / autostart の特別扱いを policy へ移した。
+  レコード生成時に kind プロファイルの既定 policy が付く (SYSTEM =
+  `AUTOSTART|RESTART_ON_EXIT|KEEP_ALIVE`、APP = `EVICTABLE|STOPPABLE`)。
+  - `sys.stop` の停止可否は `STOPPABLE` 判定 (launcher の worker 番号
+    特例を撤去。dev worker だけは名前衝突対策で常に停止可)
+  - launcher 常駐ループは record の `RESTART_ON_EXIT` を参照 (bit を
+    消せば常駐が止まる; worker 0 固定は割当規則として残置)
+  - `s_dev_hold` フラグを廃止 — dev の自然終了リランは dev レコードの
+    `RESTART_ON_EXIT` が権威 (`dev_held()`/`dev_rearm()`)。明示 stop が
+    bit を消し、push / `sys.start("dev")` が再武装する
+  - autostart の opt-in/revoke が record の `AUTOSTART` bit にミラー
+    される (リブートを跨ぐ正本は従来どおり NVS roster)
+  - `sys.apps()` 行に `evictable` を追加 (Phase 4 の UI/挙動の布石)
+  実機 E2E: stop("launcher") が TypeError、evictable = launcher のみ
+  false、既存ロースター回帰なし。残課題: dev の「source 更新で置換」
+  を要求キュー (`request_*`) 経由へ移すのは Phase 4 以降、サービス
+  (KIND_SERVICE) の実プロファイル適用は @service 相当のマニフェスト
+  導入時。
+- Phase 4: LRU eviction + `sys.onStop(reason)`。
+  - `sys_launch_core` で空き worker が無いとき `app_evict_lru()` が
+    「実行中 ∧ 非 foreground ∧ 非 caller ∧ 非 dev worker ∧ policy
+    EVICTABLE」から `last_active_ms` 最古を選び `stop(EVICTED)` →
+    枠を再利用。候補なしは従来どおり起動失敗。evict はコンソール行 +
+    "evicted: <name>" 通知で可視化 (ランチャー通知欄から復帰可能)。
+  - `sys.onStop(fn(reason))`: 停止理由 ("user" / "idle" / "updated" /
+    "evicted" / "error") 付きの last-words フック。teardown 前に呼ばれ、
+    store.set (write-behind) で状態保存 → 次回起動時に復元するパターン
+    の置き場。登録してもアプリは idle 延命しない。watchdog 適用。
+    stop 理由は reaper でも分類 (kill_req=user / dev push=updated /
+    自然終了=idle / 起動失敗=error) され App record にも届く。
+  実機 E2E: 4/4 満杯から start("circuit") = true、victim=clip_mirror
+  (LRU 正解 — 直前起動の ssh_vt より古い)、復元後ロースター一致、
+  self-stop の onStop("user") が MQTT publish まで完走 (dying context
+  からの送信も outbox が間に合う)。
 
 ## 目的
 
