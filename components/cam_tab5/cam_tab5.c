@@ -241,16 +241,22 @@ static bool scan_region(const uint16_t *px, int w, int h,
 
 /* region pass first (when the localizer found one), then the fixed
  * grid as insurance; true when a PREFIX-MATCHING code hit (ends the
- * scan). disp collects the overlay info either way. */
+ * scan). disp collects the overlay info either way. While a region is
+ * locked the grid only runs when allow_grid says so (every Nth frame)
+ * — it is pure PSRAM-bus load the region pass already covers. */
 static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
                        char out[14], FrameHit *disp,
-                       const bc_region_t *rg)
+                       const bc_region_t *rg, bool allow_grid)
 {
     ean13_scan_t st;
     disp->kind = 0;
     disp->digits = 0;
-    if (rg->found && scan_region(px, w, h, rg, line, out, disp))
-        return true;
+    if (rg->found) {
+        if (scan_region(px, w, h, rg, line, out, disp))
+            return true;
+        if (!allow_grid)
+            return false;
+    }
     for (int r = 0; r < 32; r++) {
         int y = h * (15 + r * 70 / 31) / 100; /* rows across 15%..85% */
         const uint16_t *row = px + y * w;
@@ -372,12 +378,6 @@ static bool pipeline_once(void)
     return true;
 }
 
-/* Half-res analysis copy for the barcode localizer, produced by the
- * PPA in hardware: bc_locate needs an anti-aliased image (sharp bars
- * alias into bogus diagonal orientations), and the box-filtered
- * downscale is exactly that. 960KB PSRAM, allocated once. */
-static uint16_t *s_ana;
-
 static bool ppa_once(void)
 {
     if (s_ppa)
@@ -389,47 +389,27 @@ static bool ppa_once(void)
     return ppa_register_client(&cfg, &s_ppa) == ESP_OK;
 }
 
-static bool analysis_blit(const uint16_t *px)
+/* bc_locate runs directly on the (transposed) viewfinder buffer — ONE
+ * PPA pass serves display AND analysis, saving a full 3.8MB frame read
+ * plus a 1MB write per frame on the shared PSRAM bus. The preview is a
+ * pure transpose of the frame at 1:2, so the result maps back by
+ * swapping axes and reflecting theta to 90-theta. */
+static void region_from_preview(const bc_region_t *pr, bc_region_t *rg)
 {
-    if (!s_ana) {
-        s_ana = heap_caps_aligned_alloc(
-            64, (size_t)(CAM_W / 2) * (CAM_H / 2) * 2,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-        if (!s_ana)
-            return false;
-    }
-    if (!ppa_once())
-        return false;
-    ppa_srm_oper_config_t srm = {
-        .in = {
-            .buffer = (void *)px,
-            .pic_w = CAM_W,
-            .pic_h = CAM_H,
-            .block_w = CAM_W,
-            .block_h = CAM_H,
-            .block_offset_x = 0,
-            .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        },
-        .out = {
-            .buffer = s_ana,
-            .buffer_size = (uint32_t)(CAM_W / 2) * (CAM_H / 2) * 2,
-            .pic_w = CAM_W / 2,
-            .pic_h = CAM_H / 2,
-            .block_offset_x = 0,
-            .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = 0.5,
-        .scale_y = 0.5,
-        .mirror_x = false,
-        .mirror_y = false,
-        .rgb_swap = false,
-        .byte_swap = false,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-    return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
+    rg->found = pr->found;
+    rg->x0 = pr->y0 * 2;
+    rg->x1 = pr->y1 * 2;
+    rg->y0 = pr->x0 * 2;
+    rg->y1 = pr->x1 * 2;
+    rg->cx = (rg->x0 + rg->x1) / 2;
+    rg->cy = (rg->y0 + rg->y1) / 2;
+    int th = 90 - pr->theta;
+    while (th < 0)
+        th += 180;
+    while (th >= 180)
+        th -= 180;
+    rg->theta = th;
+    rg->vertical_bars = th < 45 || th > 135;
 }
 
 /* Viewfinder blit 1280x720 -> portrait 360x640 via the PPA (the sensor
@@ -549,13 +529,16 @@ static void scan_task(void *pv)
     char code[14];
     char lbl[112], lbl_cache[112];
     FrameHit disp, last_hit;
+    bc_region_t cached;
     int hit_ttl = 0;
+    int frame_no = 0;
     bool found = false;
     const char *fail = NULL;
     bool pipe_ok = pipeline_once(); /* on failure it set s_status */
 
     lbl_cache[0] = '\0';
     last_hit.kind = 0;
+    cached.found = 0;
 
     if (pipe_ok) {
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
@@ -593,15 +576,22 @@ static void scan_task(void *pv)
             const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
             bool pv_ok = preview && s_frame_w == CAM_W &&
                          preview_blit(px, preview);
-            bc_region_t rg;
-            rg.found = 0;
-            if (s_frame_w == CAM_W && analysis_blit(px))
-                bc_locate(s_ana, CAM_W / 2, CAM_H / 2, 2, &rg);
+            /* localize on every 3rd frame (regions move at hand speed,
+               not frame speed) and reuse the cached result between */
+            if (pv_ok && (frame_no % 3) == 0) {
+                bc_region_t pr;
+                if (bc_locate(preview, PV_W, PV_H, 1, &pr))
+                    region_from_preview(&pr, &cached);
+                else
+                    cached.found = 0;
+            }
+            frame_no++;
+            bool allow_grid = !cached.found || (frame_no % 5) == 0;
             found = scan_frame(px, s_frame_w, s_frame_h, line, code, &disp,
-                               &rg);
+                               &cached, allow_grid);
             ioctl(s_fd, VIDIOC_QBUF, &buf);
-            if (pv_ok && rg.found)
-                draw_region(preview, &rg);
+            if (pv_ok && cached.found)
+                draw_region(preview, &cached);
 
             /* overlay: keep the last hit on screen ~2/3s (the PPA blit
                wiped the previous frame's drawing) */
