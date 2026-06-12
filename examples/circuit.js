@@ -47,6 +47,9 @@ var selNode = -1;
 var selComp = -1;
 var editIdx = -1;            /* 編集中の部品 index (-1 = なし) */
 var editBuf = "";
+var editFresh = false;       /* 編集開始直後 = 最初の文字で全置換 (表計算流) */
+var kbH = 0;                 /* キーボードの予約高さ (編集中のみ > 0) */
+var H = HAS_UI ? ui.size()[1] : 1192;
 var ana = null;              /* 直近の解析結果 */
 
 function nx(n) { return GX0 + (n % 16) * SP; }
@@ -565,8 +568,11 @@ function cap(s, n) {
 function drawFormula() {
     var l1 = "", l2 = "", l3 = "", l4 = "";
     if (editIdx >= 0) {
-        l1 = "入力中: " + comps[editIdx].id + " = " + editBuf + "_";
-        l2 = "Enter で確定 / Esc で取消。例: 10k, 4.7M, R1*2, 1/(1/R1+1/R2)";
+        l1 = "入力中: " + comps[editIdx].id + " = " +
+             (editFresh ? "[" + editBuf + "]" : editBuf + "_");
+        l2 = editFresh
+            ? "そのまま入力で置き換え / BS で 1 字ずつ編集 / Enter 確定 / Esc 取消"
+            : "Enter で確定 / Esc で取消。例: 10k, 4.7M, R1*2, 1/(1/R1+1/R2)";
     } else if (!ana || !ana.ok) {
         l1 = ana ? ana.msg : "";
         l2 = "電源 1 個と抵抗で閉じたループを作ると自動計算します";
@@ -700,8 +706,9 @@ function nodeTap(nn) {
 function startEdit(i) {
     editIdx = i;
     editBuf = comps[i].expr;
+    editFresh = true;
     selComp = i;
-    ui.keyboard(1);
+    kbH = ui.keyboard(1) || 400;
     scene();
 }
 
@@ -710,6 +717,7 @@ function commitEdit(ok) {
     if (ok && editBuf.length) comps[editIdx].expr = editBuf;
     editIdx = -1;
     editBuf = "";
+    kbH = 0;
     ui.keyboard(0);
     recompute();
     save();
@@ -718,6 +726,9 @@ function commitEdit(ok) {
 
 function handleTouch(x, y, kind) {
     if (kind !== 0) return;
+    /* touch_observe は LVGL キーボード上のタップも JS に届ける —
+     * 編集中の予約領域タップはキー入力なので、ここでは触らない */
+    if (editIdx >= 0 && y >= H - kbH) return;
     if (editIdx >= 0) commitEdit(true); /* 表計算ライク: 他をタップで確定 */
 
     if (y < 72) {
@@ -776,12 +787,14 @@ function handleKey(k) {
     if (k === "\n") { commitEdit(true); return; }
     if (k === "\b") {
         editBuf = editBuf.slice(0, -1);
+        editFresh = false;
     } else if (k.charCodeAt(0) === 27) {
         if (k.length > 1) return; /* 矢印等のエスケープ列は無視 */
         commitEdit(false);
         return;
     } else if (k.length === 1) {
-        editBuf += k;
+        editBuf = editFresh ? k : editBuf + k;
+        editFresh = false;
     }
     scene();
 }
@@ -939,6 +952,7 @@ if (HAS_UI) {
         selNode = -1;
         editIdx = -1;
         editBuf = "";
+        kbH = 0;
         ui.keyboard(0);
         recompute();
         scene();
