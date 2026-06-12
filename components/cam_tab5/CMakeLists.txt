@@ -22,15 +22,10 @@ idf_component_register(SRCS ${CAM_SRCS}
                        PRIV_REQUIRES esp_driver_ledc esp_driver_i2c esp_timer
                                      esp_driver_ppa ui_tab5)
 
-# The PIE arithmetic mnemonics (esp.vmulas.s16.qacc / esp.srs.s.xacc /
-# esp.andq / esp.lp.setupi ...) require the xesppie ISA extension in the
-# assembler's -march. The IDF P4 toolchain march already enables it (the
-# vld/vst precedent in main/ppa_bench.c assembles unflagged), but we pin
-# it file-scoped so the kernel keeps assembling regardless of the global
-# march. APPEND so the rest of the IDF flags are preserved.
-if(CONFIG_MQJS_CAMERA AND CONFIG_IDF_TARGET_ESP32P4)
-    set_source_files_properties("bc_tensor_p4.S"
-        TARGET_DIRECTORY ${COMPONENT_LIB}
-        PROPERTIES COMPILE_OPTIONS
-        "-march=rv32imafc_zicsr_zifencei_xesppie")
-endif()
+# No per-file -march needed: the IDF P4 toolchain (GCC 15.2) already
+# assembles the PIE + hardware-loop mnemonics. Its global asmflags carry
+# -march=...xespv2p1_xesploop (PIE = xespv2p1, Xhwlp = xesploop) — the
+# same flags main/ppa_bench.c's esp.vld/vst rely on. (NB: an older
+# toolchain spelled the PIE extension "xesppie"; do NOT pin that name
+# here — GCC 15.2 rejects it as an unknown non-standard extension and
+# clobbering the global -march would also drop zaamo/zalrsc/xesploop.)
