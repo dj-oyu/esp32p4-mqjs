@@ -13,4 +13,5 @@ endif()
 
 idf_component_register(SRCS ${CAM_SRCS}
                        INCLUDE_DIRS "include"
-                       PRIV_REQUIRES esp_driver_ledc esp_driver_i2c esp_timer)
+                       PRIV_REQUIRES esp_driver_ledc esp_driver_i2c esp_timer
+                                     esp_driver_ppa ui_tab5)

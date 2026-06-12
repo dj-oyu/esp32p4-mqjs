@@ -178,6 +178,16 @@ size_t ui_tab5_lv_mem_free(void);
  * until touch_init ran (or when it failed). */
 void *ui_tab5_i2c_bus(void);
 
+/* Camera viewfinder overlay (cam_tab5's scan task): returns the RGB565
+ * pixel buffer of a w x h lv_canvas centered near the top of the
+ * screen (created on first call, re-shown on later ones). NULL when
+ * the UI is down or the buffer allocation failed. The scan task
+ * writes frames into the buffer and calls _update (tearing is fine
+ * for a viewfinder); _hide when the scan ends. */
+void *ui_tab5_cam_canvas(int w, int h);
+void ui_tab5_cam_canvas_update(void);
+void ui_tab5_cam_canvas_hide(void);
+
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
 static inline void ui_tab5_start(void) {}
@@ -266,6 +276,14 @@ static inline void ui_tab5_w_reset(void) {}
 static inline void ui_tab5_w_commit(void) {}
 static inline size_t ui_tab5_lv_mem_free(void) { return 0; }
 static inline void *ui_tab5_i2c_bus(void) { return 0; }
+static inline void *ui_tab5_cam_canvas(int w, int h)
+{
+    (void)w;
+    (void)h;
+    return 0;
+}
+static inline void ui_tab5_cam_canvas_update(void) {}
+static inline void ui_tab5_cam_canvas_hide(void) {}
 
 #endif /* CONFIG_MQJS_TAB5_UI */
 

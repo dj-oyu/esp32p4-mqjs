@@ -25,6 +25,7 @@
 
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "driver/ppa.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_video_device.h"
@@ -34,6 +35,7 @@
 #include "linux/videodev2.h"
 
 #include "ean13.h"
+#include "ui_tab5.h"
 
 static const char *TAG = "cam_tab5";
 
@@ -176,17 +178,25 @@ static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
     return false;
 }
 
-static void scan_task(void *pv)
-{
-    static uint8_t line[CAM_W]; /* one scanner task at a time (s_busy) */
-    char code[14];
-    void *bufs[CAM_BUFS] = { 0 };
-    size_t lens[CAM_BUFS] = { 0 };
-    int fd = -1;
-    bool found = false;
-    bool streaming = false;
-    const char *fail = NULL;
+/* ---- persistent capture pipeline ----
+   M5Tab5-UserDemo never closes the camera (hal_camera.cpp keeps fd +
+   buffers + STREAMON forever and even comments out close()) — and
+   indeed re-running REQBUFS/STREAMON on esp_video after a teardown
+   fails ("STREAMON failed" on the second scan). So: bring the
+   pipeline up once on first use and keep it streaming; scans just
+   DQBUF/QBUF for their window. */
+static int s_fd = -1;
+static void *s_bufs[CAM_BUFS];
+static int s_frame_w, s_frame_h;
+static ppa_client_handle_t s_ppa; /* hardware rotate+scale for preview */
 
+static bool pipeline_once(void)
+{
+    if (s_fd >= 0)
+        return true;
+
+    const char *fail = NULL;
+    int fd = -1;
     do {
         fd = open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR);
         if (fd < 0) {
@@ -202,8 +212,9 @@ static void scan_task(void *pv)
             fail = "S_FMT failed";
             break;
         }
-        int w = (int)fmt.fmt.pix.width, h = (int)fmt.fmt.pix.height;
-        if (w > CAM_W) {
+        s_frame_w = (int)fmt.fmt.pix.width;
+        s_frame_h = (int)fmt.fmt.pix.height;
+        if (s_frame_w > CAM_W) {
             fail = "unexpected frame width";
             break;
         }
@@ -225,11 +236,10 @@ static void scan_task(void *pv)
                 fail = "QUERYBUF failed";
                 break;
             }
-            bufs[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, fd, buf.m.offset);
-            lens[i] = buf.length;
-            if (!bufs[i] || bufs[i] == MAP_FAILED) {
-                bufs[i] = NULL;
+            s_bufs[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, fd, buf.m.offset);
+            if (!s_bufs[i] || s_bufs[i] == MAP_FAILED) {
+                s_bufs[i] = NULL;
                 fail = "mmap failed";
                 break;
             }
@@ -246,7 +256,79 @@ static void scan_task(void *pv)
             fail = "STREAMON failed";
             break;
         }
-        streaming = true;
+    } while (0);
+
+    if (fail) {
+        set_status("%s", fail);
+        if (fd >= 0)
+            close(fd);
+        for (int i = 0; i < CAM_BUFS; i++)
+            s_bufs[i] = NULL;
+        return false;
+    }
+    s_fd = fd;
+    return true;
+}
+
+/* Viewfinder blit 1280x720 -> portrait 360x640 via the PPA (the sensor
+ * is mounted 90° relative to the portrait panel; mirror keeps the
+ * selfie-natural aiming). A CPU transpose here was ~1 cache miss per
+ * pixel on PSRAM and dragged the preview to a slideshow — the PPA does
+ * rotate+scale+mirror in hardware in a few ms. */
+#define PV_W (CAM_H / 2) /* 360 */
+#define PV_H (CAM_W / 2) /* 640 */
+static bool preview_blit(const uint16_t *px, uint16_t *dst) /* PPA SRM */
+{
+    if (!s_ppa) {
+        ppa_client_config_t cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+            .max_pending_trans_num = 1,
+        };
+        if (ppa_register_client(&cfg, &s_ppa) != ESP_OK)
+            return false;
+    }
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer = (void *)px,
+            .pic_w = CAM_W,
+            .pic_h = CAM_H,
+            .block_w = CAM_W,
+            .block_h = CAM_H,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = dst,
+            .buffer_size = (uint32_t)PV_W * PV_H * 2,
+            .pic_w = PV_W,
+            .pic_h = PV_H,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,
+        .scale_x = 0.5,
+        .scale_y = 0.5,
+        .mirror_x = true,
+        .mirror_y = false,
+        .rgb_swap = false,
+        .byte_swap = false,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
+}
+
+static void scan_task(void *pv)
+{
+    static uint8_t line[CAM_W]; /* one scanner task at a time (s_busy) */
+    char code[14];
+    bool found = false;
+    const char *fail = NULL;
+    bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+
+    if (pipe_ok) {
+        uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
         set_status("scanning%s", NULL);
 
         int64_t deadline =
@@ -255,31 +337,26 @@ static void scan_task(void *pv)
             struct v4l2_buffer buf = { 0 };
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
-            if (ioctl(fd, VIDIOC_DQBUF, &buf) != 0) {
+            if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0) {
                 fail = "DQBUF failed";
                 break;
             }
-            found = scan_frame((const uint16_t *)bufs[buf.index], w, h,
-                               line, code);
-            ioctl(fd, VIDIOC_QBUF, &buf);
+            const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
+            if (preview && s_frame_w == CAM_W &&
+                preview_blit(px, preview))
+                ui_tab5_cam_canvas_update();
+            found = scan_frame(px, s_frame_w, s_frame_h, line, code);
+            ioctl(s_fd, VIDIOC_QBUF, &buf);
         }
-    } while (0);
-
-    if (streaming) {
-        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        ioctl(fd, VIDIOC_STREAMOFF, &type);
+        ui_tab5_cam_canvas_hide();
+        /* the pipeline stays up and streaming (see pipeline_once) */
     }
-    for (int i = 0; i < CAM_BUFS; i++)
-        if (bufs[i])
-            munmap(bufs[i], lens[i]);
-    if (fd >= 0)
-        close(fd);
 
     if (found)
         set_status("found %s", code);
     else if (fail)
         set_status("%s", fail);
-    else
+    else if (pipe_ok)
         set_status(s_cancel ? "cancelled%s" : "timeout (no code)%s", NULL);
 
     cam_tab5_cb_t cb = s_req.cb;

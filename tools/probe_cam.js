@@ -15,15 +15,28 @@ function selfStop() {
         if (a[i].name === "probe_cam") sys.stop(a[i].slot);
 }
 
+/* 2 連続スキャンで「2 回目の STREAMON 失敗」リグレッションも検出する。
+ * 1 回目はすぐ cancel して短縮、2 回目はフルタイムアウトまで回す */
 mqtt.onConnect(function () {
     var st0 = camera.status();
-    var rc = camera.scan(function (code) {
-        pub({ phase: "cam-done", result: code || null,
+    var rc1 = camera.scan(function (c1) {
+        pub({ phase: "scan1-done", result: c1 || null,
               after: camera.status() });
-        setTimeout(selfStop, 1000);
+        var rc2 = camera.scan(function (c2) {
+            pub({ phase: "scan2-done", result: c2 || null,
+                  after: camera.status() });
+            setTimeout(selfStop, 1000);
+        }, "97");
+        pub({ phase: "scan2-start", rc: rc2, after: camera.status() });
+        if (!rc2)
+            setTimeout(selfStop, 2000);
     }, "97");
-    pub({ phase: "cam-start", rc: rc, before: st0, after: camera.status() });
-    if (!rc)
+    pub({ phase: "scan1-start", rc: rc1, before: st0,
+          after: camera.status() });
+    if (!rc1) {
         setTimeout(selfStop, 2000);
+        return;
+    }
+    setTimeout(function () { camera.cancel(); }, 6000);
 });
 mqtt.connect("mqtt://192.168.1.2");

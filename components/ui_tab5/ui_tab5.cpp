@@ -2250,4 +2250,54 @@ extern "C" void ui_tab5_start(void)
     ui_tab5_log(greet, sizeof greet - 1);
 }
 
+/* ---- camera viewfinder overlay (cam_tab5) ----
+   An lv_canvas on the top layer whose RGB565 buffer the cam_scan task
+   writes downscaled frames into. Created once and kept (460KB PSRAM
+   for 640x360); hidden between scans. All entry points take the LVGL
+   port lock — they are called from the cam_scan task. */
+static lv_obj_t *s_cam_cv;
+static uint16_t *s_cam_cv_buf;
+
+void *ui_tab5_cam_canvas(int w, int h)
+{
+    if (!s_root_scr)
+        return NULL;
+    lvgl_port_lock(0);
+    if (!s_cam_cv) {
+        /* PPA writes this buffer (cam_tab5 hardware-rotates frames into
+           it): DMA-capable + cache-line aligned */
+        s_cam_cv_buf = (uint16_t *)heap_caps_aligned_alloc(
+            64, (size_t)w * h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+        if (s_cam_cv_buf) {
+            lv_canvas_set_buffer(s_cam_cv = lv_canvas_create(lv_layer_top()),
+                                 s_cam_cv_buf, w, h, LV_COLOR_FORMAT_RGB565);
+            lv_obj_align(s_cam_cv, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_H + 24);
+            lv_obj_set_style_border_width(s_cam_cv, 2, 0);
+            lv_obj_set_style_border_color(s_cam_cv, lv_color_hex(0x2ECC71), 0);
+        }
+    }
+    if (s_cam_cv)
+        lv_obj_clear_flag(s_cam_cv, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
+    return s_cam_cv_buf;
+}
+
+void ui_tab5_cam_canvas_update(void)
+{
+    if (!s_cam_cv)
+        return;
+    lvgl_port_lock(0);
+    lv_obj_invalidate(s_cam_cv);
+    lvgl_port_unlock();
+}
+
+void ui_tab5_cam_canvas_hide(void)
+{
+    if (!s_cam_cv)
+        return;
+    lvgl_port_lock(0);
+    lv_obj_add_flag(s_cam_cv, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
+}
+
 #endif /* CONFIG_MQJS_TAB5_UI */
