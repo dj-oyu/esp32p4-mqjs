@@ -66,6 +66,8 @@ docs/widget-framework-design.md §3/§10 を参照。
 | `ssh_term.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH 最小端末 (Phase T1)。接続フォーム (ウィジェット) → 端末 (キャンバス)。認証情報はフォーム入力 |
 | `ssh_vt.js` | 要 WiFi + sshd (Tab5 画面で操作) | ハイブリッド | SSH ターミナルエミュレータ (Phase T2/T3)。VT100 パーサ + セルグリッド + 16 色。ls --color / vi / top 対応。T3a: キーボード上のコントロールバー (Esc/Tab/one-shot Ctrl·Alt/Fn→F1-F12/矢印/Paste=clipboard)。T3b: 長押し→なぞって選択コピー (clipboard へ)、ブラケットペースト (?2004) 追従。接続フォーム入力、切断でフォームに復帰。`SELFTEST=true` で PC パーサ検証 |
 | `clip_mirror.js` | 不要 (要 WiFi + broker) | ヘッドレス | T3b 層2: クリップボードの MQTT ミラー。onChange→retained publish / subscribe→set、sender ID で echo 無視、同一値スキップ。ブローカー不在時はローカルのみ (日和見同期) |
+| `circuit.js` | 不要 (Tab5 画面で操作) | キャンバス | 回路計算機。格子に部品 (導線/抵抗/電源) をタップ配置 → 合成抵抗を「R1 + (R2 // R3)」の導出式つきで自動計算し、部品タップで分圧/分流の導出式を表示。下部の表は表計算ライク: 値セルに式 (10k, R1*2, 1/(1/R1+1/R2)) が書け依存値は自動再計算。回路は NVS に自動保存。`SELFTEST=true` で PC ソルバ検証 |
+| `reading.js` | 不要 (WiFi は ISBN 自動入力時のみ) | ウィジェット | 読書記録。ページ進捗の一覧 + XP/連続日数/バッジのゲーミフィケーション。ISBN→タイトル/著者/ページ数の自動入力は PC 側 `tools/ndl_bridge.py` が NDL サーチを MQTT (`esp32p4-mqjs/ndl/req→res`) で代理 (ブリッジ不在でも手入力で全機能)。データは NVS で microSD 不要。`SELFTEST=true` で PC ロジック検証 |
 
 `life.js` / `mandelbrot.js` は ANSI エスケープを使うので、対応した
 ターミナル (`idf.py monitor`、TeraTerm 等) で見ること。
