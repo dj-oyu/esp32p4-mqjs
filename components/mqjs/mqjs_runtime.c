@@ -148,7 +148,7 @@ typedef struct {
         struct { int16_t x, y; uint8_t kind; } touch;
         struct { char text[8]; uint8_t len; } key; /* one key as UTF-8 */
         struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
-        struct { char reason[22]; int16_t id; } ssh_closed;
+        struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to AppSlot.name */
@@ -200,6 +200,8 @@ typedef struct {
     uint8_t slot;             /* own index (for s_fg_slot comparisons) */
     uint16_t gen;             /* bumped on every start: stale-event filter */
     char name[32];
+    char vault_id[32];        /* immutable source identity; setAppName cannot
+                                 impersonate another app's vault */
     uint8_t *mem;             /* fixed arena (design §3.6) */
     size_t mem_size;
     JSContext *ctx;
@@ -1855,10 +1857,43 @@ JSValue js_uiwidget_value(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 /* ------------------------------------------------------------------ */
 
 #define MQJS_STORE_VAL_MAX 3900
+#define MQJS_VAULT_VAL_MAX 127
+#define MQJS_VAULT_NAME_MAX 127
+
+/* Vault entries are automatically scoped to the calling app. There is no
+   JS read API: consumers such as ssh.connect resolve the value in C. */
+static uint64_t vault_hash(const char *app, const char *name)
+{
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (const char *p = app; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= UINT64_C(1099511628211);
+    }
+    h ^= 0;
+    h *= UINT64_C(1099511628211);
+    for (const char *p = name; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+static bool vault_key(const char *app, const char *name, char key[16])
+{
+    size_t n = strlen(name);
+    if (!app || !app[0] || n == 0 || n > MQJS_VAULT_NAME_MAX)
+        return false;
+    snprintf(key, 16, "v%014llx",
+             (unsigned long long)(vault_hash(app, name) &
+                                  UINT64_C(0x00ffffffffffffff)));
+    return true;
+}
 
 #ifdef ESP_PLATFORM
 static nvs_handle_t s_store;
 static bool s_store_open;
+static nvs_handle_t s_vault;
+static bool s_vault_open;
 
 static bool store_open(void)
 {
@@ -1872,6 +1907,16 @@ static bool store_open(void)
             return false;
     }
     s_store_open = true;
+    return true;
+}
+
+static bool vault_open(void)
+{
+    if (s_vault_open)
+        return true;
+    if (nvs_open("mqjs_vault", NVS_READWRITE, &s_vault) != ESP_OK)
+        return false;
+    s_vault_open = true;
     return true;
 }
 
@@ -1913,6 +1958,11 @@ static struct {
     char key[16];
     char *val;
 } s_pc_store[MQJS_PC_STORE];
+static struct {
+    char key[16];
+    char val[MQJS_VAULT_VAL_MAX + 1];
+    bool used;
+} s_pc_vault[MQJS_PC_STORE];
 
 static int pc_store_find(const char *k)
 {
@@ -1922,6 +1972,101 @@ static int pc_store_find(const char *k)
     return -1;
 }
 #endif
+
+static bool vault_read(const char *app, const char *name, char *dst, size_t cap)
+{
+    char key[16];
+    if (!vault_key(app, name, key) || cap == 0)
+        return false;
+#ifdef ESP_PLATFORM
+    if (!vault_open())
+        return false;
+    size_t len = cap;
+    return nvs_get_str(s_vault, key, dst, &len) == ESP_OK;
+#else
+    for (int i = 0; i < MQJS_PC_STORE; i++)
+        if (s_pc_vault[i].used && !strcmp(s_pc_vault[i].key, key)) {
+            snprintf(dst, cap, "%s", s_pc_vault[i].val);
+            return true;
+        }
+    return false;
+#endif
+}
+
+JSValue js_vault_has(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf nbuf;
+    const char *name = JS_ToCString(ctx, argv[0], &nbuf);
+    char value[MQJS_VAULT_VAL_MAX + 1];
+    bool ok = name && vault_read(s_cur_app->vault_id, name, value, sizeof value);
+    memset(value, 0, sizeof value);
+    return name ? JS_NewBool(ok) : JS_EXCEPTION;
+}
+
+JSValue js_vault_put(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf nbuf, vbuf;
+    size_t vlen;
+    const char *name = JS_ToCString(ctx, argv[0], &nbuf);
+    if (!name)
+        return JS_EXCEPTION;
+    char key[16];
+    if (!vault_key(s_cur_app->vault_id, name, key))
+        return JS_ThrowRangeError(ctx, "vault name must be 1-%d chars",
+                                  MQJS_VAULT_NAME_MAX);
+    const char *value = JS_ToCStringLen(ctx, &vlen, argv[1], &vbuf);
+    if (!value)
+        return JS_EXCEPTION;
+    if (vlen > MQJS_VAULT_VAL_MAX)
+        return JS_ThrowRangeError(ctx, "vault value too large (max %d)",
+                                  MQJS_VAULT_VAL_MAX);
+#ifdef ESP_PLATFORM
+    bool ok = vault_open() && nvs_set_str(s_vault, key, value) == ESP_OK;
+    if (ok)
+        nvs_commit(s_vault);
+#else
+    int slot = -1;
+    for (int i = 0; i < MQJS_PC_STORE; i++)
+        if (s_pc_vault[i].used && !strcmp(s_pc_vault[i].key, key)) {
+            slot = i;
+            break;
+        } else if (slot < 0 && !s_pc_vault[i].used) {
+            slot = i;
+        }
+    bool ok = slot >= 0;
+    if (ok) {
+        s_pc_vault[slot].used = true;
+        snprintf(s_pc_vault[slot].key, sizeof s_pc_vault[slot].key, "%s", key);
+        snprintf(s_pc_vault[slot].val, sizeof s_pc_vault[slot].val, "%s", value);
+    }
+#endif
+    return JS_NewBool(ok);
+}
+
+JSValue js_vault_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf nbuf;
+    const char *name = JS_ToCString(ctx, argv[0], &nbuf);
+    if (!name)
+        return JS_EXCEPTION;
+    char key[16];
+    if (!vault_key(s_cur_app->vault_id, name, key))
+        return JS_NewBool(0);
+#ifdef ESP_PLATFORM
+    bool ok = vault_open() && nvs_erase_key(s_vault, key) == ESP_OK;
+    if (ok)
+        nvs_commit(s_vault);
+#else
+    bool ok = false;
+    for (int i = 0; i < MQJS_PC_STORE; i++)
+        if (s_pc_vault[i].used && !strcmp(s_pc_vault[i].key, key)) {
+            memset(&s_pc_vault[i], 0, sizeof s_pc_vault[i]);
+            ok = true;
+            break;
+        }
+#endif
+    return JS_NewBool(ok);
+}
 
 /* copy the key argument onto the stack; NVS keys are at most 15 chars */
 static int store_key(JSContext *ctx, JSValue v, char *dst /*[16]*/)
@@ -3433,17 +3578,18 @@ static SshOwner *ssh_owner_find(int id)
 static int s_pc_ssh_next = 1; /* fake session ids for PC smoke runs */
 #endif
 
-/* ssh.connect(host, port, user, pass, cols, rows) -> session id (> 0).
-   Throws when all session slots are busy. */
-JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+/* ssh.connect(host, port, user, passwordName, hostKeyName, cols, rows)
+   resolves both values inside the caller's app-scoped vault. A missing host
+   key deliberately starts a TOFU probe which rejects before password auth
+   and returns "hostkey:<sha256-hex>" through onClose. */
+JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
 {
-    JSCStringBuf hbuf, ubuf, pbuf;
-    size_t hlen, ulen, plen;
+    JSCStringBuf hbuf, ubuf, pnbuf, knbuf;
+    size_t hlen, ulen;
     int port = 22, cols = 80, rows = 24;
+    char host[64], user[32], pass[64], hostkey[65];
 
-    /* copy host/user out first: each later ToCString may move earlier
-       strings in the compacting GC heap */
-    char host[64], user[32];
     const char *p = JS_ToCStringLen(ctx, &hlen, argv[0], &hbuf);
     if (!p)
         return JS_EXCEPTION;
@@ -3451,7 +3597,7 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
         hlen = sizeof host - 1;
     memcpy(host, p, hlen);
     host[hlen] = '\0';
-    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &port, argv[1]))
+    if (JS_ToInt32(ctx, &port, argv[1]))
         return JS_EXCEPTION;
     p = JS_ToCStringLen(ctx, &ulen, argv[2], &ubuf);
     if (!p)
@@ -3460,26 +3606,47 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
         ulen = sizeof user - 1;
     memcpy(user, p, ulen);
     user[ulen] = '\0';
-    const char *pass = JS_ToCStringLen(ctx, &plen, argv[3], &pbuf);
-    if (!pass)
+    const char *namep = JS_ToCString(ctx, argv[3], &pnbuf);
+    if (!namep)
         return JS_EXCEPTION;
-    if (argc >= 5 && !JS_IsUndefined(argv[4]) && JS_ToInt32(ctx, &cols, argv[4]))
+    char pass_name[MQJS_VAULT_NAME_MAX + 1];
+    snprintf(pass_name, sizeof pass_name, "%s", namep);
+    namep = JS_ToCString(ctx, argv[4], &knbuf);
+    if (!namep)
         return JS_EXCEPTION;
-    if (argc >= 6 && !JS_IsUndefined(argv[5]) && JS_ToInt32(ctx, &rows, argv[5]))
+    char key_name[MQJS_VAULT_NAME_MAX + 1];
+    snprintf(key_name, sizeof key_name, "%s", namep);
+    if (argc >= 6 && JS_ToInt32(ctx, &cols, argv[5]))
         return JS_EXCEPTION;
+    if (argc >= 7 && JS_ToInt32(ctx, &rows, argv[6]))
+        return JS_EXCEPTION;
+    if (!vault_read(s_cur_app->vault_id, pass_name, pass, sizeof pass))
+        return JS_ThrowTypeError(ctx, "vault password not found");
+    if (!vault_read(s_cur_app->vault_id, key_name, hostkey, sizeof hostkey))
+        hostkey[0] = '\0';
 
 #ifdef ESP_PLATFORM
-    int id = mqjs_ssh_connect(host, port, user, pass, cols, rows);
+    int id = mqjs_ssh_connect(host, port, user, pass, hostkey, cols, rows);
+    memset(pass, 0, sizeof pass);
     if (!id)
         return JS_ThrowTypeError(ctx, "no free ssh session (max %d)",
                                  SSHC_MAX_SESSIONS);
     ssh_owner_add(id, s_cur_app->slot);
 #else
+    memset(pass, 0, sizeof pass);
     int id = s_pc_ssh_next++;
-    printf("[ssh] connect(%s@%s:%d, pty %dx%d) -> #%d (stub: never connects "
-           "on PC)\n", user, host, port, cols, rows, id);
+    printf("[ssh] connect(%s@%s:%d, pty %dx%d) -> #%d "
+           "(stub: never connects on PC)\n", user, host, port, cols, rows, id);
 #endif
     return JS_NewInt32(ctx, id);
+}
+
+/* Temporary source compatibility for already-generated stdlib headers.
+   Regeneration removes this alias and the connectVault property. */
+JSValue js_ssh_connectVault(JSContext *ctx, JSValue *this_val, int argc,
+                            JSValue *argv)
+{
+    return js_ssh_connect(ctx, this_val, argc, argv);
 }
 
 JSValue js_ssh_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -4134,6 +4301,7 @@ static int app_start_internal(AppSlot *app, const char *src, size_t src_len,
     app->clip_used = false;
     app->sink_len = 0;
     snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
+    snprintf(app->vault_id, sizeof app->vault_id, "%s", name ? name : "app");
 
     JSContext *ctx = JS_NewContext(app->mem, app->mem_size, &js_stdlib);
     if (!ctx)

@@ -426,7 +426,8 @@ idf.py "-DMQJS_SCRIPT=life.js" build flash monitor
 | `ssh` | 最大 3 セッションの SSH クライアント |
 | `camera` | Tab5 カメラによる EAN-13 / ISBN 読み取り |
 | `http` | 非同期の one-shot HTTP/HTTPS GET |
-| `store` | アプリ単位の NVS キーバリュー保存 |
+| `store` | 全アプリ共有の NVS キーバリュー保存 |
+| `vault` | アプリ単位の秘密保存 (`put/has/del`、値の読み戻し不可) |
 | `clipboard` | アプリ間で共有され、再起動後も残るクリップボード |
 | `sys` | アプリ管理、前面切替、通知、アプリ間シグナル、ストア |
 | グローバル | `print`、`console.log`、タイマー、`Date`、`performance.now` |
@@ -443,6 +444,7 @@ mqtt.subscribe("demo/command", function (topic, payload) {
 mqtt.connect("mqtt://192.168.1.2");
 
 store.set("counter", "42");
+vault.put("login", "password"); // 利用は ssh.connect() 等の C API 経由
 http.get("https://example.com/data.json", function (body, status) {
     print(status, body);
 });
@@ -493,6 +495,7 @@ timeout 3 /tmp/run_pc ../../examples/life.js
 - 開発タスクとアプリ本体は、Ed25519 署名の検証に成功した場合だけ保存・実行されます
 - 秘密鍵 `tools/task_signing_key.pem` を持つ人は、デバイス上で任意の JavaScript を実行できます
 - 保存済みタスクは起動時に再検証しません。フラッシュと NVS / LittleFS は信頼済みとみなします
+- Vault は不変なアプリ起動名で分離され、秘密値を JavaScript へ読み戻せません
 - ストアのカタログ情報と削除用 tombstone は署名されません
 - 現在の `@perm` は説明用で、API アクセスを制限しません
 - MQTT ブローカーは LAN 内に置き、認証、ACL、ファイアウォールを設定してください

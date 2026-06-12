@@ -36,7 +36,8 @@ extern "C" {
  * reported via mqjs_post_ssh_closed(id, ...); data via
  * mqjs_post_ssh_data(id, ...). Stale ids are safe no-ops everywhere. */
 int mqjs_ssh_connect(const char *host, int port, const char *user,
-                     const char *pass, int cols, int rows);
+                     const char *pass, const char *hostkey, int cols,
+                     int rows);
 /* Queue bytes for the server (keystrokes). Returns false when the tx
  * buffer is full or the session is not up — the caller may retry. */
 bool mqjs_ssh_write(int id, const void *data, size_t len);
@@ -56,9 +57,10 @@ bool mqjs_ssh_up(int id);
 
 static inline int mqjs_ssh_connect(const char *host, int port,
                                    const char *user, const char *pass,
-                                   int cols, int rows)
+                                   const char *hostkey, int cols, int rows)
 {
-    (void)host; (void)port; (void)user; (void)pass; (void)cols; (void)rows;
+    (void)host; (void)port; (void)user; (void)pass; (void)hostkey;
+    (void)cols; (void)rows;
     return 0;
 }
 static inline bool mqjs_ssh_write(int id, const void *data, size_t len)
