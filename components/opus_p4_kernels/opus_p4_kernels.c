@@ -43,13 +43,14 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
 }
 
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
-void opus_p4_pie_probe_run(const int16_t *in, int32_t *out);
+void opus_p4_pie_probe_run(const int16_t *in, const int32_t *in32, int32_t *out);
 
 void opus_p4_pie_probe(void)
 {
     static int16_t in[32] __attribute__((aligned(16)));
-    static int32_t out[16] __attribute__((aligned(16)));
-    /* vmul widening: A = 1..8, B = 10..80 (products 10,40,90,160,250,360,490,640) */
+    static int32_t in32[16] __attribute__((aligned(16)));
+    static int32_t out[32] __attribute__((aligned(16)));
+    /* vmul widening: A=1..8, B=10..80 (products 10,40,90,160,250,360,490,640) */
     for (int i = 0; i < 8; i++) {
         in[i] = (int16_t)(i + 1);
         in[8 + i] = (int16_t)((i + 1) * 10);
@@ -61,14 +62,35 @@ void opus_p4_pie_probe(void)
         in[16 + i] = data[i];
         in[24 + i] = tw[i];
     }
+    /* shift test: >>15 expects 2,4,-6,32768 ; <<1 expects x2 */
+    in32[0] = 0x10000;
+    in32[1] = 0x20000;
+    in32[2] = -0x30000;
+    in32[3] = 0x40000000;
+    /* clamp test: vmin with SIG_SAT expects 100, 536870911, -100, -700000000 */
+    in32[4] = 100;
+    in32[5] = 600000000;
+    in32[6] = -100;
+    in32[7] = -700000000;
+    in32[8] = 536870911; /* SIG_SAT */
     memset(out, 0, sizeof(out));
-    opus_p4_pie_probe_run(in, out);
-    ESP_LOGI("pie_probe", "vmul.s32.s16xs16 A=1..8 B=10..80 (expect 10,40,90,160,250,360,490,640)");
-    ESP_LOGI("pie_probe", "  dst0[0..3]= %ld %ld %ld %ld", (long)out[0], (long)out[1], (long)out[2], (long)out[3]);
-    ESP_LOGI("pie_probe", "  dst1[4..7]= %ld %ld %ld %ld", (long)out[4], (long)out[5], (long)out[6], (long)out[7]);
-    ESP_LOGI("pie_probe", "cmul.s16 data=(100,0)(0,100)(100,100)(200,300) tw=(0,.5) sel2+3");
-    ESP_LOGI("pie_probe", "  q6 i32[8..11]= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
+    opus_p4_pie_probe_run(in, in32, out);
+    ESP_LOGI("pie_probe", "vmul.s32.s16xs16 (expect 10,40,90,160 / 250,360,490,640)");
+    ESP_LOGI("pie_probe", "  dst0= %ld %ld %ld %ld dst1= %ld %ld %ld %ld",
+             (long)out[0], (long)out[1], (long)out[2], (long)out[3],
+             (long)out[4], (long)out[5], (long)out[6], (long)out[7]);
+    ESP_LOGI("pie_probe", "cmul.s16 q6= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
              (long)out[8], (long)out[9], (long)out[10], (long)out[11]);
+    ESP_LOGI("pie_probe", "vunzip.16 q0={1..8} q1={10..80} ->");
+    ESP_LOGI("pie_probe", "  q0= 0x%08lx 0x%08lx 0x%08lx 0x%08lx q1= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
+             (long)out[12], (long)out[13], (long)out[14], (long)out[15],
+             (long)out[16], (long)out[17], (long)out[18], (long)out[19]);
+    ESP_LOGI("pie_probe", "vsr.s32>>15 (exp 2,4,-6,32768)= %ld %ld %ld %ld",
+             (long)out[20], (long)out[21], (long)out[22], (long)out[23]);
+    ESP_LOGI("pie_probe", "vsl.32<<1 (exp 131072,262144,-393216,-2147483648)= %ld %ld %ld %ld",
+             (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
+    ESP_LOGI("pie_probe", "vmin.s32 clamp (exp 100,536870911,-100,-700000000)= %ld %ld %ld %ld",
+             (long)out[28], (long)out[29], (long)out[30], (long)out[31]);
 }
 #else
 void opus_p4_pie_probe(void) {}
