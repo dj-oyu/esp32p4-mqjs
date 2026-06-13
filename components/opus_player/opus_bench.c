@@ -163,6 +163,8 @@ static void run_fixture_benchmark(void)
         return;
     }
 
+    opus_p4_pie_probe();
+
     ESP_LOGI(TAG,
              "fixture=%u bytes, cpu=%d MHz, warmup=%d, measured=%d, "
              "max_packets=%d",

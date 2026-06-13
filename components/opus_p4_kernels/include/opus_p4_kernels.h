@@ -59,6 +59,11 @@ void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
 void opus_p4_comb_filter_const_p4(int32_t *y, const int32_t *x, int T, int N,
                                   int16_t g10, int16_t g11, int16_t g12);
 
+/* On-device PIE instruction-semantics probe (logs results; ESP32-P4 only,
+ * no-op elsewhere). Used to confirm vmul.s32.s16xs16 / cmul.s16 behavior
+ * before building the PIE butterfly/comb kernels. */
+void opus_p4_pie_probe(void);
+
 const char *opus_p4_kernel_impl(void);
 uint32_t opus_p4_kernel_verify_failures(void);
 

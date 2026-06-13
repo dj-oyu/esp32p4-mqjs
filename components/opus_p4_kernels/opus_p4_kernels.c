@@ -42,6 +42,38 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
     return seed;
 }
 
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+void opus_p4_pie_probe_run(const int16_t *in, int32_t *out);
+
+void opus_p4_pie_probe(void)
+{
+    static int16_t in[32] __attribute__((aligned(16)));
+    static int32_t out[16] __attribute__((aligned(16)));
+    /* vmul widening: A = 1..8, B = 10..80 (products 10,40,90,160,250,360,490,640) */
+    for (int i = 0; i < 8; i++) {
+        in[i] = (int16_t)(i + 1);
+        in[8 + i] = (int16_t)((i + 1) * 10);
+    }
+    /* cmul: 4 complex data (r,i) x twiddle (0, 16384=+0.5 in Q15) */
+    static const int16_t data[8] = { 100, 0, 0, 100, 100, 100, 200, 300 };
+    static const int16_t tw[8] = { 0, 16384, 0, 16384, 0, 16384, 0, 16384 };
+    for (int i = 0; i < 8; i++) {
+        in[16 + i] = data[i];
+        in[24 + i] = tw[i];
+    }
+    memset(out, 0, sizeof(out));
+    opus_p4_pie_probe_run(in, out);
+    ESP_LOGI("pie_probe", "vmul.s32.s16xs16 A=1..8 B=10..80 (expect 10,40,90,160,250,360,490,640)");
+    ESP_LOGI("pie_probe", "  dst0[0..3]= %ld %ld %ld %ld", (long)out[0], (long)out[1], (long)out[2], (long)out[3]);
+    ESP_LOGI("pie_probe", "  dst1[4..7]= %ld %ld %ld %ld", (long)out[4], (long)out[5], (long)out[6], (long)out[7]);
+    ESP_LOGI("pie_probe", "cmul.s16 data=(100,0)(0,100)(100,100)(200,300) tw=(0,.5) sel2+3");
+    ESP_LOGI("pie_probe", "  q6 i32[8..11]= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
+             (long)out[8], (long)out[9], (long)out[10], (long)out[11]);
+}
+#else
+void opus_p4_pie_probe(void) {}
+#endif
+
 /* CELT SIG_SAT (2^29-1) and the exact MULT16_32_Q15 used in the RV32
  * (OPUS_FAST_INT64=0) fixed-point build. Kept local so this component stays
  * independent of the opus headers while reproducing their bit pattern. */
