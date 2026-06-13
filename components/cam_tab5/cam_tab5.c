@@ -258,7 +258,13 @@ static bool scan_region(const uint16_t *px, int w, int h,
     if (vext < 16)
         vext = 16;
     int best_dig = 0, best_off = 0;
-    for (int k = 0; k < 16; k++) {
+    /* S1 (docs/scanline-opt-plan.md): walk the 16 offsets center-out
+       (7,8,6,9,...) — the code usually straddles the region center, so
+       the early lines are the likely hits and a decode frame stops
+       after far fewer PSRAM-scattering lines. Full coverage and the
+       near-miss bookkeeping are unchanged, only the order differs. */
+    for (int s = 0; s < 16; s++) {
+        int k = (s & 1) ? 8 + s / 2 : 7 - s / 2;
         int off = vext * (2 * k + 1 - 16) / 16;
         if (scan_one_line(px, w, h, rg, rg->theta, off, half, line, out,
                           disp, &st))
