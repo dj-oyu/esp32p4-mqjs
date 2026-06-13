@@ -30,6 +30,10 @@
 
 static const char *TAG = "app";
 
+#if CONFIG_MQJS_OPUS_BENCHMARK
+void opus_bench_run(void);
+#endif
+
 /* embedded by EMBED_TXTFILES (NUL-terminated) */
 extern const char _binary_task_js_start[];
 extern const char _binary_launcher_js_start[];
@@ -97,6 +101,10 @@ void app_main(void)
        5.5-7x on row+/full blends, blend crossover w=36/38 at h=24
        (~900px ~ 4 cells); JS arena SRAM-vs-PSRAM ~4% (skip). -O2
        itself: pixel loops ~2x, JS ~20% vs -Og. */
+#if CONFIG_MQJS_OPUS_BENCHMARK
+    opus_bench_run();
+#endif
+
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus

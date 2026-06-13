@@ -20,9 +20,10 @@ configure_file(${MQJS_SCRIPT_PATH} ${CMAKE_CURRENT_BINARY_DIR}/task.js COPYONLY)
 
 idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                             "board_tab5.c" "ui_status.c" "ppa_bench.c"
-                            "jsmem_bench.c"
+                            "jsmem_bench.c" "opus_bench.c"
                        PRIV_REQUIRES mqjs nvs_flash esp_wifi esp_netif esp_event
                                      tweetnacl esp_driver_i2c ui_tab5 cam_tab5
-                                     esp_driver_ppa esp_timer
+                                     esp_driver_ppa esp_timer esp_opus_float
+                                     opus_p4_kernels
                        EMBED_TXTFILES ${CMAKE_CURRENT_BINARY_DIR}/task.js
                                       ${CMAKE_CURRENT_BINARY_DIR}/launcher.js)

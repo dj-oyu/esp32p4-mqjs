@@ -34,4 +34,12 @@ menu "mqjs platform"
             No signature verification yet: on a public broker the topic
             name is the only secret, pick a non-guessable one.
 
+    config MQJS_OPUS_BENCHMARK
+        bool "Run float Opus decoder benchmark at boot"
+        default n
+        help
+            Measure the portable-C float inner-product kernel and a generated
+            CELT-only 48 kHz mono packet before normal application startup.
+            Enable only for measure-and-reflash builds.
+
 endmenu

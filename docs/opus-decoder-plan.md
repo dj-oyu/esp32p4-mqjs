@@ -380,7 +380,34 @@ dispatch を使用する。ABI の都合で細切れ呼び出しを増やさな�
 - float asm カーネルごとの許容誤差と packet 単位 PCM 誤差
 - 最初に asm 化する CELT カーネルの粒度
 
-## 11. 参考
+## 11. Portable C float baseline
+
+2026-06-13 に ESP32-P4 rev 1.3、CPU 360 MHz、ESP-IDF 6.0.1 で測定した。
+commit は `dc62982` 以降の Opus benchmark 実装を含む dirty build。
+
+条件:
+
+- `CONFIG_MQJS_OPUS_BENCHMARK=y`
+- portable C dispatch
+- 48 kHz mono、20 ms、CELT-only、64 kbps
+- 決定論的な float PCM から生成した 187-byte packet
+- decoder warmup 10 frames、測定 500 frames
+
+結果:
+
+| Target | Time |
+|---|---:|
+| inner product, 120 floats | 2.119 us/call |
+| inner product, 240 floats | 4.208 us/call |
+| inner product, 480 floats | 8.491 us/call |
+| inner product, 960 floats | 17.571 us/call |
+| CELT float decode, 20 ms frame | 1,790.7 us/frame |
+| CELT float decode realtime load | 8.95% |
+
+初回測定では `main` task の既定 stack 上で encoder/decoder を実行して stack
+protection fault になったため、benchmark は 32 KB の専用 task で実行する。
+
+## 12. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
   - https://components.espressif.com/components/78/esp-opus/versions/1.0.5/readme
