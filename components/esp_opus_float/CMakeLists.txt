@@ -229,3 +229,7 @@ idf_component_register(SRCS ${srcs}
                        PRIV_REQUIRES opus_p4_kernels)
 
 target_compile_options(${COMPONENT_LIB} PRIVATE ${OPUS_COMPILE_OPTIONS})
+
+if(CONFIG_OPUS_P4_FUNCTION_PROFILE)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -finstrument-functions)
+endif()

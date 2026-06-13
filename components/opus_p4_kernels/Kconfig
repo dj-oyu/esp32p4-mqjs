@@ -16,4 +16,13 @@ choice OPUS_P4_KERNEL_MODE
         depends on IDF_TARGET_ESP32P4
 endchoice
 
+config OPUS_P4_FUNCTION_PROFILE
+    bool "Instrument Opus functions for profiling"
+    default n
+    depends on IDF_TARGET_ESP32P4
+    help
+        Add compiler function instrumentation to esp_opus_float and collect
+        approximate per-function self cycles during the boot benchmark.
+        Enable only for profiling builds because the overhead is substantial.
+
 endmenu

@@ -19,6 +19,9 @@ float opus_p4_inner_prod_f32_c(const float *a, const float *b, int n);
 
 const char *opus_p4_kernel_impl(void);
 
+void opus_p4_profile_reset(void);
+void opus_p4_profile_dump(int top_n);
+
 #ifdef __cplusplus
 }
 #endif

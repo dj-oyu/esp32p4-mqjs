@@ -19,6 +19,7 @@ static const char *TAG = "opus_bench";
 #define FRAME_SIZE 960
 #define MAX_PACKET_BYTES 1500
 #define DECODE_ROUNDS 500
+#define PROFILE_DECODE_ROUNDS 100
 #define KERNEL_ROUNDS 4000
 
 static float s_input[FRAME_SIZE];
@@ -77,10 +78,11 @@ static void bench_decoder(void)
         ESP_LOGE(TAG, "decoder create failed: %s", opus_strerror(error));
         goto done;
     }
+    int decoded = OPUS_OK;
 
     for (int i = 0; i < 10; i++) {
-        int decoded = opus_decode_float(decoder, s_packet, packet_bytes,
-                                        s_output, FRAME_SIZE, 0);
+        decoded = opus_decode_float(decoder, s_packet, packet_bytes, s_output,
+                                    FRAME_SIZE, 0);
         if (decoded < 0) {
             ESP_LOGE(TAG, "warmup decode failed: %s", opus_strerror(decoded));
             opus_decoder_destroy(decoder);
@@ -88,8 +90,15 @@ static void bench_decoder(void)
         }
     }
 
+#if CONFIG_OPUS_P4_FUNCTION_PROFILE
+    opus_p4_profile_reset();
+    for (int i = 0; i < PROFILE_DECODE_ROUNDS; i++)
+        decoded = opus_decode_float(decoder, s_packet, packet_bytes, s_output,
+                                    FRAME_SIZE, 0);
+    opus_p4_profile_dump(30);
+#endif
+
     int64_t start = esp_timer_get_time();
-    int decoded = OPUS_OK;
     for (int i = 0; i < DECODE_ROUNDS; i++)
         decoded = opus_decode_float(decoder, s_packet, packet_bytes, s_output,
                                     FRAME_SIZE, 0);

@@ -1,6 +1,6 @@
 # Opus デコーダ導入計画 — ESP32-P4 float + PIE asm
 
-ステータス: **計画のみ (2026-06-13)**。実装・ビルド・flash・COM 接続は未実施。
+ステータス: **P1 実装・portable C baseline・CELT profile 実施済み (2026-06-13)**。
 実装ブランチ: `codex/opus-float-plan`。
 
 ## 0. 結論
@@ -180,13 +180,18 @@ packet source
 初期実装時に libopus の演算を無差別に wrapper 化しない。プロファイル上有望で、
 かつ独立した契約に切り出せる演算だけを kernel ABI にする。
 
-優先候補:
+初回 CELT profile 後の優先候補:
 
-1. CELT float inner product / dual inner product
-2. CELT inverse MDCT / FFT の butterfly と post-rotation
-3. CELT band energy、denormalize、interleave/clip
-4. SILK float LPC synthesis / resampler
-5. PCM gain、clip、mono/stereo 整形
+1. CELT `anti_collapse`
+2. CELT `exp_rotation` / `normalise_residual`
+3. CELT `denormalise_bands`
+4. CELT inverse MDCT / FFT の butterfly と post-rotation
+5. SILK float LPC synthesis / resampler（SILK fixture 計測後）
+6. PCM gain、clip、mono/stereo 整形
+
+既存の CELT float inner product hook は今回の CELT-only fixture の上位 30 関数に
+入らなかった。asm 化を急がず、まず上位の連続 float 演算を portable C で整理し、
+同じ kernel ABI を維持したまま PIE asm へ置換できる形にする。
 
 entropy decode、分岐の多い制御処理、小さい単発ループは原則 portable C のまま
 残す。PIE は連続データを十分長く処理できる演算へ集中する。
@@ -407,7 +412,43 @@ commit は `dc62982` 以降の Opus benchmark 実装を含む dirty build。
 初回測定では `main` task の既定 stack 上で encoder/decoder を実行して stack
 protection fault になったため、benchmark は 32 KB の専用 task で実行する。
 
-## 12. 参考
+## 12. CELT float function profile
+
+2026-06-13 に COM8 へ専用 profile build を flash し、baseline と同じ 48 kHz
+mono、20 ms、CELT-only packet を 100 frames decode して測定した。
+`-finstrument-functions` による関数単位の approximate self cycle であり、
+instrumentation overhead を含むため絶対時間ではなく優先順位の判断に使う。
+
+上位関数:
+
+| Rank | Function | Self cycles | Calls |
+|---:|---|---:|---:|
+| 1 | `anti_collapse` | 14,754,002 | 100 |
+| 2 | `exp_rotation` | 9,363,687 | 5,900 |
+| 3 | `normalise_residual` | 7,485,034 | 5,900 |
+| 4 | `denormalise_bands` | 6,858,367 | 100 |
+| 5 | `quant_band` | 3,958,682 | 2,100 |
+| 6 | `quant_partition` | 3,470,721 | 9,700 |
+| 7 | `cwrsi` | 3,328,754 | 5,900 |
+| 8 | `compute_theta` | 2,768,382 | 3,800 |
+| 9 | `clt_mdct_backward_c` | 2,617,032 | 800 |
+| 10 | `ec_dec_uint` | 2,194,914 | 8,600 |
+
+- `dropped=0` で、複数回の測定でも順位は概ね再現した。
+- profile build の decode は約 2,012 us/frame、10.06% realtime まで増えた。
+  非 profile baseline は 1,790.7 us/frame、8.95% realtime を採用する。
+- `celt_inner_prod` は上位 30 件に入らず、この fixture では初期最適化対象にしない。
+- entropy decode 系は call 数が多いが分岐中心のため、初期の SIMD/PIE asm 対象から
+  外す。
+- 最初の portable C 最適化は `anti_collapse`、`exp_rotation`、
+  `normalise_residual`、`denormalise_bands`、MDCT の順に調査する。
+- stereo CELT、SILK、hybrid の profile を追加するまでは全 Opus workload に
+  一般化しない。
+
+benchmark 完了後に既存 startup 経路の `tcpip_send_msg_wait_sem` assert が発生した。
+profile 出力後の事象で計測値には影響しないが、audio 統合前に別途切り分ける。
+
+## 13. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
   - https://components.espressif.com/components/78/esp-opus/versions/1.0.5/readme
