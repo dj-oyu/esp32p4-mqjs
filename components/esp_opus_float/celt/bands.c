@@ -284,7 +284,7 @@ void anti_collapse(const CELTMode *m, celt_norm *X_, unsigned char *collapse_mas
       int start, int end, const celt_glog *logE, const celt_glog *prev1logE,
       const celt_glog *prev2logE, const int *pulses, opus_uint32 seed, int encode, int arch)
 {
-   int c, i, j, k;
+   int c, i, k;
    for (i=start;i<end;i++)
    {
       int N0;
@@ -361,11 +361,17 @@ void anti_collapse(const CELTMode *m, celt_norm *X_, unsigned char *collapse_mas
             if (!(collapse_masks[i*C+c]&1<<k))
             {
                /* Fill with noise */
+#if defined(OPUS_P4_KERNELS_FLOAT) && !defined(FIXED_POINT)
+               seed = opus_p4_anti_collapse_noise_f32(X+k, N0, 1<<LM, r,
+                                                       seed);
+#else
+               int j;
                for (j=0;j<N0;j++)
                {
                   seed = celt_lcg_rand(seed);
                   X[(j<<LM)+k] = (seed&0x8000 ? r : -r);
                }
+#endif
                renormalize = 1;
             }
          }

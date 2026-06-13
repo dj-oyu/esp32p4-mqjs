@@ -8,13 +8,30 @@ choice OPUS_P4_KERNEL_MODE
         bool "Portable C"
 
     config OPUS_P4_KERNEL_ASM
-        bool "ESP32-P4 PIE asm"
+        bool "ESP32-P4 asm ABI scaffold"
         depends on IDF_TARGET_ESP32P4
+        help
+            Route implemented kernel boundaries through their P4 assembly
+            symbols. The anti-collapse noise symbol is currently an ABI
+            scaffold that tail-calls the portable C reference.
 
     config OPUS_P4_KERNEL_ASM_VERIFY
-        bool "ESP32-P4 PIE asm with C verification"
+        bool "ESP32-P4 asm ABI scaffold with C verification"
         depends on IDF_TARGET_ESP32P4
+        help
+            Verify the first calls against the portable C contract and latch
+            a permanent C fallback on any mismatch. The anti-collapse noise
+            symbol is currently an ABI scaffold, not an optimized PIE kernel.
 endchoice
+
+config OPUS_P4_VERIFY_CALLS
+    int "Calls verified before accepting an asm kernel"
+    default 64
+    range 1 4096
+    depends on OPUS_P4_KERNEL_ASM_VERIFY
+    help
+        Number of calls checked before a kernel changes from verification to
+        direct asm dispatch for the rest of the boot.
 
 config OPUS_P4_FUNCTION_PROFILE
     bool "Instrument Opus functions for profiling"

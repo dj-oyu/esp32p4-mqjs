@@ -16,6 +16,9 @@ bool opus_player_play_mem_async(const uint8_t *data, size_t len);
 bool opus_player_play_boot(void);
 void opus_player_stop(void);
 bool opus_player_playing(void);
+#if CONFIG_MQJS_OPUS_BENCHMARK
+void opus_player_bench_run(void);
+#endif
 
 #else
 

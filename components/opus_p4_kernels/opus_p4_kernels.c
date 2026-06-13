@@ -9,14 +9,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-#if defined(CONFIG_OPUS_P4_KERNEL_ASM) || defined(CONFIG_OPUS_P4_KERNEL_ASM_VERIFY)
-#error "P4 PIE Opus kernels are selected but have not been implemented yet"
-#endif
-
 typedef float (*inner_prod_f32_fn)(const float *, const float *, int);
+typedef uint32_t (*anti_collapse_noise_f32_fn)(float *, int, int, float,
+                                               uint32_t);
 
 typedef struct {
     inner_prod_f32_fn inner_prod_f32;
+    anti_collapse_noise_f32_fn anti_collapse_noise_f32;
     const char *name;
 } opus_kernel_ops_t;
 
@@ -28,13 +27,82 @@ float opus_p4_inner_prod_f32_c(const float *a, const float *b, int n)
     return sum;
 }
 
+uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
+                                           uint32_t seed)
+{
+    for (int i = 0; i < n; i++) {
+        seed = 1664525u * seed + 1013904223u;
+        x[i * stride] = (seed & 0x8000u) ? r : -r;
+    }
+    return seed;
+}
+
+#if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
+
+enum {
+    VERIFY_ACTIVE,
+    VERIFY_ACCEPTED,
+    VERIFY_C_FALLBACK,
+};
+
+static unsigned s_anti_collapse_verify_mode;
+static uint32_t s_anti_collapse_verify_calls;
+static uint32_t s_verify_failures;
+
+static bool anti_collapse_noise_matches(const float *x, int n, int stride,
+                                        float r, uint32_t seed,
+                                        uint32_t actual_seed)
+{
+    for (int i = 0; i < n; i++) {
+        float expected;
+        seed = 1664525u * seed + 1013904223u;
+        expected = (seed & 0x8000u) ? r : -r;
+        if (memcmp(&x[i * stride], &expected, sizeof(expected)) != 0)
+            return false;
+    }
+    return seed == actual_seed;
+}
+
+static uint32_t anti_collapse_noise_f32_verify(float *x, int n, int stride,
+                                               float r, uint32_t seed)
+{
+    if (s_anti_collapse_verify_mode == VERIFY_C_FALLBACK)
+        return opus_p4_anti_collapse_noise_f32_c(x, n, stride, r, seed);
+
+    uint32_t result = opus_p4_anti_collapse_noise_f32_p4(x, n, stride, r, seed);
+    if (s_anti_collapse_verify_mode == VERIFY_ACCEPTED)
+        return result;
+
+    if (!anti_collapse_noise_matches(x, n, stride, r, seed, result)) {
+        s_verify_failures++;
+        s_anti_collapse_verify_mode = VERIFY_C_FALLBACK;
+        ESP_LOGE("opus_p4", "anti-collapse asm mismatch; using portable C");
+        return opus_p4_anti_collapse_noise_f32_c(x, n, stride, r, seed);
+    }
+
+    if (++s_anti_collapse_verify_calls >= CONFIG_OPUS_P4_VERIFY_CALLS)
+        s_anti_collapse_verify_mode = VERIFY_ACCEPTED;
+    return result;
+}
+
+#endif
+
 /*
  * The dispatch object exists from the first integration step so codec call
  * sites do not change when PIE kernels replace individual C functions.
  */
 static const opus_kernel_ops_t s_ops = {
     .inner_prod_f32 = opus_p4_inner_prod_f32_c,
+#if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
+    .anti_collapse_noise_f32 = anti_collapse_noise_f32_verify,
+    .name = "p4-asm-abi-scaffold+verify",
+#elif CONFIG_OPUS_P4_KERNEL_ASM
+    .anti_collapse_noise_f32 = opus_p4_anti_collapse_noise_f32_p4,
+    .name = "p4-asm-abi-scaffold",
+#else
+    .anti_collapse_noise_f32 = opus_p4_anti_collapse_noise_f32_c,
     .name = "portable-c",
+#endif
 };
 
 float opus_p4_inner_prod_f32(const float *a, const float *b, int n)
@@ -42,9 +110,30 @@ float opus_p4_inner_prod_f32(const float *a, const float *b, int n)
     return s_ops.inner_prod_f32(a, b, n);
 }
 
+uint32_t opus_p4_anti_collapse_noise_f32(float *x, int n, int stride, float r,
+                                         uint32_t seed)
+{
+    return s_ops.anti_collapse_noise_f32(x, n, stride, r, seed);
+}
+
 const char *opus_p4_kernel_impl(void)
 {
+#if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
+    if (s_anti_collapse_verify_mode == VERIFY_C_FALLBACK)
+        return "portable-c(fallback)";
+    if (s_anti_collapse_verify_mode == VERIFY_ACCEPTED)
+        return "p4-asm-abi-scaffold(verified)";
+#endif
     return s_ops.name;
+}
+
+uint32_t opus_p4_kernel_verify_failures(void)
+{
+#if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
+    return s_verify_failures;
+#else
+    return 0;
+#endif
 }
 
 #if CONFIG_OPUS_P4_FUNCTION_PROFILE

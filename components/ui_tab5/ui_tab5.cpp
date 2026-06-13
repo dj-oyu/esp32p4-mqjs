@@ -2222,7 +2222,7 @@ private:
     char _origin[sizeof(ui_status_t::task_origin)] = "";
 };
 
-extern "C" void ui_tab5_start(void)
+extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
 {
     /* the data plane must exist before app_main registers the print
        sink, and must stay usable even if the panel init below fails
@@ -2297,6 +2297,8 @@ extern "C" void ui_tab5_start(void)
 
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
+    if (ready_cb)
+        ready_cb(arg);
 
     /* note: no em-dash etc. here — U+2014 is in neither font (tofu) */
     static const char greet[] = "mqjs コンソール: JS の print がここに流れます";

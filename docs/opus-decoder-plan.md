@@ -504,7 +504,132 @@ Ogg page/lacing parser
   - binary `0x13d9f0`、app partition空き79%
 - flashと実機autoplayは未実施。
 
-## 13. 参考
+## 13. 実音源 decoder-only ベンチ
+
+最適化の end-to-end 判定用として、`components/opus_player/opus_bench.c` に
+実機ベンチを置く。boot直後、UI・Wi-Fi・audio出力を起動する前に、埋め込み
+48 kbps stereo fixture全体を複数周デコードする。
+
+測定範囲は `opus_decode()` のみとし、Ogg parser、PCM hash、I2S、speakerは
+packet時間から除外する。各周でdecoderを再生成し、実際のpacket順序と状態遷移を
+維持する。
+
+出力:
+
+- 全packetのdecode合計時間とaudio durationに対するrealtime load
+- decode cycle合計とcycles/frame
+- packet latencyのmin / p50 / p95 / p99 / max
+- packet数、圧縮bytes、decoded frames
+- 周回ごとのPCM FNV-1a checksum
+- 全周のthroughput (`x realtime`)
+
+専用build:
+
+```powershell
+. C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1
+$env:ESP_IDF_VERSION='6.0'
+idf.py -B build_opus_bench `
+  -D SDKCONFIG=build_opus_bench/sdkconfig `
+  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus-bench.defaults" `
+  build
+```
+
+通常buildの`sdkconfig`を変更せず、UI・カメラ・Wi-Fiも有効化しない静かな
+decoder-only構成とする。計測前はbuild / flash / monitor / COM8の競合を確認する。
+関数profileが必要な場合だけ
+`CONFIG_OPUS_P4_FUNCTION_PROFILE=y`を追加し、profile値は絶対時間baselineと
+分離して扱う。
+
+### 2026-06-13 stereo fixture baseline
+
+COM8へ`build_opus_bench`をflashし、ESP32-P4 rev 1.3、CPU 360 MHz、
+ESP-IDF 6.0.1で測定した。計測firmwareは`2b7185b-dirty`で、本節の
+real-fixture benchmark実装を含む。function profile、audio出力は無効。
+
+条件:
+
+- fixture: `assets/audio/tab5-boot-48k.opus`、38,683 bytes
+- 48 kHz stereo、48 kbps CBR、20 ms packet
+- warmup 1周、測定5周
+- 各周でdecoderを再生成
+- `opus_decode()`のみpacket時間として計測
+
+結果:
+
+| Metric | Result |
+|---|---:|
+| Audio packets / pass | 317 |
+| Compressed audio bytes / pass | 38,040 |
+| Decoded frames / pass | 304,320 |
+| Decode time / pass | 714,040–714,357 us |
+| Decode cycles / frame | 845.0–845.4 |
+| Realtime load | 11.26–11.27% |
+| Throughput | 8.88x realtime |
+| Packet p50 | 2,099–2,108 us |
+| Packet p95 | 2,819–2,828 us |
+| Packet p99 | 2,889–2,899 us |
+| Packet max | 3,335–3,360 us |
+| PCM FNV-1a | `37e8c5b59e9a40c6`、全5周一致 |
+
+5周合計はdecode `3,570,866 us`、`1,285,973,195 cycles`、
+`845.1 cycles/frame`。周回差は小さく、以後のportable C / PIE asm比較の
+end-to-end baselineとして使用できる。
+
+### anti-collapse signed-noise kernel候補
+
+`anti_collapse()`全体はband/channel/block制御、collapse判定、seed更新、
+renormalizeを含み、最初のASM境界としては広すぎる。最初のportable C候補は、
+collapsed short-MDCT blockへ決定的な符号付きnoiseを書き込むループだけとする。
+
+ABI:
+
+```c
+uint32_t opus_p4_anti_collapse_noise_f32(
+    float *x, int n, int stride, float r, uint32_t seed);
+```
+
+- CELTのLCG seed進行と符号選択をbit-exactに維持する。
+- `stride`をABIに含め、`LM`ごとのstrided writeをcodec外へ切り出す。
+- portable C referenceとdispatch wrapperを用意し、後続のPIE ASMは同じABIで
+  置換する。
+- 生成コードではstatic dispatchが解決され、wrapper内に70-byteの独立ループが
+  生成された。hot loop内の関数ポインタdispatchは残っていない。
+
+2026-06-13にESP-IDF 6.0.1でbenchmark buildと通常buildの両方が成功した。
+実機flashは保留中。採用判断にはbaselineと同じfixtureでPCM FNV-1a
+`37e8c5b59e9a40c6`の維持とcycles/frame比較が必要。
+
+### ASM差し替え下準備
+
+実ASM最適化へ入る前に、`anti-collapse signed-noise`カーネルで次の経路を
+実装する。
+
+- `opus_p4_anti_collapse_noise_f32_p4`をP4用`.S`シンボルとして分離する。
+- 現在の`.S`本体はportable C referenceへのtail callだけを行うABI scaffold。
+  PIE命令による最適化はまだ行わない。
+- portable、asm scaffold、asm scaffold + verifyをKconfigで選択する。
+- verifyは最初の`CONFIG_OPUS_P4_VERIFY_CALLS`回で、出力floatのbit patternと
+  最終seedをC契約から検証する。
+- 1回でも不一致なら、その呼び出しをCで再実行して出力を修復し、以後は
+  permanent C fallbackとする。
+- benchmark終了時に最終kernel状態とverify failure数を出力する。
+
+verify専用buildは通常buildと分離する。
+
+```powershell
+. C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1
+$env:ESP_IDF_VERSION='6.0'
+idf.py -B build_opus_asm_verify `
+  -D SDKCONFIG=build_opus_asm_verify/sdkconfig `
+  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus-bench.defaults;sdkconfig.opus-asm-verify.defaults" `
+  build
+```
+
+この段階で確認するのは、P4 assembler、RISC-V hard-float ABI、symbol link、
+compile-time dispatch、verify/fallback経路。実機速度の改善は期待せず、
+ASM本体へ置換した後にportable baselineと比較する。
+
+## 14. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
   - https://components.espressif.com/components/78/esp-opus/versions/1.0.5/readme

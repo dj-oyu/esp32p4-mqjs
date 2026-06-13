@@ -11,5 +11,9 @@ Local changes:
   Registry component's forced fixed-point configuration.
 - Route float CELT inner products through `opus_p4_kernels`, which keeps a
   portable C reference and provides the replacement boundary for P4 PIE asm.
+- Route the float CELT anti-collapse signed-noise fill through
+  `opus_p4_kernels`. Its P4 assembly symbol is currently an ABI scaffold that
+  tail-calls the portable C reference; asm/verify dispatch and permanent C
+  fallback are implemented outside the upstream codec source.
 
 The upstream API and codec source remain otherwise unchanged.

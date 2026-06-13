@@ -2,6 +2,8 @@
 
 #if CONFIG_OPUS_PLAYER
 
+#include <inttypes.h>
+#include <limits.h>
 #include <stdlib.h>
 
 #include "audio_tab5.h"
@@ -14,11 +16,62 @@
 #include "opus_player.h"
 
 #define OPUS_MAX_FRAME_SAMPLES 5760
-#define OPUS_TASK_STACK 12288
+#define OPUS_TASK_STACK 32768
 
 static const char *TAG = "opus_player";
 static volatile bool s_playing;
 static volatile bool s_abort;
+
+#if CONFIG_OPUS_PLAYER_DIAGNOSTICS
+#define DIAG_HASH_FRAMES 4096
+#define DIAG_FIRST_SAMPLES 16
+
+typedef struct {
+    uint64_t hash;
+    size_t hash_frames;
+    int16_t min;
+    int16_t max;
+    int16_t first[DIAG_FIRST_SAMPLES];
+    size_t first_count;
+} pcm_diag_t;
+
+static void pcm_diag_add(pcm_diag_t *diag, const int16_t *pcm, size_t frames,
+                         int channels)
+{
+    size_t samples = frames * (size_t)channels;
+    for (size_t i = 0; i < samples; i++) {
+        int16_t sample = pcm[i];
+        if (sample < diag->min)
+            diag->min = sample;
+        if (sample > diag->max)
+            diag->max = sample;
+        if (diag->first_count < DIAG_FIRST_SAMPLES)
+            diag->first[diag->first_count++] = sample;
+    }
+
+    size_t hash_frames = frames;
+    if (hash_frames > DIAG_HASH_FRAMES - diag->hash_frames)
+        hash_frames = DIAG_HASH_FRAMES - diag->hash_frames;
+    const uint8_t *bytes = (const uint8_t *)pcm;
+    size_t byte_count = hash_frames * (size_t)channels * sizeof(*pcm);
+    for (size_t i = 0; i < byte_count; i++) {
+        diag->hash ^= bytes[i];
+        diag->hash *= UINT64_C(1099511628211);
+    }
+    diag->hash_frames += hash_frames;
+}
+
+static void pcm_diag_log(const pcm_diag_t *diag)
+{
+    ESP_LOGI(TAG, "pcm diag: first4096-fnv=%016" PRIx64 " min=%d max=%d",
+             diag->hash, diag->min, diag->max);
+    ESP_LOGI(TAG, "pcm first: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d",
+             diag->first[0], diag->first[1], diag->first[2], diag->first[3],
+             diag->first[4], diag->first[5], diag->first[6], diag->first[7],
+             diag->first[8], diag->first[9], diag->first[10], diag->first[11],
+             diag->first[12], diag->first[13], diag->first[14], diag->first[15]);
+}
+#endif
 
 static esp_err_t play_mem(const uint8_t *data, size_t len)
 {
@@ -60,6 +113,13 @@ static esp_err_t play_mem(const uint8_t *data, size_t len)
     unsigned packets = 0;
     const uint8_t *packet;
     size_t packet_len;
+#if CONFIG_OPUS_PLAYER_DIAGNOSTICS
+    pcm_diag_t diag = {
+        .hash = UINT64_C(14695981039346656037),
+        .min = INT16_MAX,
+        .max = INT16_MIN,
+    };
+#endif
 
     while (!s_abort) {
         int next = ogg_opus_next(reader, &packet, &packet_len);
@@ -83,6 +143,10 @@ static esp_err_t play_mem(const uint8_t *data, size_t len)
         size_t offset = skip < (uint32_t)decoded ? skip : (uint32_t)decoded;
         skip -= offset;
         size_t remaining = (size_t)decoded - offset;
+#if CONFIG_OPUS_PLAYER_DIAGNOSTICS
+        pcm_diag_add(&diag, pcm + offset * info.channels, remaining,
+                     info.channels);
+#endif
         while (remaining && !s_abort) {
             size_t sent = audio_tab5_write(
                 pcm + offset * info.channels, remaining, 2000);
@@ -97,6 +161,15 @@ static esp_err_t play_mem(const uint8_t *data, size_t len)
         }
     }
 
+#if CONFIG_OPUS_PLAYER_DIAGNOSTICS
+    audio_tab5_stats_t audio_stats;
+    audio_tab5_get_stats(&audio_stats);
+    ESP_LOGI(TAG, "audio diag: written=%llu queued=%lu underruns=%lu",
+             (unsigned long long)audio_stats.frames_written,
+             (unsigned long)audio_stats.queued_bytes,
+             (unsigned long)audio_stats.underruns);
+    pcm_diag_log(&diag);
+#endif
     audio_tab5_stop();
     ESP_LOGI(TAG, "done: %u packets, %llu frames, %uch, %s", packets,
              (unsigned long long)frames, info.channels,

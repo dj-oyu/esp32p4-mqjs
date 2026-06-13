@@ -23,9 +23,17 @@ menu "Opus playback"
         depends on !MQJS_TAB5_AUDIO_SELFTEST
         depends on !MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
         help
-            Start playback after the display and shared codec I2C bus
-            have initialized. Intended for initial device verification.
+            Start asynchronous playback from the UI/I2C ready event.
+            Intended for initial device verification.
             The WAV autoplay and speaker self-test options must be off so
             only one producer owns the PCM stream.
+
+    config OPUS_PLAYER_DIAGNOSTICS
+        bool "Log decoded PCM diagnostics"
+        default n
+        depends on OPUS_PLAYER
+        help
+            Log the first decoded samples, min/max, and an FNV-1a hash of
+            the first 4096 output frames. Intended for decoder validation.
 
 endmenu

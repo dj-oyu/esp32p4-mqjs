@@ -1,0 +1,4 @@
+# Add after sdkconfig.opus-bench.defaults to exercise the P4 assembly ABI,
+# verification, and fallback paths without changing the normal sdkconfig.
+CONFIG_OPUS_P4_KERNEL_ASM_VERIFY=y
+CONFIG_OPUS_P4_VERIFY_CALLS=64
