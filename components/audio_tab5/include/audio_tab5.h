@@ -28,10 +28,6 @@ typedef struct {
                               exactly N — mid-stream increments are real
                               underruns */
     uint64_t frames_written; /* frames handed to I2S DMA since boot */
-    uint16_t peak;           /* max |sample| of the downmixed mono signal
-                                since the previous stats read (0..32768);
-                                32768 means the fold railed (it never does) */
-    uint32_t clipped;        /* count of full-scale samples since last read */
 } audio_tab5_stats_t;
 
 #if CONFIG_MQJS_TAB5_AUDIO
@@ -62,20 +58,7 @@ int audio_tab5_volume(void);
 void audio_tab5_set_downmix(bool on);
 bool audio_tab5_downmix(void);
 
-/* Resonant high-pass (RBJ biquad) on the mono signal. fc_hz<=0 disables.
-   q is the resonance: 0.707 = flat (Butterworth), higher = a bump just
-   above the cutoff that keeps the sound from getting thin after the lows
-   are removed. Cuts the sub-bass the small speaker can't reproduce
-   (the source of the analog overdrive/distortion). */
-void audio_tab5_set_hpf(int fc_hz, float q);
-
 void audio_tab5_get_stats(audio_tab5_stats_t *out);
-
-/* 16-band log-spaced magnitude spectrum (0..100) of the mono signal most
- * recently sent to the speaker — a real-time analyzer / EQ display for the
- * JS sound-test harness. Computed on demand (512-pt FFT + Hann window) from
- * a rolling sample window; all zeros when not running. */
-void audio_tab5_spectrum(uint8_t bands[16]);
 
 /* Blocking sine tone through the normal write path (P2 gate helper).
  * Starts the pipeline at the current rate (or 48 kHz stereo if idle). */
@@ -131,16 +114,10 @@ static inline esp_err_t audio_tab5_set_volume(int pct)
 static inline int audio_tab5_volume(void) { return 0; }
 static inline void audio_tab5_set_downmix(bool on) { (void)on; }
 static inline bool audio_tab5_downmix(void) { return true; }
-static inline void audio_tab5_set_hpf(int fc_hz, float q) { (void)fc_hz; (void)q; }
 static inline void audio_tab5_get_stats(audio_tab5_stats_t *out)
 {
     if (out)
         *out = (audio_tab5_stats_t){ 0 };
-}
-static inline void audio_tab5_spectrum(uint8_t bands[16])
-{
-    if (bands)
-        for (int i = 0; i < 16; i++) bands[i] = 0;
 }
 static inline esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
 {

@@ -2739,52 +2739,21 @@ JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
     (void)this_val;
     (void)argc;
     (void)argv;
-    char buf[320];
+    char buf[160];
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
     audio_tab5_stats_t st;
     audio_tab5_get_stats(&st);
-    uint8_t spec[16];
-    audio_tab5_spectrum(spec);
-    int off = snprintf(buf, sizeof buf,
+    snprintf(buf, sizeof buf,
              "{\"running\":%s,\"rate\":%lu,\"ch\":%u,\"queued\":%lu,"
-             "\"underruns\":%lu,\"frames\":%llu,\"peak\":%u,\"clip\":%lu,"
-             "\"spec\":[",
+             "\"underruns\":%lu,\"frames\":%llu}",
              st.running ? "true" : "false", (unsigned long)st.sample_rate,
              (unsigned)st.channels, (unsigned long)st.queued_bytes,
              (unsigned long)st.underruns,
-             (unsigned long long)st.frames_written,
-             (unsigned)st.peak, (unsigned long)st.clipped);
-    for (int i = 0; i < 16 && off < (int)sizeof buf; i++)
-        off += snprintf(buf + off, sizeof buf - off, "%s%u",
-                        i ? "," : "", spec[i]);
-    if (off < (int)sizeof buf)
-        snprintf(buf + off, sizeof buf - off, "]}");
+             (unsigned long long)st.frames_written);
 #else
     snprintf(buf, sizeof buf, "{\"running\":false,\"audio\":\"off\"}");
 #endif
     return JS_NewString(ctx, buf);
-}
-
-/* audio.hpf(fcHz, Qx10) -> bool: resonant high-pass on the mono output.
-   fcHz<=0 disables; Qx10 is Q*10 (default 7 = 0.7 Butterworth; >7 adds a
-   resonant bump so the sound doesn't thin out after the lows are cut).
-   Cuts sub-bass the small speaker can't reproduce (the analog overdrive
-   source). Returns true when the filter is enabled. */
-JSValue js_audio_hpf(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    int fc = 0, qx10 = 7;
-    if (argc >= 1 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &fc, argv[0]))
-        return JS_EXCEPTION;
-    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &qx10, argv[1]))
-        return JS_EXCEPTION;
-#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
-    audio_tab5_set_hpf(fc, (float)qx10 / 10.0f);
-    return JS_NewBool(fc > 0);
-#else
-    printf("[audio] hpf(%d Hz, Q=%d/10) (stub)\n", fc, qx10);
-    return JS_NewBool(0);
-#endif
 }
 
 /* ------------------------------------------------------------------ */

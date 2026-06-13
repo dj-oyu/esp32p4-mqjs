@@ -69,90 +69,6 @@ static volatile bool s_wav_abort;
    the mono speaker (NS4150B). Set false for true-stereo routing. */
 static bool s_downmix = true;
 
-/* rolling window of the mono signal sent to the speaker, for the on-demand
-   FFT analyzer (audio_tab5_spectrum). Written by the producer, read on the
-   js_task; a torn read only yields a slightly stale window — fine for a
-   visualizer. AUD_FFT_N is a power of two so the index wraps with a mask. */
-#define AUD_FFT_N 512
-static float s_fft_buf[AUD_FFT_N];
-static volatile uint32_t s_fft_wr;
-/* digital peak meter on the downmixed mono signal — proves whether the
-   (L+R)/2 fold ever rails (it cannot, mathematically; this measures it).
-   Reset on each stats read so it reports the peak of the last window. */
-static volatile int s_peak;
-static volatile uint32_t s_clipcnt;
-static inline void fft_capture(int16_t v)
-{
-    s_fft_buf[s_fft_wr & (AUD_FFT_N - 1)] = (float)v;
-    s_fft_wr++;
-    int a = v < 0 ? -(int)v : (int)v;
-    if (a > s_peak) s_peak = a;
-    if (a >= 32767) s_clipcnt++;
-}
-
-/* ---- resonant high-pass (RBJ biquad) on the mono signal -------------- */
-/* The tiny NS4150B speaker can't reproduce sub-bass; pushing it there is
-   what overdrives/distorts. A high-pass removes that energy. Q > 0.707
-   adds a resonant bump just above the cutoff so the result doesn't sound
-   thin. Coeffs set on js_task (audio.start extra args), applied on the
-   producer task — the only shared state is the coeffs (a benign one-sample
-   glitch on a live change is fine). */
-static volatile bool s_hpf_on;
-static float s_hb0, s_hb1, s_hb2, s_ha1, s_ha2;
-static float s_hx1, s_hx2, s_hy1, s_hy2;
-static float s_hgain = 1.0f; /* output scale so the resonance peak <= 0 dBFS */
-
-void audio_tab5_set_hpf(int fc_hz, float q)
-{
-    if (fc_hz <= 0) { s_hpf_on = false; return; }
-    if (q < 0.1f) q = 0.1f;
-    uint32_t fs = s_rate ? s_rate : 48000;
-    float w0 = 2.0f * (float)M_PI * (float)fc_hz / (float)fs;
-    float cw = cosf(w0), sw = sinf(w0);
-    float alpha = sw / (2.0f * q);
-    float a0 = 1.0f + alpha;
-    s_hb0 = (1.0f + cw) / 2.0f / a0;
-    s_hb1 = -(1.0f + cw) / a0;
-    s_hb2 = (1.0f + cw) / 2.0f / a0;
-    s_ha1 = -2.0f * cw / a0;
-    s_ha2 = (1.0f - alpha) / a0;
-    s_hx1 = s_hx2 = s_hy1 = s_hy2 = 0.0f;
-    /* find the filter's peak magnitude response and normalize the output to
-       it, so a resonant (high-Q) bump can't push a full-scale input past
-       0 dBFS and clip in the int16 clamp below (that clipping was itself the
-       low-frequency noise). The resonance SHAPE (peak relative to passband)
-       is preserved; only the absolute level drops. */
-    float maxg = 1.0f;
-    for (int i = 1; i <= 48; i++) {
-        float ww = (float)M_PI * (float)i / 48.0f;
-        float c1 = cosf(ww), s1 = sinf(ww), c2 = cosf(2.0f * ww), s2 = sinf(2.0f * ww);
-        float nr = s_hb0 + s_hb1 * c1 + s_hb2 * c2;
-        float ni = -(s_hb1 * s1 + s_hb2 * s2);
-        float dr = 1.0f + s_ha1 * c1 + s_ha2 * c2;
-        float di = -(s_ha1 * s1 + s_ha2 * s2);
-        float g = sqrtf((nr * nr + ni * ni) / (dr * dr + di * di));
-        if (g > maxg) maxg = g;
-    }
-    s_hgain = 1.0f / maxg;
-    s_hpf_on = true;
-    ESP_LOGI(TAG, "hpf on: fc=%dHz Q=%.2f peakgain=%.2f", fc_hz, (double)q, (double)maxg);
-}
-
-static inline int16_t hpf_apply(int16_t in)
-{
-    if (!s_hpf_on)
-        return in;
-    float x = (float)in;
-    float y = s_hb0 * x + s_hb1 * s_hx1 + s_hb2 * s_hx2
-              - s_ha1 * s_hy1 - s_ha2 * s_hy2;
-    s_hx2 = s_hx1; s_hx1 = x;
-    s_hy2 = s_hy1; s_hy1 = y;   /* feedback uses the un-scaled biquad output */
-    float out = y * s_hgain;    /* level normalized so the peak <= 0 dBFS */
-    if (out > 32767.0f) out = 32767.0f;
-    else if (out < -32768.0f) out = -32768.0f;
-    return (int16_t)out;
-}
-
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
 static esp_err_t spk_enable(i2c_master_bus_handle_t bus, bool on)
 {
@@ -400,17 +316,13 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
                        -inf, inaudible bias. */
                     int16_t m = (int16_t)(((int32_t)src[2 * i] +
                                            src[2 * i + 1]) >> 1);
-                    m = hpf_apply(m);
                     st[2 * i] = m;
                     st[2 * i + 1] = m;
-                    fft_capture(m);
                 }
             } else {
                 for (size_t i = 0; i < n; i++) {
-                    int16_t m = hpf_apply(pcm[done + i]);
-                    st[2 * i] = m;
-                    st[2 * i + 1] = m;
-                    fft_capture(m);
+                    st[2 * i] = pcm[done + i];
+                    st[2 * i + 1] = pcm[done + i];
                 }
             }
             if (ring_send(st, n * 4, deadline) == 0)
@@ -475,94 +387,7 @@ void audio_tab5_get_stats(audio_tab5_stats_t *out)
             : 0,
         .underruns = s_underruns,
         .frames_written = s_frames_written,
-        .peak = (uint16_t)s_peak,
-        .clipped = s_clipcnt,
     };
-    s_peak = 0;       /* peak meter: report the level since the last read */
-    s_clipcnt = 0;
-}
-
-/* ---- 16-band FFT analyzer ------------------------------------------- */
-/* Self-contained iterative radix-2 FFT (no esp-dsp dependency); 512 pts is
-   ample for a 16-bar EQ at 48 kHz (~94 Hz/bin). Runs on the js_task when
-   audio.stats() is polled, so the cost is bounded by the poll rate. */
-static void fft_radix2(float *re, float *im)
-{
-    for (int i = 1, j = 0; i < AUD_FFT_N; i++) { /* bit-reversal */
-        int bit = AUD_FFT_N >> 1;
-        for (; j & bit; bit >>= 1)
-            j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            float t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-    }
-    for (int len = 2; len <= AUD_FFT_N; len <<= 1) {
-        float ang = -2.0f * (float)M_PI / (float)len;
-        float wr = cosf(ang), wi = sinf(ang);
-        for (int i = 0; i < AUD_FFT_N; i += len) {
-            float cr = 1.0f, ci = 0.0f;
-            for (int k = 0; k < len / 2; k++) {
-                int a = i + k, b = a + len / 2;
-                float br = re[b] * cr - im[b] * ci;
-                float bi = re[b] * ci + im[b] * cr;
-                re[b] = re[a] - br; im[b] = im[a] - bi;
-                re[a] += br;        im[a] += bi;
-                float ncr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr; cr = ncr;
-            }
-        }
-    }
-}
-
-void audio_tab5_spectrum(uint8_t bands[16])
-{
-    if (!bands)
-        return;
-    if (!s_running) {
-        for (int i = 0; i < 16; i++) bands[i] = 0;
-        return;
-    }
-    static float re[AUD_FFT_N], im[AUD_FFT_N], hann[AUD_FFT_N];
-    static bool hann_ready;
-    if (!hann_ready) {
-        for (int i = 0; i < AUD_FFT_N; i++)
-            hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i /
-                                          (float)(AUD_FFT_N - 1)));
-        hann_ready = true;
-    }
-    uint32_t wr = s_fft_wr; /* snapshot: oldest captured sample sits at wr */
-    for (int i = 0; i < AUD_FFT_N; i++) {
-        re[i] = s_fft_buf[(wr + i) & (AUD_FFT_N - 1)] * hann[i] / 32768.0f;
-        im[i] = 0.0f;
-    }
-    fft_radix2(re, im);
-
-    /* bins 1..N/2 grouped into 16 geometric (log) bands; mag -> dB -> 0..100.
-       The geometric ratio spans bin 1..256 over 16 bands (~sqrt(2)/band). */
-    const int half = AUD_FFT_N / 2;
-    const float ratio = 1.4142136f;
-    const float norm = 4.0f / (float)AUD_FFT_N; /* full-scale sine bin -> 1.0 */
-    float edge = 1.0f;
-    for (int b = 0; b < 16; b++) {
-        int k0 = (int)(edge + 0.5f);
-        edge *= ratio;
-        int k1 = (int)(edge + 0.5f);
-        if (k0 < 1) k0 = 1;
-        if (k1 > half) k1 = half;
-        if (k1 < k0) k1 = k0;
-        float peak = 0.0f;                        /* peak-hold across the band */
-        for (int k = k0; k <= k1; k++) {
-            float mg = sqrtf(re[k] * re[k] + im[k] * im[k]) * norm;
-            if (mg > peak) peak = mg;
-        }
-        float db = 20.0f * log10f(peak + 1e-9f);  /* 0 dBFS = full scale */
-        int v = (int)((db + 72.0f) * (100.0f / 72.0f)); /* -72..0 dB -> 0..100 */
-        if (v < 0) v = 0;
-        if (v > 100) v = 100;
-        bands[b] = (uint8_t)v;
-    }
 }
 
 esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)

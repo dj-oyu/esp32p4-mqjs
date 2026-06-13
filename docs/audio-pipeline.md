@@ -301,6 +301,12 @@ flash 直後は Tab5 がダウンロードモードで沈黙するので watchdo
 聞こえる。無音時は出ない。音量に依らない。原因切り分けは尽くしたが解決せず、
 一旦保留。調査結果のみ記録(再開時の出発点)。
 
+> 注: 切り分けに使った **16-band FFT アナライザ・レゾナンス HPF・peak/clip
+> メータは、未使用のため調査後に削除**(内部 RAM 約8KB 回収)。よって
+> `audio.hpf()` / `audio.stats()` の `spec`/`peak`/`clip` は**現存しない**
+> (`audio.stats()` は running/rate/ch/queued/underruns/frames の6項目に復帰)。
+> tone のデクリック包絡のみ残置。下記の findings(原因切り分け)は有効。
+
 **ソフトは無実と確定:**
 
 - デジタル信号は FFT でクリーン(純音トーンに倍音なし＝高バンド 0、
