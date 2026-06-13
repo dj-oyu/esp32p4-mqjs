@@ -124,6 +124,8 @@ void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
     }
 }
 
+uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
+
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_comb8(int32_t *y, const int32_t *x, int T, int16_t g10,
                    int16_t g11, int16_t g12);
@@ -133,8 +135,17 @@ void opus_p4_comb_filter_const_p4(int32_t *y, const int32_t *x, int T, int N,
 {
     int i = 0;
     int n8 = N & ~7;
-    for (; i < n8; i += 8)
-        opus_p4_comb8(y + i, x + i, T, g10, g11, g12);
+    /* comb8 handles unaligned x (src.q) but stores 8 outputs with vst.128
+     * (aligned). The codec's y is often misaligned, so write each block to an
+     * aligned temp and memcpy it out -- PIE then runs regardless of alignment. */
+    int32_t tmp[8] __attribute__((aligned(16)));
+    extern uint32_t opus_p4_comb_pie_calls;
+    if (n8 > 0)
+        opus_p4_comb_pie_calls++;
+    for (; i < n8; i += 8) {
+        opus_p4_comb8(tmp, x + i, T, g10, g11, g12);
+        memcpy(y + i, tmp, 8 * sizeof(int32_t));
+    }
     for (; i < N; i++) {
         int32_t s = x[i - T];
         int32_t a = (int32_t)((uint32_t)x[i - T + 1] + (uint32_t)x[i - T - 1]);

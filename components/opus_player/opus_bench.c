@@ -237,6 +237,11 @@ static void run_fixture_benchmark(void)
              total_audio_us / total_decode_us);
     ESP_LOGI(TAG, "kernel=%s verify_failures=%" PRIu32,
              opus_p4_kernel_impl(), opus_p4_kernel_verify_failures());
+    {
+        extern uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
+        ESP_LOGI(TAG, "comb: pie_calls=%" PRIu32 " c_calls=%" PRIu32,
+                 opus_p4_comb_pie_calls, opus_p4_comb_c_calls);
+    }
 
 #if CONFIG_OPUS_P4_FUNCTION_PROFILE
     opus_p4_profile_dump(30);

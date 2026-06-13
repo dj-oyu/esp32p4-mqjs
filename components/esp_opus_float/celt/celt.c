@@ -165,6 +165,14 @@ void comb_filter_const_c(opus_val32 *y, opus_val32 *x, int T, int N,
 {
    opus_val32 x0, x1, x2, x3, x4;
    int i;
+#if defined(OPUS_P4_COMB_PIE) && defined(FIXED_POINT)
+   {
+      void opus_p4_comb_filter_const_p4(opus_int32 *, const opus_int32 *, int,
+                                        int, opus_int16, opus_int16, opus_int16);
+      opus_p4_comb_filter_const_p4(y, x, T, N, g10, g11, g12);
+      return;
+   }
+#endif
    x4 = x[-T-2];
    x3 = x[-T-1];
    x2 = x[-T];

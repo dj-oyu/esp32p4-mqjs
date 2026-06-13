@@ -1,0 +1,3 @@
+# Route the fixed-point comb filter through the PIE kernel. Layer after
+# sdkconfig.opus-fixed.defaults.
+CONFIG_OPUS_P4_COMB_PIE=y

@@ -82,8 +82,16 @@ opus_p4_comb8:
     slli    a6, a2, 2               /* a6 = 4*T (bytes) */
     sub     s0, a1, a6              /* s0 = &x[k-T] */
 
-    esp.vld.128.ip      q0, a1, 16  /* t = x[k..k+3]   (k mult 8 -> aligned) */
-    esp.vld.128.ip      q1, a1, 16  /* t = x[k+4..k+7] */
+    /* t = x[k..k+7], possibly unaligned -> src.q funnel like a tap */
+    mv      a3, a1
+    andi    a4, a3, 15
+    esp.movx.w.sar.bytes a4
+    andi    a3, a3, -16
+    esp.vld.128.ip      q2, a3, 16
+    esp.vld.128.ip      q3, a3, 16
+    esp.vld.128.ip      q4, a3, 16
+    esp.src.q           q0, q2, q3  /* t = x[k..k+3]  */
+    esp.src.q           q1, q3, q4  /* t = x[k+4..k+7]*/
 
     TAP     0, 8                     /* d= 0, g10 */
     TAP     -4, 10                   /* d=-1, g11 */

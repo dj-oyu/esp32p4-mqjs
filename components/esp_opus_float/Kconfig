@@ -15,4 +15,14 @@ config OPUS_FIXED_POINT
         Default off keeps the float decode path and the OPUS_P4_KERNELS_FLOAT
         anti-collapse kernel unchanged.
 
+config OPUS_P4_COMB_PIE
+    bool "Use the ESP32-P4 PIE comb filter (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route comb_filter_const_c through the PIE kernel opus_p4_comb8 (16x32
+        via vmul.s32.s16xs16, unaligned taps via src.q). ~2x faster than scalar
+        on the comb filter; relaxed (not bit-exact, ~-64 dB vs the C reference,
+        within opus_compare tolerance). Misaligned buffers fall back to C.
+
 endmenu
