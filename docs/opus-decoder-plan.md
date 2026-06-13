@@ -470,6 +470,40 @@ codec benchmark は Ogg を直接扱わないため、次の実装では Ogg pag
 を抽出した決定論的 fixture を生成する。48 kbps は低帯域 stereo の負荷確認に使い、
 音質比較と高複雑度側の profile には 96 kbps fixture も追加する。
 
+### Initial playback implementation
+
+`components/opus_player/` に、埋め込みまたはメモリ上の Ogg Opus を既存
+`audio_tab5` PCM pipeline へ流す初期実装を追加した。
+
+```text
+Ogg page/lacing parser
+  -> Opus packet
+  -> opus_decode() (48 kHz signed 16-bit PCM)
+  -> audio_tab5_write()
+  -> PCM ring / I2S / ES8388
+```
+
+- Ogg parser は IDF 非依存で、pageをまたぐpacket、`OpusHead`、`OpusTags`、
+  mono/stereo mapping family 0 を扱う。
+- `pre_skip` を適用し、audio ring の backpressure に従ってblocking writeする。
+- `CONFIG_OPUS_PLAYER_BOOT_OPUS` で48 kbps fixtureを埋め込み、
+  `CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY` で実機確認できる。
+- 初期版はメモリ上の完全なOgg blobのみ対象。filesystem/streaming input、
+  chained Ogg、CRC検証、最終page granuleによる末尾padding除去は後続実装とする。
+- WAV/selftestとOpus autoplayの同時producer起動は禁止する。将来はaudio session
+  ownershipを共通化してpreemptionを実装する。
+
+2026-06-13 verification:
+
+- host parser test: 48 kbps fixtureを317 audio packetsとして走査、
+  stereo、`pre_skip=312`。capture破損と末尾欠損を拒否。
+- ESP-IDF 6.0.1 dedicated build: `build_opus_play`
+  - `CONFIG_MQJS_TAB5_AUDIO=y`
+  - `CONFIG_OPUS_PLAYER=y`
+  - `CONFIG_OPUS_PLAYER_BOOT_OPUS=y`
+  - binary `0x13d9f0`、app partition空き79%
+- flashと実機autoplayは未実施。
+
 ## 13. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5

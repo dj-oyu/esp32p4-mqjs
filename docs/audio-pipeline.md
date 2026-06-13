@@ -23,6 +23,10 @@ ES8388 経由で Tab5 内蔵スピーカーへ音切れなく流すのが責務�
 - 非対象: エンコード、Ogg/MP3 demux、マイク入力/AEC、音量 UI
 
 設計の上位原則は [opus-decoder-plan.md](opus-decoder-plan.md) §4-5 と整合。
+
+Opusの初期再生経路は`components/opus_player/`がOgg packetを解析・decodeし、
+このcomponentの`audio_tab5_write()`へPCMを供給する。codec/container責務は
+`audio_tab5`へ持ち込まない。
 audio_tab5 は codec にも Tab5 以外の構成にも依存せず、非 Tab5 ビルドでは
 ヘッダがすべて no-op inline stub になる (`ui_tab5` と同じ流儀)。
 

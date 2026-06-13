@@ -57,3 +57,8 @@ CONFIG_MQJS_TAB5_AUDIO=y
 # works without a filesystem. Off by default — it grows every flash.
 # CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV=y
 # CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY=y
+
+# Optional: decode the embedded 48 kbps Ogg Opus fixture through audio_tab5.
+# CONFIG_OPUS_PLAYER=y
+# CONFIG_OPUS_PLAYER_BOOT_OPUS=y
+# CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY=y

@@ -27,6 +27,7 @@
 #include "ui_tab5.h"
 #include "cam_tab5.h"
 #include "audio_tab5.h"
+#include "opus_player.h"
 #include "wifi.h"
 
 static const char *TAG = "app";
@@ -112,6 +113,9 @@ void app_main(void)
                                             (no-op stubs elsewhere) */
 #if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
     audio_tab5_selftest_async(); /* P2 gate: boot beep + optional WAV autoplay */
+#endif
+#if CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY
+    opus_player_play_boot();
 #endif
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
