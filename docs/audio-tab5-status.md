@@ -1,5 +1,8 @@
 # audio_tab5 — Tab5 スピーカー再生パス (opus-decoder-plan P2)
 
+> 設計と API の正式ドキュメントは **[audio-pipeline.md](audio-pipeline.md)**。
+> 本ファイルは実装の経緯・検証ログ・コミット履歴を残す状態メモ。
+
 ステータス: **実機検証済み (2026-06-13, COM8 flash)**。ブート時のビープ +
 WAV 自動再生をユーザーが実聴確認。`tools/probe_audio.js` の MQTT テレメトリで
 frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレートで PCM 消費)、
