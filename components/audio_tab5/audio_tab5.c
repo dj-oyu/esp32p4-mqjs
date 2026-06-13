@@ -596,7 +596,9 @@ bool audio_tab5_play_boot_wav(void)
 static void selftest_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(3000)); /* let UI / Wi-Fi bring-up settle */
+    /* No fixed settle delay: app_main starts this once the ES8388's shared
+       I2C bus is up (ui_tab5_start). Audio needs no network, so it does not
+       wait on Wi-Fi. The readiness is the call site, not a timer. */
 
 #if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     esp_err_t err = audio_tab5_start(48000, 2);

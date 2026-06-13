@@ -364,7 +364,7 @@ static const JSClassDef js_i2c_obj =
 
 /* ---- device API: mqtt object (via esp-mqtt over WiFi) ---- */
 static const JSPropDef js_mqtt[] = {
-    JS_CFUNC_DEF("connect", 1, js_mqtt_connect),
+    JS_CFUNC_DEF("connect", 1, js_mqtt_connect), /* (token[, uri]) — token from net.onReady */
     JS_CFUNC_DEF("disconnect", 0, js_mqtt_disconnect),
     JS_CFUNC_DEF("connected", 0, js_mqtt_connected),
     JS_CFUNC_DEF("onConnect", 1, js_mqtt_onConnect),
@@ -375,6 +375,16 @@ static const JSPropDef js_mqtt[] = {
 
 static const JSClassDef js_mqtt_obj =
     JS_OBJECT_DEF("MQTT", js_mqtt);
+
+/* ---- device API: net object (event-driven Wi-Fi readiness) ---- */
+static const JSPropDef js_net[] = {
+    JS_CFUNC_DEF("onReady", 1, js_net_onReady), /* cb(token) once link is up */
+    JS_CFUNC_DEF("topic", 1, js_net_topic),     /* prefix + leaf name */
+    JS_PROP_END,
+};
+
+static const JSClassDef js_net_obj =
+    JS_OBJECT_DEF("Net", js_net);
 
 /* ---- device API: ui widget layer (W1, widget-framework-design.md) ----
    Handle objects: ui.screen(title) returns a UiScreen whose methods
@@ -620,6 +630,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("gpio", &js_gpio_obj),
     JS_PROP_CLASS_DEF("i2c", &js_i2c_obj),
     JS_PROP_CLASS_DEF("mqtt", &js_mqtt_obj),
+    JS_PROP_CLASS_DEF("net", &js_net_obj),
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),

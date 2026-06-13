@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -29,15 +28,18 @@ static const char *TAG = "wifi";
  * On Stamp builds the constructor already did the work and this no-ops. */
 int esp_hosted_init(void);
 
-static EventGroupHandle_t s_evt;
-#define GOT_IP_BIT BIT0
+/* fired once, on the first IP: brings up the only network-dependent
+   service (MQTT task delivery). Everything else — JS mqtt/http/ssh — opens
+   its own connection on demand and self-retries, so nothing else needs to
+   gate boot on the link. */
+static void (*s_on_got_ip)(void);
+static bool s_ip_announced;
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(s_evt, GOT_IP_BIT);
         ESP_LOGW(TAG, "disconnected, reconnecting");
         ui_status_set_net(false, NULL);
         esp_wifi_connect();
@@ -47,15 +49,27 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         char ip[16];
         snprintf(ip, sizeof ip, IPSTR, IP2STR(&e->ip_info.ip));
         ui_status_set_net(true, ip);
-        xEventGroupSetBits(s_evt, GOT_IP_BIT);
+        if (!s_ip_announced && s_on_got_ip) {
+            s_ip_announced = true;
+            s_on_got_ip();   /* e.g. task_source_start() — runs in the event
+                                task; esp_mqtt_client_start is non-blocking */
+        }
     }
 }
 
-bool wifi_start_and_wait(uint32_t timeout_ms)
+/* Non-blocking: brings the link up and returns. The connect itself is
+   asynchronous (esp_wifi_connect runs off WIFI_EVENT_STA_START), so app_main
+   is never held waiting for an IP — on_got_ip fires once the link is up and
+   starts the network-dependent service. The only unavoidable cost here is
+   esp_hosted_init bringing up the SDIO transport to the C6 (~1s), which is
+   link setup, not the connect. */
+void wifi_start(void (*on_got_ip)(void))
 {
+    s_on_got_ip = on_got_ip;
+
     if (CONFIG_MQJS_WIFI_SSID[0] == '\0') {
         ESP_LOGW(TAG, "no SSID set (menuconfig: mqjs platform), WiFi disabled");
-        return false;
+        return;
     }
 
     esp_err_t err = nvs_flash_init();
@@ -69,10 +83,11 @@ bool wifi_start_and_wait(uint32_t timeout_ms)
     ESP_ERROR_CHECK(esp_hosted_init());
 
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t le = esp_event_loop_create_default();
+    if (le != ESP_ERR_INVALID_STATE)   /* already created is fine */
+        ESP_ERROR_CHECK(le);
     esp_netif_create_default_wifi_sta();
 
-    s_evt = xEventGroupCreate();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL));
@@ -90,14 +105,5 @@ bool wifi_start_and_wait(uint32_t timeout_ms)
     esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_cfg));
 
-    ESP_LOGI(TAG, "connecting to \"%s\"...", CONFIG_MQJS_WIFI_SSID);
-    EventBits_t bits = xEventGroupWaitBits(s_evt, GOT_IP_BIT, pdFALSE, pdFALSE,
-                                           timeout_ms ? pdMS_TO_TICKS(timeout_ms)
-                                                      : portMAX_DELAY);
-    if (!(bits & GOT_IP_BIT)) {
-        ESP_LOGW(TAG, "no IP after %lu ms (keeps retrying in background)",
-                 (unsigned long)timeout_ms);
-        return false;
-    }
-    return true;
+    ESP_LOGI(TAG, "connecting to \"%s\" in background...", CONFIG_MQJS_WIFI_SSID);
 }

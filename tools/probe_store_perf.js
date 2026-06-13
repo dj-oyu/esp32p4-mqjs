@@ -22,4 +22,4 @@ mqtt.onConnect(function () {
             if (a[k].name === "probe_store_t") sys.stop(a[k].slot);
     }, 1500);
 });
-mqtt.connect("mqtt://192.168.1.2");
+net.onReady(function (token) { mqtt.connect(token); });

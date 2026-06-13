@@ -72,6 +72,15 @@ static const mqjs_store_api_t s_store_api = {
     .install = task_source_install,
 };
 
+/* Fired once on the first IP (from the Wi-Fi event task). Releases the two
+   things that were genuinely waiting on the network: the C-side task-delivery
+   service, and any JS app parked in the net.onReady wait queue. */
+static void on_net_up(void)
+{
+    task_source_start();   /* accept replacement tasks over MQTT */
+    mqjs_notify_net_up();  /* drain the net.onReady wait queue (JS apps) */
+}
+
 static void js_task(void *arg)
 {
     mqjs_rt_init(); /* arenas (4 x 256KB PSRAM) + shared event queue */
@@ -102,21 +111,42 @@ void app_main(void)
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus
                                             (no-op stubs elsewhere) */
-#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
-    audio_tab5_selftest_async(); /* P2 gate: boot beep + optional WAV autoplay */
-#endif
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
     mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
     storage_init();            /* mount LittleFS for persisted tasks */
 
-    /* network first: blocks up to 30s for an IP, JS runs either way */
-    if (wifi_start_and_wait(30000))
-        task_source_start();   /* accept replacement tasks over MQTT */
+    /* Platform-owned network defaults: apps never hardcode the broker or the
+       topic namespace. The namespace is the first segment of the task topic
+       ("esp32p4-mqjs" from "esp32p4-mqjs/task/<id>") — single source of truth. */
+    mqjs_set_default_broker(CONFIG_MQJS_TASK_BROKER);
+    static char s_topic_prefix[32];
+    {
+        const char *t = CONFIG_MQJS_TASK_TOPIC;
+        const char *slash = strchr(t, '/');
+        size_t n = slash ? (size_t)(slash - t) : strlen(t);
+        if (n >= sizeof s_topic_prefix)
+            n = sizeof s_topic_prefix - 1;
+        memcpy(s_topic_prefix, t, n);
+        s_topic_prefix[n] = '\0';
+        mqjs_set_topic_prefix(s_topic_prefix);
+    }
 
-    /* the mquickjs VM does not use the C stack for JS frames, but the
-       parser + bindings still need headroom. Pinned to Core 0: the LVGL
-       task lives on Core 1 (see ui_tab5) */
+    /* Launcher + UI runtime start immediately, NOT gated on Wi-Fi (so the
+       UI is up at once even with a slow/absent network). The mquickjs VM
+       does not use the C stack for JS frames, but the parser + bindings
+       need headroom. Core 0: the LVGL task lives on Core 1 (see ui_tab5). */
     xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
+
+#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+    /* boot audio: the ES8388's shared I2C bus is up since ui_tab5_start()
+       and audio needs no network, so it is not gated on the Wi-Fi wait. */
+    audio_tab5_selftest_async();
+#endif
+
+    /* Wi-Fi comes up in the background while the above already runs. Nothing
+       blocks here on the network: the services that need it are released from
+       the got-IP event (on_net_up), so app_main returns immediately. */
+    wifi_start(on_net_up);
 }

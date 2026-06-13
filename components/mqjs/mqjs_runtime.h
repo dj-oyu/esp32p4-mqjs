@@ -161,6 +161,23 @@ void mqjs_set_store_provider(const mqjs_store_api_t *api);
 void mqjs_set_uninstall_hook(void (*fn)(const char *name));
 
 /*
+ * Network readiness, event-driven (Wi-Fi bring-up is async, see wifi.c).
+ * Called from the got-IP event to mint a fresh readiness token and release
+ * every JS app parked in the net.onReady wait queue (each callback receives
+ * the token, which mqtt.connect then demands). Safe to call from another task
+ * — it only enqueues a broadcast event; the JS task fires the callbacks.
+ */
+void mqjs_notify_net_up(void);
+
+/*
+ * Platform-owned network defaults, so apps hardcode neither the broker nor the
+ * topic namespace. mqtt.connect(token) uses the broker; net.topic(name)
+ * prepends the prefix. Pointers must outlive the runtime (pass static strings).
+ */
+void mqjs_set_default_broker(const char *uri);
+void mqjs_set_topic_prefix(const char *prefix);
+
+/*
  * Post a touch event to the JS event loop (callable from another task,
  * not from an ISR). kind: 0 = down, 1 = move, 2 = up. Coordinates are
  * in the ui canvas space (see ui.size()). Touch always belongs to the

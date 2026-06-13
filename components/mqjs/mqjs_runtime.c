@@ -137,7 +137,9 @@ typedef struct {
    (also when it drops the event because its owner died). */
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
-               EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP } MqjsEventType;
+               EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
+               EV_NET /* broadcast: release the net.onReady wait queue */
+             } MqjsEventType;
 
 typedef struct {
     uint8_t type;
@@ -233,6 +235,9 @@ typedef struct {
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
     bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
+    bool net_used;  JSGCRef net_cb;  /* net.onReady one-shot: the app's ticket
+                                        in the network wait queue (fires once
+                                        the link is up, then auto-releases) */
 
 #ifdef ESP_PLATFORM
     esp_mqtt_client_handle_t mqtt;  /* per-app client: "mqjs-app-<slot>" */
@@ -295,6 +300,44 @@ static void dev_rearm(void)
 /* the status-bar chip target: the previous foreground app, kept by NAME
    (a relaunch may land in a different slot) */
 static char s_prev_name[32];
+
+/* Network readiness as a capability (event-driven Wi-Fi, see wifi.c). The
+   token is the ONLY proof the link is up: net.onReady hands it to its callback
+   and mqtt.connect demands it, so there is no token to pass at top level — a
+   connect before the link cannot be expressed, not merely caught. It doubles
+   as the crash floor (a call with no/stale token is rejected before lwip) and
+   as lifetime: bumped on every up edge, so a token from a prior link is stale.
+   0 = never up. PC/host builds start "ready" (1) so smoke tests run. */
+static volatile uint32_t s_net_token =
+#ifdef ESP_PLATFORM
+    0;
+#else
+    1;
+#endif
+
+/* Platform-configured default MQTT broker (injected by app_main from
+   CONFIG_MQJS_TASK_BROKER). mqtt.connect(token) uses it, so apps never
+   hardcode "mqtt://...". A literal stub on PC keeps smoke tests connecting. */
+static const char *s_default_broker
+#ifndef ESP_PLATFORM
+    = "mqtt://pc-stub"
+#endif
+    ;
+
+void mqjs_set_default_broker(const char *uri)
+{
+    s_default_broker = uri;   /* expected to be a static string (not copied) */
+}
+
+/* Platform topic namespace (injected by app_main from CONFIG_MQJS_TASK_TOPIC's
+   first segment). net.topic(name) prepends it, so apps hold only the leaf name
+   and never hardcode "esp32p4-mqjs/...". */
+static const char *s_topic_prefix;
+
+void mqjs_set_topic_prefix(const char *prefix)
+{
+    s_topic_prefix = prefix;  /* expected to be a static string (not copied) */
+}
 
 static void (*s_notify_sink)(const char *text);
 
@@ -379,6 +422,17 @@ static bool ev_post(const MqjsEvent *ev, int wait_ms)
     s_pc_q_count++;
     return true;
 #endif
+}
+
+/* got-IP: mint a fresh token (invalidating any prior one) and post one
+   broadcast so the JS task drains the net.onReady wait queue. Callable from
+   another task (enqueue only; the token int is written atomically enough). */
+void mqjs_notify_net_up(void)
+{
+    if (++s_net_token == 0)   /* 0 stays reserved for "never up" */
+        s_net_token = 1;
+    MqjsEvent ev = { .type = EV_NET };
+    ev_post(&ev, 0);
 }
 
 #ifndef ESP_PLATFORM
@@ -2831,6 +2885,9 @@ JSValue js_http_get(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     (void)argc;
     if (s_http_active)
         return JS_NewBool(0);
+    if (!s_net_token)   /* link not up: report "not started" (its bool
+                           contract), don't enter lwip. Wait on net.onReady. */
+        return JS_NewBool(0);
     if (uiw_copy_str(ctx, argv[0], s_http_url, sizeof s_http_url))
         return JS_EXCEPTION;
     if (!s_http_url[0])
@@ -4002,6 +4059,10 @@ JSValue js_ssh_connect(JSContext *ctx, JSValue *this_val, int argc,
         hostkey[0] = '\0';
 
 #ifdef ESP_PLATFORM
+    if (!s_net_token) {   /* link not up: don't enter lwip (would assert) */
+        memset(pass, 0, sizeof pass);
+        return JS_ThrowInternalError(ctx, "network not ready");
+    }
     int id = mqjs_ssh_connect(host, port, user, pass, hostkey, cols, rows);
     memset(pass, 0, sizeof pass);
     if (!id)
@@ -4326,13 +4387,34 @@ static void mqtt_event_cb(void *arg, esp_event_base_t base,
 }
 #endif
 
+/* mqtt.connect(token[, uri]): the token comes from net.onReady's callback and
+   is the capability proving the link is up — there is no way to obtain a valid
+   token without the event, so a top-level connect cannot be written, and a
+   stale/absent token is rejected here before lwip (no "Invalid mbox" assert).
+   uri is optional: omit it to use the platform-configured broker, so apps do
+   not hardcode "mqtt://...". */
 JSValue js_mqtt_connect(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
+    int token = 0;   /* JS_ToInt32 wants int* (not int32_t*) on riscv32 */
+    if (argc < 1 || JS_ToInt32(ctx, &token, argv[0]))
+        return JS_ThrowTypeError(ctx,
+            "mqtt.connect(token[, uri]): token comes from net.onReady(token => ...)");
+    if (!s_net_token || (uint32_t)token != s_net_token)
+        return JS_ThrowInternalError(ctx,
+            "network not ready: connect inside net.onReady (stale/no token)");
+
     JSCStringBuf buf;
     size_t len;
-    const char *uri = JS_ToCStringLen(ctx, &len, argv[0], &buf);
-    if (!uri)
-        return JS_EXCEPTION;
+    const char *uri;
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        uri = JS_ToCStringLen(ctx, &len, argv[1], &buf);  /* explicit override */
+        if (!uri)
+            return JS_EXCEPTION;
+    } else if (s_default_broker) {
+        uri = s_default_broker;                           /* platform default */
+    } else {
+        return JS_ThrowTypeError(ctx, "no broker configured (pass a uri)");
+    }
 
 #ifdef ESP_PLATFORM
     MqjsWorker *app = s_cur_wk;
@@ -4392,6 +4474,44 @@ JSValue js_mqtt_onConnect(JSContext *ctx, JSValue *this_val, int argc, JSValue *
 {
     return register_cb(ctx, argv[0], &s_cur_wk->mqtt_onconn_used,
                        &s_cur_wk->mqtt_onconn);
+}
+
+/* net.onReady(cb): park the app in the network wait queue. cb is invoked as
+   cb(token) once the link is up; if it is already up, it runs on the next loop
+   turn (so the edge is never missed). The token must be handed to mqtt.connect
+   — it is the only way to obtain one, so a connect outside this callback (e.g.
+   at top level, before the link) cannot be written. One-shot: re-arm inside cb
+   to wait for the next bring-up. Event-driven, not polling: the app yields and
+   is woken by got-IP. */
+JSValue js_net_onReady(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSValue r = register_cb(ctx, argv[0], &s_cur_wk->net_used,
+                            &s_cur_wk->net_cb);
+    if (JS_IsException(r))
+        return r;
+    if (s_net_token) {         /* already up: fire (with the token) next turn */
+        MqjsEvent ev = { .type = EV_NET };
+        ev_post(&ev, 0);
+    }
+    return JS_UNDEFINED;
+}
+
+/* net.topic(name): prepend the platform topic namespace, so apps publish/
+   subscribe with just a leaf ("clipboard") and never hardcode the prefix.
+   With no prefix configured (PC/host) the name passes through unchanged. */
+JSValue js_net_topic(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *name = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!name)
+        return JS_EXCEPTION;
+    char topic[160];
+    if (s_topic_prefix && s_topic_prefix[0])
+        snprintf(topic, sizeof topic, "%s/%s", s_topic_prefix, name);
+    else
+        snprintf(topic, sizeof topic, "%s", name);
+    return JS_NewStringLen(ctx, topic, strlen(topic));
 }
 
 JSValue js_mqtt_publish(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
@@ -4543,6 +4663,9 @@ static bool anything_pending(const MqjsWorker *app)
         return true; /* a camera.scan in flight: its result must land */
     if (app->http_used)
         return true; /* an http.get in flight: its result must land */
+    if (app->net_used)
+        return true; /* parked in the net.onReady wait queue: keep it alive
+                        until the link comes up (§3.8) */
     for (int i = 0; i < MQJS_MAX_WIDGET_CB; i++)
         if (app->widget_cbs[i].used) /* a live widget screen, too */
             return true;
@@ -4641,6 +4764,10 @@ static void app_reset_bindings(MqjsWorker *app)
         app->http_used = false;
         /* a request in flight cannot be cancelled mid-flight; its result
            event dies on the gen check and frees its own body (§3.2) */
+    }
+    if (app->net_used) {
+        JS_DeleteGCRef(ctx, &app->net_cb);
+        app->net_used = false;
     }
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
     if (s_cam_active && s_cam_worker == app->idx)
@@ -4755,6 +4882,7 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     app->stop_used = false;
     app->stopping = false;
     app->clip_used = false;
+    app->net_used = false;
     app->sink_len = 0;
     snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
     snprintf(app->vault_id, sizeof app->vault_id, "%s", name ? name : "app");
@@ -4869,6 +4997,38 @@ static void focus_apply(int target)
         switch_foreground(target);
 }
 
+/* EV_NET broadcast: release every app parked in the net.onReady wait queue.
+   Runs on the JS task, so iterating the workers and calling into their
+   contexts is safe (the poster only enqueued the broadcast). One-shot: the
+   ticket is cleared before the call so the handler may re-arm for the next
+   bring-up, exactly like the http.get / camera.scan one-shots. */
+static void net_ready_broadcast(void)
+{
+    MqjsWorker *prev = s_cur_wk;
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        MqjsWorker *app = &s_workers[i];
+        if (!app->used || !app->net_used)
+            continue;
+        s_cur_wk = app;
+        if (JS_StackCheck(app->ctx, 2)) {
+            dump_error(app->ctx);
+            app->net_used = false;
+            JS_DeleteGCRef(app->ctx, &app->net_cb);
+            continue;
+        }
+        JS_PushArg(app->ctx, JS_NewInt32(app->ctx, (int)s_net_token)); /* arg0: token */
+        JS_PushArg(app->ctx, app->net_cb.val);  /* func (rooted on arg stack) */
+        JS_PushArg(app->ctx, JS_NULL);          /* this */
+        app->net_used = false;                  /* release before the call so */
+        JS_DeleteGCRef(app->ctx, &app->net_cb); /* the cb may re-arm onReady  */
+        arm_watchdog();
+        JSValue ret = JS_Call(app->ctx, 1);
+        if (JS_IsException(ret))
+            dump_error(app->ctx);
+    }
+    s_cur_wk = prev;
+}
+
 /* drop an event without dispatching: free its heap payload */
 static void free_event_payload(MqjsEvent *ev)
 {
@@ -4973,6 +5133,10 @@ static bool pump_one_event(int idle)
 #endif
     if (ev.type == EV_FOCUS) {
         focus_apply(ev.u.focus.target);
+        return true;
+    }
+    if (ev.type == EV_NET) {   /* broadcast: not owned by one slot */
+        net_ready_broadcast();
         return true;
     }
     MqjsWorker *owner = event_owner(&ev);

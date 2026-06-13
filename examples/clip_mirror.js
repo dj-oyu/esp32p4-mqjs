@@ -21,8 +21,10 @@
 "use strict";
 sys.setAppName("clip_mirror");
 
-var BROKER = "mqtt://192.168.1.2";
-var TOPIC = "esp32p4-mqjs/clipboard";
+/* broker も topic prefix もプラットフォームが持つ: 接続は mqtt.connect(token)
+   (デフォルト broker)、topic は net.topic("clipboard") (共通 prefix + leaf)。
+   アプリは "clipboard" という名前しか持たない。 */
+var TOPIC = null;   /* net.onReady で net.topic("clipboard") を設定 */
 
 /* 送信者 ID (echo 識別)。初回に乱数生成して store に永続。 */
 var MY = store.get("clipmirror_id");
@@ -47,7 +49,7 @@ clipboard.onChange(function (data, type) {
                  0, 1 /* retain = ストアの棚と同じ「最新が残る」意味論 */);
 });
 
-mqtt.subscribe(TOPIC, function (t, payload) {
+function onMessage(t, payload) {
     var m;
     try {
         m = JSON.parse(payload);
@@ -64,9 +66,17 @@ mqtt.subscribe(TOPIC, function (t, payload) {
         return; /* 冪等: 同一値はスキップ */
     clipboard.set(m.data, type);
     sys.notify("クリップボード受信 " + type + " (" + m.data.length + "B)");
-});
+}
 
-mqtt.onConnect(function () {
-    print("[clip_mirror] connected as " + MY);
+/* @autostart なので起動はリンク確立より早い。ポーリングで叩き直すのではなく
+   net.onReady でネット準備イベント(=token)を待ってから接続する。token は
+   capability で、これ無しに mqtt.connect は呼べない (トップレベル接続不可)。
+   broker/prefix はプラットフォーム任せ。 */
+net.onReady(function (token) {
+    TOPIC = net.topic("clipboard");
+    mqtt.subscribe(TOPIC, onMessage);
+    mqtt.onConnect(function () {
+        print("[clip_mirror] connected as " + MY);
+    });
+    mqtt.connect(token);   /* デフォルト broker (プラットフォーム設定) */
 });
-mqtt.connect(BROKER);

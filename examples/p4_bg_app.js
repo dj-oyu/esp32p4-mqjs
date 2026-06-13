@@ -44,7 +44,11 @@ mqtt.subscribe(TOPIC, function (t, p) {
     if (stRx)
         stRx.setText("rx#" + rxCount + ": " + p);
 });
-mqtt.connect(BROKER);
+/* net.onReady でリンク確立(=token)を待ってから接続 (token は capability)。
+   BROKER は公開テストブローカーなので明示指定。 */
+net.onReady(function (token) {
+    mqtt.connect(token, BROKER);
+});
 
 setInterval(function () {
     if (mqtt.connected())
