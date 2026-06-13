@@ -448,6 +448,28 @@ instrumentation overhead を含むため絶対時間ではなく優先順位の�
 benchmark 完了後に既存 startup 経路の `tcpip_send_msg_wait_sem` assert が発生した。
 profile 出力後の事象で計測値には影響しないが、audio 統合前に別途切り分ける。
 
+### Stereo fixture
+
+実音源を使う stereo CELT profile 用に次を追加した。
+
+- source: `assets/audio/tab5-boot.wav`
+  - 48 kHz、stereo、signed 16-bit PCM、6.32 秒
+- encoded: `assets/audio/tab5-boot-48k.opus`
+  - libopus、audio application、20 ms frame、CBR 48 kbps
+  - Ogg Opus、38,683 bytes、コンテナ込み実効 48.9 kbps
+
+生成コマンド:
+
+```powershell
+ffmpeg -i assets/audio/tab5-boot.wav -map_metadata -1 -c:a libopus `
+  -application audio -b:a 48k -vbr off -frame_duration 20 `
+  assets/audio/tab5-boot-48k.opus
+```
+
+codec benchmark は Ogg を直接扱わないため、次の実装では Ogg page から Opus packet
+を抽出した決定論的 fixture を生成する。48 kbps は低帯域 stereo の負荷確認に使い、
+音質比較と高複雑度側の profile には 96 kbps fixture も追加する。
+
 ## 13. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
