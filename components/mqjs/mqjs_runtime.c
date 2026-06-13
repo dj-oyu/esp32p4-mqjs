@@ -69,6 +69,7 @@
 #include "ui_tab5.h"
 #include "sshc.h"
 #include "cam_tab5.h"
+#include "audio_tab5.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -2599,6 +2600,113 @@ static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
     JSValue ret = JS_Call(ctx, 1);
     if (JS_IsException(ret))
         dump_error(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* audio: Tab5 speaker (audio.start/stop/tone/volume/stats, audio_tab5) */
+/* Scalar control + telemetry only — decoded PCM is fed from C (the     */
+/* Opus path calls audio_tab5_write directly), so no buffer crosses the */
+/* JS boundary. tone() is async (one-shot task) to never stall the loop.*/
+/* All entries are stubs (return false / "off") off-device.            */
+/* ------------------------------------------------------------------ */
+
+/* audio.start(rate=48000, channels=2) -> true on success. */
+JSValue js_audio_start(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+    (void)this_val;
+    int rate = 48000, ch = 2;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &rate, argv[0]))
+        return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &ch, argv[1]))
+        return JS_EXCEPTION;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    return JS_NewBool(audio_tab5_start((uint32_t)rate, ch) == ESP_OK);
+#else
+    printf("[audio] start(%d Hz, %d ch) (stub)\n", rate, ch);
+    return JS_NewBool(0);
+#endif
+}
+
+/* audio.stop() -> undefined. Drains the ring; HW stays initialized. */
+JSValue js_audio_stop(JSContext *ctx, JSValue *this_val, int argc,
+                      JSValue *argv)
+{
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    audio_tab5_stop();
+#endif
+    return JS_UNDEFINED;
+}
+
+/* audio.tone(freq_hz, duration_ms) -> true if the beep was started.
+   Non-blocking: a one-shot task plays it; a second call while sounding
+   returns false. The P2-gate verifier callable remotely over MQTT. */
+JSValue js_audio_tone(JSContext *ctx, JSValue *this_val, int argc,
+                      JSValue *argv)
+{
+    (void)this_val;
+    int freq = 0, ms = 0;
+    if (argc < 2 || JS_ToInt32(ctx, &freq, argv[0]) ||
+        JS_ToInt32(ctx, &ms, argv[1]))
+        return JS_EXCEPTION;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    return JS_NewBool(audio_tab5_tone_async(freq, ms));
+#else
+    printf("[audio] tone(%d Hz, %d ms) (stub)\n", freq, ms);
+    return JS_NewBool(0);
+#endif
+}
+
+/* audio.volume([pct]) -> current volume 0..100. With an arg, sets it. */
+JSValue js_audio_volume(JSContext *ctx, JSValue *this_val, int argc,
+                        JSValue *argv)
+{
+    (void)this_val;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        int pct;
+        if (JS_ToInt32(ctx, &pct, argv[0]))
+            return JS_EXCEPTION;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+        audio_tab5_set_volume(pct);
+#else
+        printf("[audio] volume(%d) (stub)\n", pct);
+#endif
+    }
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    return JS_NewInt32(ctx, audio_tab5_volume());
+#else
+    return JS_NewInt32(ctx, 0);
+#endif
+}
+
+/* audio.stats() -> JSON string. Remote readback (no usable serial in
+   the field): running, rate, channels, queued PCM bytes, underruns,
+   total frames written to I2S. */
+JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    char buf[160];
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    audio_tab5_stats_t st;
+    audio_tab5_get_stats(&st);
+    snprintf(buf, sizeof buf,
+             "{\"running\":%s,\"rate\":%lu,\"ch\":%u,\"queued\":%lu,"
+             "\"underruns\":%lu,\"frames\":%llu}",
+             st.running ? "true" : "false", (unsigned long)st.sample_rate,
+             (unsigned)st.channels, (unsigned long)st.queued_bytes,
+             (unsigned long)st.underruns,
+             (unsigned long long)st.frames_written);
+#else
+    snprintf(buf, sizeof buf, "{\"running\":false,\"audio\":\"off\"}");
+#endif
+    return JS_NewString(ctx, buf);
 }
 
 /* ------------------------------------------------------------------ */

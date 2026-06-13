@@ -57,6 +57,12 @@ void audio_tab5_get_stats(audio_tab5_stats_t *out);
  * Starts the pipeline at the current rate (or 48 kHz stereo if idle). */
 esp_err_t audio_tab5_tone(int freq_hz, int duration_ms);
 
+/* Non-blocking tone: spawns a one-shot task and returns immediately.
+ * true = started, false = bad args, already sounding, or no memory.
+ * This is what the JS audio.tone() binding calls so the JS event loop
+ * is never stalled. duration_ms capped at 5000. */
+bool audio_tab5_tone_async(int freq_hz, int duration_ms);
+
 /* Spawn a one-shot task: wait 3 s after boot, beep twice, log stats.
  * Wired into app_main behind CONFIG_MQJS_TAB5_AUDIO_SELFTEST. */
 void audio_tab5_selftest_async(void);
@@ -94,6 +100,12 @@ static inline esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
     (void)freq_hz;
     (void)duration_ms;
     return ESP_ERR_NOT_SUPPORTED;
+}
+static inline bool audio_tab5_tone_async(int freq_hz, int duration_ms)
+{
+    (void)freq_hz;
+    (void)duration_ms;
+    return false;
 }
 static inline void audio_tab5_selftest_async(void) {}
 

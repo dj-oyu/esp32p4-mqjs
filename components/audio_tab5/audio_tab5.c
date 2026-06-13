@@ -390,6 +390,50 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
     return ESP_OK;
 }
 
+/* ---- async tone (JS audio.tone): never block the caller ------------- */
+/* The blocking tone above can hold the caller for hundreds of ms (two
+ * 300 ms tones outlast the 64 KB ring), which would stall the JS event
+ * loop / trip the watchdog. JS calls this instead: it spawns a one-shot
+ * task, guarded so a second call while one is sounding is rejected. */
+static volatile bool s_tone_busy;
+
+typedef struct {
+    int freq_hz;
+    int duration_ms;
+} tone_req_t;
+
+static void tone_task(void *arg)
+{
+    tone_req_t req = *(tone_req_t *)arg;
+    free(arg);
+    esp_err_t err = audio_tab5_tone(req.freq_hz, req.duration_ms);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "tone %dHz/%dms: %s", req.freq_hz, req.duration_ms,
+                 esp_err_to_name(err));
+    s_tone_busy = false;
+    vTaskDelete(NULL);
+}
+
+bool audio_tab5_tone_async(int freq_hz, int duration_ms)
+{
+    if (freq_hz <= 0 || duration_ms <= 0 || duration_ms > 5000)
+        return false;
+    if (s_tone_busy)
+        return false;
+    tone_req_t *req = malloc(sizeof *req);
+    if (!req)
+        return false;
+    req->freq_hz = freq_hz;
+    req->duration_ms = duration_ms;
+    s_tone_busy = true;
+    if (xTaskCreate(tone_task, "audio_tone", 4096, req, 6, NULL) != pdPASS) {
+        s_tone_busy = false;
+        free(req);
+        return false;
+    }
+    return true;
+}
+
 /* ---- boot self-test (P2 gate) ---------------------------------------- */
 static void selftest_task(void *arg)
 {

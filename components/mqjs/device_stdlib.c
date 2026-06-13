@@ -478,6 +478,22 @@ static const JSPropDef js_camera[] = {
 static const JSClassDef js_camera_obj =
     JS_OBJECT_DEF("Camera", js_camera);
 
+/* ---- device API: audio object (Tab5 ES8388 speaker) ----
+   start(rate,ch)->bool, stop(), tone(hz,ms)->bool (async beep),
+   volume([pct])->0..100, stats()->JSON string. Decoded PCM is fed from
+   C (Opus path), not JS. Stubs (tone/start -> false) off-device. ---- */
+static const JSPropDef js_audio[] = {
+    JS_CFUNC_DEF("start", 2, js_audio_start),
+    JS_CFUNC_DEF("stop", 0, js_audio_stop),
+    JS_CFUNC_DEF("tone", 2, js_audio_tone),
+    JS_CFUNC_DEF("volume", 1, js_audio_volume),
+    JS_CFUNC_DEF("stats", 0, js_audio_stats),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_audio_obj =
+    JS_OBJECT_DEF("Audio", js_audio);
+
 /* ---- device API: http object (one-shot GET over esp_http_client) ----
    get(url, fn) -> 1/0: one request system-wide, fn(body|undefined,
    status). https:// validates against the cert bundle; http:// allowed
@@ -609,6 +625,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("vault", &js_vault_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     JS_PROP_CLASS_DEF("camera", &js_camera_obj),
+    JS_PROP_CLASS_DEF("audio", &js_audio_obj),
     JS_PROP_CLASS_DEF("http", &js_http_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
