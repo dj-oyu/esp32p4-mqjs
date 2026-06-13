@@ -1,0 +1,392 @@
+# Opus デコーダ導入計画 — ESP32-P4 float + PIE asm
+
+ステータス: **計画のみ (2026-06-13)**。実装・ビルド・flash・COM 接続は未実施。
+実装ブランチ: `codex/opus-float-plan`。
+
+## 0. 結論
+
+Opus コーデック本体は ESP Component Registry の `78/esp-opus` **1.0.5**
+をベースにする。ただし Registry 版の `CMakeLists.txt` は次を強制しており、
+そのままでは本計画の float 優先方針を満たさない。
+
+- `FIXED_POINT=1`
+- `DISABLE_FLOAT_API`
+- SILK の固定小数点ソース (`silk/fixed/*.c`) のみをビルド
+- `USE_ALLOCA`
+- コンポーネント単位の `-O2`
+
+したがって、初期実装では 1.0.5 のソースを追跡可能なローカルコンポーネント
+として取り込み、CMake のソース選択と定義を変更する。最終到達点は、float
+デコーダの主要カーネルを ESP32-P4 PIE asm へ段階的に置き換えることとする。
+
+初期 C 実装の時点から asm 差し替え境界、portable C reference、dispatch、
+比較テスト、C fallback を設ける。upstream 関数へ場当たり的に asm を埋め込まず、
+計測で優先順位を決めながら、カーネル単位で安全に置換可能な構造にする。
+
+成功条件は、Tab5 で Opus packet を継続的にデコードし、ES8388 経由で音切れ
+なく再生できること、かつ UI・カメラ・MQTT の既存動作を阻害しないこと。
+
+## 1. スコープ
+
+### 対象
+
+- raw Opus packet から signed 16-bit PCM へのデコード
+- 8 / 12 / 16 / 24 / 48 kHz、mono / stereo
+- Tab5 の ES8388 + I2S による PCM 再生
+- float build と fixed-point build の比較測定
+- float portable C カーネルから P4 PIE asm カーネルへの段階的置換
+- デコード時間、CPU 使用率、スタック、内蔵 RAM、PSRAM 使用量の計測
+- 将来の JavaScript API またはストリーミング入力を載せられる C API 境界
+
+### 初期スコープ外
+
+- Opus エンコード
+- Ogg/Opus コンテナの demux
+- HTTP/MQTT/RTP 固有のストリーミング実装
+- マイク入力、AEC、録音
+- 音量 UI やプレイヤー UI
+
+Ogg ファイル再生が必要になった場合は、Opus デコーダとは別コンポーネント
+として demuxer を追加する。libopus にコンテナ責務を持たせない。
+
+## 2. ベースライブラリの管理方針
+
+### 採用
+
+- upstream: `78/esp-opus`
+- baseline: ESP Component Registry `1.0.5`
+- API: upstream の `opus_decoder_create()`, `opus_decode()` 等を維持
+
+### ローカル化が必要な理由
+
+Registry 版を `main/idf_component.yml` に追加するだけでは fixed-point build
+になる。managed component を生成後に直接編集すると再取得で変更が失われ、
+差分管理も困難になる。
+
+初期実装では `components/esp_opus_float/` に 1.0.5 を取り込み、以下を明示する。
+
+- upstream のバージョンと commit
+- upstream から変更したファイル一覧
+- ライセンスファイル
+- float / fixed の選択を行う Kconfig と CMake
+
+将来の upstream 更新は「新バージョンを取り込み、ローカル CMake 差分を再適用、
+テストベクタを再実行」の手順に固定する。
+
+## 3. float build 方針
+
+### 原則
+
+ESP32-P4 は単精度・倍精度 FPU を持つため、まず libopus の float 実装を評価する。
+「float API を呼ぶ」だけではなく、内部処理も非 `FIXED_POINT` build にする。
+
+ローカルコンポーネントの初期設定:
+
+- `FIXED_POINT` を定義しない
+- `DISABLE_FLOAT_API` を定義しない
+- `silk/fixed/*.c` の代わりに `silk/float/*.c` を選択
+- 共通 SILK / CELT / Opus ソースは upstream 1.0.5 の構成を維持
+- 最初は Registry 版と同じ `-O2`
+- `-ffast-math` は使用しない
+
+`-ffast-math` は libopus の NaN/Inf 前提を壊し得るため、性能測定だけを理由に
+有効化しない。
+
+### fixed-point 比較系
+
+float 採用を推測で確定しないため、Kconfig で fixed-point build も選択可能にする。
+同じ packet と同じ再生経路で比較し、次を記録する。
+
+- 1 packet の decode 時間: median / p95 / max
+- 20 ms 音声に対するリアルタイム係数
+- decoder state サイズ
+- タスクの stack high-water mark
+- 内蔵 RAM / PSRAM の前後差分
+- PCM 差分と聴感上の異常
+
+float を既定にするゲート:
+
+- 対象ワークロードすべてでリアルタイム期限を十分に満たす
+- fixed より明確に遅くない、または遅くてもシステム余裕を損なわない
+- UI、カメラ、ネットワーク同時動作で underrun が発生しない
+
+## 4. コンポーネント構成
+
+予定構成:
+
+```text
+components/
+  esp_opus_float/       78/esp-opus 1.0.5 ベースの codec 本体
+  opus_p4_kernels/      portable C reference + P4 PIE asm + dispatch
+  audio_tab5/           Tab5 の ES8388、I2S、PCM queue、再生タスク
+```
+
+`esp_opus_float` は codec のみを提供し、ESP-IDF ドライバや Tab5 に依存しない。
+upstream 差分は、選定した演算を `opus_p4_kernels` の内部 ABI 経由で呼ぶための
+最小限の hook に留める。
+
+`opus_p4_kernels` は次を所有する。
+
+- libopus 内部型を外へ漏らさない、固定幅型と明示的 stride の kernel ABI
+- portable C reference 実装
+- ESP32-P4 PIE asm 実装
+- compile-time / runtime dispatch
+- asm と C reference の比較検証
+- kernel ごとの cycle / call count テレメトリ
+
+カーネル ABI は、連続バッファ、要素数、stride、アラインメント、alias 条件、
+入出力範囲、丸め、飽和、NaN/Inf の扱いを明文化する。asm 化のためだけに
+中間バッファを増やし、メモリ帯域で利益を失う設計は避ける。
+
+`audio_tab5` は次を所有する。
+
+- 共有 I2C バス上の ES8388 初期化
+- I2S TX: MCLK GPIO30、BCLK GPIO27、WS GPIO29、DOUT GPIO26
+- IO expander `0x43` P1 の `SPK_EN`
+- DMA 対応 PCM バッファ
+- デコード・再生キューと underrun/overflow カウンタ
+- Stamp-P4 など非 Tab5 構成向けの no-op stub
+
+既存の `ui_tab5_i2c_bus()` を共有し、音声側で別の I2C master bus を作らない。
+IO expander のレジスタ全体を書き潰さず、既存状態を維持した read-modify-write
+または共有 board abstraction を使う。
+
+## 5. データフロー
+
+```text
+packet source
+  -> bounded Opus packet queue
+  -> audio decode task
+  -> opus_decode()
+  -> bounded PCM queue / ring buffer
+  -> I2S DMA
+  -> ES8388
+  -> speaker
+```
+
+- packet queue と PCM queue は上限を持たせる。
+- decoder state と頻繁に触る小さい作業領域は内蔵 RAM を優先する。
+- 大きい先読みバッファは PSRAM 使用を許可する。
+- I2S DMA バッファは DMA 対応内蔵 RAM に置く。
+- UI の LVGL task が Core 1、JS task が Core 0 を使う現状を計測した上で、
+  audio task の affinity と priority を決める。
+- `USE_ALLOCA` は初期比較では維持するが、stack high-water mark が不足する場合は
+  allocator 方針を見直す。
+
+## 6. asm 差し替え可能な設計
+
+### カーネル境界
+
+初期実装時に libopus の演算を無差別に wrapper 化しない。プロファイル上有望で、
+かつ独立した契約に切り出せる演算だけを kernel ABI にする。
+
+優先候補:
+
+1. CELT float inner product / dual inner product
+2. CELT inverse MDCT / FFT の butterfly と post-rotation
+3. CELT band energy、denormalize、interleave/clip
+4. SILK float LPC synthesis / resampler
+5. PCM gain、clip、mono/stereo 整形
+
+entropy decode、分岐の多い制御処理、小さい単発ループは原則 portable C のまま
+残す。PIE は連続データを十分長く処理できる演算へ集中する。
+
+### ABI と dispatch
+
+各カーネルは次の形を基本とする。
+
+```c
+typedef struct {
+    void (*inner_prod_f32)(const float *a, const float *b, size_t n,
+                           float *result);
+    /* 実測で採用したカーネルだけを追加する。 */
+} opus_kernel_ops_t;
+```
+
+- `*_c()` は常にビルドされる portable reference。
+- `*_p4()` は P4 のみビルドする `.S` 実装。
+- codec 初期化時に `opus_kernel_ops_t` を確定し、hot loop 内で target 判定しない。
+- Kconfig で `portable C`、`P4 asm`、`P4 asm + verify` を選択可能にする。
+- asm 未実装または検証失敗時は自動的に C へ fallback する。
+- upstream hook は dispatch 呼び出しだけにし、upstream 更新時の競合を抑える。
+
+関数ポインタ呼び出しのオーバーヘッドが短いカーネルで問題になる場合は、
+codec 初期化時に上位粒度の関数を切り替えるか、P4 build 専用の compile-time
+dispatch を使用する。ABI の都合で細切れ呼び出しを増やさない。
+
+### 正しさ
+
+- asm 実装前に、同じ ABI の C reference と独立テスト fixture を作る。
+- 固定小数点カーネルは bit-exact を必須にする。
+- float カーネルは演算順変更で丸め差が出るため、カーネル単体の ULP/絶対誤差、
+  packet 単位の PCM 誤差、長時間 decode の drift をそれぞれ検証する。
+- NaN、Inf、denormal、ゼロ長、非 16-byte aligned 入力、端数 lane を含める。
+- `P4 asm + verify` では初期 packet または test fixture を C/asm 両方で実行し、
+  不一致なら boot 中に asm を無効化する。
+
+### asm 実装規約
+
+- `.S` は P4 専用コンポーネントに置き、generic libopus ソースへ混在させない。
+- P4 toolchain の既定 `-march` を使用し、独自 `-march` で他拡張を落とさない。
+- ABI、使用 q register、XACC/QACC、alignment、hardware loop の終端規約を
+  ファイル冒頭に記録する。
+- C reference と同じ契約を保ち、asm 都合の公開 API 変更を行わない。
+- 各 asm カーネルに単独 benchmark と before/after の cycle 値を残す。
+- 改善しないカーネルは採用せず、C 実装へ戻す。
+
+## 7. 実装ステップとゲート
+
+### P1. codec 単体導入
+
+- `78/esp-opus` 1.0.5 をローカルコンポーネント化
+- float / fixed のビルド選択を追加
+- decoder-only の利用例と最小 wrapper を追加
+- raw packet をデコードするホストまたはデバイステストを追加
+- `opus_p4_kernels` の ABI、portable C、dispatch、verify skeleton を追加
+
+ゲート:
+
+- float build が ESP32-P4 / ESP-IDF 6.0 でコンパイルできる
+- 公式 Opus test vector または既知 packet の PCM 結果を検証できる
+- upstream API への不要な変更がない
+- codec が portable C dispatch 経由で動き、将来の asm 置換箇所が分離されている
+
+### P2. Tab5 PCM 出力
+
+- `audio_tab5` を追加
+- ES8388、I2S TX、`SPK_EN` を初期化
+- 生成した PCM tone または埋め込み PCM を再生
+
+ゲート:
+
+- codec を使わず、PCM 経路だけで安定再生できる
+- I2C 共有による touch / camera 回帰がない
+- underrun、I2S error がない
+
+### P3. Opus decode + playback
+
+- 埋め込み raw Opus packet 列をデコードして再生
+- decode / queue / I2S のテレメトリを追加
+- float と fixed を同一条件で比較
+
+ゲート:
+
+- 48 kHz stereo を含む対象条件でリアルタイム再生
+- decode max 時間が packet duration を超えない
+- 連続再生でメモリ増加、stack 不足、音切れがない
+
+### P4. 既存機能との同時動作
+
+- UI 操作、カメラ preview/scan、MQTT、JS apps と同時に再生
+- CPU affinity、priority、queue サイズを調整
+
+ゲート:
+
+- UI latency と camera telemetry の明確な悪化がない
+- audio underrun がない
+- 内蔵 RAM の安全余裕を維持
+
+### P5. P4 asm 優先順位決定
+
+プロファイルで支配項を特定し、asm 化する順序を決める。
+
+候補:
+
+- CELT inverse MDCT / FFT
+- CELT inner product / band operations
+- SILK LPC synthesis / resampler
+- PCM interleave、gain、clip
+
+各 PIE カーネルの採用条件:
+
+- 対象カーネルが decode 時間の十分大きな割合を占める
+- 呼び出し境界や中間バッファの追加が利益を相殺しない
+- end-to-end decode 時間または CPU 余裕が明確に改善する
+- C reference との比較検証を通過する
+
+### P6. P4 PIE asm への段階的置換
+
+- 優先順位の高いカーネルから `*_p4.S` を実装
+- C/asm 単体 benchmark と correctness test を実行
+- `P4 asm + verify` で実機 decode
+- 採用条件を満たしたカーネルのみ既定 dispatch に追加
+
+ゲート:
+
+- すべての asm カーネルに C reference と fallback がある
+- float 誤差が定義した許容範囲内
+- codec test vector と連続再生を通過
+- end-to-end の改善値を記録
+
+### P7. asm 統合後の同時動作検証
+
+- P4 asm 有効状態で UI、カメラ、MQTT、JS apps と同時再生
+- PIE register / hardware-loop 使用による割り込み・task 切替時の問題を確認
+- portable C build と P4 asm build の回帰比較
+
+ゲート:
+
+- underrun、PCM corruption、例外がない
+- portable C build よりシステム余裕が改善する
+- asm 無効化で常に portable C 動作へ戻せる
+
+## 8. 検証マトリクス
+
+最低限の codec 条件:
+
+| Rate | Channels | Mode |
+|---|---:|---|
+| 8 kHz | mono | SILK speech |
+| 16 kHz | mono | SILK/hybrid speech |
+| 24 kHz | mono | hybrid |
+| 48 kHz | mono | CELT |
+| 48 kHz | stereo | CELT music |
+
+各条件で正常 packet、packet loss concealment (`data == NULL`)、不正 packet、
+最大 frame duration を確認する。
+
+システム条件:
+
+- audio only
+- audio + UI interaction
+- audio + camera preview/scan
+- audio + Wi-Fi/MQTT + JS app
+
+実装方式:
+
+- float portable C
+- float P4 asm
+- float P4 asm + verify
+- fixed-point portable C（比較基準）
+
+## 9. 競合回避と作業ルール
+
+裏で別作業が行われているため、以下を毎回守る。
+
+1. build、flash、monitor、COM 接続の直前に関連プロセスと COM 使用状況を確認する。
+2. ユーザー確認なしに flash、monitor、COM 接続を行わない。
+3. 専用 build directory を worktree 内または明示した別パスに置き、既存
+   `build` / `build_tab5` を共有しない。
+4. dependency lock 更新は本 worktree 内だけで行う。
+5. 実機計測値は条件、sdkconfig、commit と一緒に文書化する。
+
+## 10. 未決事項
+
+- 最初に提供する packet source: 埋め込み fixture、LittleFS、または JS API
+- Ogg demux が初期リリースに必要か
+- speaker playback のみか、将来 microphone path も同じ abstraction に載せるか
+- Registry component の更新追従を subtree、script、手動 vendor のどれで管理するか
+- float 採用判定に必要な許容 CPU 使用率と最低内蔵 RAM 余裕
+- float asm カーネルごとの許容誤差と packet 単位 PCM 誤差
+- 最初に asm 化する CELT カーネルの粒度
+
+## 11. 参考
+
+- ESP Component Registry: `78/esp-opus` 1.0.5
+  - https://components.espressif.com/components/78/esp-opus/versions/1.0.5/readme
+- upstream repository
+  - https://github.com/78/esp-opus
+- Xiph libopus
+  - https://gitlab.xiph.org/xiph/opus
+- Tab5 audio implementation reference
+  - https://github.com/m5stack/M5Tab5-UserDemo
