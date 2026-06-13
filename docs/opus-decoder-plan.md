@@ -774,7 +774,31 @@ ABI 境界は butterfly の内側ループ（kf_bfly3 の `do{}while(--k)`／kf_
 4. before/after を fixed baseline 729.9 cycles/frame に対して計測、採用判定。
 5. 同パターンで kf_bfly5 / kf_bfly4 へ展開。
 
-### PIE 適用可否の最終結論（2026-06-14）
+### 【訂正 2026-06-14】PIE 適用可否 — 前回結論は誤り
+
+下の「4つの壁」は **ISA 調査が不完全で、うち3つは誤り**だった。`xesppie.S`
+decoder test の全命令（360 mnemonics）を読み直し、P4 toolchain で実アセンブル
+して確認した結果、**PIE は fixed-point CELT decode を高速化できる**。
+
+| 旧結論（誤） | 実際 |
+|---|---|
+| 32-bit 積を register に出す乗算が無い | **`esp.vmul.s32.s16xs16`**＝要素別 s16×s16→**s32 を register へ**（dst 2本=8×s32）。QACC/メモリ往復不要。 |
+| gather/scatter 無い | **`esp.ldxq.32` / `esp.stxq.32`**＝indexed gather/scatter（butterfly の strided twiddle、anti_collapse の scatter store に使える） |
+| butterfly は layout 非適合 | **`esp.fft.r2bf.s16` / `fft.cmul.s16` / `fft.ams.s16` / `fft.bitrev`**＝専用 FFT butterfly/bit-reverse 命令 |
+| float SIMD 無い | これは正（が fixed-point 路線なので無関係） |
+
+16×32 は register 内で完結:
+```
+xh=vsr.s32(x,16); xl=x&0xffff
+phi=vmul.s32.s16xs16(g,xh); plo=vmul.s32.s16xs16(g,xl)
+m = vsl.32(phi,1) + vsr.s32(plo,15)   // vadd.s32 (native 32-bit), vsat.s32 で飽和
+```
+comb_filter は上記で素直にベクタ化でき、MDCT butterflies は `fft.*` 命令へほぼ
+直接マップできる可能性がある（#1 hot kernel）。命令はアセンブル確認済み。実機
+semantics 確認は要（ただし blog 情報では P4 PIE ≡ S3 PIE で S3 は esp-dsp 実績あり）。
+→ task #13 を再開。下の旧記述は誤りとして残置（経緯記録）。
+
+### 【旧・誤】PIE 適用不可の結論
 
 実装前に ESP32-P4 PIE の全命令（`xespv2p1`、IDF の `xesppie.S` decoder
 test）を精査し、CELT decode への適用可否を確定した。**PIE は CELT decode を
