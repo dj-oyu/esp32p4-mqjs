@@ -5,9 +5,14 @@
 #include <stdint.h>
 #include <string.h>
 
+/* The ESP headers are only needed by the verify and profiling blocks, both of
+ * which are CONFIG_-gated off in a host build. Guard them so the portable C
+ * kernels and references compile on the host for bit-exactness testing. */
+#ifdef ESP_PLATFORM
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#endif
 
 typedef float (*inner_prod_f32_fn)(const float *, const float *, int);
 typedef uint32_t (*anti_collapse_noise_f32_fn)(float *, int, int, float,
@@ -35,6 +40,44 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
         x[i * stride] = (seed & 0x8000u) ? r : -r;
     }
     return seed;
+}
+
+/* CELT SIG_SAT (2^29-1) and the exact MULT16_32_Q15 used in the RV32
+ * (OPUS_FAST_INT64=0) fixed-point build. Kept local so this component stays
+ * independent of the opus headers while reproducing their bit pattern. */
+#define OPUS_P4_SIG_SAT 536870911
+
+static inline int32_t p4_mult16_32_q15(int16_t a, int32_t b)
+{
+    /* ADD32(SHL(MULT16_16(a, b>>16), 1), SHR(MULT16_16SU(a, b&0xffff), 15)) */
+    int32_t hi = (int32_t)((uint32_t)((int32_t)a * (int32_t)(int16_t)(b >> 16))
+                           << 1);
+    int32_t lo = ((int32_t)a * (int32_t)(uint16_t)(b & 0xffffu)) >> 15;
+    return (int32_t)((uint32_t)hi + (uint32_t)lo);
+}
+
+static inline int32_t p4_sig_sat(int32_t x)
+{
+    if (x > OPUS_P4_SIG_SAT)
+        return OPUS_P4_SIG_SAT;
+    if (x < -OPUS_P4_SIG_SAT)
+        return -OPUS_P4_SIG_SAT;
+    return x;
+}
+
+void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
+                                 int16_t g10, int16_t g11, int16_t g12)
+{
+    for (int i = 0; i < N; i++) {
+        int32_t s = x[i - T];
+        int32_t a = (int32_t)((uint32_t)x[i - T + 1] + (uint32_t)x[i - T - 1]);
+        int32_t b = (int32_t)((uint32_t)x[i - T + 2] + (uint32_t)x[i - T - 2]);
+        int32_t t = x[i];
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g10, s));
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g11, a));
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g12, b));
+        y[i] = p4_sig_sat(t);
+    }
 }
 
 #if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
