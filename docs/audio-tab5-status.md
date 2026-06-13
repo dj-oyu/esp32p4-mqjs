@@ -92,6 +92,26 @@ Opus デコーダより先に再生パスを実体化。テスト素材は実 WA
 将来のファイル転送パス (LittleFS への WAV 転送、あるいは partition 拡張)
 が出来たら `audio_tab5_play_wav_file(path)` を足す。
 
+## ステレオ→モノ ダウンミックス (commit 0a3821e)
+
+Tab5 スピーカーは物理モノ (NS4150B 単入力)。esp_codec_dev の es8388 初期化は
+ストレートステレオ結線 (`device/es8388/es8388.c`: DACCONTROL17/20 = "only
+left/right DAC to its own mixer" + DACCONTROL24=0x1E で 4 出力 0dB)。ES8388
+ミキサーは「自側 DAC + 同側ライン入力バイパス」のみで反対側 DAC を引き込む
+クロス経路が無いため、**コーデックは L+R を合成しない** → 未 fold の 2ch
+素材は片 ch がスピーカーから落ちる。
+
+対策: `audio_tab5_write` のモノ経路で `(L+R)>>1` を両レーンに展開
+(int32 和 →>>1 は int16 範囲ちょうど、クリップ不要)。既定 ON
+(`s_downmix`、駆動先がモノスピーカーのみのため)。ヘッドホン等の真ステレオ
+出力用に OFF も可。JS `audio.downmix([on])` でトグル (boot WAV を fold vs
+straight で A/B 可能)。
+
+PIE は使わない判断: ダウンミックスは 48kHz で ~0.04% CPU・I2S 律速で
+ボトルネックでないため計測ゲートを通らない (連続データで PIE 向きではあるが
+インタリーブの deinterleave 前処理が要りコスト先行)。PIE 予算は Opus CELT
+カーネル (opus-decoder-plan §5/§6) へ。カーネル境界は差し替え可能に残してある。
+
 ## 未決 / 次フェーズ
 
 - `audio.play(pcm)` (JS からの任意 PCM 投入) は未実装。エンジンに
