@@ -196,13 +196,24 @@ set(SILK_SOURCES_FLOAT
     silk/float/sort_FLP.c
 )
 
-list(APPEND srcs ${CELT_SOURCES}
-                 ${OPUS_SOURCES}
-                 ${OPUS_SOURCES_FLOAT}
-                 ${SILK_SOURCES}
-                 ${SILK_SOURCES_FLOAT})
-
-set(PRIV_INCLUDES "celt/" "silk/" "silk/float" "src/" ".")
+# FIXED_POINT flips the CELT decoder to integer arithmetic (the ESP32-P4 PIE
+# target, since PIE has no float SIMD) and selects the SILK fixed-point encoder
+# sources. The SILK decoder is fixed-point in both configurations.
+if(CONFIG_OPUS_FIXED_POINT)
+    list(APPEND srcs ${CELT_SOURCES}
+                     ${OPUS_SOURCES}
+                     ${OPUS_SOURCES_FLOAT}
+                     ${SILK_SOURCES}
+                     ${SILK_SOURCES_FIXED})
+    set(PRIV_INCLUDES "celt/" "silk/" "silk/fixed" "src/" ".")
+else()
+    list(APPEND srcs ${CELT_SOURCES}
+                     ${OPUS_SOURCES}
+                     ${OPUS_SOURCES_FLOAT}
+                     ${SILK_SOURCES}
+                     ${SILK_SOURCES_FLOAT})
+    set(PRIV_INCLUDES "celt/" "silk/" "silk/float" "src/" ".")
+endif()
 
 # 定义编译选项
 set(OPUS_COMPILE_OPTIONS
@@ -212,11 +223,18 @@ set(OPUS_COMPILE_OPTIONS
     -DHAVE_MEMORY_H
     -DUSE_ALLOCA
     -DOPUS_BUILD
-    -DOPUS_P4_KERNELS_FLOAT
     -O2
     -Wno-maybe-uninitialized
     -Wno-unused-variable
 )
+
+# Fixed-point uses the integer CELT path; the float anti-collapse kernel
+# (OPUS_P4_KERNELS_FLOAT) only applies to the float build.
+if(CONFIG_OPUS_FIXED_POINT)
+    list(APPEND OPUS_COMPILE_OPTIONS -DFIXED_POINT)
+else()
+    list(APPEND OPUS_COMPILE_OPTIONS -DOPUS_P4_KERNELS_FLOAT)
+endif()
 
 # 根据芯片类型添加特定选项
 if(${IDF_TARGET} STREQUAL "esp32s2" OR ${IDF_TARGET} STREQUAL "esp32s3")

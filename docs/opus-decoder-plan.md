@@ -704,6 +704,25 @@ resampler 等）が s16 SIMD + QACC MAC へ乗る。次ステップ:
 float build の scalar 最適化（hardware loop / FMA scheduling）は PIE なしの
 控えめな改善に留まるため、PIE を主目的とする本ブランチでは fixed-point を優先する。
 
+### fixed-point build 導入と baseline（2026-06-13）
+
+`esp_opus_float` に `CONFIG_OPUS_FIXED_POINT`（既定 off）を追加。on で
+`-DFIXED_POINT`＋SILK fixed encoder ソース／`silk/fixed` include を使い、CELT
+decoder が整数演算になる（`OPUS_P4_KERNELS_FLOAT` は float build 専用なので
+fixed では外す）。SILK decoder は両 build とも fixed。
+
+同一 fixture・同一 bench 条件で COM8 実測:
+
+| build | cycles/frame | load | throughput | pcm_fnv |
+|---|---:|---:|---:|---|
+| float (portable-c) | 844.2 | 11.25% | 8.89x | `37e8c5b59e9a40c6` |
+| **fixed-point (portable-c)** | **729.9** | **9.73%** | **10.28x** | `7b5fb44e0fc51d62` |
+
+PIE を入れる前から fixed-point CELT decoder は float より **約 13.5% 速い**
+（844.2 → 729.9 cycles/frame）。PCM hash は当然 float と異なる（整数演算）。
+以後の PIE 採用判断は **fixed baseline 729.9 cycles/frame** を基準にし、bit-exact
+検証は fixed-asm vs fixed-C で行う。
+
 ## 15. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5

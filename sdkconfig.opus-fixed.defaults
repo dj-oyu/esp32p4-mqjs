@@ -1,0 +1,3 @@
+# Build the Opus codec in fixed-point arithmetic (ESP32-P4 PIE target).
+# Layer after sdkconfig.opus-bench.defaults.
+CONFIG_OPUS_FIXED_POINT=y

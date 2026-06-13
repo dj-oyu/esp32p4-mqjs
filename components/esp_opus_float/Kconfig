@@ -1,0 +1,18 @@
+menu "Opus codec (esp_opus_float)"
+
+config OPUS_FIXED_POINT
+    bool "Build Opus in fixed-point arithmetic"
+    default n
+    help
+        Compile the Opus codec with -DFIXED_POINT: the CELT decoder uses
+        integer arithmetic and the SILK fixed-point encoder sources are built.
+
+        This is the prerequisite for ESP32-P4 PIE acceleration, whose SIMD is
+        integer-only (no float vector instructions). It changes the decoded
+        PCM bit-for-bit versus the float path, so validate fixed output
+        against the fixed C reference (not the float hash).
+
+        Default off keeps the float decode path and the OPUS_P4_KERNELS_FLOAT
+        anti-collapse kernel unchanged.
+
+endmenu
