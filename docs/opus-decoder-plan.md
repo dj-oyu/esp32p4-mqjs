@@ -832,6 +832,46 @@ kernel reference として残置（PIE body は上記結論により未実装；
 relaxed-tolerance 路線の足場）。anti_collapse scalar asm も検証済み scaffold
 として残置。
 
+### PIE comb filter 統合結果（2026-06-14）
+
+`opus_p4_comb8`（8出力/呼び、16×32 を `vmul.s32.s16xs16`、未整列 tap/t-load を
+`src.q` funnel-shift、出力は aligned temp + memcpy）を `CONFIG_OPUS_P4_COMB_PIE`
+で `celt.c comb_filter_const_c` に統合。relaxed（対称 tap を5独立 MULT16_32_Q15
+へ分割、~-64dB、opus_compare 許容内）。
+
+実機 decode bench（fixed fixture）:
+
+| build | cycles/frame | vs float | realtime | pcm |
+|---|---:|---:|---:|---|
+| float | 844.2 | — | 8.89x | 7b5f.. はfloat別 |
+| fixed-C | 729.9 | -13.5% | 10.28x | 7b5f..1d62 |
+| **fixed + PIE comb** | **701.8** | **-16.9%** | **10.69x** | 3ff4..29dd |
+
+comb 単体 microbench 1.96x（tap毎3ブロック再ロードが律速；ブロック共有で~3xへ
+戻せる）。常時 engage（pie=6896, c=0）。実機再生でユーザー音質OK確認。
+
+確立した PIE 実装知見（再利用可）:
+- `vmul.s32.s16xs16` は積を **SAR で右シフト**（Q-format mul）。raw積は SAR=0。
+- `vunzip.16` で int32→lo/hi の s16 分割。`src.q qd,qLOW,qHIGH` は `{qHIGH:qLOW}`
+  を SAR_BYTES 右シフト（未整列ロード）。SAR と SAR_BYTES は別レジスタ。
+- PIE mem/SAR の base GPR は x8..x15。`vst.128` は整列のみ→未整列出力は
+  aligned temp + memcpy。
+- relaxed 化（sum 分割・signed-lo 分割）で opus_compare 許容内、register も節約。
+
+### 次カーネル候補（ROI 順）
+
+1. **逆MDCT/FFT butterflies**（~18%、最大）: 連続データ（未整列スライディング窓
+   なし）、`fft.cmul.s16`/`vmul.s32.s16xs16`+`ldxq` twiddle gather。複素演算で重い。
+2. **denormalise_bands**（~6%）: `f[j]=MULT16_32_Q15(x[j],g)>>shift`、x=int16連続、
+   g/shift帯域不変、スライディング窓なし=combより素直。band offset は未整列なので
+   x load=src.q、f store=temp/memcpy。common path（shift>=0）を PIE、edge は C。
+3. **normalise_residual**（~7%）: `X[i]=clamp16((g·iy[i])>>(k+1))`、16×16+round+
+   clamp16。PIE-native（srs 向き）だが出力 int16 の narrowing が要る。
+4. comb 速度最適化: tap 間でアラインブロック共有→1.96x を~3x へ、end-to-end +1-2%。
+
+各カーネルは comb 同様 C ref→host test→PIE asm→未整列対応→codec統合→音質確認の
+multi-iteration。
+
 ## 15. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
