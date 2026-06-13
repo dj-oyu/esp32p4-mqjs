@@ -219,6 +219,59 @@ int main(void)
                "plain background rejected");
     }
 
+    /* S2 staged sampling: bc_sample_line_l8 over a staged luma rect
+     * must be BIT-IDENTICAL to bc_sample_line over the frame — at all
+     * angles, all offsets, and with the line clipping the frame edge
+     * (clamp parity). Extent math mirrors scan_region in cam_tab5.c. */
+    {
+        static uint8_t stage_buf[FW * FH];
+        static uint8_t l1[2048], l2[2048];
+        /* centered + a corner case that clips the frame edges hard */
+        static const int spots[][2] = { { FW / 2, FH / 2 }, { 70, 60 } };
+        for (size_t s = 0; s < sizeof spots / sizeof spots[0]; s++) {
+            for (size_t a = 0; a < sizeof angles / sizeof angles[0]; a++) {
+                int cx = spots[s][0], cy = spots[s][1];
+                int deg = angles[a];
+                background(frame, 33 + (unsigned)(a + s));
+                embed_rotated(frame, code, cx, cy, deg, 3, 64, 40, 210);
+                int half_len = 240, vmax = 60;
+                float th = deg * (float)M_PI / 180.0f;
+                float aux = fabsf(cosf(th)), auy = fabsf(sinf(th));
+                /* +half/12 covers the theta-fan's +-4 deg variants */
+                int hw = (int)(half_len * aux + vmax * auy) +
+                         (half_len + vmax) / 12 + 2;
+                int hh = (int)(half_len * auy + vmax * aux) +
+                         (half_len + vmax) / 12 + 2;
+                bc_stage_t stg;
+                expect(bc_stage_region(frame, FW, FH, cx - hw, cy - hh,
+                                       cx + hw + 1, cy + hh + 1, stage_buf,
+                                       (int)sizeof stage_buf, &stg),
+                       "stage fits");
+                int bad = 0;
+                for (int dth = -4; dth <= 4; dth += 2)
+                    for (int off = -vmax; off <= vmax; off += 15) {
+                        int t = ((deg + dth) % 180 + 180) % 180;
+                        int n1 = bc_sample_line(frame, FW, FH, cx, cy, t,
+                                                off, half_len, l1,
+                                                (int)sizeof l1);
+                        int n2 = bc_sample_line_l8(&stg, cx, cy, t, off,
+                                                   half_len, l2,
+                                                   (int)sizeof l2);
+                        if (n1 != n2 || memcmp(l1, l2, (size_t)n1) != 0)
+                            bad++;
+                    }
+                snprintf(name, sizeof name,
+                         "staged==direct @(%d,%d) %d deg", cx, cy, deg);
+                expect(bad == 0, name);
+            }
+        }
+        /* cap exceeded -> refuses (caller falls back to direct) */
+        bc_stage_t stg;
+        expect(!bc_stage_region(frame, FW, FH, 0, 0, FW, FH, stage_buf,
+                                1024, &stg),
+               "oversized stage refused");
+    }
+
     if (fails) {
         printf("bc_locate selftest: %d FAILED\n", fails);
         return 1;
