@@ -1,6 +1,43 @@
 # Audio device capability token 設計
 
-ステータス: **設計合意、未実装 (2026-06-13)**。
+ステータス: **P1 排他 token + P3 overdub mixer 実装済み・実機検証済み
+（ブランチ `feat/audio-device-p1`、Tab5/COM8 2026-06-13）。P2 preempt と
+プロデューサー移行（tone/WAV/boot/JS）は未了**。
+
+実装メモ:
+
+- `components/audio_device/` 新規。純粋な状態機械
+  `audio_device_core.{c,h}`（FreeRTOS 非依存・ロックなし・副作用は
+  action list として返すだけ）と、その上の FreeRTOS ラッパ
+  `audio_device.{c,h}`（manager task + command queue、core を mutex で保護、
+  write ホットパスは token 検証後に `audio_tab5` へ直接）に分離。
+- core は `tools/audio_device_test.c` でホスト単体テスト（grant / queue 優先度+
+  FIFO / finish dispatch / abort / stale token 拒否 / START→GRANTED 順序 /
+  世代再利用 / キュー満杯拒否 / **MIXING の open・join・source 除去・最終 teardown** /
+  OVERDUB の EXCLUSIVE 衝突・format 不一致フォールバック）。
+  `gcc -fsanitize=address,undefined` で ALL PASS。
+- P3 mixer: OVERDUB stream ごとに source ring（16KB PSRAM）、`audio_mix` task が
+  各 ring から同一時間幅を取り `int32` 加算→`int16` 飽和→`audio_tab5` master へ。
+  EXCLUSIVE 経路は mixer を通らず従来どおり直書き（fast path 維持）。
+- `AUDIO_ACT_BACKEND_FLUSH` は現状 `audio_tab5_stop()`（drain）にマップ。
+  真の discard API は P2。
+- 実機検証（`CONFIG_MQJS_TAB5_AUDIO_DEVICE_SELFTEST`、`audio_device_selftest.c`、
+  起動時自己テスト）: S1 EXCLUSIVE+QUEUE（A→B 逐次、slot0 再利用 gen1→2）、
+  S2 CANCELABLE（queued D を `audio_request_cancel` で撤回→無音）、
+  S3 OVERDUB 旧来逐次、S4 **OVERDUB CHORD**（C5+E5+G5 を t=0 で一斉発音、
+  別 slot 0/1/2 gen6/7/8 で並行、~2s 三和音持続、`underruns=0`、実機クリーン確認）。
+- **mixer の onset ノイズ対策**: 旧 mixer は `max` フレーム出力＋短いソースを
+  ゼロ詰めしていたため、起動充填期に速いリングが毎 tick 削られ頭にノイズ。
+  修正＝(1) **min フレーム消費**（全寄与ソースから同数だけ取り、live ソースを
+  ゼロ詰めしない）、(2) **per-source prime gate**（各ソースは `PRIME_FRAMES`
+  ＝~10ms 充填するまで無音で待機しミックスを律速しない→一斉発音は全員 prime を
+  待ってから整列して入る／遅参も既存音を乱さない）、(3) ring 操作はテーブルを
+  ロックでスナップショット後 **ロックなし** で実行。実機で一斉発音もクリーン確認。
+- 自己テスト（`audio_device_selftest.c` / `CONFIG_MQJS_TAB5_AUDIO_DEVICE_SELFTEST`）は
+  検証専用。**既定 off**。通常起動は従来どおり起動 WAV 自動再生
+  （`CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV[_AUTOPLAY]`）。
+- 未了: P2 preempt（priority + cancel callback + ring 即時破棄）、
+  tone / WAV / boot 音楽 / JS binding を `audio_device` 経由へ移行。
 
 本書は、Opus / WAV / tone / boot 音楽など複数の音声プロデューサーを、
 Tab5 の単一スピーカーへ安全に合流させる `audio_device` 層を定義する。

@@ -1,0 +1,18 @@
+menu "Tab5 audio device arbitration"
+
+    config MQJS_TAB5_AUDIO_DEVICE_SELFTEST
+        bool "Boot-time audio_device token self-test"
+        depends on MQJS_TAB5_AUDIO
+        default n
+        help
+            Exercise the audio_device P1 exclusive-token layer on real
+            hardware shortly after boot: submit two overlapping requests so
+            the first is granted immediately and the second queues, play a
+            short beep through each granted token (audio_request ->
+            audio_stream_write -> audio_stream_finish), and log the
+            grant/queue/dispatch sequence plus audio_tab5 stats. Verifies
+            the manager task, token validation, and backend hand-off without
+            touching the existing tone/WAV producers. Leave off in shipping
+            builds.
+
+endmenu
