@@ -1,0 +1,32 @@
+menu "Tab5 audio output"
+
+    config MQJS_TAB5_AUDIO
+        bool "Enable Tab5 audio output (ES8388 + I2S)"
+        default n
+        depends on IDF_TARGET_ESP32P4
+        help
+            PCM playback path for the M5Stack Tab5 speaker: ES8388 codec
+            (esp_codec_dev driver, shared ui_tab5 I2C bus), I2S TX on
+            MCLK=G30/BCLK=G27/WS=G29/DOUT=G26, SPK_EN on the 0x43 IO
+            expander P1, and a PSRAM PCM ring buffer drained by a writer
+            task. Off by default so Stamp-P4 builds are unaffected; when
+            disabled audio_tab5.h provides no-op inline stubs.
+
+    config MQJS_TAB5_AUDIO_RING_KB
+        int "PCM ring buffer size (KB, PSRAM)"
+        depends on MQJS_TAB5_AUDIO
+        default 64
+        help
+            Bounded PCM queue between the decoder/producer and the I2S
+            writer task. 64 KB is ~340 ms of 48 kHz stereo 16-bit audio.
+
+    config MQJS_TAB5_AUDIO_SELFTEST
+        bool "Boot-time speaker self-test tone"
+        depends on MQJS_TAB5_AUDIO
+        default n
+        help
+            Play two short beeps ~3 s after boot and log ring/underrun
+            telemetry. P2 gate of docs/opus-decoder-plan.md: verifies the
+            PCM path (I2S + ES8388 + SPK_EN) without any codec involved.
+
+endmenu

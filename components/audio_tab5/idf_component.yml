@@ -1,0 +1,4 @@
+dependencies:
+  # ES8388 playback driver + esp_codec_dev abstraction, same version line
+  # as the official m5stack_tab5 BSP.
+  espressif/esp_codec_dev: "~1.5"
