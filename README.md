@@ -232,6 +232,14 @@ SDIO 接続の無線コプロセッサとして使います。
 ESP-IDF の導入と `idf.py` が使えるシェルの準備は、
 [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32p4/get-started/) を参照してください。
 
+Espressif Installation Manager (EIM) で導入した Windows 環境では、
+コマンドを実行するPowerShellごとに次を実行してください。
+
+```powershell
+. C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1
+$env:ESP_IDF_VERSION = '6.0'
+```
+
 ## クイックスタート: Tab5
 
 以下では PowerShell を使い、MQTT ブローカーを `192.168.1.2:1883`、
@@ -271,9 +279,6 @@ esp32p4-mqjs/task/my-tab5-a8f31c
 ```powershell
 $TASK_TOPIC = "esp32p4-mqjs/task/my-tab5-a8f31c"
 ```
-
-> EIM で ESP-IDF を有効化した環境では、ビルド前に
-> `$env:ESP_IDF_VERSION='6.0'` が必要な場合があります。
 
 ### 2. 署名鍵を作る
 
@@ -527,7 +532,8 @@ timeout 3 /tmp/run_pc ../../examples/life.js
 - Tab5 は `CONFIG_MQJS_TAB5_POWER=y` が必要です
 - SSID とパスワードを確認してください
 - ESP32-P4 自体には Wi-Fi がないため、C6 が必要です
-- EIM 環境ではビルド前に `$env:ESP_IDF_VERSION='6.0'` を試してください
+- EIM 環境では上記のPowerShellプロファイルを読み込み、
+  `$env:ESP_IDF_VERSION = '6.0'`を設定してください
 
 ### `requires chip revision` で書き込めない
 
