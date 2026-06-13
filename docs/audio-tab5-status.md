@@ -1,8 +1,12 @@
 # audio_tab5 — Tab5 スピーカー再生パス (opus-decoder-plan P2)
 
-ステータス: **実装済み・実機未検証 (2026-06-13)**。flash はユーザーのタイミング
-確認待ち。Opus デコーダ (`codex/opus-float-plan` worktree) と並行作業のため、
-本件は `feat/audio-tab5` ブランチ / 専用 worktree / 専用 `build_tab5` で行う。
+ステータス: **実機検証済み (2026-06-13, COM8 flash)**。ブート時のビープ +
+WAV 自動再生をユーザーが実聴確認。`tools/probe_audio.js` の MQTT テレメトリで
+frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレートで PCM 消費)、
+リングは 64KB で頭打ち (バックプレッシャー動作)、underrun は意図したギャップ
+のみ (再生中の途切れなし)。Opus デコーダ (`codex/opus-float-plan` worktree) と
+並行作業のため、本件は `feat/audio-tab5` ブランチ / 専用 worktree / 専用
+`build_tab5` で行う。
 
 ## 実装
 
@@ -24,13 +28,20 @@
 - 非 Tab5 build は inline stub (`ui_tab5.h` と同パターン)、Kconfig
   `CONFIG_MQJS_TAB5_AUDIO` で sources ごと外れる。
 
-## P2 ゲートの検証手順 (flash 後)
+## P2 ゲートの検証手順 (flash 後) — 2026-06-13 PASS
 
 1. `CONFIG_MQJS_TAB5_AUDIO_SELFTEST=y` でブート ~3 秒後に 880Hz /
-   1319Hz の 300ms ビープ ×2 がスピーカーから鳴る。
-2. ログ `audio5: SELFTEST done: frames=... underruns=...` —
-   underruns はトーン間ギャップの 1 のみが期待値。
-3. タッチ / カメラの回帰がないこと (I2C 共有の確認)。
+   1319Hz の 300ms ビープ ×2 がスピーカーから鳴る。**実聴 OK。**
+2. `CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY=y` で続けて WAV 自動再生。
+   **実聴 OK。**
+3. `tools/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
+   audio.stats() を時系列で publish。確認済み実測 (COM 不要):
+   - playWav 347584 → wav-2s 453120 → wav-5s 596992 frames = **48000/s
+     ちょうど** (I2S が正レートで消費)。
+   - 再生中 queued ≈ 65280/65536 (リング満杯 = バックプレッシャー)。
+   - underruns はトーン後/WAV 後のドレインのみ (途切れなし)。
+   probe 後は `tools/dev_idle.js` を push して dev スロット復元。
+4. タッチ / カメラの回帰がないこと (I2C 共有の確認) — 未確認 (次回)。
 
 ## JS バインディング `audio.*` (commit af2c98a, PC 検証済み)
 
