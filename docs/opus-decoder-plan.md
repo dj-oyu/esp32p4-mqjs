@@ -858,19 +858,64 @@ comb 単体 microbench 1.96x（tap毎3ブロック再ロードが律速；ブロ
   aligned temp + memcpy。
 - relaxed 化（sum 分割・signed-lo 分割）で opus_compare 許容内、register も節約。
 
-### 次カーネル候補（ROI 順）
+### 次カーネル候補（ROI 順・再開ガイド）
 
-1. **逆MDCT/FFT butterflies**（~18%、最大）: 連続データ（未整列スライディング窓
-   なし）、`fft.cmul.s16`/`vmul.s32.s16xs16`+`ldxq` twiddle gather。複素演算で重い。
-2. **denormalise_bands**（~6%）: `f[j]=MULT16_32_Q15(x[j],g)>>shift`、x=int16連続、
-   g/shift帯域不変、スライディング窓なし=combより素直。band offset は未整列なので
-   x load=src.q、f store=temp/memcpy。common path（shift>=0）を PIE、edge は C。
-3. **normalise_residual**（~7%）: `X[i]=clamp16((g·iy[i])>>(k+1))`、16×16+round+
-   clamp16。PIE-native（srs 向き）だが出力 int16 の narrowing が要る。
-4. comb 速度最適化: tap 間でアラインブロック共有→1.96x を~3x へ、end-to-end +1-2%。
+各候補は comb 同様の手順: **C ref（bit-exact）→ host test → PIE asm（8要素/呼）→
+未整列対応 → microbench で C 比 maxdiff+速度 → codec 統合 → 実機音質確認**。
+combで確立した PIE 知見（§上）と `opus_p4_comb8.S`/`opus_p4_kernels.c` の
+comb 実装が雛形になる。各々 ~10-25 build/flash iteration を見込む。
 
-各カーネルは comb 同様 C ref→host test→PIE asm→未整列対応→codec統合→音質確認の
-multi-iteration。
+**1. denormalise_bands（最も素直・推奨スタート、~6%）**
+- 位置: `celt/bands.c:209` `denormalise_bands`、内側 common path（`shift>=0`）は
+  `bands.c:273` `*f++ = SHR32(MULT16_32_Q15(*x, g), shift)`。
+- カーネル ABI 案: `void opus_p4_denorm_band(int32_t *f, const int16_t *x, int N,
+  int32_t g, int shift)`。`f[j] = MULT16_32_Q15(x[j], g) >> shift`。
+- PIE: x=int16連続なので `vld.128` で 8 個直接ロード（**vunzip 不要**＝combより楽）。
+  g は帯域不変→`g_hi=(s16)(g>>16)`, `g_lo=(s16)(g&0xffff)` を一度分割・broadcast。
+  `m = (x·g_hi)·2 + (x·g_lo)>>15`（`vmul.s32.s16xs16` SAR=0 raw、vadd で×2、
+  もう一方 vsr SAR=15）、`f = m >> shift`（vsr SAR=shift）、`vst.128`×2。
+- 未整列: x は band offset で未整列→src.q ロード。f も未整列→aligned temp+memcpy。
+- relaxed: g_lo を signed 扱い（本来 MULT16_16SU は unsigned）で ~x·2 の誤差
+  （~-78dB）。edge（`shift<0`/silence/gain cap）は C フォールバック。
+- スライディング窓なし＝comb の最難所が無い。**最初に着手すべき**。
+
+**2. normalise_residual（~7%）**
+- 位置: `celt/vq.c:121`、`X[i] = EXTRACT16(PSHR32(MULT16_16(g, iy[i]), k+1))`。
+- 16×16（g,iy とも s16 に収まる）→ round-shift(k+1) → clamp16。出力 int16。
+- PIE-native（`vmulas.s16`+`srs` 向き）だが **出力 int16 の narrowing**（s32→s16
+  飽和）と round が要る。iy は `int*` だが値は小（s16 化可）。
+
+**3. 逆MDCT/FFT butterflies（最大 ~18%、ただし最難）**
+- 位置: `celt/kiss_fft.c` `kf_bfly5`(238)/`kf_bfly3`(180)/`kf_bfly4`(108)。
+  hot は radix 3/4/5（radix-2 `fft.r2bf` は CELT でほぼ未使用）。
+- データ連続（`Fout[u]`/`Fout[m+u]` を u 方向）＝**未整列スライディング窓なし**。
+  ただし複素演算（C_MUL=実4積）と twiddle 飛び飛び（`twiddles[u·fstride]`→
+  `ldxq` gather、未検証）。32bit complex data × 16bit twiddle＝16×32 を
+  `vmul.s32.s16xs16` で。`fft.cmul.s16` は 16bit data 用なので精度要検討。
+- 仕様（bit-exact 契約）は §「kf_bfly bit-exact 契約」に既出。最大利得だが
+  実装は comb 以上。denormalise で PIE 複素 MAC の足場を固めてから推奨。
+
+**4. comb 速度最適化（~+1-2%、低リスク）**
+- 現状 `opus_p4_comb8` は tap 毎に 3 aligned block 再ロード→1.96x。5 tap の窓は
+  `x[i-T-2..i-T+9]` を共有するので、span を一度ロード→virtual-align（src.q 1回）
+  → 各 tap は固定シフト src.q、で再ロードを削減し ~3x へ。register pressure に注意
+  （V0..V2 永続 + vmul 用）。
+
+### ビルド/計測コマンド（再開用）
+
+```powershell
+. C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1; $env:ESP_IDF_VERSION='6.0'
+# fixed + PIE comb の decode bench:
+idf.py -B build_opus_combpie "-DSDKCONFIG=sdkconfig.opus_combpie" `
+  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults;sdkconfig.opus-bench.defaults;sdkconfig.opus-fixed.defaults;sdkconfig.opus-comb-pie.defaults" build
+idf.py -B build_opus_combpie -p COM8 flash
+python -m esptool --chip esp32p4 -p COM8 --before default-reset --after watchdog-reset flash-id
+python tools/capture_com8.py COM8 40
+# .S 単体アセンブル確認: riscv32-esp-elf-gcc -c -march=rv32imafc_..._xesploop_xespv2p1 ...
+# 音質確認は build_opus_playpie（sdkconfig.opus-play.defaults を足す）で autoplay。
+```
+microbench（C vs PIE の maxdiff/速度）は `opus_p4_kernels.c` の `opus_p4_comb_bench`
+が雛形。新カーネルも同様に boot で 1 回計測してから codec 統合する。
 
 ## 15. 参考
 
