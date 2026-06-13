@@ -400,6 +400,12 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
     const float amp = 0.25f * 32767.0f;
     const float step = 2.0f * (float)M_PI * (float)freq_hz / (float)s_rate;
     size_t total = (size_t)s_rate * (size_t)duration_ms / 1000;
+    /* linear fade in/out (~5 ms) so short tones don't click. Without it a
+       tone starts/ends mid-cycle -> a step discontinuity the ear hears as a
+       plosive "pop" rather than a beep, which dominates very short tones. */
+    size_t fade = (size_t)s_rate / 200;
+    if (fade > total / 2)
+        fade = total / 2;
     int16_t buf[240 * 2];
     float phase = 0.0f;
     int producer_ch = s_ch;
@@ -408,7 +414,15 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
         if (n > 240)
             n = 240;
         for (size_t i = 0; i < n; i++) {
-            int16_t v = (int16_t)(amp * sinf(phase));
+            size_t pos = off + i;
+            float env = 1.0f;
+            if (fade > 0) {
+                if (pos < fade)
+                    env = (float)pos / (float)fade;
+                else if (pos >= total - fade)
+                    env = (float)(total - 1 - pos) / (float)fade;
+            }
+            int16_t v = (int16_t)(amp * env * sinf(phase));
             phase += step;
             if (phase > 2.0f * (float)M_PI)
                 phase -= 2.0f * (float)M_PI;
@@ -582,7 +596,9 @@ bool audio_tab5_play_boot_wav(void)
 static void selftest_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(3000)); /* let UI / Wi-Fi bring-up settle */
+    /* No fixed settle delay: app_main starts this once the ES8388's shared
+       I2C bus is up (ui_tab5_start). Audio needs no network, so it does not
+       wait on Wi-Fi. The readiness is the call site, not a timer. */
 
 #if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     esp_err_t err = audio_tab5_start(48000, 2);

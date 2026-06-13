@@ -27,9 +27,10 @@ sys.setAppName("reading");
 var SELFTEST = false; /* true にすると PC でロジック検証だけ走る */
 var HAS_UI = !SELFTEST && ui.size()[0] !== 0;
 
-var BROKER = "mqtt://192.168.1.2";
-var REQ_T = "esp32p4-mqjs/ndl/req";
-var RES_T = "esp32p4-mqjs/ndl/res";
+/* broker も topic prefix もプラットフォーム任せ: 接続は mqtt.connect(token)、
+   トピックは net.topic(leaf) で共通 prefix を前置。 */
+var REQ_T = net.topic("ndl/req");
+var RES_T = net.topic("ndl/res");
 var MAX_BOOKS = 25; /* NVS 値 3.9KB に収める */
 
 /* ===== モデル ===== */
@@ -586,7 +587,9 @@ function selftest() {
 if (HAS_UI) {
     load();
     mqtt.subscribe(RES_T, ndlReply);
-    mqtt.connect(BROKER); /* 日和見: ブローカー不在でも手入力で全機能可 */
+    /* net.onReady でリンク確立(=token)を待って接続。broker はプラットフォーム
+       既定 (mqtt.connect(token))。日和見: ブローカー不在でも手入力で全機能可。 */
+    net.onReady(function (token) { mqtt.connect(token); });
     buildHome();
     setInterval(mqTick, MQ_TICK);
     sys.onForeground(goHome);

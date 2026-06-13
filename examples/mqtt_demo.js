@@ -45,7 +45,12 @@ mqtt.subscribe(TOPIC, function (t, p) {
         stRx.setText("rx: " + p);
 });
 
-mqtt.connect(BROKER);
+/* net.onReady でリンク確立(=token)を待ってから接続。token は capability で、
+   これ無しに mqtt.connect は呼べない。BROKER は公開テストブローカーなので明示
+   指定する (省略すればプラットフォーム既定 broker = mqtt.connect(token))。 */
+net.onReady(function (token) {
+    mqtt.connect(token, BROKER);
+});
 
 function publishNow() {
     if (!mqtt.connected())

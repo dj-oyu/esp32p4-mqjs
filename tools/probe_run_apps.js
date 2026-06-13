@@ -49,4 +49,4 @@ mqtt.onConnect(function () {
         }, 4000);
     }, 4000);
 });
-mqtt.connect("mqtt://192.168.1.2");
+net.onReady(function (token) { mqtt.connect(token); });
