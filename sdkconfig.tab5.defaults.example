@@ -53,3 +53,7 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
 # Speaker playback path (ES8388 + I2S; audio_tab5 component).
 CONFIG_MQJS_TAB5_AUDIO=y
+# Optional: embed assets/audio/tab5-boot.wav (~1.2 MB) so audio.playWav()
+# works without a filesystem. Off by default — it grows every flash.
+# CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV=y
+# CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY=y

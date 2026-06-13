@@ -29,4 +29,23 @@ menu "Tab5 audio output"
             telemetry. P2 gate of docs/opus-decoder-plan.md: verifies the
             PCM path (I2S + ES8388 + SPK_EN) without any codec involved.
 
+    config MQJS_TAB5_AUDIO_BOOT_WAV
+        bool "Embed assets/audio/tab5-boot.wav in the firmware"
+        depends on MQJS_TAB5_AUDIO
+        default n
+        help
+            Embed the WAV at assets/audio/tab5-boot.wav (16-bit PCM) into
+            the binary so it can be played without a filesystem, via
+            audio.playWav() / audio_tab5_play_boot_wav(). The asset is
+            ~1.2 MB and grows every flash — leave off unless testing the
+            real-audio playback path.
+
+    config MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+        bool "Play the embedded boot WAV ~3 s after boot"
+        depends on MQJS_TAB5_AUDIO_BOOT_WAV
+        default n
+        help
+            Fire audio_tab5_play_boot_wav() shortly after boot (shares the
+            self-test delay path). Handy for a hands-off playback check.
+
 endmenu

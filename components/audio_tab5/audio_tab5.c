@@ -34,6 +34,7 @@
 #include "esp_log.h"
 #include "ui_tab5.h"
 #include "audio_tab5.h"
+#include "wav.h"
 
 #define AUD_I2S_MCLK GPIO_NUM_30
 #define AUD_I2S_BCLK GPIO_NUM_27
@@ -62,6 +63,8 @@ static int s_ch = 2;
 static int s_vol = 70;
 static volatile uint32_t s_underruns;
 static volatile uint64_t s_frames_written;
+static volatile bool s_wav_playing;
+static volatile bool s_wav_abort;
 
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
 static esp_err_t spk_enable(i2c_master_bus_handle_t bus, bool on)
@@ -311,6 +314,7 @@ esp_err_t audio_tab5_stop(void)
 {
     if (!s_inited)
         return ESP_OK;
+    s_wav_abort = true; /* unblock any WAV streamer waiting on the ring */
     s_running = false;
     /* let the writer drain what the producer already queued */
     for (int i = 0; i < 100; i++) {
@@ -434,32 +438,148 @@ bool audio_tab5_tone_async(int freq_hz, int duration_ms)
     return true;
 }
 
-/* ---- boot self-test (P2 gate) ---------------------------------------- */
+/* ---- WAV playback ---------------------------------------------------- */
+/* Parse a RIFF/WAVE blob held in memory and stream its PCM through the
+ * normal pipeline. Blocking: feeds in chunks with backpressure, so the
+ * caller is held for ~the clip duration (run it on a task — see the
+ * async wrapper). audio_tab5_stop() / a new play aborts via s_wav_abort.
+ * (s_wav_playing / s_wav_abort are declared with the other state up top
+ * so audio_tab5_stop() can reach them.) */
+esp_err_t audio_tab5_play_wav_mem(const uint8_t *data, size_t len)
+{
+    wav_info_t w;
+    if (!wav_parse_mem(data, len, &w))
+        return ESP_ERR_INVALID_ARG;
+    if (w.format_tag != 1 || w.bits_per_sample != 16)
+        return ESP_ERR_NOT_SUPPORTED; /* only integer 16-bit PCM */
+    if (w.channels < 1 || w.channels > 2)
+        return ESP_ERR_NOT_SUPPORTED;
+
+    ESP_RETURN_ON_ERROR(audio_tab5_start(w.sample_rate, w.channels), TAG,
+                        "wav start %lu Hz", (unsigned long)w.sample_rate);
+
+    const size_t frame_samples = w.channels;        /* s16 per frame */
+    const size_t total_frames = w.pcm_bytes / (frame_samples * 2);
+    const int16_t *pcm = (const int16_t *)(const void *)w.pcm;
+
+    ESP_LOGI(TAG, "wav: %lu Hz %uch %u frames (%.2fs)",
+             (unsigned long)w.sample_rate, w.channels, (unsigned)total_frames,
+             (double)total_frames / (double)w.sample_rate);
+
+    s_wav_abort = false;
+    s_wav_playing = true;
+    size_t done = 0;
+    esp_err_t ret = ESP_OK;
+    while (done < total_frames && !s_wav_abort) {
+        size_t n = total_frames - done;
+        if (n > 4096)
+            n = 4096;
+        size_t sent = audio_tab5_write(pcm + done * frame_samples, n, 2000);
+        if (sent == 0) { /* writer stuck >2 s: give up rather than hang */
+            ret = ESP_ERR_TIMEOUT;
+            break;
+        }
+        done += sent;
+    }
+    s_wav_playing = false;
+    return s_wav_abort ? ESP_OK : ret;
+}
+
+typedef struct {
+    const uint8_t *data;
+    size_t len;
+} wav_req_t;
+
+static void wav_task(void *arg)
+{
+    wav_req_t req = *(wav_req_t *)arg;
+    free(arg);
+    esp_err_t err = audio_tab5_play_wav_mem(req.data, req.len);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "wav play: %s", esp_err_to_name(err));
+    vTaskDelete(NULL);
+}
+
+bool audio_tab5_play_wav_mem_async(const uint8_t *data, size_t len)
+{
+    if (!data || len < 44)
+        return false;
+    if (s_wav_playing) /* preempt the current clip, then start the new one */
+        s_wav_abort = true;
+    wav_req_t *req = malloc(sizeof *req);
+    if (!req)
+        return false;
+    req->data = data;
+    req->len = len;
+    /* slightly bigger stack than tone: wav_parse + logging */
+    if (xTaskCreate(wav_task, "audio_wav", 4096, req, 6, NULL) != pdPASS) {
+        free(req);
+        return false;
+    }
+    return true;
+}
+
+bool audio_tab5_wav_playing(void)
+{
+    return s_wav_playing;
+}
+
+/* ---- firmware-embedded boot WAV ------------------------------------- */
+#if CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV
+/* EMBED_FILES (see CMakeLists) exposes the blob as these linker symbols.
+   Embedded with the .bin trailing-NUL convention off (binary file), so
+   _end marks one past the last byte. */
+extern const uint8_t boot_wav_start[] asm("_binary_tab5_boot_wav_start");
+extern const uint8_t boot_wav_end[]   asm("_binary_tab5_boot_wav_end");
+
+bool audio_tab5_play_boot_wav(void)
+{
+    return audio_tab5_play_wav_mem_async(boot_wav_start,
+                                         (size_t)(boot_wav_end - boot_wav_start));
+}
+#else
+bool audio_tab5_play_boot_wav(void)
+{
+    ESP_LOGW(TAG, "no boot WAV embedded (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV off)");
+    return false;
+}
+#endif
+
+/* ---- boot self-test (P2 gate) + optional WAV autoplay --------------- */
 static void selftest_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(3000)); /* let UI / Wi-Fi bring-up settle */
+
+#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     esp_err_t err = audio_tab5_start(48000, 2);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SELFTEST start failed: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
-        return;
-    }
-    audio_tab5_set_volume(70);
-    err = audio_tab5_tone(880, 300);
     if (err == ESP_OK) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        err = audio_tab5_tone(1319, 300);
+        audio_tab5_set_volume(70);
+        err = audio_tab5_tone(880, 300);
+        if (err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            err = audio_tab5_tone(1319, 300);
+        }
+        audio_tab5_stop();
+        audio_tab5_stats_t st;
+        audio_tab5_get_stats(&st);
+        ESP_LOGI(TAG,
+                 "SELFTEST %s: frames=%llu underruns=%lu (1 expected: the gap "
+                 "between the tones) queued=%lu",
+                 err == ESP_OK ? "done" : esp_err_to_name(err),
+                 (unsigned long long)st.frames_written,
+                 (unsigned long)st.underruns, (unsigned long)st.queued_bytes);
+    } else {
+        ESP_LOGE(TAG, "SELFTEST start failed: %s", esp_err_to_name(err));
     }
-    audio_tab5_stop();
-    audio_tab5_stats_t st;
-    audio_tab5_get_stats(&st);
-    ESP_LOGI(TAG,
-             "SELFTEST %s: frames=%llu underruns=%lu (1 expected: the gap "
-             "between the tones) queued=%lu",
-             err == ESP_OK ? "done" : esp_err_to_name(err),
-             (unsigned long long)st.frames_written,
-             (unsigned long)st.underruns, (unsigned long)st.queued_bytes);
+#endif
+
+#if CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG, "boot WAV autoplay");
+    audio_tab5_play_boot_wav(); /* spawns its own streamer task */
+#endif
+
     vTaskDelete(NULL);
 }
 

@@ -63,6 +63,21 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms);
  * is never stalled. duration_ms capped at 5000. */
 bool audio_tab5_tone_async(int freq_hz, int duration_ms);
 
+/* Parse a RIFF/WAVE blob (16-bit integer PCM, 1|2 ch) held in memory
+ * and stream it through the pipeline. Blocking ~clip duration. */
+esp_err_t audio_tab5_play_wav_mem(const uint8_t *data, size_t len);
+
+/* Async wrapper: spawns a task to play the blob; a clip already playing
+ * is preempted. true = task started. The buffer must outlive playback
+ * (an embedded blob or a static buffer — not a stack copy). */
+bool audio_tab5_play_wav_mem_async(const uint8_t *data, size_t len);
+bool audio_tab5_wav_playing(void);
+
+/* Play the firmware-embedded boot WAV (assets/audio/tab5-boot.wav).
+ * true = started; false if no WAV was embedded
+ * (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV off). */
+bool audio_tab5_play_boot_wav(void);
+
 /* Spawn a one-shot task: wait 3 s after boot, beep twice, log stats.
  * Wired into app_main behind CONFIG_MQJS_TAB5_AUDIO_SELFTEST. */
 void audio_tab5_selftest_async(void);
@@ -107,6 +122,20 @@ static inline bool audio_tab5_tone_async(int freq_hz, int duration_ms)
     (void)duration_ms;
     return false;
 }
+static inline esp_err_t audio_tab5_play_wav_mem(const uint8_t *data, size_t len)
+{
+    (void)data;
+    (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+static inline bool audio_tab5_play_wav_mem_async(const uint8_t *data, size_t len)
+{
+    (void)data;
+    (void)len;
+    return false;
+}
+static inline bool audio_tab5_wav_playing(void) { return false; }
+static inline bool audio_tab5_play_boot_wav(void) { return false; }
 static inline void audio_tab5_selftest_async(void) {}
 
 #endif /* CONFIG_MQJS_TAB5_AUDIO */

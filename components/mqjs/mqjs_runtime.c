@@ -2683,6 +2683,24 @@ JSValue js_audio_volume(JSContext *ctx, JSValue *this_val, int argc,
 #endif
 }
 
+/* audio.playWav() -> true if playback started. Streams the
+   firmware-embedded boot WAV (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV) through
+   the pipeline. The real-audio playback verifier, callable over MQTT. */
+JSValue js_audio_playwav(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    return JS_NewBool(audio_tab5_play_boot_wav());
+#else
+    printf("[audio] playWav() (stub)\n");
+    return JS_NewBool(0);
+#endif
+}
+
 /* audio.stats() -> JSON string. Remote readback (no usable serial in
    the field): running, rate, channels, queued PCM bytes, underruns,
    total frames written to I2S. */

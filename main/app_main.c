@@ -102,8 +102,8 @@ void app_main(void)
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus
                                             (no-op stubs elsewhere) */
-#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
-    audio_tab5_selftest_async(); /* P2 gate: boot beep through ES8388/I2S */
+#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+    audio_tab5_selftest_async(); /* P2 gate: boot beep + optional WAV autoplay */
 #endif
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */

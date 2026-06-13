@@ -44,6 +44,11 @@ if (HAS_UI) {
             setTimeout(function () { beep(784, 250); }, 500);
             setTimeout(refresh, 900);
         });
+        s.button("WAV 再生", function () {
+            var ok = audio.playWav();
+            print("[audio] playWav -> " + ok);
+            setTimeout(refresh, 800);
+        });
         s.button("音量 +10", function () {
             vol = audio.volume(Math.min(100, vol + 10));
             volLbl.setText("音量: " + vol + "%");
