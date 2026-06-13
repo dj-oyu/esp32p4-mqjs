@@ -641,7 +641,70 @@ idf.py -B build_opus_asm_verify `
 compile-time dispatch、verify/fallback経路。実機速度の改善は期待せず、
 ASM本体へ置換した後にportable baselineと比較する。
 
-## 14. 参考
+## 14. anti-collapse 実 ASM 結果と PIE 適用判定
+
+### 実 ASM 結果（scalar branchless）
+
+`opus_p4_anti_collapse_noise_p4.S` の tail-call scaffold を、実際の RV32 scalar
+ループへ置換した（branch しない符号選択）。
+
+- LCG 状態をレジスタ保持（`mul`/`add`）、符号選択を整数ドメインで実施:
+  `nb = bits(-r) = bits(r) ^ 0x80000000`、出力語 = `nb ^ (seed&0x8000 のとき sign bit)`。
+  C の `(seed&0x8000)?r:-r` と bit-exact のため verify harness（memcmp）を厳密に通過。
+- pseudo-random bit に対する分岐を排除（C 三項演算子の ~50% mispredict を回避）。
+  stack frame なし。caller-saved のみ使用。
+
+2026-06-13、COM8 実測（ESP32-P4 rev 1.3、360 MHz、ESP-IDF 6.0.1、5 周測定）:
+
+| build | kernel | cycles/frame | load | pcm_fnv | verify_failures |
+|---|---|---:|---:|---|---:|
+| baseline | portable-c | 844.2 | 11.25% | `37e8c5b59e9a40c6` | 0 |
+| asm | scalar (verified) | 842.4 | 11.23% | `37e8c5b59e9a40c6` | 0 |
+
+bit-exact（PCM hash 同値）かつ `verify_failures=0` で正しいが、改善は約 **0.2%**
+に留まる。理由は (1) noise-fill LCG ループは `anti_collapse` self-cycle
+（profile で 14.75M/100f）のごく一部で、大半は per-band **renormalize**、
+(2) fill は collapsed band でのみ発火し、この music fixture では稀。
+ユーザー判断で「正しく検証済みの ABI/verify/dispatch を実機で実証する scaffold」
+として **維持**する。
+
+### ESP32-P4 PIE 適用可否（toolchain で実証）
+
+`xespv2p1`（PIE vector）+ `xesploop`（hardware loop）の assembler に対し、
+mnemonic を直接アセンブルして可否を確認した。
+
+| 命令 | 可否 |
+|---|---|
+| `esp.vmul.s16` / `esp.vmulas.s16.qacc` | OK（16-bit 整数 SIMD・MAC） |
+| `esp.vadd.s32` / `esp.vsub.s32` / `esp.andq` / `esp.notq` | OK（32-bit 加減算・論理） |
+| `esp.vst.128.ip` / `esp.vld.128.ip` | OK（128-bit aligned 連続 load/store） |
+| `esp.lp.setup` / `esp.lp.starti` | OK（hardware loop） |
+| `esp.vmul.s32` / `esp.vmul.u32` | **不可（opcode 不在）** — 32-bit 整数乗算なし |
+| `esp.vmul.f32` / `esp.vadd.f32` / `esp.vmulas.f32.qacc` | **不可（opcode 不在）** — float SIMD なし |
+
+結論:
+
+- **PIE は float 非対応**。`esp_opus_float` の dot-product / rotation / MDCT は
+  すべて scalar FPU で動く。float decode path に PIE で置換できる命令は存在しない。
+- **anti-collapse noise-fill は PIE 非適合**。LCG が 32-bit 整数乗算を要するが
+  PIE は s16 までしか乗算がなく、書き込みは stride `1<<LM` の scatter で、
+  PIE の連続 128-bit store では表現できない。scalar branchless が最適。
+
+### 方針: fixed-point + PIE へ pivot
+
+PIE が効くのは **fixed-point opus build**（`FIXED_POINT`）のみ。CELT/SILK の
+16/32-bit 整数カーネル（inner_prod, comb filter, MDCT butterfly, SILK LPC,
+resampler 等）が s16 SIMD + QACC MAC へ乗る。次ステップ:
+
+1. fixed-point decode build を有効化し、bench で fixed baseline cycles/frame を取得。
+2. fixed-point build を re-profile し、PIE 適合の hot 整数カーネルを特定。
+3. 上位カーネルから `*_p4.S` を PIE 実装。bit-exact（fixed は厳密一致必須）を
+   verify harness で確認し、before/after を記録。
+
+float build の scalar 最適化（hardware loop / FMA scheduling）は PIE なしの
+控えめな改善に留まるため、PIE を主目的とする本ブランチでは fixed-point を優先する。
+
+## 15. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
   - https://components.espressif.com/components/78/esp-opus/versions/1.0.5/readme
