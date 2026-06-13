@@ -100,6 +100,7 @@ static inline void fft_capture(int16_t v)
 static volatile bool s_hpf_on;
 static float s_hb0, s_hb1, s_hb2, s_ha1, s_ha2;
 static float s_hx1, s_hx2, s_hy1, s_hy2;
+static float s_hgain = 1.0f; /* output scale so the resonance peak <= 0 dBFS */
 
 void audio_tab5_set_hpf(int fc_hz, float q)
 {
@@ -116,8 +117,25 @@ void audio_tab5_set_hpf(int fc_hz, float q)
     s_ha1 = -2.0f * cw / a0;
     s_ha2 = (1.0f - alpha) / a0;
     s_hx1 = s_hx2 = s_hy1 = s_hy2 = 0.0f;
+    /* find the filter's peak magnitude response and normalize the output to
+       it, so a resonant (high-Q) bump can't push a full-scale input past
+       0 dBFS and clip in the int16 clamp below (that clipping was itself the
+       low-frequency noise). The resonance SHAPE (peak relative to passband)
+       is preserved; only the absolute level drops. */
+    float maxg = 1.0f;
+    for (int i = 1; i <= 48; i++) {
+        float ww = (float)M_PI * (float)i / 48.0f;
+        float c1 = cosf(ww), s1 = sinf(ww), c2 = cosf(2.0f * ww), s2 = sinf(2.0f * ww);
+        float nr = s_hb0 + s_hb1 * c1 + s_hb2 * c2;
+        float ni = -(s_hb1 * s1 + s_hb2 * s2);
+        float dr = 1.0f + s_ha1 * c1 + s_ha2 * c2;
+        float di = -(s_ha1 * s1 + s_ha2 * s2);
+        float g = sqrtf((nr * nr + ni * ni) / (dr * dr + di * di));
+        if (g > maxg) maxg = g;
+    }
+    s_hgain = 1.0f / maxg;
     s_hpf_on = true;
-    ESP_LOGI(TAG, "hpf on: fc=%dHz Q=%.2f", fc_hz, (double)q);
+    ESP_LOGI(TAG, "hpf on: fc=%dHz Q=%.2f peakgain=%.2f", fc_hz, (double)q, (double)maxg);
 }
 
 static inline int16_t hpf_apply(int16_t in)
@@ -128,10 +146,11 @@ static inline int16_t hpf_apply(int16_t in)
     float y = s_hb0 * x + s_hb1 * s_hx1 + s_hb2 * s_hx2
               - s_ha1 * s_hy1 - s_ha2 * s_hy2;
     s_hx2 = s_hx1; s_hx1 = x;
-    s_hy2 = s_hy1; s_hy1 = y;
-    if (y > 32767.0f) y = 32767.0f;
-    else if (y < -32768.0f) y = -32768.0f;
-    return (int16_t)y;
+    s_hy2 = s_hy1; s_hy1 = y;   /* feedback uses the un-scaled biquad output */
+    float out = y * s_hgain;    /* level normalized so the peak <= 0 dBFS */
+    if (out > 32767.0f) out = 32767.0f;
+    else if (out < -32768.0f) out = -32768.0f;
+    return (int16_t)out;
 }
 
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
