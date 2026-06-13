@@ -23,7 +23,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     PRIV_INCLUDE_DIRS "${MQJS_DIR}" "${GEN_DIR}"
     PRIV_REQUIRES driver esp_driver_gpio esp_driver_i2c esp_timer nvs_flash
-                  ui_tab5 sshc cam_tab5 esp_http_client esp-tls mbedtls
+                  ui_tab5 sshc cam_tab5 audio_tab5 esp_http_client esp-tls mbedtls
 )
 
 # Vendored engine: uint32_t is 'long unsigned int' on riscv32, so the
