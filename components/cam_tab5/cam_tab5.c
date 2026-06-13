@@ -201,19 +201,55 @@ static void hit_record(FrameHit *disp, const ean13_scan_t *st, int theta,
     disp->by = by;
 }
 
+/* One scanline at (theta, off) through the region center: sample,
+ * decode, record overlay info. True on a prefix-matching decode
+ * (copied into out); st is left filled for the caller's heuristics. */
+static bool scan_one_line(const uint16_t *px, int w, int h,
+                          const bc_region_t *rg, int theta, int off,
+                          int half, uint8_t *line, char out[14],
+                          FrameHit *disp, ean13_scan_t *st)
+{
+    float th = theta * (float)M_PI / 180.0f;
+    float ux = cosf(th), uy = sinf(th);
+    float vx = -uy, vy = ux;
+    int n = bc_sample_line(px, w, h, rg->cx, rg->cy, theta, off, half,
+                           line, CAM_W);
+    int hit = ean13_scan_gray_line(line, n, st);
+    float sx = rg->cx + vx * off - ux * (n / 2);
+    float sy = rg->cy + vy * off - uy * (n / 2);
+    hit_record(disp, st, theta,
+               (int)(sx + ux * st->x0), (int)(sy + uy * st->x0),
+               (int)(sx + ux * st->x1), (int)(sy + uy * st->x1));
+    if (hit && prefix_ok(st->code)) {
+        memcpy(out, st->code, 14);
+        return true;
+    }
+    return false;
+}
+
+/* θ-fan band: a near-miss with this many digits usually means the
+ * scanline geometry is slightly off (theta is 1°-quantized and only
+ * refreshed every 3rd frame), drifting the line ends out of the bar
+ * band and clipping end digits. digits=12 = checksum/parity fail —
+ * one digit misread by contrast, not geometry; the fan can't help. */
+#define FAN_MIN_DIGITS 8
+#define FAN_MAX_DIGITS 11
+
+static int s_fan_runs, s_fan_hits; /* per-scan telemetry, see perf[] */
+
 /* Dense pass across the localized barcode region: 16 scanlines through
  * the region center ALONG the gradient direction theta (so tilt and
  * orientation no longer matter), offset across the bar direction, each
  * with ±1px binning along the bars (bc_sample_line) — this is what
- * reads the weak-contrast/shadowed codes the coarse grid misses. */
+ * reads the weak-contrast/shadowed codes the coarse grid misses.
+ * When the pass ends in a fan-band near-miss, retry a small θ±2°/±4°
+ * fan around the best offset in the SAME frame (a scanline re-sample
+ * is sub-ms; the alternative is waiting a frame for fresh theta). */
 static bool scan_region(const uint16_t *px, int w, int h,
                         const bc_region_t *rg, uint8_t *line, char out[14],
                         FrameHit *disp)
 {
     ean13_scan_t st;
-    float th = rg->theta * (float)M_PI / 180.0f;
-    float ux = cosf(th), uy = sinf(th);
-    float vx = -uy, vy = ux;
     int dx = rg->x1 - rg->x0, dy = rg->y1 - rg->y0;
     int half = (int)(sqrtf((float)(dx * dx + dy * dy)) * 0.5f) + 48;
     if (half > CAM_W / 2)
@@ -221,20 +257,30 @@ static bool scan_region(const uint16_t *px, int w, int h,
     int vext = (dx < dy ? dx : dy) / 2; /* bar extent ~ smaller bbox side */
     if (vext < 16)
         vext = 16;
+    int best_dig = 0, best_off = 0;
     for (int k = 0; k < 16; k++) {
         int off = vext * (2 * k + 1 - 16) / 16;
-        int n = bc_sample_line(px, w, h, rg->cx, rg->cy, rg->theta, off,
-                               half, line, CAM_W);
-        int hit = ean13_scan_gray_line(line, n, &st);
-        float sx = rg->cx + vx * off - ux * (n / 2);
-        float sy = rg->cy + vy * off - uy * (n / 2);
-        hit_record(disp, &st, rg->theta,
-                   (int)(sx + ux * st.x0), (int)(sy + uy * st.x0),
-                   (int)(sx + ux * st.x1), (int)(sy + uy * st.x1));
-        if (hit && prefix_ok(st.code)) {
-            memcpy(out, st.code, 14);
+        if (scan_one_line(px, w, h, rg, rg->theta, off, half, line, out,
+                          disp, &st))
             return true;
+        if (!st.found && st.digits > best_dig) {
+            best_dig = st.digits;
+            best_off = off;
         }
+    }
+    if (best_dig < FAN_MIN_DIGITS || best_dig > FAN_MAX_DIGITS)
+        return false;
+    s_fan_runs++;
+    int joff = vext / 8 < 2 ? 2 : vext / 8;
+    static const int dth[4] = { -2, 2, -4, 4 };
+    for (int a = 0; a < 4; a++) {
+        int t = (rg->theta + dth[a] + 180) % 180; /* keep 0..179 */
+        for (int j = -1; j <= 1; j++)
+            if (scan_one_line(px, w, h, rg, t, best_off + j * joff, half,
+                              line, out, disp, &st)) {
+                s_fan_hits++;
+                return true;
+            }
     }
     return false;
 }
@@ -588,6 +634,8 @@ static void scan_task(void *pv)
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
     int n_loc = 0, n_frames = 0;
+    s_fan_runs = 0;
+    s_fan_hits = 0;
 
     lbl_cache[0] = '\0';
     last_hit.kind = 0;
@@ -696,12 +744,13 @@ static void scan_task(void *pv)
     }
 
     char done[96];
-    char perf[48] = "";
+    char perf[64] = "";
     if (n_frames)
-        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f %s]",
+        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f %s fan%d/%d]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(n_loc ? t_loc / n_loc / 1000 : 0),
-                 (int)(t_scan / n_frames / 1000), bc_tensor_impl());
+                 (int)(t_scan / n_frames / 1000), bc_tensor_impl(),
+                 s_fan_runs, s_fan_hits);
     if (found)
         snprintf(done, sizeof done, "found %s%s", code, perf);
     else if (fail)
