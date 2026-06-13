@@ -62,6 +62,13 @@ int audio_tab5_volume(void);
 void audio_tab5_set_downmix(bool on);
 bool audio_tab5_downmix(void);
 
+/* Resonant high-pass (RBJ biquad) on the mono signal. fc_hz<=0 disables.
+   q is the resonance: 0.707 = flat (Butterworth), higher = a bump just
+   above the cutoff that keeps the sound from getting thin after the lows
+   are removed. Cuts the sub-bass the small speaker can't reproduce
+   (the source of the analog overdrive/distortion). */
+void audio_tab5_set_hpf(int fc_hz, float q);
+
 void audio_tab5_get_stats(audio_tab5_stats_t *out);
 
 /* 16-band log-spaced magnitude spectrum (0..100) of the mono signal most
@@ -124,6 +131,7 @@ static inline esp_err_t audio_tab5_set_volume(int pct)
 static inline int audio_tab5_volume(void) { return 0; }
 static inline void audio_tab5_set_downmix(bool on) { (void)on; }
 static inline bool audio_tab5_downmix(void) { return true; }
+static inline void audio_tab5_set_hpf(int fc_hz, float q) { (void)fc_hz; (void)q; }
 static inline void audio_tab5_get_stats(audio_tab5_stats_t *out)
 {
     if (out)

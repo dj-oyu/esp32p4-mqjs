@@ -2765,6 +2765,28 @@ JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
     return JS_NewString(ctx, buf);
 }
 
+/* audio.hpf(fcHz, Qx10) -> bool: resonant high-pass on the mono output.
+   fcHz<=0 disables; Qx10 is Q*10 (default 7 = 0.7 Butterworth; >7 adds a
+   resonant bump so the sound doesn't thin out after the lows are cut).
+   Cuts sub-bass the small speaker can't reproduce (the analog overdrive
+   source). Returns true when the filter is enabled. */
+JSValue js_audio_hpf(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    int fc = 0, qx10 = 7;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &fc, argv[0]))
+        return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &qx10, argv[1]))
+        return JS_EXCEPTION;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    audio_tab5_set_hpf(fc, (float)qx10 / 10.0f);
+    return JS_NewBool(fc > 0);
+#else
+    printf("[audio] hpf(%d Hz, Q=%d/10) (stub)\n", fc, qx10);
+    return JS_NewBool(0);
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* http: one-shot GET (http.get, esp_http_client + esp_crt_bundle)     */
 /* One request system-wide. A short-lived FreeRTOS task runs the        */

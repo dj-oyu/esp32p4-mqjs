@@ -488,6 +488,7 @@ static const JSPropDef js_audio[] = {
     JS_CFUNC_DEF("tone", 2, js_audio_tone),
     JS_CFUNC_DEF("volume", 1, js_audio_volume),
     JS_CFUNC_DEF("downmix", 1, js_audio_downmix),
+    JS_CFUNC_DEF("hpf", 2, js_audio_hpf),
     JS_CFUNC_DEF("playWav", 0, js_audio_playwav),
     JS_CFUNC_DEF("stats", 0, js_audio_stats),
     JS_PROP_END,

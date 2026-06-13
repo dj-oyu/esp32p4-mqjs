@@ -90,6 +90,50 @@ static inline void fft_capture(int16_t v)
     if (a >= 32767) s_clipcnt++;
 }
 
+/* ---- resonant high-pass (RBJ biquad) on the mono signal -------------- */
+/* The tiny NS4150B speaker can't reproduce sub-bass; pushing it there is
+   what overdrives/distorts. A high-pass removes that energy. Q > 0.707
+   adds a resonant bump just above the cutoff so the result doesn't sound
+   thin. Coeffs set on js_task (audio.start extra args), applied on the
+   producer task — the only shared state is the coeffs (a benign one-sample
+   glitch on a live change is fine). */
+static volatile bool s_hpf_on;
+static float s_hb0, s_hb1, s_hb2, s_ha1, s_ha2;
+static float s_hx1, s_hx2, s_hy1, s_hy2;
+
+void audio_tab5_set_hpf(int fc_hz, float q)
+{
+    if (fc_hz <= 0) { s_hpf_on = false; return; }
+    if (q < 0.1f) q = 0.1f;
+    uint32_t fs = s_rate ? s_rate : 48000;
+    float w0 = 2.0f * (float)M_PI * (float)fc_hz / (float)fs;
+    float cw = cosf(w0), sw = sinf(w0);
+    float alpha = sw / (2.0f * q);
+    float a0 = 1.0f + alpha;
+    s_hb0 = (1.0f + cw) / 2.0f / a0;
+    s_hb1 = -(1.0f + cw) / a0;
+    s_hb2 = (1.0f + cw) / 2.0f / a0;
+    s_ha1 = -2.0f * cw / a0;
+    s_ha2 = (1.0f - alpha) / a0;
+    s_hx1 = s_hx2 = s_hy1 = s_hy2 = 0.0f;
+    s_hpf_on = true;
+    ESP_LOGI(TAG, "hpf on: fc=%dHz Q=%.2f", fc_hz, (double)q);
+}
+
+static inline int16_t hpf_apply(int16_t in)
+{
+    if (!s_hpf_on)
+        return in;
+    float x = (float)in;
+    float y = s_hb0 * x + s_hb1 * s_hx1 + s_hb2 * s_hx2
+              - s_ha1 * s_hy1 - s_ha2 * s_hy2;
+    s_hx2 = s_hx1; s_hx1 = x;
+    s_hy2 = s_hy1; s_hy1 = y;
+    if (y > 32767.0f) y = 32767.0f;
+    else if (y < -32768.0f) y = -32768.0f;
+    return (int16_t)y;
+}
+
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
 static esp_err_t spk_enable(i2c_master_bus_handle_t bus, bool on)
 {
@@ -337,15 +381,17 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
                        -inf, inaudible bias. */
                     int16_t m = (int16_t)(((int32_t)src[2 * i] +
                                            src[2 * i + 1]) >> 1);
+                    m = hpf_apply(m);
                     st[2 * i] = m;
                     st[2 * i + 1] = m;
                     fft_capture(m);
                 }
             } else {
                 for (size_t i = 0; i < n; i++) {
-                    st[2 * i] = pcm[done + i];
-                    st[2 * i + 1] = pcm[done + i];
-                    fft_capture(pcm[done + i]);
+                    int16_t m = hpf_apply(pcm[done + i]);
+                    st[2 * i] = m;
+                    st[2 * i + 1] = m;
+                    fft_capture(m);
                 }
             }
             if (ring_send(st, n * 4, deadline) == 0)
