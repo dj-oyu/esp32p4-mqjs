@@ -2739,17 +2739,24 @@ JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
     (void)this_val;
     (void)argc;
     (void)argv;
-    char buf[160];
+    char buf[320];
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
     audio_tab5_stats_t st;
     audio_tab5_get_stats(&st);
-    snprintf(buf, sizeof buf,
+    uint8_t spec[16];
+    audio_tab5_spectrum(spec);
+    int off = snprintf(buf, sizeof buf,
              "{\"running\":%s,\"rate\":%lu,\"ch\":%u,\"queued\":%lu,"
-             "\"underruns\":%lu,\"frames\":%llu}",
+             "\"underruns\":%lu,\"frames\":%llu,\"spec\":[",
              st.running ? "true" : "false", (unsigned long)st.sample_rate,
              (unsigned)st.channels, (unsigned long)st.queued_bytes,
              (unsigned long)st.underruns,
              (unsigned long long)st.frames_written);
+    for (int i = 0; i < 16 && off < (int)sizeof buf; i++)
+        off += snprintf(buf + off, sizeof buf - off, "%s%u",
+                        i ? "," : "", spec[i]);
+    if (off < (int)sizeof buf)
+        snprintf(buf + off, sizeof buf - off, "]}");
 #else
     snprintf(buf, sizeof buf, "{\"running\":false,\"audio\":\"off\"}");
 #endif

@@ -69,6 +69,19 @@ static volatile bool s_wav_abort;
    the mono speaker (NS4150B). Set false for true-stereo routing. */
 static bool s_downmix = true;
 
+/* rolling window of the mono signal sent to the speaker, for the on-demand
+   FFT analyzer (audio_tab5_spectrum). Written by the producer, read on the
+   js_task; a torn read only yields a slightly stale window — fine for a
+   visualizer. AUD_FFT_N is a power of two so the index wraps with a mask. */
+#define AUD_FFT_N 512
+static float s_fft_buf[AUD_FFT_N];
+static volatile uint32_t s_fft_wr;
+static inline void fft_capture(int16_t v)
+{
+    s_fft_buf[s_fft_wr & (AUD_FFT_N - 1)] = (float)v;
+    s_fft_wr++;
+}
+
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
 static esp_err_t spk_enable(i2c_master_bus_handle_t bus, bool on)
 {
@@ -318,11 +331,13 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
                                            src[2 * i + 1]) >> 1);
                     st[2 * i] = m;
                     st[2 * i + 1] = m;
+                    fft_capture(m);
                 }
             } else {
                 for (size_t i = 0; i < n; i++) {
                     st[2 * i] = pcm[done + i];
                     st[2 * i + 1] = pcm[done + i];
+                    fft_capture(pcm[done + i]);
                 }
             }
             if (ring_send(st, n * 4, deadline) == 0)
@@ -390,6 +405,87 @@ void audio_tab5_get_stats(audio_tab5_stats_t *out)
     };
 }
 
+/* ---- 16-band FFT analyzer ------------------------------------------- */
+/* Self-contained iterative radix-2 FFT (no esp-dsp dependency); 512 pts is
+   ample for a 16-bar EQ at 48 kHz (~94 Hz/bin). Runs on the js_task when
+   audio.stats() is polled, so the cost is bounded by the poll rate. */
+static void fft_radix2(float *re, float *im)
+{
+    for (int i = 1, j = 0; i < AUD_FFT_N; i++) { /* bit-reversal */
+        int bit = AUD_FFT_N >> 1;
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
+    }
+    for (int len = 2; len <= AUD_FFT_N; len <<= 1) {
+        float ang = -2.0f * (float)M_PI / (float)len;
+        float wr = cosf(ang), wi = sinf(ang);
+        for (int i = 0; i < AUD_FFT_N; i += len) {
+            float cr = 1.0f, ci = 0.0f;
+            for (int k = 0; k < len / 2; k++) {
+                int a = i + k, b = a + len / 2;
+                float br = re[b] * cr - im[b] * ci;
+                float bi = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - br; im[b] = im[a] - bi;
+                re[a] += br;        im[a] += bi;
+                float ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr; cr = ncr;
+            }
+        }
+    }
+}
+
+void audio_tab5_spectrum(uint8_t bands[16])
+{
+    if (!bands)
+        return;
+    if (!s_running) {
+        for (int i = 0; i < 16; i++) bands[i] = 0;
+        return;
+    }
+    static float re[AUD_FFT_N], im[AUD_FFT_N], hann[AUD_FFT_N];
+    static bool hann_ready;
+    if (!hann_ready) {
+        for (int i = 0; i < AUD_FFT_N; i++)
+            hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i /
+                                          (float)(AUD_FFT_N - 1)));
+        hann_ready = true;
+    }
+    uint32_t wr = s_fft_wr; /* snapshot: oldest captured sample sits at wr */
+    for (int i = 0; i < AUD_FFT_N; i++) {
+        re[i] = s_fft_buf[(wr + i) & (AUD_FFT_N - 1)] * hann[i] / 32768.0f;
+        im[i] = 0.0f;
+    }
+    fft_radix2(re, im);
+
+    /* bins 1..N/2 grouped into 16 geometric (log) bands; mag -> dB -> 0..100.
+       The geometric ratio spans bin 1..256 over 16 bands (~sqrt(2)/band). */
+    const int half = AUD_FFT_N / 2;
+    const float ratio = 1.4142136f;
+    float edge = 1.0f;
+    for (int b = 0; b < 16; b++) {
+        int k0 = (int)(edge + 0.5f);
+        edge *= ratio;
+        int k1 = (int)(edge + 0.5f);
+        if (k0 < 1) k0 = 1;
+        if (k1 > half) k1 = half;
+        if (k1 < k0) k1 = k0;
+        float mag = 0.0f;
+        for (int k = k0; k <= k1; k++)
+            mag += sqrtf(re[k] * re[k] + im[k] * im[k]);
+        mag /= (float)(k1 - k0 + 1);
+        float db = 20.0f * log10f(mag + 1e-6f);
+        int v = (int)((db + 60.0f) * (100.0f / 60.0f)); /* -60..0 dB -> 0..100 */
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        bands[b] = (uint8_t)v;
+    }
+}
+
 esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
 {
     if (freq_hz <= 0 || duration_ms <= 0)
@@ -400,6 +496,12 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
     const float amp = 0.25f * 32767.0f;
     const float step = 2.0f * (float)M_PI * (float)freq_hz / (float)s_rate;
     size_t total = (size_t)s_rate * (size_t)duration_ms / 1000;
+    /* linear fade in/out (~5 ms) so short tones don't click. Without it a
+       tone starts/ends mid-cycle -> a step discontinuity the ear hears as a
+       plosive "pop" rather than a beep, which dominates very short tones. */
+    size_t fade = (size_t)s_rate / 200;
+    if (fade > total / 2)
+        fade = total / 2;
     int16_t buf[240 * 2];
     float phase = 0.0f;
     int producer_ch = s_ch;
@@ -408,7 +510,15 @@ esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
         if (n > 240)
             n = 240;
         for (size_t i = 0; i < n; i++) {
-            int16_t v = (int16_t)(amp * sinf(phase));
+            size_t pos = off + i;
+            float env = 1.0f;
+            if (fade > 0) {
+                if (pos < fade)
+                    env = (float)pos / (float)fade;
+                else if (pos >= total - fade)
+                    env = (float)(total - 1 - pos) / (float)fade;
+            }
+            int16_t v = (int16_t)(amp * env * sinf(phase));
             phase += step;
             if (phase > 2.0f * (float)M_PI)
                 phase -= 2.0f * (float)M_PI;

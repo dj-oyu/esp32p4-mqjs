@@ -60,6 +60,12 @@ bool audio_tab5_downmix(void);
 
 void audio_tab5_get_stats(audio_tab5_stats_t *out);
 
+/* 16-band log-spaced magnitude spectrum (0..100) of the mono signal most
+ * recently sent to the speaker — a real-time analyzer / EQ display for the
+ * JS sound-test harness. Computed on demand (512-pt FFT + Hann window) from
+ * a rolling sample window; all zeros when not running. */
+void audio_tab5_spectrum(uint8_t bands[16]);
+
 /* Blocking sine tone through the normal write path (P2 gate helper).
  * Starts the pipeline at the current rate (or 48 kHz stereo if idle). */
 esp_err_t audio_tab5_tone(int freq_hz, int duration_ms);
@@ -118,6 +124,11 @@ static inline void audio_tab5_get_stats(audio_tab5_stats_t *out)
 {
     if (out)
         *out = (audio_tab5_stats_t){ 0 };
+}
+static inline void audio_tab5_spectrum(uint8_t bands[16])
+{
+    if (bands)
+        for (int i = 0; i < 16; i++) bands[i] = 0;
 }
 static inline esp_err_t audio_tab5_tone(int freq_hz, int duration_ms)
 {

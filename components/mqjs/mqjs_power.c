@@ -38,11 +38,12 @@ static void ui_tab5_screen_scrim(bool on) { (void)on; }
 #define PWR_LOG(fmt, ...) printf("[power] " fmt "\n", ##__VA_ARGS__)
 #endif
 
-/* TEST thresholds — deliberately short for on-device verification via
-   the serial monitor. Production values are 60s / 180s
-   (docs/power-states.md, confirmed 2026-06-13). */
-#define PWR_T_DIM_MS   5000
-#define PWR_T_OFF_MS   10000
+/* Production thresholds (docs/power-states.md, confirmed 2026-06-13).
+   The short 5s/10s TEST values were used for the on-device verification of
+   the state machine; restored to 60s/180s now that idle + wake are proven
+   (also keeps the screen up long enough for hands-off audio testing). */
+#define PWR_T_DIM_MS   60000
+#define PWR_T_OFF_MS   180000
 #define PWR_DIM_PCT    10
 
 typedef enum {
