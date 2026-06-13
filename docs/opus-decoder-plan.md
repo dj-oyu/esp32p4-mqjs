@@ -723,6 +723,57 @@ PIE を入れる前から fixed-point CELT decoder は float より **約 13.5% 
 以後の PIE 採用判断は **fixed baseline 729.9 cycles/frame** を基準にし、bit-exact
 検証は fixed-asm vs fixed-C で行う。
 
+### fixed-point re-profile（2026-06-13）
+
+fixed build に `CONFIG_OPUS_P4_FUNCTION_PROFILE=y` を載せて COM8 で profile
+（`-finstrument-functions`、48 kHz stereo CELT fixture、`dropped=0`）。
+instrumentation で no-inline 化＆絶対値は膨張するため、**subsystem 順位**で読む。
+
+| 系統 | 主な関数（rank） | PIE 適合 |
+|---|---|---|
+| PCM 出力/de-emphasis | SIG2WORD16(#1), deemphasis_stereo(#3), deemphasis(#6), SAT16(#10) | shift+saturate は SIMD 可だが **IIR が直列**（2ch 並列のみ） |
+| 逆 MDCT / FFT | clt_mdct_backward(#2), kf_bfly5(#4), kf_bfly3(#8), kf_bfly4(#9) | **clean SIMD**: 16-bit twiddle × 32-bit complex MAC、再帰なし |
+| CELT comb filter | comb_filter_const(#5), comb_filter(#30) | FIR MAC、再帰なし |
+| SILK decode/resampler | silk_decode_core(#7), resampler(#12,#24) | resampler FIR は SIMD 可 |
+| entropy / VQ | ec_dec_*, quant_*, cwrsi, compute_theta | 分岐/表引き中心 — PIE 対象外 |
+
+float profile（§12）の anti_collapse 偏重とは別物。SIG2WORD16 の 3M calls は
+instrumentation 由来（実 build では deemphasis に inline）。
+
+**第1 PIE 対象: 逆 MDCT butterflies（kf_bfly5/4/3）**。最大の clean SIMD
+（合算 ~380M）で再帰がなく、16-bit twiddle × 32-bit sample の complex MAC が
+`esp.vmul.s16`+QACC に乗る。de-emphasis 出力段は最大だが IIR 直列のため後回し。
+
+### kf_bfly bit-exact 契約（PIE 実装の仕様）
+
+`OPUS_FAST_INT64=0`（RV32）かつ `ENABLE_QEXT` off を確認済み。型と演算:
+
+- `kiss_fft_cpx = {opus_int32 r, i}`（8 byte、complex data）
+- `kiss_twiddle_cpx = {opus_int16 r, i}`（4 byte、Q15 twiddle、`celt_coef=opus_int16`）
+- `COEF_SHIFT=16`、twiddle 定数は `QCONST32(x, 15)=round(x·2^15)`
+- `S_MUL(data32, tw16) = MULT16_32_Q15(tw16, data32)`
+  = `((int16)tw · (int64)data) >> 15` を int32 へ truncate。
+  FAST_INT64=0 実装: `((tw·(data>>16))<<1) + (MULT16_16SU(tw, data&0xffff) >> 15)`
+  （PIE では 16×16→32 部分積 2 本＝`esp.vmul.s16`/QACC で合成）
+- `C_MUL(m,a,b)`: `m.r = S_MUL(a.r,b.r) ⊟ S_MUL(a.i,b.i)`,
+  `m.i = S_MUL(a.r,b.i) ⊞ S_MUL(a.i,b.r)`（⊞/⊟ は 32-bit modular = `ADD/SUB32_ovflw`）
+- `C_ADD/C_SUB/C_ADDTO`: 32-bit modular（`esp.vadd/vsub.s32` が wrap 一致）
+- `C_MULBYSCALAR(c,s)`: `c.{r,i} = S_MUL(c.{r,i}, s)`、`HALF_OF(x)=x>>1`(算術)
+- `*_ovflw` は unsigned wrap で UB 回避。PIE 整数 SIMD の modular 加減算と一致。
+
+ABI 境界は butterfly の内側ループ（kf_bfly3 の `do{}while(--k)`／kf_bfly5 の
+`for u`）単位とし、`細切れ呼び出しを増やさない`規約を守る。
+
+### 段階実装計画（task #13）
+
+1. kf_bfly3（radix-3、最小: C_MUL×2 + C_MULBYSCALAR）を `opus_p4_kernels` の
+   新 ABI として切り出し、マクロ展開と一致する C reference を書く。
+2. host で bit-exact test（ランダム data/twiddle、ovflw 境界、QCONST 定数）。
+3. PIE asm（16×16 部分積→QACC→Q15 合成、complex modular add/sub、`esp.lp.*`
+   hardware loop）。verify harness で fixed-asm vs fixed-C を実機照合。
+4. before/after を fixed baseline 729.9 cycles/frame に対して計測、採用判定。
+5. 同パターンで kf_bfly5 / kf_bfly4 へ展開。
+
 ## 15. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
