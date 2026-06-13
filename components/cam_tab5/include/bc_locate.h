@@ -43,6 +43,30 @@ int bc_sample_line(const uint16_t *rgb565, int w, int h, int cx, int cy,
                    int theta, int offset_v, int half_len, uint8_t *out,
                    int max);
 
+/* Staged sampling (scanline-opt S2): the angled lines scatter-read the
+ * PSRAM frame one cache line per sample; staging copies the sampled
+ * extent ONCE (sequential read) into an 8-bit luma buffer and the
+ * lines then sample that. bc_sample_line_l8 is bit-identical to
+ * bc_sample_line (same fixed-point walk, same frame-edge clamping —
+ * fw/fh keep the clamp parity) as long as every frame-clamped sample
+ * point lands inside the staged rect; it returns -1 when one does not
+ * (caller falls back to the direct path). */
+typedef struct {
+    const uint8_t *buf;
+    int x0, y0; /* stage origin, frame px (after clipping) */
+    int w, h;   /* staged size */
+    int fw, fh; /* frame size (clamp parity with bc_sample_line) */
+} bc_stage_t;
+
+/* Convert the frame rect [x0,x1) x [y0,y1) (clipped to the frame) into
+ * buf as 8-bit luma. Returns 0 when the clipped rect is empty or needs
+ * more than cap bytes (caller falls back), else fills *st and returns 1. */
+int bc_stage_region(const uint16_t *rgb565, int w, int h, int x0, int y0,
+                    int x1, int y1, uint8_t *buf, int cap, bc_stage_t *st);
+
+int bc_sample_line_l8(const bc_stage_t *st, int cx, int cy, int theta,
+                      int offset_v, int half_len, uint8_t *out, int max);
+
 /* Structure tensor of one 32x32 block (30x30 interior central diffs of
  * the 6-bit green luma): out[0..2] = Sxx, Syy, Sxy. base points at the
  * block's top-left sample, stride_px is the image width in pixels. Pure

@@ -313,3 +313,77 @@ int bc_sample_line(const uint16_t *f, int w, int h, int cx, int cy,
     }
     return n;
 }
+
+int bc_stage_region(const uint16_t *f, int w, int h, int x0, int y0,
+                    int x1, int y1, uint8_t *buf, int cap, bc_stage_t *st)
+{
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > w)
+        x1 = w;
+    if (y1 > h)
+        y1 = h;
+    int sw = x1 - x0, sh = y1 - y0;
+    if (sw <= 0 || sh <= 0 || (int64_t)sw * sh > cap)
+        return 0;
+    for (int y = 0; y < sh; y++) {
+        const uint16_t *src = f + (size_t)(y0 + y) * w + x0;
+        uint8_t *dst = buf + (size_t)y * sw;
+        for (int x = 0; x < sw; x++)
+            dst[x] = (uint8_t)luma(src[x]);
+    }
+    st->buf = buf;
+    st->x0 = x0;
+    st->y0 = y0;
+    st->w = sw;
+    st->h = sh;
+    st->fw = w;
+    st->fh = h;
+    return 1;
+}
+
+/* keep this the line-for-line twin of bc_sample_line above: same
+   fixed-point walk, same FRAME-edge clamping (st->fw/fh), only the
+   pixel fetch differs (staged 8-bit luma instead of RGB565+luma()) */
+int bc_sample_line_l8(const bc_stage_t *st, int cx, int cy, int theta,
+                      int offset_v, int half_len, uint8_t *out, int max)
+{
+    float th = theta * (float)M_PI / 180.0f;
+    float ux = cosf(th), uy = sinf(th);
+    float vx = -uy, vy = ux;
+    int n = 2 * half_len;
+    if (n > max)
+        n = max;
+    if (n < 1)
+        return 0;
+    int32_t fux = (int32_t)(ux * 65536.0f);
+    int32_t fuy = (int32_t)(uy * 65536.0f);
+    int32_t bx = (int32_t)(vx * 65536.0f);
+    int32_t by = (int32_t)(vy * 65536.0f);
+    int32_t x = (int32_t)((cx + vx * offset_v - ux * (n / 2)) * 65536.0f);
+    int32_t y = (int32_t)((cy + vy * offset_v - uy * (n / 2)) * 65536.0f);
+    for (int i = 0; i < n; i++, x += fux, y += fuy) {
+        int acc = 0;
+        for (int b = -1; b <= 1; b++) {
+            int xi = (x + b * bx + 32768) >> 16;
+            int yi = (y + b * by + 32768) >> 16;
+            if (xi < 0)
+                xi = 0;
+            if (xi > st->fw - 1)
+                xi = st->fw - 1;
+            if (yi < 0)
+                yi = 0;
+            if (yi > st->fh - 1)
+                yi = st->fh - 1;
+            xi -= st->x0;
+            yi -= st->y0;
+            if (xi < 0 || xi >= st->w || yi < 0 || yi >= st->h)
+                return -1; /* stage too small: caller goes direct */
+            acc += st->buf[(size_t)yi * st->w + xi];
+        }
+        out[i] = (uint8_t)(acc / 3);
+    }
+    return n;
+}
