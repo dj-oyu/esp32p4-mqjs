@@ -56,7 +56,7 @@ static i2c_master_bus_handle_t s_bus;
 static bool s_video_ready;
 static volatile bool s_busy;
 static volatile bool s_cancel;
-static char s_status[96] = "idle";
+static char s_status[128] = "idle";
 
 static struct {
     cam_tab5_cb_t cb;
@@ -203,16 +203,23 @@ static void hit_record(FrameHit *disp, const ean13_scan_t *st, int theta,
 
 /* One scanline at (theta, off) through the region center: sample,
  * decode, record overlay info. True on a prefix-matching decode
- * (copied into out); st is left filled for the caller's heuristics. */
+ * (copied into out); st is left filled for the caller's heuristics.
+ * stg = staged luma rect (S2) or NULL; the staged sampler is bit-
+ * identical and falls back to the direct frame walk if the line ever
+ * leaves the stage (host-tested equivalence, bc_locate_test.c). */
 static bool scan_one_line(const uint16_t *px, int w, int h,
-                          const bc_region_t *rg, int theta, int off,
-                          int half, uint8_t *line, char out[14],
-                          FrameHit *disp, ean13_scan_t *st)
+                          const bc_region_t *rg, const bc_stage_t *stg,
+                          int theta, int off, int half, uint8_t *line,
+                          char out[14], FrameHit *disp, ean13_scan_t *st)
 {
     float th = theta * (float)M_PI / 180.0f;
     float ux = cosf(th), uy = sinf(th);
     float vx = -uy, vy = ux;
-    int n = bc_sample_line(px, w, h, rg->cx, rg->cy, theta, off, half,
+    int n = stg ? bc_sample_line_l8(stg, rg->cx, rg->cy, theta, off, half,
+                                    line, CAM_W)
+                : -1;
+    if (n < 0)
+        n = bc_sample_line(px, w, h, rg->cx, rg->cy, theta, off, half,
                            line, CAM_W);
     int hit = ean13_scan_gray_line(line, n, st);
     float sx = rg->cx + vx * off - ux * (n / 2);
@@ -251,12 +258,26 @@ static bool scan_region(const uint16_t *px, int w, int h,
 {
     ean13_scan_t st;
     int dx = rg->x1 - rg->x0, dy = rg->y1 - rg->y0;
-    int half = (int)(sqrtf((float)(dx * dx + dy * dy)) * 0.5f) + 48;
+    float thf = rg->theta * (float)M_PI / 180.0f;
+    float aux = fabsf(cosf(thf)), auy = fabsf(sinf(thf));
+    /* walk length: bbox PROJECTED onto the bar-run direction u (+quiet
+       margin) — the old diag/2 overshot badly on squarish regions,
+       inflating both the direct walk and the S2 stage extent */
+    int half = (int)(dx * aux + dy * auy) / 2 + 48;
     if (half > CAM_W / 2)
         half = CAM_W / 2; /* line buffer is CAM_W bytes */
     int vext = (dx < dy ? dx : dy) / 2; /* bar extent ~ smaller bbox side */
     if (vext < 16)
         vext = 16;
+    int joff = vext / 8 < 2 ? 2 : vext / 8;
+    /* S2 staging was measured here and REJECTED (see
+       docs/scanline-opt-plan.md §S2 post-mortem): luma conversion is
+       ALU-bound (~12 cyc/px) and stages beyond the 128KB L2 scatter
+       anyway — staged frames clocked 2x slower than direct ones.
+       bc_stage_region/bc_sample_line_l8 stay in bc_locate (host-tested)
+       should an L2-sized + PIE-converted variant ever pencil out. */
+    const bc_stage_t *stg = NULL;
+
     int best_dig = 0, best_off = 0;
     /* S1 (docs/scanline-opt-plan.md): walk the 16 offsets center-out
        (7,8,6,9,...) — the code usually straddles the region center, so
@@ -266,8 +287,8 @@ static bool scan_region(const uint16_t *px, int w, int h,
     for (int s = 0; s < 16; s++) {
         int k = (s & 1) ? 8 + s / 2 : 7 - s / 2;
         int off = vext * (2 * k + 1 - 16) / 16;
-        if (scan_one_line(px, w, h, rg, rg->theta, off, half, line, out,
-                          disp, &st))
+        if (scan_one_line(px, w, h, rg, stg, rg->theta, off, half, line,
+                          out, disp, &st))
             return true;
         if (!st.found && st.digits > best_dig) {
             best_dig = st.digits;
@@ -277,13 +298,12 @@ static bool scan_region(const uint16_t *px, int w, int h,
     if (best_dig < FAN_MIN_DIGITS || best_dig > FAN_MAX_DIGITS)
         return false;
     s_fan_runs++;
-    int joff = vext / 8 < 2 ? 2 : vext / 8;
     static const int dth[4] = { -2, 2, -4, 4 };
     for (int a = 0; a < 4; a++) {
         int t = (rg->theta + dth[a] + 180) % 180; /* keep 0..179 */
         for (int j = -1; j <= 1; j++)
-            if (scan_one_line(px, w, h, rg, t, best_off + j * joff, half,
-                              line, out, disp, &st)) {
+            if (scan_one_line(px, w, h, rg, stg, t, best_off + j * joff,
+                              half, line, out, disp, &st)) {
                 s_fan_hits++;
                 return true;
             }
@@ -752,10 +772,11 @@ static void scan_task(void *pv)
         /* the pipeline stays up and streaming (see pipeline_once) */
     }
 
-    char done[96];
-    char perf[64] = "";
+    char done[128];
+    char perf[80] = "";
     if (n_frames)
-        snprintf(perf, sizeof perf, " [pv%d loc%d scan%d ms/f %s fan%d/%d]",
+        snprintf(perf, sizeof perf,
+                 " [pv%d loc%d scan%d ms/f %s fan%d/%d]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(n_loc ? t_loc / n_loc / 1000 : 0),
                  (int)(t_scan / n_frames / 1000), bc_tensor_impl(),
