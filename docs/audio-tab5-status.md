@@ -32,11 +32,35 @@
    underruns はトーン間ギャップの 1 のみが期待値。
 3. タッチ / カメラの回帰がないこと (I2C 共有の確認)。
 
+## JS バインディング `audio.*` (commit af2c98a, PC 検証済み)
+
+実装済み。デコード済み PCM は C 側 (Opus パス) が `audio_tab5_write` に
+直接流すので、JS はスカラ制御 + テレメトリのみ (エンジンに TypedArray
+の公開リーダが無いことも確認 — 余計な複雑さを避けた)。
+
+- `audio.start(rate=48000, ch=2)` -> bool
+- `audio.stop()`
+- `audio.tone(hz, ms)` -> bool — 非ブロッキング (一発タスク、再入ガード)。
+  これが MQTT 越しに叩ける P2 検証トリガ。
+- `audio.volume([pct])` -> 0..100
+- `audio.stats()` -> JSON 文字列 (running/rate/ch/queued/underruns/
+  frames) — COM8 不要のリモート読み出し。
+
+`examples/audio_test.js`: Tab5 はボタン付きパネル、画面なし機はビープ列 +
+MQTT へ stats publish。run_pc スモークテスト通過、Tab5 ビルドもクリーン。
+
+実機 P2 検証 (flash 後) の遠隔手順:
+1. `audio_test` を push (`tools/mqjs_push.py` または webui)。
+2. UI 機ならボタンでビープ。画面なし機なら自動でビープ列。
+3. `audio.stats()` の JSON を MQTT で受けて underruns/frames を確認。
+   COM8 を開かずに P2 を判定できる。
+
 ## 未決 / 次フェーズ
 
-- JS バインディング (`audio.*`) は意図的に未実装 — device_stdlib.c と
-  生成ヘッダ (Windows は pregen) に触るため、Opus 側と衝突しやすい。
-  P3 統合時に合わせて追加する。
+- `audio.play(pcm)` (JS からの任意 PCM 投入) は未実装。エンジンに
+  TypedArray の生ポインタ取得 API が無く、Array 反復は遅い。Opus path
+  は C 内完結なので P3 では不要。必要になったらエンジンに最小の
+  TypedArray アクセサを足してから対応。
 - writer task の affinity/priority は plan §5 のとおり同時動作計測
   (P4) で見直す。
 - `audio_tab5_stop()` は HW を落とさない (再 start を速くするため)。
