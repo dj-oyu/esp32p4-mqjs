@@ -642,6 +642,9 @@ static void scan_task(void *pv)
     cached.found = 0;
 
     if (pipe_ok) {
+        /* web-modal viewfinder: tap outside it = cancel (and the scrim
+           keeps every touch away from the UI behind, see ui_tab5) */
+        ui_tab5_cam_set_dismiss_cb(cam_tab5_cancel);
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
         set_status("scanning%s", NULL);
 

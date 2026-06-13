@@ -190,6 +190,12 @@ void ui_tab5_cam_canvas_hide(void);
 /* Telemetry label below the viewfinder (decode/near-miss readout);
  * shown on first call, hidden together with the canvas. */
 void ui_tab5_cam_overlay_text(const char *utf8);
+/* While the viewfinder is shown it behaves like a web modal: a
+ * translucent scrim absorbs every touch (nothing reaches the widgets
+ * or ui.onTouch behind it) and a tap OUTSIDE the viewfinder/readout
+ * fires cb (runs on the LVGL task — keep it to a flag write).
+ * cam_tab5 registers its cancel here before each scan. */
+void ui_tab5_cam_set_dismiss_cb(void (*cb)(void));
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
@@ -291,6 +297,7 @@ static inline void ui_tab5_cam_overlay_text(const char *utf8)
 {
     (void)utf8;
 }
+static inline void ui_tab5_cam_set_dismiss_cb(void (*cb)(void)) { (void)cb; }
 
 #endif /* CONFIG_MQJS_TAB5_UI */
 

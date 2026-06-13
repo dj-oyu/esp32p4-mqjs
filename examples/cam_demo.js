@@ -60,11 +60,18 @@ function build() {
         status.setText(code ? "読み取り成功!" : "読めませんでした: " + st);
     }
     /* 連続モード: 読めても読めなくても即再スキャン。θファンの実証用
-       (本を傾けて持ったまま、救済カウントが立つかを見る)。 */
+       (本を傾けて持ったまま、救済カウントが立つかを見る)。
+       ファインダーはモーダル: 画面外タップ = cancelled で抜けてくる
+       ので、それはユーザーの「やめる」として ループも止める。 */
     function loopScan(code) {
         var st = tally(code);
         if (!looping)
             return;
+        if (!code && st.indexOf("cancelled") === 0) {
+            looping = false;
+            status.setText("連続スキャン停止 (画面外タップ)");
+            return;
+        }
         if (camera.scan(loopScan, "97"))
             status.setText("連続スキャン中... " + st);
         else {
@@ -81,7 +88,7 @@ function build() {
         }
         looping = true;
         if (camera.scan(loopScan, "97"))
-            status.setText("連続スキャン中... 本を傾けてかざして");
+            status.setText("連続スキャン中... 画面外タップでやめる");
         else {
             looping = false;
             status.setText("開始できず: " + camera.status());
