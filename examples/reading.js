@@ -413,8 +413,13 @@ function buildAdd() {
         }
         var ok = camera.scan(function (code) {
             if (!code) {
-                status.setText("読み取れませんでした (" + camera.status() +
-                               ")。明るい所でもう一度");
+                /* ファインダーはモーダル: 画面外タップ = 自分でやめた
+                   (cancelled)。タイムアウトとは文言を分ける */
+                var st = camera.status();
+                status.setText(st.indexOf("cancelled") === 0
+                    ? "スキャンをやめました"
+                    : "読み取れませんでした (" + st +
+                      ")。明るい所でもう一度");
                 return;
             }
             fIsbn.setText(code);
@@ -422,7 +427,7 @@ function buildAdd() {
             ndlQuery();
         }, "97");
         status.setText(ok ? "スキャン中 (45 秒)... 本の裏の上段バーコード " +
-                            "(978〜) をカメラにかざして"
+                            "(978〜) をかざして。画面外タップで中止"
                           : "カメラを使えません: " + camera.status());
     });
     s.button("NDL サーチで自動入力", ndlQuery);

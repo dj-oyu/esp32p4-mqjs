@@ -662,6 +662,11 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
 /* runs in the LVGL task (from the mooncake lv_timer): mirror the indev
    state LVGL already polled into JS touch events. Coordinates are
    canvas-relative (status bar clamps to y=0); kind 0=down 1=move 2=up. */
+/* viewfinder modal state (set under the LVGL lock by the cam entry
+   points below; read on the LVGL task) — while true, JS gets NO touch
+   events: the scrim owns the screen like a web modal backdrop */
+static volatile bool s_cam_modal;
+
 static void touch_observe(void)
 {
     static bool was_pressed;
@@ -669,6 +674,14 @@ static void touch_observe(void)
 
     if (!s_touch_indev)
         return;
+    if (s_cam_modal) {
+        /* close any in-flight gesture so ui.onTouch apps don't hang in
+           "pressed" state, then go silent for the modal's lifetime */
+        if (was_pressed)
+            mqjs_post_touch(last.x, last.y, 2);
+        was_pressed = false;
+        return;
+    }
     bool pressed = lv_indev_get_state(s_touch_indev) == LV_INDEV_STATE_PRESSED;
     lv_point_t p;
     lv_indev_get_point(s_touch_indev, &p);
@@ -2258,13 +2271,46 @@ extern "C" void ui_tab5_start(void)
 static lv_obj_t *s_cam_cv;
 static uint16_t *s_cam_cv_buf;
 static lv_obj_t *s_cam_lbl;
+static lv_obj_t *s_cam_scrim;
 static int s_cam_cv_h;
+static void (*s_cam_dismiss)(void);
+
+void ui_tab5_cam_set_dismiss_cb(void (*cb)(void))
+{
+    s_cam_dismiss = cb;
+}
+
+/* tap on the backdrop (= outside viewfinder + readout, which are
+   CLICKABLE and absorb their own taps) — web-modal dismiss. Runs on
+   the LVGL task; the registered cb only flips the scan's cancel flag */
+static void cam_scrim_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (s_cam_dismiss)
+        s_cam_dismiss();
+}
 
 void *ui_tab5_cam_canvas(int w, int h)
 {
     if (!s_root_scr)
         return NULL;
     lvgl_port_lock(0);
+    if (!s_cam_scrim) {
+        /* full-screen translucent backdrop UNDER the canvas: blocks
+           every LVGL widget behind it (clicks land here, not below) */
+        s_cam_scrim = lv_obj_create(lv_layer_top());
+        lv_obj_set_size(s_cam_scrim, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_pos(s_cam_scrim, 0, 0);
+        lv_obj_set_style_radius(s_cam_scrim, 0, 0);
+        lv_obj_set_style_border_width(s_cam_scrim, 0, 0);
+        lv_obj_set_style_pad_all(s_cam_scrim, 0, 0);
+        lv_obj_set_style_bg_color(s_cam_scrim, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(s_cam_scrim, LV_OPA_50, 0);
+        lv_obj_add_flag(s_cam_scrim, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(s_cam_scrim, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(s_cam_scrim, cam_scrim_clicked,
+                            LV_EVENT_CLICKED, NULL);
+    }
     if (!s_cam_cv) {
         /* PPA writes this buffer (cam_tab5 hardware-rotates frames into
            it): DMA-capable + cache-line aligned */
@@ -2283,11 +2329,21 @@ void *ui_tab5_cam_canvas(int w, int h)
                          (UI_LCD_H_RES - w) / 2, UI_STATUSBAR_H + 24);
             lv_obj_set_style_border_width(s_cam_cv, 2, 0);
             lv_obj_set_style_border_color(s_cam_cv, lv_color_hex(0x2ECC71), 0);
+            /* modal content: absorb taps (don't dismiss, don't pass) */
+            lv_obj_add_flag(s_cam_cv, LV_OBJ_FLAG_CLICKABLE);
             s_cam_cv_h = h;
         }
     }
-    if (s_cam_cv)
+    if (s_cam_cv) {
+        lv_obj_clear_flag(s_cam_scrim, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_cam_cv, LV_OBJ_FLAG_HIDDEN);
+        /* keep modal stack on top of whatever joined the layer since */
+        lv_obj_move_foreground(s_cam_scrim);
+        lv_obj_move_foreground(s_cam_cv);
+        if (s_cam_lbl)
+            lv_obj_move_foreground(s_cam_lbl);
+        s_cam_modal = true;
+    }
     lvgl_port_unlock();
     return s_cam_cv_buf;
 }
@@ -2306,7 +2362,10 @@ void ui_tab5_cam_canvas_hide(void)
     if (!s_cam_cv)
         return;
     lvgl_port_lock(0);
+    s_cam_modal = false;
     lv_obj_add_flag(s_cam_cv, LV_OBJ_FLAG_HIDDEN);
+    if (s_cam_scrim)
+        lv_obj_add_flag(s_cam_scrim, LV_OBJ_FLAG_HIDDEN);
     if (s_cam_lbl)
         lv_obj_add_flag(s_cam_lbl, LV_OBJ_FLAG_HIDDEN);
     lvgl_port_unlock();
@@ -2332,9 +2391,12 @@ void ui_tab5_cam_overlay_text(const char *utf8)
         lv_obj_set_style_pad_all(s_cam_lbl, 8, 0);
         lv_obj_align(s_cam_lbl, LV_ALIGN_TOP_MID, 0,
                      UI_STATUSBAR_H + 24 + s_cam_cv_h + 6);
+        /* modal content like the canvas: absorb taps, don't dismiss */
+        lv_obj_add_flag(s_cam_lbl, LV_OBJ_FLAG_CLICKABLE);
     }
     lv_label_set_text(s_cam_lbl, utf8);
     lv_obj_clear_flag(s_cam_lbl, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_cam_lbl);
     lvgl_port_unlock();
 }
 
