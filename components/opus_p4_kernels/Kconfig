@@ -1,0 +1,19 @@
+menu "Opus ESP32-P4 kernels"
+
+choice OPUS_P4_KERNEL_MODE
+    prompt "Opus kernel implementation"
+    default OPUS_P4_KERNEL_PORTABLE
+
+    config OPUS_P4_KERNEL_PORTABLE
+        bool "Portable C"
+
+    config OPUS_P4_KERNEL_ASM
+        bool "ESP32-P4 PIE asm"
+        depends on IDF_TARGET_ESP32P4
+
+    config OPUS_P4_KERNEL_ASM_VERIFY
+        bool "ESP32-P4 PIE asm with C verification"
+        depends on IDF_TARGET_ESP32P4
+endchoice
+
+endmenu
