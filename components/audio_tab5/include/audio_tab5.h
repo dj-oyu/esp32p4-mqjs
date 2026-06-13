@@ -51,6 +51,13 @@ esp_err_t audio_tab5_stop(void);
 esp_err_t audio_tab5_set_volume(int pct);
 int audio_tab5_volume(void);
 
+/* Stereo->mono fold for the built-in mono speaker. When on (default), a
+ * 2-channel source is mixed (L+R)/2 and sent to both lanes so no channel
+ * is dropped (the ES8388/NS4150B path does not sum L/R). Turn off only
+ * for genuine stereo routing (e.g. headphone out). */
+void audio_tab5_set_downmix(bool on);
+bool audio_tab5_downmix(void);
+
 void audio_tab5_get_stats(audio_tab5_stats_t *out);
 
 /* Blocking sine tone through the normal write path (P2 gate helper).
@@ -105,6 +112,8 @@ static inline esp_err_t audio_tab5_set_volume(int pct)
     return ESP_ERR_NOT_SUPPORTED;
 }
 static inline int audio_tab5_volume(void) { return 0; }
+static inline void audio_tab5_set_downmix(bool on) { (void)on; }
+static inline bool audio_tab5_downmix(void) { return true; }
 static inline void audio_tab5_get_stats(audio_tab5_stats_t *out)
 {
     if (out)

@@ -65,6 +65,9 @@ static volatile uint32_t s_underruns;
 static volatile uint64_t s_frames_written;
 static volatile bool s_wav_playing;
 static volatile bool s_wav_abort;
+/* fold stereo to (L+R)/2 mono. Default true: the only output we drive is
+   the mono speaker (NS4150B). Set false for true-stereo routing. */
+static bool s_downmix = true;
 
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
 static esp_err_t spk_enable(i2c_master_bus_handle_t bus, bool on)
@@ -283,7 +286,9 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
         return 0;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
     size_t done = 0;
-    if (s_ch == 2) {
+    if (s_ch == 2 && !s_downmix) {
+        /* true stereo passthrough (e.g. future headphone routing):
+           zero-copy the caller's interleaved buffer straight to the ring */
         while (done < frames) {
             size_t n = frames - done;
             if (n > AUD_CHUNK_BYTES / 4)
@@ -293,14 +298,32 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
             done += n;
         }
     } else {
+        /* mono path: build L=R stereo frames in a temp buffer. Source is
+           either mono (duplicate the sample) or stereo folded to mono for
+           the mono speaker ((L+R)/2 — the codec does NOT sum L/R, and the
+           NS4150B has one input, so an unfolded stereo source would drop a
+           channel; see docs/audio-tab5-status.md). */
         int16_t st[256 * 2];
         while (done < frames) {
             size_t n = frames - done;
             if (n > 256)
                 n = 256;
-            for (size_t i = 0; i < n; i++) {
-                st[2 * i] = pcm[done + i];
-                st[2 * i + 1] = pcm[done + i];
+            if (s_ch == 2) {
+                const int16_t *src = pcm + done * 2;
+                for (size_t i = 0; i < n; i++) {
+                    /* sum fits int32; >>1 average is exactly within int16
+                       range (no clip needed). arithmetic shift = round to
+                       -inf, inaudible bias. */
+                    int16_t m = (int16_t)(((int32_t)src[2 * i] +
+                                           src[2 * i + 1]) >> 1);
+                    st[2 * i] = m;
+                    st[2 * i + 1] = m;
+                }
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    st[2 * i] = pcm[done + i];
+                    st[2 * i + 1] = pcm[done + i];
+                }
             }
             if (ring_send(st, n * 4, deadline) == 0)
                 break;
@@ -339,6 +362,16 @@ esp_err_t audio_tab5_set_volume(int pct)
 int audio_tab5_volume(void)
 {
     return s_vol;
+}
+
+void audio_tab5_set_downmix(bool on)
+{
+    s_downmix = on;
+}
+
+bool audio_tab5_downmix(void)
+{
+    return s_downmix;
 }
 
 void audio_tab5_get_stats(audio_tab5_stats_t *out)

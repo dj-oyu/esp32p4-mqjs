@@ -2683,6 +2683,29 @@ JSValue js_audio_volume(JSContext *ctx, JSValue *this_val, int argc,
 #endif
 }
 
+/* audio.downmix([on]) -> current bool. With an arg, sets stereo->mono
+   (L+R)/2 fold for the mono speaker (default on). Off = true stereo. */
+JSValue js_audio_downmix(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    (void)this_val;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        int on;
+        if (JS_ToInt32(ctx, &on, argv[0]))
+            return JS_EXCEPTION;
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+        audio_tab5_set_downmix(on != 0);
+#else
+        printf("[audio] downmix(%d) (stub)\n", on);
+#endif
+    }
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
+    return JS_NewBool(audio_tab5_downmix());
+#else
+    return JS_NewBool(1);
+#endif
+}
+
 /* audio.playWav() -> true if playback started. Streams the
    firmware-embedded boot WAV (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV) through
    the pipeline. The real-audio playback verifier, callable over MQTT. */
