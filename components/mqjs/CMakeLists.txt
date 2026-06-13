@@ -14,7 +14,7 @@ set(PREGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
 
 idf_component_register(
-    SRCS "device_stdlib.c" "mqjs_runtime.c"
+    SRCS "mqjs_power.c" "device_stdlib.c" "mqjs_runtime.c"
          "app/mqjs_app_manager.c"
          "${MQJS_DIR}/mquickjs.c"
          "${MQJS_DIR}/cutils.c"

@@ -1492,6 +1492,13 @@ static lv_obj_t *s_sp_arc;
 static lv_timer_t *s_sp_timer;
 static int s_brightness = 100; /* boot value set by ui_tab5_start */
 
+/* Power-state overlay (docs/power-states.md): the power manager dims or
+   blanks the backlight WITHOUT touching s_brightness, then restores the
+   user's level on wake. Distinct from spanel_apply_brightness, which is
+   the user's source-of-truth dial. Called from mqjs_power.c via extern. */
+extern "C" void ui_tab5_backlight_apply(int percent) { backlight_set(percent); }
+extern "C" int  ui_tab5_backlight_user(void) { return s_brightness; }
+
 static void spanel_apply_brightness(int v)
 {
     if (v < 5)

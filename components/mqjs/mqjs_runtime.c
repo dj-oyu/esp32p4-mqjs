@@ -48,6 +48,7 @@
 #include "mquickjs.h"
 #include "mqjs_runtime.h"
 #include "mqjs_classes.h"
+#include "mqjs_power.h"
 #include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
@@ -1349,6 +1350,11 @@ JSValue js_ui_onTouch(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 void mqjs_post_touch(int x, int y, int kind)
 {
 #ifdef ESP_PLATFORM
+    /* feed the device idle clock first, and let it swallow the gesture
+       that only woke a blanked screen (before the fg-handler check, so a
+       tap wakes even when the foreground app has no touch handler). */
+    if (mqjs_power_note_input(kind))
+        return;
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* touch always goes to the fg app */
     if (!s_event_queue || !fg->used || !fg->touch_used)
         return;
@@ -5170,6 +5176,7 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
     s_dev_retry_at = 0; /* 0 = ask the provider right away */
 #ifdef ESP_PLATFORM
     autostart_boot(); /* §8: opted-in resident apps come back at boot */
+    mqjs_power_init(time_ms()); /* screen power-state machine */
 #endif
 
     for (;;) {
@@ -5214,6 +5221,9 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
         ui_tab5_w_commit(); /* §3.4: start a queued screen-load anim only
                                after this dispatch finished building */
         reap_idle_apps();
+#ifdef ESP_PLATFORM
+        mqjs_power_update(time_ms()); /* dim/blank on idle, wake on touch */
+#endif
     }
 }
 
