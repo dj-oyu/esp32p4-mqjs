@@ -3,10 +3,12 @@
 Status: 2026-06-13 起案。**P0 screen slice（ACTIVE/DIMMED/SCREEN_OFF +
 backlight + idle clock + wake-touch 食い + monitor ログ）実装済**
 （`mqjs_power.{c,h}`、TEST しきい値 `T_dim`=5s/`T_off`=10s）。
-**idle 自動遷移はデバイス検証済 2026-06-13 COM8**（シリアルキャプチャで
-init→ACTIVE、+5.03s で DIMMED(bl 10%)、+10.02s で SCREEN_OFF(消灯) を確認）。
-wake-on-touch / タップ食いは物理タップ検証待ち。本番しきい値(60s/180s)への
-復帰は wake 検証後。SUSPEND・OFF・INA226・wake-lock は未実装（P1 以降）。
+**P0 全項目デバイス検証済 2026-06-13 COM8**（App 11bfddc）: idle 進行
+(init→ACTIVE、+5.04s DIMMED bl10%、+10.03s SCREEN_OFF)、wake-on-touch
+(タップで SCREEN_OFF→ACTIVE を3回、再 dim/off サイクルも正常)。タップ食いは
+目視確認。BEEP(SELFTEST)無効化も同ビルドで確認(WAV のみ再生)。
+本番しきい値(60s/180s)への復帰は未(現状 TEST 5s/10s)。SUSPEND・OFF・
+INA226・wake-lock は未実装（P1 以降）。
 
 ESP-IDF の `esp_pm`（DFS / 自動 light-sleep）を**前提にしない**。
 M5Tab5-UserDemo 公式も `CONFIG_PM_ENABLE is not set` で、電源 UX は

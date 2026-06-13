@@ -27,12 +27,14 @@
    user's chosen level (ui_tab5_backlight_user), then restore it. */
 extern void ui_tab5_backlight_apply(int percent);
 extern int  ui_tab5_backlight_user(void);
+extern void ui_tab5_screen_scrim(bool on); /* eat widget taps while dark */
 static const char *TAG = "power";
 #define PWR_LOG(...) ESP_LOGI(TAG, __VA_ARGS__)
 #else
 #include <stdio.h>
 static void ui_tab5_backlight_apply(int percent) { (void)percent; }
 static int  ui_tab5_backlight_user(void) { return 100; }
+static void ui_tab5_screen_scrim(bool on) { (void)on; }
 #define PWR_LOG(fmt, ...) printf("[power] " fmt "\n", ##__VA_ARGS__)
 #endif
 
@@ -97,6 +99,7 @@ void mqjs_power_update(int64_t now_ms)
         if (s_state != PWR_ACTIVE) {
             PWR_LOG("%s -> ACTIVE (wake)", state_name(s_state));
             ui_tab5_backlight_apply(ui_tab5_backlight_user());
+            ui_tab5_screen_scrim(false); /* drop the input eater */
             s_state = PWR_ACTIVE;
         }
         return;
@@ -117,6 +120,7 @@ void mqjs_power_update(int64_t now_ms)
             PWR_LOG("DIMMED -> SCREEN_OFF (idle %lldms, backlight off)",
                     (long long)idle);
             ui_tab5_backlight_apply(0);
+            ui_tab5_screen_scrim(true); /* eat taps so they don't hit widgets */
             s_state = PWR_SCREEN_OFF;
             /* P1 here: suspend background apps + non-locked foreground */
         }

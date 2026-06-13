@@ -1499,6 +1499,39 @@ static int s_brightness = 100; /* boot value set by ui_tab5_start */
 extern "C" void ui_tab5_backlight_apply(int percent) { backlight_set(percent); }
 extern "C" int  ui_tab5_backlight_user(void) { return s_brightness; }
 
+/* SCREEN_OFF input eater. The JS mqjs_post_touch path is already swallowed
+   by the power manager, but LVGL dispatches touch to widgets independently,
+   so a tap on the dark screen would still press a launcher button. Raise a
+   fullscreen clickable object on the top layer (same web-modal backdrop
+   trick as the camera viewfinder s_cam_scrim) so the wake tap lands on it,
+   not on a widget. Transparent — invisible anyway with the backlight off.
+   The indev still reports the raw press, so touch_observe -> wake detection
+   is unaffected. Called from mqjs_power on js_task; takes the LVGL lock. */
+static lv_obj_t *s_pwr_scrim;
+
+extern "C" void ui_tab5_screen_scrim(bool on)
+{
+    lvgl_port_lock(0);
+    if (on) {
+        if (!s_pwr_scrim) {
+            s_pwr_scrim = lv_obj_create(lv_layer_top());
+            lv_obj_set_size(s_pwr_scrim, LV_PCT(100), LV_PCT(100));
+            lv_obj_set_pos(s_pwr_scrim, 0, 0);
+            lv_obj_set_style_radius(s_pwr_scrim, 0, 0);
+            lv_obj_set_style_border_width(s_pwr_scrim, 0, 0);
+            lv_obj_set_style_pad_all(s_pwr_scrim, 0, 0);
+            lv_obj_set_style_bg_opa(s_pwr_scrim, LV_OPA_TRANSP, 0);
+            lv_obj_add_flag(s_pwr_scrim, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(s_pwr_scrim, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        lv_obj_clear_flag(s_pwr_scrim, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_pwr_scrim);
+    } else if (s_pwr_scrim) {
+        lv_obj_add_flag(s_pwr_scrim, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_port_unlock();
+}
+
 static void spanel_apply_brightness(int v)
 {
     if (v < 5)
