@@ -595,9 +595,21 @@ uint32_t opus_p4_anti_collapse_noise_f32(
 - 生成コードではstatic dispatchが解決され、wrapper内に70-byteの独立ループが
   生成された。hot loop内の関数ポインタdispatchは残っていない。
 
-2026-06-13にESP-IDF 6.0.1でbenchmark buildと通常buildの両方が成功した。
-実機flashは保留中。採用判断にはbaselineと同じfixtureでPCM FNV-1a
-`37e8c5b59e9a40c6`の維持とcycles/frame比較が必要。
+2026-06-13にESP-IDF 6.0.1でbenchmark build、ASM-verify build、通常buildが
+成功した。portable C構成をCOM8へflashし、baselineと同じ条件で実測した。
+
+| Metric | Baseline | Signed-noise kernel boundary |
+|---|---:|---:|
+| Decode total / 5 passes | 3,570,866 us | 3,566,822 us |
+| Cycles / frame | 845.1 | 844.2 |
+| Realtime load | 11.26% | 11.25% |
+| Throughput | 8.88x | 8.89x |
+| PCM FNV-1a | `37e8c5b59e9a40c6` | 同値、全5周一致 |
+
+`cycles/frame`は約0.11%改善したが、周回揺らぎに近く、この境界切り出し単体の
+明確な高速化とは判断しない。bit-exact性と動作回帰がないことは確認できたため、
+後続ASMの置換境界として維持する。ASM採用判断では引き続き`845.1 cycles/frame`
+をend-to-end baselineとして使用する。
 
 ### ASM差し替え下準備
 
