@@ -103,9 +103,11 @@ left/right DAC to its own mixer" + DACCONTROL24=0x1E で 4 出力 0dB)。ES8388
 
 対策: `audio_tab5_write` のモノ経路で `(L+R)>>1` を両レーンに展開
 (int32 和 →>>1 は int16 範囲ちょうど、クリップ不要)。既定 ON
-(`s_downmix`、駆動先がモノスピーカーのみのため)。ヘッドホン等の真ステレオ
-出力用に OFF も可。JS `audio.downmix([on])` でトグル (boot WAV を fold vs
-straight で A/B 可能)。
+(`s_downmix`、駆動先がモノスピーカーのみのため — ユーザー方針「スピーカー
+出力なら常に L+R」)。ヘッドホン等の真ステレオ出力用に OFF も可。JS
+`audio.downmix([on])` でトグル。**実機検証済み 2026-06-13** (downmix ON で
+flash、probe_audio.js で frames 48000/s・バックプレッシャー・途切れなしを
+確認、ステレオ boot WAV が片 ch 落ちなく再生)。
 
 PIE は使わない判断: ダウンミックスは 48kHz で ~0.04% CPU・I2S 律速で
 ボトルネックでないため計測ゲートを通らない (連続データで PIE 向きではあるが
