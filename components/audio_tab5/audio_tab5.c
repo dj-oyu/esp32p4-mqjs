@@ -76,10 +76,18 @@ static bool s_downmix = true;
 #define AUD_FFT_N 512
 static float s_fft_buf[AUD_FFT_N];
 static volatile uint32_t s_fft_wr;
+/* digital peak meter on the downmixed mono signal — proves whether the
+   (L+R)/2 fold ever rails (it cannot, mathematically; this measures it).
+   Reset on each stats read so it reports the peak of the last window. */
+static volatile int s_peak;
+static volatile uint32_t s_clipcnt;
 static inline void fft_capture(int16_t v)
 {
     s_fft_buf[s_fft_wr & (AUD_FFT_N - 1)] = (float)v;
     s_fft_wr++;
+    int a = v < 0 ? -(int)v : (int)v;
+    if (a > s_peak) s_peak = a;
+    if (a >= 32767) s_clipcnt++;
 }
 
 /* ---- SPK_EN on the 0x43 expander, read-modify-write ---------------- */
@@ -402,7 +410,11 @@ void audio_tab5_get_stats(audio_tab5_stats_t *out)
             : 0,
         .underruns = s_underruns,
         .frames_written = s_frames_written,
+        .peak = (uint16_t)s_peak,
+        .clipped = s_clipcnt,
     };
+    s_peak = 0;       /* peak meter: report the level since the last read */
+    s_clipcnt = 0;
 }
 
 /* ---- 16-band FFT analyzer ------------------------------------------- */
@@ -466,6 +478,7 @@ void audio_tab5_spectrum(uint8_t bands[16])
        The geometric ratio spans bin 1..256 over 16 bands (~sqrt(2)/band). */
     const int half = AUD_FFT_N / 2;
     const float ratio = 1.4142136f;
+    const float norm = 4.0f / (float)AUD_FFT_N; /* full-scale sine bin -> 1.0 */
     float edge = 1.0f;
     for (int b = 0; b < 16; b++) {
         int k0 = (int)(edge + 0.5f);
@@ -474,12 +487,13 @@ void audio_tab5_spectrum(uint8_t bands[16])
         if (k0 < 1) k0 = 1;
         if (k1 > half) k1 = half;
         if (k1 < k0) k1 = k0;
-        float mag = 0.0f;
-        for (int k = k0; k <= k1; k++)
-            mag += sqrtf(re[k] * re[k] + im[k] * im[k]);
-        mag /= (float)(k1 - k0 + 1);
-        float db = 20.0f * log10f(mag + 1e-6f);
-        int v = (int)((db + 60.0f) * (100.0f / 60.0f)); /* -60..0 dB -> 0..100 */
+        float peak = 0.0f;                        /* peak-hold across the band */
+        for (int k = k0; k <= k1; k++) {
+            float mg = sqrtf(re[k] * re[k] + im[k] * im[k]) * norm;
+            if (mg > peak) peak = mg;
+        }
+        float db = 20.0f * log10f(peak + 1e-9f);  /* 0 dBFS = full scale */
+        int v = (int)((db + 72.0f) * (100.0f / 72.0f)); /* -72..0 dB -> 0..100 */
         if (v < 0) v = 0;
         if (v > 100) v = 100;
         bands[b] = (uint8_t)v;

@@ -2747,11 +2747,13 @@ JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
     audio_tab5_spectrum(spec);
     int off = snprintf(buf, sizeof buf,
              "{\"running\":%s,\"rate\":%lu,\"ch\":%u,\"queued\":%lu,"
-             "\"underruns\":%lu,\"frames\":%llu,\"spec\":[",
+             "\"underruns\":%lu,\"frames\":%llu,\"peak\":%u,\"clip\":%lu,"
+             "\"spec\":[",
              st.running ? "true" : "false", (unsigned long)st.sample_rate,
              (unsigned)st.channels, (unsigned long)st.queued_bytes,
              (unsigned long)st.underruns,
-             (unsigned long long)st.frames_written);
+             (unsigned long long)st.frames_written,
+             (unsigned)st.peak, (unsigned long)st.clipped);
     for (int i = 0; i < 16 && off < (int)sizeof buf; i++)
         off += snprintf(buf + off, sizeof buf - off, "%s%u",
                         i ? "," : "", spec[i]);

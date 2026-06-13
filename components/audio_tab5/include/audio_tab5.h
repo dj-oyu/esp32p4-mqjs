@@ -28,6 +28,10 @@ typedef struct {
                               exactly N — mid-stream increments are real
                               underruns */
     uint64_t frames_written; /* frames handed to I2S DMA since boot */
+    uint16_t peak;           /* max |sample| of the downmixed mono signal
+                                since the previous stats read (0..32768);
+                                32768 means the fold railed (it never does) */
+    uint32_t clipped;        /* count of full-scale samples since last read */
 } audio_tab5_stats_t;
 
 #if CONFIG_MQJS_TAB5_AUDIO

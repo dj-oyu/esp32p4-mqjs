@@ -37,11 +37,15 @@ function draw() {
   ui.rect(B2.x, BTN_Y, B2.w, BTN_H, B2.c);
   ui.text(B2.x + 105, BTN_Y + 36, B2.t, 0xFFFFFF);
 }
+var pk = 0, cl = 0;
 function poll() {
-  try { var o = JSON.parse(audio.stats()); if (o && o.spec) spec = o.spec; } catch (e) {}
+  try {
+    var o = JSON.parse(audio.stats());
+    if (o && o.spec) { spec = o.spec; pk = o.peak; cl = o.clip; }
+  } catch (e) {}
   draw();
-  if ((pc++ % 7) === 0)   // ~ every 490 ms
-    print("spec[" + mode + "] " + spec.join(" "));
+  if ((pc++ % 4) === 0)   // ~ every 280 ms
+    print("spec[" + mode + "] pk=" + pk + " clip=" + cl + " | " + spec.join(" "));
 }
 
 audio.start(48000, 2);
@@ -49,7 +53,7 @@ audio.volume(70);
 
 var sweep = [120, 220, 440, 880], si = 0;
 function sweepStep() {
-  if (si >= sweep.length) { mode = "READY"; return; }
+  if (si >= sweep.length) { mode = "READY"; setTimeout(playWav, 800); return; }
   var f = sweep[si++];
   mode = f + "Hz";
   audio.tone(f, 500);
@@ -66,12 +70,9 @@ ui.onTouch(function (x, y, kind) {
   }
 });
 
-var firstFg = true;
-sys.onForeground(function () {
-  draw();
-  if (firstFg) { firstFg = false; setTimeout(playSweep, 900); }
-});
+sys.onForeground(function () { draw(); });
 setTimeout(function () { sys.focus("sndtest"); }, 200);
+setTimeout(playSweep, 1200); // auto demo: sweep -> WAV, regardless of fg state
 
 setInterval(poll, 70);
 draw();
