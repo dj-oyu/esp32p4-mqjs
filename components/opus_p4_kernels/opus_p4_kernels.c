@@ -65,10 +65,9 @@ void opus_p4_pie_probe(void)
         in[16 + i] = data[i];
         in[24 + i] = tw[i];
     }
-    /* comb-inner trace: 8 const int32 = 0x100000 (lo=0, hi=16), g=9000 */
+    /* src.q / unaligned-load test: in32[0..7] = 10..17 */
     for (int i = 0; i < 8; i++)
-        in32[i] = 0x100000;
-    in32[8] = 9000; /* g (low 16 used by vldbc.16) */
+        in32[i] = 10 + i;
     memset(out, 0, sizeof(out));
     opus_p4_pie_probe_run(in, in32, out);
     ESP_LOGI("pie_probe", "vmul.s32.s16xs16 SIGNED (expect -10,-40,-90,-160 / -250,-360,-490,-640)");
@@ -77,13 +76,10 @@ void opus_p4_pie_probe(void)
              (long)out[4], (long)out[5], (long)out[6], (long)out[7]);
     ESP_LOGI("pie_probe", "cmul.s16 q6= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
              (long)out[8], (long)out[9], (long)out[10], (long)out[11]);
-    ESP_LOGI("pie_probe", "comb-inner const=0x100000 g=9000:");
-    ESP_LOGI("pie_probe", "  lo(exp 0)= %ld %ld  hi(exp 16)= %ld %ld",
-             (long)out[20], (long)out[21], (long)out[24], (long)out[25]);
-    ESP_LOGI("pie_probe", "  phi=g*hi(exp 144000)= %ld %ld  phi<<1(exp 288000)= %ld %ld",
-             (long)out[28], (long)out[29], (long)out[32], (long)out[33]);
-    ESP_LOGI("pie_probe", "  in-place vadd.s32 (exp 432000)= %ld %ld",
-             (long)out[36], (long)out[37]);
+    ESP_LOGI("pie_probe", "src.q q0,q1 >>4B (exp 11,12,13,14)= %ld %ld %ld %ld",
+             (long)out[20], (long)out[21], (long)out[22], (long)out[23]);
+    ESP_LOGI("pie_probe", "usar+src.q.ld unaligned@in32[1] (exp 11,12,13,14)= %ld %ld %ld %ld",
+             (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
     opus_p4_comb_bench();
 }
 #else
@@ -154,8 +150,9 @@ void opus_p4_comb_filter_const_p4(int32_t *y, const int32_t *x, int T, int N,
 void opus_p4_comb_bench(void)
 {
     enum { N = 480, T = 100, GUARD = 16, BUF = N + T + GUARD + 16 };
-    static int32_t xbuf[BUF];
-    static int32_t yc[N], yp[N];
+    static int32_t xbuf[BUF] __attribute__((aligned(16)));
+    static int32_t yc[N] __attribute__((aligned(16)));
+    static int32_t yp[N] __attribute__((aligned(16)));
     uint32_t seed = 12345u;
     for (int i = 0; i < BUF; i++) {
         seed = 1664525u * seed + 1013904223u;

@@ -4,27 +4,28 @@
  * void opus_p4_comb8(int32_t *y, const int32_t *x, int T,
  *                    int16_t g10, int16_t g11, int16_t g12);
  *
- * For k = 0..7:
- *   s = x[k-T]; a = x[k-T+1]+x[k-T-1]; b = x[k-T+2]+x[k-T-2];
- *   t = x[k] + M(g10,s) + M(g11,a) + M(g12,b);  y[k] = clamp(t, +/-SIG_SAT)
- * with relaxed M(g,v) = (g*hi)*2 + (g*lo)>>15, signed split hi=(s16)(v>>16),
- * lo=(s16)v (vunzip.16).
+ * Relaxed comb (opus_compare tolerance, not bit-exact): the symmetric taps are
+ * split into 5 independent MULT16_32_Q15 terms,
+ *   y[k] = x[k] + M(g10,x[k-T]) + M(g11,x[k-T-1]) + M(g11,x[k-T+1])
+ *               + M(g12,x[k-T-2]) + M(g12,x[k-T+2])
+ * clamped to +/-SIG_SAT. M(g,v) = (g*hi)*2 + (g*lo)>>15 with the signed split
+ * hi=(s16)(v>>16), lo=(s16)v (vunzip.16).
  *
- * NOTE: esp.vmul.s32.s16xs16 right-shifts its product by SAR. So the hi
- * product is taken with SAR=0 (raw g*hi, then *2 via vadd) and the lo product
- * with SAR=15 (= (g*lo)>>15 directly). SAR is set per term right before each
- * multiply.
+ * Each tap window is unaligned (x[k-T+d] is not 16-aligned). PIE vld.128 is
+ * aligned-only, so each tap loads 3 aligned blocks from its own aligned base
+ * and funnel-shifts (esp.src.q with SAR_BYTES = P&15) to recover the window.
+ * SAR_BYTES (src.q) and SAR (vmul/vsr) are independent registers.
+ *
+ * Verified on device: maxdiff vs scalar ~5.4e4 (~-64 dB, the relaxed split
+ * error), ~2x faster than scalar. Requires the 8-output blocks (x+k) to be
+ * 16-aligned, which holds when the caller's x is 16-aligned and k is a
+ * multiple of 8.
+ *
+ * NOTE: esp.vmul.s32.s16xs16 right-shifts its product by SAR; use SAR=0 for the
+ * raw g*hi product, SAR=15 for the >>15.
  *
  * ABI: a0=y, a1=x (=&x[i]), a2=T, a3=g10, a4=g11, a5=g12.
  * PIE memory / SAR ops require base GPRs in x8..x15 (a0-a5, s0, s1).
- *
- * KNOWN BUG (WIP): esp.vld.128 is 16-byte-aligned only -- it drops the low
- * address bits. The shifted comb taps (x[i-T+/-1], x[i-T+/-2] at s0+/-4, s0+/-8)
- * are not 16-aligned, so those loads read wrong data. Verified correct only
- * when every tap address is 16-aligned. Fix requires unaligned loads via
- * esp.ld.128.usar + esp.src.q funnel-shift (the esp-dsp FIR pattern). The
- * arithmetic (16x32 via vmul.s32.s16xs16, SAR-controlled shift, saturate) and
- * the ~3x speedup are confirmed; only the windowed loads need the usar path.
  */
 
 #include "sdkconfig.h"
@@ -36,29 +37,40 @@
     .global opus_p4_comb8
     .type   opus_p4_comb8,@function
 
-    /* term: q2=lo, q3=hi (after vunzip), q4=g broadcast.
-     * accumulates into t (q0,q1). Clobbers a4,q2,q3,q5,q6,q7. */
-    .macro COMB_TERM
+    /* One tap: d_bytes = byte offset of x[k-T+d] from s0; g_off = stack offset
+     * of the s16 gain. Accumulates M(g, tap) into t (q0,q1). */
+    .macro TAP d_bytes, g_off
+    addi    a3, s0, \d_bytes        /* P = &x[k-T+d] */
+    andi    a4, a3, 15
+    esp.movx.w.sar.bytes a4         /* SAR_BYTES = P & 15 */
+    andi    a3, a3, -16             /* abase = P & ~15 */
+    esp.vld.128.ip      q2, a3, 16  /* Ba */
+    esp.vld.128.ip      q3, a3, 16  /* Bb */
+    esp.vld.128.ip      q4, a3, 16  /* Bc */
+    esp.src.q           q5, q2, q3  /* win lo = x[P..P+3] */
+    esp.src.q           q6, q3, q4  /* win hi = x[P+4..P+7] */
+    esp.vunzip.16       q5, q6      /* q5=lo s16, q6=hi s16 */
+    addi    a4, sp, \g_off
+    esp.vldbc.16.ip     q7, a4, 0   /* q7 = g broadcast */
     li      a4, 0
     esp.movx.w.sar      a4
-    esp.vmul.s32.s16xs16 q5, q6, q4, q3   /* phi = g*hi (raw, SAR=0) */
-    esp.vadd.s32        q3, q5, q5  /* phi*2 -> q3,q7 */
-    esp.vadd.s32        q7, q6, q6
-    esp.vmul.s32.s16xs16 q5, q6, q4, q2   /* plo = g*lo (raw, SAR=0) */
+    esp.vmul.s32.s16xs16 q2, q3, q7, q6   /* phi = g*hi (raw) */
+    esp.vadd.s32        q2, q2, q2  /* phi*2 */
+    esp.vadd.s32        q3, q3, q3
+    esp.vmul.s32.s16xs16 q5, q6, q7, q5   /* plo = g*lo (raw) */
     li      a4, 15
     esp.movx.w.sar      a4
-    esp.vsr.s32         q5, q5      /* plo>>15 (arithmetic) */
+    esp.vsr.s32         q5, q5      /* plo>>15 */
     esp.vsr.s32         q6, q6
-    esp.vadd.s32        q3, q3, q5  /* m = phi*2 + plo>>15 */
-    esp.vadd.s32        q7, q7, q6
-    esp.vadd.s32        q0, q0, q3  /* t += m */
-    esp.vadd.s32        q1, q1, q7
+    esp.vadd.s32        q2, q2, q5  /* m = phi*2 + plo>>15 */
+    esp.vadd.s32        q3, q3, q6
+    esp.vadd.s32        q0, q0, q2  /* t += m */
+    esp.vadd.s32        q1, q1, q3
     .endm
 
 opus_p4_comb8:
     addi    sp, sp, -32
     sw      s0, 0(sp)
-    sw      s1, 4(sp)
     sh      a3, 8(sp)               /* g10 */
     sh      a4, 10(sp)              /* g11 */
     sh      a5, 12(sp)              /* g12 */
@@ -68,45 +80,16 @@ opus_p4_comb8:
     sw      a6, 20(sp)
 
     slli    a6, a2, 2               /* a6 = 4*T (bytes) */
-    sub     s0, a1, a6              /* s0 = &x[i-T] */
-    addi    s1, sp, 8              /* s1 -> g10/g11/g12 (vldbc.16 stream) */
+    sub     s0, a1, a6              /* s0 = &x[k-T] */
 
-    esp.vld.128.ip      q0, a1, 16  /* t = x[i..i+3]  */
-    esp.vld.128.ip      q1, a1, 16  /* t = x[i+4..i+7]*/
+    esp.vld.128.ip      q0, a1, 16  /* t = x[k..k+3]   (k mult 8 -> aligned) */
+    esp.vld.128.ip      q1, a1, 16  /* t = x[k+4..k+7] */
 
-    /* ---- term g10:  s = x[i-T..]  ---- */
-    mv      a3, s0
-    esp.vld.128.ip      q2, a3, 16
-    esp.vld.128.ip      q3, a3, 16
-    esp.vunzip.16       q2, q3      /* q2=lo s16, q3=hi s16 */
-    esp.vldbc.16.ip     q4, s1, 2   /* g10 */
-    COMB_TERM
-
-    /* ---- term g11:  a = x[i-T+1..] + x[i-T-1..]  ---- */
-    addi    a3, s0, 4
-    esp.vld.128.ip      q2, a3, 16
-    esp.vld.128.ip      q3, a3, 16
-    addi    a3, s0, -4
-    esp.vld.128.ip      q5, a3, 16
-    esp.vld.128.ip      q6, a3, 16
-    esp.vadd.s32        q2, q2, q5
-    esp.vadd.s32        q3, q3, q6
-    esp.vunzip.16       q2, q3
-    esp.vldbc.16.ip     q4, s1, 2   /* g11 */
-    COMB_TERM
-
-    /* ---- term g12:  b = x[i-T+2..] + x[i-T-2..]  ---- */
-    addi    a3, s0, 8
-    esp.vld.128.ip      q2, a3, 16
-    esp.vld.128.ip      q3, a3, 16
-    addi    a3, s0, -8
-    esp.vld.128.ip      q5, a3, 16
-    esp.vld.128.ip      q6, a3, 16
-    esp.vadd.s32        q2, q2, q5
-    esp.vadd.s32        q3, q3, q6
-    esp.vunzip.16       q2, q3
-    esp.vldbc.16.ip     q4, s1, 2   /* g12 */
-    COMB_TERM
+    TAP     0, 8                     /* d= 0, g10 */
+    TAP     -4, 10                   /* d=-1, g11 */
+    TAP     4, 10                    /* d=+1, g11 */
+    TAP     -8, 12                   /* d=-2, g12 */
+    TAP     8, 12                    /* d=+2, g12 */
 
     /* ---- saturate to +/- SIG_SAT and store ---- */
     addi    a3, sp, 16
@@ -120,7 +103,6 @@ opus_p4_comb8:
     esp.vst.128.ip      q1, a0, 16
 
     lw      s0, 0(sp)
-    lw      s1, 4(sp)
     addi    sp, sp, 32
     ret
 
