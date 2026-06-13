@@ -774,6 +774,40 @@ ABI 境界は butterfly の内側ループ（kf_bfly3 の `do{}while(--k)`／kf_
 4. before/after を fixed baseline 729.9 cycles/frame に対して計測、採用判定。
 5. 同パターンで kf_bfly5 / kf_bfly4 へ展開。
 
+### PIE 適用可否の最終結論（2026-06-14）
+
+実装前に ESP32-P4 PIE の全命令（`xespv2p1`、IDF の `xesppie.S` decoder
+test）を精査し、CELT decode への適用可否を確定した。**PIE は CELT decode を
+高速化できない**。理由を 4 つの壁として記録する。
+
+1. **float SIMD なし**: `esp.vmul.f32` 等は opcode 不在。float build は全演算が
+   scalar FPU。→ fixed-point へ pivot（これ自体が 13.5% の本命 win）。
+2. **gather/scatter なし**: load/store は連続 128-bit のみ。anti_collapse の
+   stride `1<<LM` scatter store、kf_bfly の `twiddles[u·fstride]` strided gather を
+   表現できない。
+3. **32-bit 整数乗算なし**: 乗算は s8/s16/u8/u16 のみ。CELT decode は
+   16-bit coef × **32-bit signal**（`MULT16_32_Q15`）。16×32 を 16×16 で合成しても、
+   各項を 32-bit へ truncate してから加算する CELT の順序を QACC 蓄積では再現できず
+   bit-exact 不可。
+4. **積の取り出しが 16-bit narrowing のみ**（決定的）: 全乗算は QACC/XACC 蓄積。
+   `mov.*.qacc` は 16/8-bit へ saturate narrow、32-bit/lane を register へ戻す命令は
+   無く、保持には `st.qacc`→memory roundtrip が必要。つまり PIE は本質的に
+   **16-bit 出力の FIR/dotprod エンジン**。32-bit signal の CELT decode kernel
+   （comb filter, butterflies, denormalise, exp_rotation 等）は、
+   conformance tolerance に緩めても (a) 16-bit narrow で精度劣化か
+   (b) memory roundtrip で scalar より遅い、のいずれかになり win にならない。
+
+**PIE が真に効くのは 16-bit data kernel**＝SILK（speech）の LPC synthesis /
+resampler（`vmulas.s16` / `cmul.s16` が適合）。ただし現 fixture は CELT-only
+music で SILK 未起動のため、別途 speech fixture と re-profile が必要。
+
+**本ブランチの成果**: float→fixed-point 切替で **13.5% 高速化**
+（844.2→729.9 cycles/frame、8.89x→10.28x realtime、`CONFIG_OPUS_FIXED_POINT`、
+既定 off で無回帰）。`opus_p4_comb_filter_const_c` は bit-exact 検証済みの
+kernel reference として残置（PIE body は上記結論により未実装；将来 SILK or
+relaxed-tolerance 路線の足場）。anti_collapse scalar asm も検証済み scaffold
+として残置。
+
 ## 15. 参考
 
 - ESP Component Registry: `78/esp-opus` 1.0.5
