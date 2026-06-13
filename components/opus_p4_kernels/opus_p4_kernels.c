@@ -44,16 +44,19 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
 
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_pie_probe_run(const int16_t *in, const int32_t *in32, int32_t *out);
+void opus_p4_comb_bench(void);
 
 void opus_p4_pie_probe(void)
 {
     static int16_t in[32] __attribute__((aligned(16)));
     static int32_t in32[16] __attribute__((aligned(16)));
-    static int32_t out[32] __attribute__((aligned(16)));
-    /* vmul widening: A=1..8, B=10..80 (products 10,40,90,160,250,360,490,640) */
+    static int32_t out[40] __attribute__((aligned(16)));
+    /* vmul widening with SIGNED operands: A={1,-2,3,-4,5,-6,7,-8},
+     * B={-10,20,-30,40,-50,60,-70,80} -> -10,-40,-90,-160,-250,-360,-490,-640 */
     for (int i = 0; i < 8; i++) {
-        in[i] = (int16_t)(i + 1);
-        in[8 + i] = (int16_t)((i + 1) * 10);
+        int s = (i & 1) ? -1 : 1;
+        in[i] = (int16_t)(s * (i + 1));
+        in[8 + i] = (int16_t)(-s * (i + 1) * 10);
     }
     /* cmul: 4 complex data (r,i) x twiddle (0, 16384=+0.5 in Q15) */
     static const int16_t data[8] = { 100, 0, 0, 100, 100, 100, 200, 300 };
@@ -62,35 +65,26 @@ void opus_p4_pie_probe(void)
         in[16 + i] = data[i];
         in[24 + i] = tw[i];
     }
-    /* shift test: >>15 expects 2,4,-6,32768 ; <<1 expects x2 */
-    in32[0] = 0x10000;
-    in32[1] = 0x20000;
-    in32[2] = -0x30000;
-    in32[3] = 0x40000000;
-    /* clamp test: vmin with SIG_SAT expects 100, 536870911, -100, -700000000 */
-    in32[4] = 100;
-    in32[5] = 600000000;
-    in32[6] = -100;
-    in32[7] = -700000000;
-    in32[8] = 536870911; /* SIG_SAT */
+    /* comb-inner trace: 8 const int32 = 0x100000 (lo=0, hi=16), g=9000 */
+    for (int i = 0; i < 8; i++)
+        in32[i] = 0x100000;
+    in32[8] = 9000; /* g (low 16 used by vldbc.16) */
     memset(out, 0, sizeof(out));
     opus_p4_pie_probe_run(in, in32, out);
-    ESP_LOGI("pie_probe", "vmul.s32.s16xs16 (expect 10,40,90,160 / 250,360,490,640)");
+    ESP_LOGI("pie_probe", "vmul.s32.s16xs16 SIGNED (expect -10,-40,-90,-160 / -250,-360,-490,-640)");
     ESP_LOGI("pie_probe", "  dst0= %ld %ld %ld %ld dst1= %ld %ld %ld %ld",
              (long)out[0], (long)out[1], (long)out[2], (long)out[3],
              (long)out[4], (long)out[5], (long)out[6], (long)out[7]);
     ESP_LOGI("pie_probe", "cmul.s16 q6= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
              (long)out[8], (long)out[9], (long)out[10], (long)out[11]);
-    ESP_LOGI("pie_probe", "vunzip.16 q0={1..8} q1={10..80} ->");
-    ESP_LOGI("pie_probe", "  q0= 0x%08lx 0x%08lx 0x%08lx 0x%08lx q1= 0x%08lx 0x%08lx 0x%08lx 0x%08lx",
-             (long)out[12], (long)out[13], (long)out[14], (long)out[15],
-             (long)out[16], (long)out[17], (long)out[18], (long)out[19]);
-    ESP_LOGI("pie_probe", "vsr.s32>>15 (exp 2,4,-6,32768)= %ld %ld %ld %ld",
-             (long)out[20], (long)out[21], (long)out[22], (long)out[23]);
-    ESP_LOGI("pie_probe", "vsl.32<<1 (exp 131072,262144,-393216,-2147483648)= %ld %ld %ld %ld",
-             (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
-    ESP_LOGI("pie_probe", "vmin.s32 clamp (exp 100,536870911,-100,-700000000)= %ld %ld %ld %ld",
-             (long)out[28], (long)out[29], (long)out[30], (long)out[31]);
+    ESP_LOGI("pie_probe", "comb-inner const=0x100000 g=9000:");
+    ESP_LOGI("pie_probe", "  lo(exp 0)= %ld %ld  hi(exp 16)= %ld %ld",
+             (long)out[20], (long)out[21], (long)out[24], (long)out[25]);
+    ESP_LOGI("pie_probe", "  phi=g*hi(exp 144000)= %ld %ld  phi<<1(exp 288000)= %ld %ld",
+             (long)out[28], (long)out[29], (long)out[32], (long)out[33]);
+    ESP_LOGI("pie_probe", "  in-place vadd.s32 (exp 432000)= %ld %ld",
+             (long)out[36], (long)out[37]);
+    opus_p4_comb_bench();
 }
 #else
 void opus_p4_pie_probe(void) {}
@@ -133,6 +127,81 @@ void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
         y[i] = p4_sig_sat(t);
     }
 }
+
+#if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
+void opus_p4_comb8(int32_t *y, const int32_t *x, int T, int16_t g10,
+                   int16_t g11, int16_t g12);
+
+void opus_p4_comb_filter_const_p4(int32_t *y, const int32_t *x, int T, int N,
+                                  int16_t g10, int16_t g11, int16_t g12)
+{
+    int i = 0;
+    int n8 = N & ~7;
+    for (; i < n8; i += 8)
+        opus_p4_comb8(y + i, x + i, T, g10, g11, g12);
+    for (; i < N; i++) {
+        int32_t s = x[i - T];
+        int32_t a = (int32_t)((uint32_t)x[i - T + 1] + (uint32_t)x[i - T - 1]);
+        int32_t b = (int32_t)((uint32_t)x[i - T + 2] + (uint32_t)x[i - T - 2]);
+        int32_t t = x[i];
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g10, s));
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g11, a));
+        t = (int32_t)((uint32_t)t + (uint32_t)p4_mult16_32_q15(g12, b));
+        y[i] = p4_sig_sat(t);
+    }
+}
+
+void opus_p4_comb_bench(void)
+{
+    enum { N = 480, T = 100, GUARD = 16, BUF = N + T + GUARD + 16 };
+    static int32_t xbuf[BUF];
+    static int32_t yc[N], yp[N];
+    uint32_t seed = 12345u;
+    for (int i = 0; i < BUF; i++) {
+        seed = 1664525u * seed + 1013904223u;
+        xbuf[i] = (int32_t)seed >> 4; /* +/- ~2^27 */
+    }
+    const int32_t *x = &xbuf[T + GUARD];
+    int16_t g10 = 9000, g11 = 6000, g12 = 3000;
+    const int iters = 2000;
+
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_comb_filter_const_c(yc, x, T, N, g10, g11, g12);
+    uint32_t tc = esp_cpu_get_cycle_count() - t0;
+
+    t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_comb_filter_const_p4(yp, x, T, N, g10, g11, g12);
+    uint32_t tp = esp_cpu_get_cycle_count() - t0;
+
+    int32_t maxdiff = 0;
+    int imax = 0;
+    for (int i = 0; i < N; i++) {
+        int32_t d = yc[i] - yp[i];
+        if (d < 0)
+            d = -d;
+        if (d > maxdiff) {
+            maxdiff = d;
+            imax = i;
+        }
+    }
+    ESP_LOGI("comb_bench",
+             "imax=%d yc=%ld yp=%ld | x[i]=%ld x[i-T]=%ld xm1=%ld xp1=%ld xm2=%ld xp2=%ld",
+             imax, (long)yc[imax], (long)yp[imax], (long)x[imax],
+             (long)x[imax - T], (long)x[imax - T - 1], (long)x[imax - T + 1],
+             (long)x[imax - T - 2], (long)x[imax - T + 2]);
+    ESP_LOGI("comb_bench",
+             "N=%d iters=%d  C=%lu (%.1f/call)  PIE=%lu (%.1f/call)  "
+             "speedup=%.2fx  maxdiff=%ld",
+             N, iters, (unsigned long)tc, (double)tc / iters,
+             (unsigned long)tp, (double)tp / iters, (double)tc / (double)tp,
+             (long)maxdiff);
+    ESP_LOGI("comb_bench", "yc[0..7]= %ld %ld %ld %ld %ld %ld %ld %ld",
+             (long)yc[0], (long)yc[1], (long)yc[2], (long)yc[3], (long)yc[4],
+             (long)yc[5], (long)yc[6], (long)yc[7]);
+}
+#endif
 
 #if CONFIG_OPUS_P4_KERNEL_ASM_VERIFY
 
