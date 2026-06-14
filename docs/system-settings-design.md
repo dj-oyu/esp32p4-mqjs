@@ -229,10 +229,26 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
 
 ### Phase 4: QR 読み取り
 
-- QR decoder component
-- system app 専用 one-shot scan API
-- v1 parser、期限/対象確認、秘密を伏せた確認画面
-- 明示確認後に用途別 API へ投入
+- QR decoder component **(DONE・device-verified 2026-06-15)**
+  - `components/quirc` (Ogg/quirc) を統合。`camera.scanQr()` (system app 専用)
+    が `device_settings` の「QR読み取りテスト」から呼ばれ、実機の
+    プロビジョニング QR をデコードできる。
+  - **解析解像度がカギ**: 旧 0.5x s_mid(400x300) では実カメラのボケで
+    quirc が候補ゼロ。フルフレーム中央 **800x600 を直接 quirc** に渡して解決。
+    自作 finder prefilter は実機で markers=0 のため撤去し、quirc 自身の検出に
+    委ねる。詳細は [`qr-read-performance.md`](qr-read-performance.md)。
+  - **プレビューを止めない**ため、gray変換+quirc(~220ms)は**別ワーカータスク**
+    (core0/prio3, LVGLのcore1を避ける) で実行。scan_task は 800x600 crop を
+    コピーして渡し、結果は非ブロッキングで回収。ビューファインダは ~47ms/frame
+    を維持。(commit 3becc83)
+  - 検討して棄却した高速化: PIE SIMD luma (P4 ISA に16bitレーンシフト無)、
+    PPA GRAY8 (この P4 では非対応)、内部SRAMバッファ (480KB は実行時の空き
+    ~101KB/最大連続31KB に入らない)。id(quirc identify ~145ms) は本質コスト
+    なのでオフロードが唯一の実効策。
+- system app 専用 one-shot scan API **(DONE: `camera.scanQr`)**
+- v1 parser、期限/対象確認、秘密を伏せた確認画面 **(未: 現状は復号テキストを
+  一時表示するのみ。MQJSP1 envelope 検証と確認画面は未実装)**
+- 明示確認後に用途別 API へ投入 **(未)**
 
 ## 検証基準
 
