@@ -527,20 +527,41 @@ static void opus_p4_bfly3_c_rx(int32_t *Fout, int m, const int16_t *tw,
 
 void opus_p4_bfly3_4(int32_t *fa, int32_t *fb, int32_t *fc, const int16_t *tw1,
                      const int16_t *tw2, int16_t epi3);
+void opus_p4_bfly3_8(int32_t *fa, int32_t *fb, int32_t *fc, const int16_t *tw1,
+                     const int16_t *tw2, int16_t epi3);
 
 void opus_p4_bfly3_p4(int32_t *Fout, int m, const int16_t *tw, int fstride,
                       int16_t epi3_i)
 {
     int m2 = 2 * m;
     int k = 0;
-    int32_t fa_t[8] __attribute__((aligned(16)));
-    int32_t fb_t[8] __attribute__((aligned(16)));
-    int32_t fc_t[8] __attribute__((aligned(16)));
-    int16_t tw1_t[8] __attribute__((aligned(16)));
-    int16_t tw2_t[8] __attribute__((aligned(16)));
+    int32_t fa_t[16] __attribute__((aligned(16)));
+    int32_t fb_t[16] __attribute__((aligned(16)));
+    int32_t fc_t[16] __attribute__((aligned(16)));
+    int16_t tw1_t[16] __attribute__((aligned(16)));
+    int16_t tw2_t[16] __attribute__((aligned(16)));
     extern uint32_t opus_p4_bfly3_pie_calls;
     if (m >= 4)
         opus_p4_bfly3_pie_calls++;
+    /* 8-wide blocks */
+    for (; k + 8 <= m; k += 8) {
+        for (int j = 0; j < 8; j++) {
+            const int16_t *t1 = tw + 2 * ((k + j) * fstride);
+            const int16_t *t2 = tw + 2 * ((k + j) * 2 * fstride);
+            tw1_t[2 * j] = t1[0];
+            tw1_t[2 * j + 1] = t1[1];
+            tw2_t[2 * j] = t2[0];
+            tw2_t[2 * j + 1] = t2[1];
+        }
+        memcpy(fa_t, Fout + 2 * k, 16 * sizeof(int32_t));
+        memcpy(fb_t, Fout + 2 * (m + k), 16 * sizeof(int32_t));
+        memcpy(fc_t, Fout + 2 * (m2 + k), 16 * sizeof(int32_t));
+        opus_p4_bfly3_8(fa_t, fb_t, fc_t, tw1_t, tw2_t, epi3_i);
+        memcpy(Fout + 2 * k, fa_t, 16 * sizeof(int32_t));
+        memcpy(Fout + 2 * (m + k), fb_t, 16 * sizeof(int32_t));
+        memcpy(Fout + 2 * (m2 + k), fc_t, 16 * sizeof(int32_t));
+    }
+    /* one 4-wide block if a multiple-of-4 remainder is left */
     for (; k + 4 <= m; k += 4) {
         for (int j = 0; j < 4; j++) {
             const int16_t *t1 = tw + 2 * ((k + j) * fstride);
@@ -550,13 +571,13 @@ void opus_p4_bfly3_p4(int32_t *Fout, int m, const int16_t *tw, int fstride,
             tw2_t[2 * j] = t2[0];
             tw2_t[2 * j + 1] = t2[1];
         }
-        memcpy(fa_t, Fout + 2 * k, sizeof(fa_t));
-        memcpy(fb_t, Fout + 2 * (m + k), sizeof(fb_t));
-        memcpy(fc_t, Fout + 2 * (m2 + k), sizeof(fc_t));
+        memcpy(fa_t, Fout + 2 * k, 8 * sizeof(int32_t));
+        memcpy(fb_t, Fout + 2 * (m + k), 8 * sizeof(int32_t));
+        memcpy(fc_t, Fout + 2 * (m2 + k), 8 * sizeof(int32_t));
         opus_p4_bfly3_4(fa_t, fb_t, fc_t, tw1_t, tw2_t, epi3_i);
-        memcpy(Fout + 2 * k, fa_t, sizeof(fa_t));
-        memcpy(Fout + 2 * (m + k), fb_t, sizeof(fb_t));
-        memcpy(Fout + 2 * (m2 + k), fc_t, sizeof(fc_t));
+        memcpy(Fout + 2 * k, fa_t, 8 * sizeof(int32_t));
+        memcpy(Fout + 2 * (m + k), fb_t, 8 * sizeof(int32_t));
+        memcpy(Fout + 2 * (m2 + k), fc_t, 8 * sizeof(int32_t));
     }
     /* scalar tail when m is not a multiple of 4 */
     for (; k < m; k++) {

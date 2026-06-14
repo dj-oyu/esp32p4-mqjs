@@ -1008,10 +1008,17 @@ twiddle scalar-gather + data memcpy で aligned temp 化）。実機 microbench
    unsigned-lo 補正（MULT16_16SU）が要り更に遅くなる。signed-split 方式は
    bfly では fast と bit-exact を両立できない。
 
-→ `opus_p4_bfly3_4.S` は **microbench 検証済みの足場**として残置（将来の
-bit-exact 8-wide・spill-free・in-place 版の参照）。adopt は 8-wide 路線が
-overhead を amortize できるか次第。**butterflies は現状の PIE primitive とは
-相性が悪い**のが本質的結論（fft.* 専用命令が存在しないため）。
+→ `opus_p4_bfly3_4.S` は **microbench 検証済みの足場**として残置。
+
+**8-wide 拡張（`opus_p4_bfly3_8.S`、2026-06-14）**: 全 SIMD lane 使用（vmul の
+8 product を全て活用、vunzip.16 で 8-lane lo/hi を self-copy なしに分割）。
+実機 microbench: **maxdiff_relaxedC=0（構造正）、speedup=1.01x**（4-wide 0.94x
+から改善）。wasted-lane は解消したが **stack spill が律速**: QR 8 本では ~10
+product を全て scratch 経由にせざるを得ず、mul 削減分を相殺。memcpy 除去
+（in-place）でも ~1.1x 止まり見込み。→ **8-wide でも非採用**。結論確定:
+**butterflies は PIE register file に載らない**（複素 live state が多すぎ、
+FFT 複素乗算命令が無い）。fast と bit-exact を両立不能。wrapper は m に応じて
+_8（8-block）→ _4（4-remainder）→ scalar へ dispatch。両足場は将来参照用に残置。
 
 ### 当ブランチ PIE 最適化キャンペーン総括（2026-06-14）
 
