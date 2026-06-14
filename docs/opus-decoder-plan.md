@@ -452,7 +452,9 @@ profile 出力後の事象で計測値には影響しないが、audio 統合前
 
 実音源を使う stereo CELT profile 用に次を追加した。
 
-- source: `assets/audio/tab5-boot.wav`
+- source: `assets/audio/tab5-boot.wav`（**2026-06-14 に repo から削除済み** — 1.2 MB
+  の boot WAV 機構ごと撤去。Opus が boot 音源になったため。下記 fixture 自体は
+  コミット済みで動作に影響なし。再生成が必要なら同等の 48k/stereo/16-bit WAV から）
   - 48 kHz、stereo、signed 16-bit PCM、6.32 秒
 - encoded: `assets/audio/tab5-boot-48k.opus`
   - libopus、audio application、20 ms frame、CBR 48 kbps

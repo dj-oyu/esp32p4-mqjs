@@ -2940,9 +2940,9 @@ JSValue js_audio_downmix(JSContext *ctx, JSValue *this_val, int argc,
 #endif
 }
 
-/* audio.playWav() -> true if playback started. Streams the
-   firmware-embedded boot WAV (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV) through
-   the pipeline. The real-audio playback verifier, callable over MQTT. */
+/* audio.playWav() -> false. The firmware-embedded boot WAV was removed
+   (Opus is the boot audio now), so this no-arg verifier has nothing to play.
+   Kept as an inert stub so existing callers do not break. */
 JSValue js_audio_playwav(JSContext *ctx, JSValue *this_val, int argc,
                          JSValue *argv)
 {
@@ -2950,12 +2950,7 @@ JSValue js_audio_playwav(JSContext *ctx, JSValue *this_val, int argc,
     (void)this_val;
     (void)argc;
     (void)argv;
-#if defined(ESP_PLATFORM) && CONFIG_MQJS_TAB5_AUDIO
-    return JS_NewBool(audio_tab5_play_boot_wav());
-#else
-    printf("[audio] playWav() (stub)\n");
     return JS_NewBool(0);
-#endif
 }
 
 /* audio.stats() -> JSON string. Remote readback (no usable serial in

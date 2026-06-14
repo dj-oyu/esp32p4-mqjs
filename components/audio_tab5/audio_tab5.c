@@ -571,28 +571,7 @@ bool audio_tab5_wav_playing(void)
     return s_wav_playing;
 }
 
-/* ---- firmware-embedded boot WAV ------------------------------------- */
-#if CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV
-/* EMBED_FILES (see CMakeLists) exposes the blob as these linker symbols.
-   Embedded with the .bin trailing-NUL convention off (binary file), so
-   _end marks one past the last byte. */
-extern const uint8_t boot_wav_start[] asm("_binary_tab5_boot_wav_start");
-extern const uint8_t boot_wav_end[]   asm("_binary_tab5_boot_wav_end");
-
-bool audio_tab5_play_boot_wav(void)
-{
-    return audio_tab5_play_wav_mem_async(boot_wav_start,
-                                         (size_t)(boot_wav_end - boot_wav_start));
-}
-#else
-bool audio_tab5_play_boot_wav(void)
-{
-    ESP_LOGW(TAG, "no boot WAV embedded (CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV off)");
-    return false;
-}
-#endif
-
-/* ---- boot self-test (P2 gate) + optional WAV autoplay --------------- */
+/* ---- boot self-test (P2 gate) -------------------------------------- */
 static void selftest_task(void *arg)
 {
     (void)arg;
@@ -621,12 +600,6 @@ static void selftest_task(void *arg)
     } else {
         ESP_LOGE(TAG, "SELFTEST start failed: %s", esp_err_to_name(err));
     }
-#endif
-
-#if CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGI(TAG, "boot WAV autoplay");
-    audio_tab5_play_boot_wav(); /* spawns its own streamer task */
 #endif
 
     vTaskDelete(NULL);

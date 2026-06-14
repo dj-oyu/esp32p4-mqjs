@@ -109,7 +109,7 @@ static void tab5_ui_ready(void *arg)
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
     cam_tab5_probe_once();               /* boot-time camera/V4L2 diagnostics */
 
-#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     audio_tab5_selftest_async();
 #endif
 

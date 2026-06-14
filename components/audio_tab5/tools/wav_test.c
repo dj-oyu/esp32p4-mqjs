@@ -2,7 +2,7 @@
  * Host unit test for the WAV parser. Build + run in WSL:
  *   cd components/audio_tab5
  *   gcc -O2 -I. -fsanitize=address -o /tmp/wav_test tools/wav_test.c wav.c
- *   /tmp/wav_test ../../../../assets/audio/tab5-boot.wav
+ *   /tmp/wav_test path/to/some.wav
  * (the path arg is optional; synthetic cases always run)
  */
 #include "wav.h"
