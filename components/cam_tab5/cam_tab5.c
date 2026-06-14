@@ -18,6 +18,7 @@
 #if CONFIG_MQJS_CAMERA
 
 #include <fcntl.h>
+#include <errno.h>
 #include <math.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -373,7 +374,121 @@ static bool scan_frame(const uint16_t *px, int w, int h, uint8_t *line,
 static int s_fd = -1;
 static void *s_bufs[CAM_BUFS];
 static int s_frame_w, s_frame_h;
+static uint32_t s_frame_pixfmt = V4L2_PIX_FMT_RGB565;
 static ppa_client_handle_t s_ppa; /* hardware rotate+scale for preview */
+static bool s_logged_dqbuf_bytes;
+
+static const char *fourcc_str(uint32_t v, char out[5])
+{
+    out[0] = (char)(v & 0xff);
+    out[1] = (char)((v >> 8) & 0xff);
+    out[2] = (char)((v >> 16) & 0xff);
+    out[3] = (char)((v >> 24) & 0xff);
+    out[4] = '\0';
+    return out;
+}
+
+static bool frame_size_supports(const struct v4l2_frmsizeenum *fs,
+                                uint32_t want_w, uint32_t want_h)
+{
+    if (fs->type == V4L2_FRMSIZE_TYPE_DISCRETE)
+        return fs->discrete.width == want_w && fs->discrete.height == want_h;
+    if (fs->type == V4L2_FRMSIZE_TYPE_STEPWISE)
+        if (fs->stepwise.step_width == 0 || fs->stepwise.step_height == 0)
+            return false;
+    if (fs->type == V4L2_FRMSIZE_TYPE_STEPWISE)
+        return fs->stepwise.min_width <= want_w &&
+               fs->stepwise.max_width >= want_w &&
+               fs->stepwise.min_height <= want_h &&
+               fs->stepwise.max_height >= want_h &&
+               ((want_w - fs->stepwise.min_width) % fs->stepwise.step_width) == 0 &&
+               ((want_h - fs->stepwise.min_height) % fs->stepwise.step_height) == 0;
+    return false;
+}
+
+static void log_video_format_diag(int fd)
+{
+    static bool done;
+    if (done)
+        return;
+
+    ESP_LOGI(TAG, "v4l2 format probe: begin");
+    for (uint32_t i = 0;; i++) {
+        struct v4l2_fmtdesc fm = { 0 };
+        fm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fm.index = i;
+        if (ioctl(fd, VIDIOC_ENUM_FMT, &fm) != 0) {
+            if (errno != EINVAL)
+                ESP_LOGW(TAG, "VIDIOC_ENUM_FMT index=%lu failed errno=%d",
+                         (unsigned long)i, errno);
+            break;
+        }
+        char fourcc[5];
+        bool has_1600x1200 = false;
+        bool has_1280x720 = false;
+        for (uint32_t k = 0;; k++) {
+            struct v4l2_frmsizeenum fs = { 0 };
+            fs.pixel_format = fm.pixelformat;
+            fs.index = k;
+            if (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fs) != 0) {
+                if (errno != EINVAL)
+                    ESP_LOGW(TAG, "VIDIOC_ENUM_FRAMESIZES %s index=%lu errno=%d",
+                             fourcc_str(fm.pixelformat, fourcc),
+                             (unsigned long)k, errno);
+                break;
+            }
+            has_1600x1200 = has_1600x1200 || frame_size_supports(&fs, 1600, 1200);
+            has_1280x720 = has_1280x720 || frame_size_supports(&fs, 1280, 720);
+        }
+        ESP_LOGI(TAG, "v4l2 fmt=%s desc=\"%s\" 1600x1200=%c 1280x720=%c",
+                 fourcc_str(fm.pixelformat, fourcc), fm.description,
+                 has_1600x1200 ? 'Y' : 'N', has_1280x720 ? 'Y' : 'N');
+    }
+    ESP_LOGI(TAG, "v4l2 format probe: end");
+    done = true;
+}
+
+static void log_try_fmt_diag(int fd, uint32_t req_pixfmt, const char *label)
+{
+    struct v4l2_format fmt = { 0 };
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = CAM_W;
+    fmt.fmt.pix.height = CAM_H;
+    fmt.fmt.pix.pixelformat = req_pixfmt;
+    if (ioctl(fd, VIDIOC_TRY_FMT, &fmt) != 0) {
+        char req[5];
+        ESP_LOGW(TAG, "VIDIOC_TRY_FMT %s(%s) failed errno=%d",
+                 label, fourcc_str(req_pixfmt, req), errno);
+        return;
+    }
+    char req[5], ret[5];
+    ESP_LOGI(TAG, "VIDIOC_TRY_FMT %s(%s) -> %dx%d %s bpl=%u size=%u",
+             label, fourcc_str(req_pixfmt, req),
+             (int)fmt.fmt.pix.width, (int)fmt.fmt.pix.height,
+             fourcc_str(fmt.fmt.pix.pixelformat, ret),
+             fmt.fmt.pix.bytesperline, fmt.fmt.pix.sizeimage);
+}
+
+static void log_s_fmt_diag(int fd, uint32_t req_pixfmt, const char *label)
+{
+    struct v4l2_format fmt = { 0 };
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = CAM_W;
+    fmt.fmt.pix.height = CAM_H;
+    fmt.fmt.pix.pixelformat = req_pixfmt;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0) {
+        char req[5];
+        ESP_LOGW(TAG, "VIDIOC_S_FMT(diag) %s(%s) failed errno=%d",
+                 label, fourcc_str(req_pixfmt, req), errno);
+        return;
+    }
+    char req[5], ret[5];
+    ESP_LOGI(TAG, "VIDIOC_S_FMT(diag) %s(%s) -> %dx%d %s bpl=%u size=%u",
+             label, fourcc_str(req_pixfmt, req),
+             (int)fmt.fmt.pix.width, (int)fmt.fmt.pix.height,
+             fourcc_str(fmt.fmt.pix.pixelformat, ret),
+             fmt.fmt.pix.bytesperline, fmt.fmt.pix.sizeimage);
+}
 
 static bool pipeline_once(void)
 {
@@ -388,6 +503,14 @@ static bool pipeline_once(void)
             fail = "open /dev/video0 failed";
             break;
         }
+        log_video_format_diag(fd);
+        log_try_fmt_diag(fd, V4L2_PIX_FMT_RGB565, "rgb565");
+        log_try_fmt_diag(fd, V4L2_PIX_FMT_YUV420, "yuv420");
+        log_try_fmt_diag(fd, V4L2_PIX_FMT_UYVY, "uyvy");
+        log_try_fmt_diag(fd, V4L2_PIX_FMT_GREY, "grey");
+        log_s_fmt_diag(fd, V4L2_PIX_FMT_YUV420, "yuv420");
+        log_s_fmt_diag(fd, V4L2_PIX_FMT_UYVY, "uyvy");
+        log_s_fmt_diag(fd, V4L2_PIX_FMT_GREY, "grey");
         struct v4l2_format fmt = { 0 };
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = CAM_W;
@@ -399,6 +522,11 @@ static bool pipeline_once(void)
         }
         s_frame_w = (int)fmt.fmt.pix.width;
         s_frame_h = (int)fmt.fmt.pix.height;
+        s_frame_pixfmt = fmt.fmt.pix.pixelformat;
+        char fourcc[5];
+        ESP_LOGI(TAG, "VIDIOC_S_FMT -> %dx%d %s bpl=%u size=%u",
+                 s_frame_w, s_frame_h, fourcc_str(fmt.fmt.pix.pixelformat, fourcc),
+                 fmt.fmt.pix.bytesperline, fmt.fmt.pix.sizeimage);
         if (s_frame_w > CAM_W) {
             fail = "unexpected frame width";
             break;
@@ -454,8 +582,16 @@ static bool pipeline_once(void)
     s_fd = fd;
     char dims[20];
     snprintf(dims, sizeof dims, "%dx%d", s_frame_w, s_frame_h);
+    s_logged_dqbuf_bytes = false;
     set_status("video ready %s", dims);
     return true;
+}
+
+bool cam_tab5_probe_once(void)
+{
+    if (!video_init_once())
+        return false;
+    return pipeline_once();
 }
 
 static bool ppa_once(void)
@@ -491,7 +627,8 @@ static uint16_t *s_mid;
 static struct quirc *s_quirc;
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
-static uint8_t *s_qr_gray;
+static uint8_t *s_qr_yuv420_uv;
+static uint16_t *s_qr_rgb565_from_yuv;
 
 static bool mid_blit(const uint16_t *px)
 {
@@ -542,58 +679,128 @@ static bool qr_once(void)
     s_quirc = quirc_new();
     if (!s_quirc)
         return false;
-    if (!s_qr_gray) {
-        s_qr_gray = heap_caps_malloc((size_t)MID_W * MID_H,
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!s_qr_gray) {
-            quirc_destroy(s_quirc);
-            s_quirc = NULL;
-            return false;
-        }
-    }
     if (quirc_resize(s_quirc, MID_W, MID_H) < 0) {
         quirc_destroy(s_quirc);
         s_quirc = NULL;
         return false;
     }
+    if (!s_qr_yuv420_uv) {
+        size_t uv_sz = (size_t)MID_W * MID_H / 2;
+        s_qr_yuv420_uv = heap_caps_malloc(uv_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_qr_yuv420_uv)
+            memset(s_qr_yuv420_uv, 128, uv_sz); /* neutral chroma */
+    }
+    if (!s_qr_rgb565_from_yuv)
+        s_qr_rgb565_from_yuv = heap_caps_malloc((size_t)MID_W * MID_H * 2,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return true;
+}
+
+static inline uint8_t clip_u8(int v)
+{
+    if (v < 0)
+        return 0;
+    if (v > 255)
+        return 255;
+    return (uint8_t)v;
+}
+
+/* Bench the software YUV420->RGB565 conversion on the same 400x300 analysis
+ * image size used by preview/QR. Y comes from the current gray image; U/V are
+ * fixed neutral chroma so the measured cost focuses on conversion work. */
+static void bench_yuv420_to_rgb565(const uint8_t *y, int y_stride, int64_t *y2r_us)
+{
+    if (!s_qr_yuv420_uv || !s_qr_rgb565_from_yuv)
+        return;
+    const uint8_t *u_plane = s_qr_yuv420_uv;
+    const uint8_t *v_plane = s_qr_yuv420_uv + (size_t)MID_W * MID_H / 4;
+    int64_t t0 = esp_timer_get_time();
+    for (int yy = 0; yy < MID_H; yy++) {
+        const uint8_t *row_y = y + (size_t)yy * y_stride;
+        uint16_t *row_rgb = s_qr_rgb565_from_yuv + (size_t)yy * MID_W;
+        int cidx = (yy >> 1) * (MID_W >> 1);
+        for (int xx = 0; xx < MID_W; xx++) {
+            int c = (int)row_y[xx] - 16;
+            int d = (int)u_plane[cidx + (xx >> 1)] - 128;
+            int e = (int)v_plane[cidx + (xx >> 1)] - 128;
+            if (c < 0)
+                c = 0;
+            int r = (298 * c + 409 * e + 128) >> 8;
+            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b = (298 * c + 516 * d + 128) >> 8;
+            uint8_t rr = clip_u8(r);
+            uint8_t gg = clip_u8(g);
+            uint8_t bb = clip_u8(b);
+            row_rgb[xx] = (uint16_t)(((rr & 0xF8) << 8) |
+                                     ((gg & 0xFC) << 3) |
+                                     (bb >> 3));
+        }
+    }
+    *y2r_us += esp_timer_get_time() - t0;
+}
+
+static void log_qr_run_perf(int64_t gray_us, int64_t y2r_us, int64_t marker_us,
+                            int64_t identify_us, int64_t decode_us,
+                            int markers, int polarity, int candidates, bool found)
+{
+    ESP_LOGW(TAG,
+             "qr run gray=%d y2r=%d mark=%d id=%d dec=%d markers=%d/%c candidates=%d found=%c",
+             (int)(gray_us / 1000), (int)(y2r_us / 1000), (int)(marker_us / 1000),
+             (int)(identify_us / 1000), (int)(decode_us / 1000), markers,
+             polarity ? 'I' : 'N', candidates, found ? 'Y' : 'N');
 }
 
 /* Decode the current center crop. The payload stays out of logs/status and is
  * copied only after rejecting binary/NUL data and oversized provisioning QR. */
 static bool qr_scan_mid(char *out, size_t cap, int *candidates,
                         int *markers, int *polarity, int64_t *gray_us,
-                        int64_t *marker_us, int64_t *identify_us,
+                        int64_t *y2r_us, int64_t *marker_us, int64_t *identify_us,
                         int64_t *decode_us)
 {
     if (!qr_once())
         return false;
 
     *candidates = 0;
+    int64_t gray0 = *gray_us, y2r0 = *y2r_us, mark0 = *marker_us;
+    int64_t id0 = *identify_us, dec0 = *decode_us;
+    int w, h;
     int64_t t0 = esp_timer_get_time();
+    uint8_t *gray = quirc_begin(s_quirc, &w, &h);
+    if (!gray || w < MID_W || h < MID_H) {
+        if (gray)
+            quirc_end(s_quirc);
+        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+                        *identify_us - id0, *decode_us - dec0,
+                        0, 0, *candidates, false);
+        return false;
+    }
     for (int y = 0; y < MID_H; y++)
         for (int x = 0; x < MID_W; x++)
-            s_qr_gray[y * MID_W + x] = luma565(s_mid[y * MID_W + x]);
+            gray[y * w + x] = luma565(s_mid[y * MID_W + x]);
     *gray_us += esp_timer_get_time() - t0;
+    bench_yuv420_to_rgb565(gray, w, y2r_us);
 
     qr_marker_result_t mr = { 0 };
     t0 = esp_timer_get_time();
-    bool marker_ok = qr_marker_detect(s_qr_gray, MID_W, MID_H, &mr);
+    bool marker_ok = qr_marker_detect(gray, MID_W, MID_H, &mr);
     *marker_us += esp_timer_get_time() - t0;
     *markers = mr.markers;
     *polarity = mr.inverted ? 1 : 0;
-    if (!marker_ok)
+    if (!marker_ok) {
+        quirc_end(s_quirc);
+        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+                        *identify_us - id0, *decode_us - dec0,
+                        *markers, *polarity, *candidates, false);
         return false;
+    }
 
-    int w, h;
-    t0 = esp_timer_get_time();
-    uint8_t *gray = quirc_begin(s_quirc, &w, &h);
-    for (int y = 0; y < MID_H; y++)
-        for (int x = 0; x < MID_W; x++) {
-            uint8_t v = s_qr_gray[y * MID_W + x];
-            gray[y * w + x] = mr.inverted ? (uint8_t)(255 - v) : v;
-        }
-    *gray_us += esp_timer_get_time() - t0;
+    if (mr.inverted) {
+        t0 = esp_timer_get_time();
+        for (int y = 0; y < MID_H; y++)
+            for (int x = 0; x < MID_W; x++)
+                gray[y * w + x] = (uint8_t)(255 - gray[y * w + x]);
+        *gray_us += esp_timer_get_time() - t0;
+    }
 
     t0 = esp_timer_get_time();
     quirc_end(s_quirc);
@@ -615,9 +822,15 @@ static bool qr_scan_mid(char *out, size_t cap, int *candidates,
         memcpy(out, s_qr_data.payload, s_qr_data.payload_len);
         out[s_qr_data.payload_len] = '\0';
         *decode_us += esp_timer_get_time() - t0;
+        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+                        *identify_us - id0, *decode_us - dec0,
+                        *markers, *polarity, *candidates, true);
         return true;
     }
     *decode_us += esp_timer_get_time() - t0;
+    log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+                    *identify_us - id0, *decode_us - dec0,
+                    *markers, *polarity, *candidates, false);
     return false;
 }
 
@@ -757,7 +970,8 @@ static void scan_task(void *pv)
     /* per-stage averages, surfaced through camera.status() at scan end
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
-    int64_t t_qr_gray = 0, t_qr_marker = 0, t_qr_identify = 0, t_qr_decode = 0;
+    int64_t t_qr_gray = 0, t_qr_y2r = 0, t_qr_marker = 0, t_qr_identify = 0,
+            t_qr_decode = 0;
     int64_t scan_started = 0;
     int qr_candidates = 0, qr_markers = 0, qr_polarity = 0, qr_runs = 0;
     int n_loc = 0, n_frames = 0;
@@ -808,6 +1022,13 @@ static void scan_task(void *pv)
                 fail = "DQBUF failed";
                 break;
             }
+            if (!s_logged_dqbuf_bytes) {
+                char fourcc[5];
+                ESP_LOGI(TAG, "DQBUF sample fmt=%s idx=%u bytesused=%u seq=%u",
+                         fourcc_str(s_frame_pixfmt, fourcc), buf.index,
+                         buf.bytesused, buf.sequence);
+                s_logged_dqbuf_bytes = true;
+            }
             const uint16_t *px = (const uint16_t *)s_bufs[buf.index];
             int64_t t0 = esp_timer_get_time();
             bool mid_ok = s_frame_w == CAM_W && mid_blit(px);
@@ -819,7 +1040,7 @@ static void scan_task(void *pv)
                 if (mid_ok && (frame_no % 2) == 0) {
                     found = qr_scan_mid(code, sizeof code, &qr_candidates,
                                         &qr_markers, &qr_polarity, &t_qr_gray,
-                                        &t_qr_marker, &t_qr_identify,
+                                        &t_qr_y2r, &t_qr_marker, &t_qr_identify,
                                         &t_qr_decode);
                     qr_runs++;
                 }
@@ -893,12 +1114,13 @@ static void scan_task(void *pv)
     }
 
     char done[256];
-    char perf[176] = "";
+    char perf[192] = "";
     if (qr_runs)
         snprintf(perf, sizeof perf,
-                 " [pv%d gray%d mark%d id%d dec%d ms/run markers%d/%c candidates%d runs%d total%dms]",
+                 " [pv%d gray%d y2r%d mark%d id%d dec%d ms/run markers%d/%c candidates%d runs%d total%dms]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(t_qr_gray / qr_runs / 1000),
+                 (int)(t_qr_y2r / qr_runs / 1000),
                  (int)(t_qr_marker / qr_runs / 1000),
                  (int)(t_qr_identify / qr_runs / 1000),
                  (int)(t_qr_decode / qr_runs / 1000), qr_markers,
@@ -983,6 +1205,11 @@ void cam_tab5_cancel(void)
 void cam_tab5_set_i2c(void *i2c_master_bus_handle)
 {
     (void)i2c_master_bus_handle;
+}
+
+bool cam_tab5_probe_once(void)
+{
+    return false;
 }
 
 bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,

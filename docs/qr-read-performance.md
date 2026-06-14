@@ -15,7 +15,8 @@
   EAN scanは数ms/frame。
 
 QR は1次元走査線では読めない。実装では既存の400x300中央解析面を8-bit grayscale
-へ変換し、`quirc`へ1フレームおきに渡す。全面1600x1200 grayscaleは約1.9MBで、
+へ変換し、`quirc`へ1フレームおきに渡す。現在は`quirc`入力bufferへ直接1回だけ
+変換し、反転極性時だけin-place反転を追加する。全面1600x1200 grayscaleは約1.9MBで、
 毎frameの変換と探索が重いため採用しない。
 
 システム設定の「QR読み取りテスト」は、読み取った文字列と
@@ -54,6 +55,18 @@ payloadはログとstatusには含めない。
 - ISP変換形式をYUVへ変えるだけでは、QR finder検出やquircの探索時間そのものは
   改善しない。主な改善対象はtelemetryの`gray`とmemory bandwidthである。
 
+### 2026-06-14 実機ログ結果 (COM8)
+
+- `VIDIOC_ENUM_FMT` で `YU12(YUV420)` と `UYVY` は列挙された。
+- `VIDIOC_TRY_FMT` は `RGB565` / `YUV420` / `UYVY` / `GREY` の全てで
+  `errno=22` になり、実機では対応判定に使えなかった。
+- `VIDIOC_S_FMT(diag)` は `YUV420` と `UYVY` で受理された。
+  (`1600x1200`, 返却fourcc `YU12`/`UYVY`)
+- `VIDIOC_S_FMT(diag)` の `GREY` は
+  `CSI can't support format=GREY` で失敗した。
+- 結論として、当該構成では
+  **YUV420/UYVY は実際に設定可能、GREY は未対応**。
+
 ### 既存処理への影響
 
 現在のpipelineは一度`STREAMON`した後、scan間でも閉じずに維持する。以前、
@@ -74,6 +87,21 @@ teardown後の再`REQBUFS`/`STREAMON`に失敗しているため、QR scan時だ
 ### 次セッションの調査手順
 
 まず永続pipelineの形式を変更せず、起動時診断を追加して実機が列挙する形式を確認する。
+
+2026-06-14 進捗:
+
+- `cam_tab5` に `/dev/video0` open直後の `VIDIOC_ENUM_FMT` /
+  `VIDIOC_ENUM_FRAMESIZES` 診断ログを追加済み。
+- `VIDIOC_TRY_FMT` で RGB565 / YUV420 / UYVY / GREY を
+  1600x1200で試行し、返却形式と `bytesperline` / `sizeimage` を
+  記録する診断を追加済み。
+- `VIDIOC_S_FMT(diag)` でも YUV420 / UYVY / GREY を試行し、
+  実際に `S_FMT` が受理されるかを起動ログで確認できるようにした。
+- `VIDIOC_S_FMT` 後の返却 `width` / `height` / `pixelformat` /
+  `bytesperline` / `sizeimage` 記録ログを追加済み。
+- scan開始後の最初の `DQBUF` で `bytesused` を1回記録するログを追加済み。
+- 調査中ビルドでは boot時に `cam_tab5_probe_once()` を呼び、手動スキャン前でも
+  V4L2列挙/TRY_FMTログが monitor に出るようにした。
 
 1. `/dev/video0`をopenした直後、`VIDIOC_ENUM_FMT`をindexが尽きるまで実行し、
    fourccとdescriptionをログへ出す。
@@ -99,6 +127,41 @@ teardown後の再`REQBUFS`/`STREAMON`に失敗しているため、QR scan時だ
 
 YUV420が使えてもpreview/EAN共存のコストが高い場合、通常pipelineはRGB565のままとし、
 現在のmarker prefilterとRGB565-to-gray変換の最適化を継続する。
+
+### 現時点の方針 (2026-06-14)
+
+- 本流は `RGB565` を維持する。
+  - preview/LVGL表示とEAN/localizerがRGB565前提で結合しており、
+    YUV化はQR局所最適化ではなくパイプライン再設計になるため。
+- `YUV420` は将来候補として保持する。
+  - QRはY plane直結で有利だが、preview/EANをどう共存させるかを先に設計する。
+- `GREY` は採用対象から外す (現行CSI/ISPで未対応)。
+
+### 2026-06-14 実機比較実験 (COM8 monitor)
+
+`camera.status()` 依存を避けるため、QR実行ごとに monitor へ次のテレメトリを直接出力する
+計測を追加した。
+
+```text
+qr run gray=<ms> y2r=<ms> mark=<ms> id=<ms> dec=<ms> markers=<n>/<N|I> candidates=<n> found=<Y|N>
+```
+
+- `gray`: 現行パイプラインの RGB565 -> gray (quirc入力) 変換時間
+- `y2r`: 同解像度での YUV420 -> RGB565 相当変換の疑似計測時間
+- `mark`/`id`/`dec`: 既存QR処理の内訳時間
+
+monitorログの代表値:
+
+- `gray=21..32ms`
+- `y2r=32..45ms`
+- `mark=8..14ms`
+- `candidates=0`, `found=N` が継続
+
+結論:
+
+- 現状実装・同条件では **RGB565 -> gray の方が YUV420 -> RGB565 より軽い**
+  （概ね 10ms 前後有利）。
+- 今回の試行では候補検出段階に到達しておらず、decode比較 (`id`/`dec`) まで進んでいない。
 
 ## Decoder候補
 

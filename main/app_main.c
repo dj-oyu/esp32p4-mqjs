@@ -115,6 +115,7 @@ void app_main(void)
     ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus
                                             (no-op stubs elsewhere) */
+    cam_tab5_probe_once();     /* boot-time camera/V4L2 diagnostics */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */

@@ -27,6 +27,10 @@ typedef void (*cam_tab5_cb_t)(const char *decoded_text_or_null, void *arg);
  * pass ui_tab5's bus handle once at boot, before the first scan. */
 void cam_tab5_set_i2c(void *i2c_master_bus_handle);
 
+/* Boot-time probe for diagnostics: initialize esp_video and keep the capture
+ * pipeline streaming so V4L2 format logs are emitted without a manual scan. */
+bool cam_tab5_probe_once(void);
+
 /* false = busy / camera unavailable (see cam_tab5_status()). prefix
  * may be NULL (accept any EAN-13). */
 bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
