@@ -965,8 +965,24 @@ fft.* 主張は誤りだった**:
 5. C_ADD/SUB/HALF/MULBYSCALAR は `vadd/vsub.s32` + arithmetic `vsr.s32`。
 6. 結果を `vzip.32` で r/i 再 interleave→Fa/Fb/Fc へ scatter store
    （未整列は aligned temp+memcpy）。
-- **要 device 検証**: `vunzip.32`/`vzip.32` の lane 順、scalar-gather の正当性
-   （opus_p4_pie_probe に追加してから asm 着手）。bit-exact 必須（fixed）。
+- **device 検証済み（2026-06-14）**: `vunzip.32` は even/odd 32bit lane 分割
+   （r={10,12,14,16}/i={11,13,15,17}）、`vzip.32` は round-trip 一致を実機確認
+   （opus_p4_pie_probe、commit 後続）。全 primitive 確定。
+
+**register pressure（実装上の最重要課題、2026-06-14 判明）**: QR は **8 本のみ**。
+8-wide だと fb_r/fb_i/fc_r/fc_i だけで各 2 qreg=計 8 本を占有し、twiddle・積・
+accumulator が乗らない。対策（採用予定）:
+1. **real+imag を source ロード中にまとめて計算**: fb をロード・split したら
+   s1.r と s1.i を両方算出（同じ fb_r/fb_i split を再利用）→ scratch へ spill。
+   次に fc で s2.r/s2.i。最後に s3=s1±s2, s0, 出力合成。
+2. s1.r/s1.i/s2.r/s2.i（各 2 qreg）は **wrapper の aligned scratch へ store/reload**
+   （register に保持しない）。複素演算は memory 経由でも scalar 10 S_MUL より速い見込み。
+3. 代替: **4-wide**（4 complex=各 1 qreg）で pressure 半減も、vmul.s32.s16xs16 の
+   8-lane を半分しか使わず throughput 半減。まず 8-wide+spill で正しさ優先。
+- 安全策: **verify harness（fixed-asm vs fixed-C、mismatch で自動 C fallback）**
+   背後に実装→ asm にバグがあっても codec は無回帰、microbench maxdiff で即判定。
+- 規模感: 本 kernel は comb/denorm/normres より大きい（~10 S_MUL/8-block +
+   spill + 複素 marshaling、~100+ 命令）。複数 device cycle を要する見込み。
 
 ### 次カーネル候補（ROI 順・再開ガイド）
 
