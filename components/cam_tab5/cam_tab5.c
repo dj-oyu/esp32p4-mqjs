@@ -691,8 +691,16 @@ static uint16_t *s_mid;
 static struct quirc *s_quirc;
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
-static uint8_t *s_qr_yuv420_uv;
-static uint16_t *s_qr_rgb565_from_yuv;
+/* QR decode runs on the FULL-RES 800x600 center crop straight from the
+ * captured frame — the same resolution advantage EAN already enjoys by
+ * scanning px directly. The old 0.5x s_mid (400x300) threw away the modules
+ * quirc needs: on-device the custom finder prefilter found markers=0 on the
+ * downscaled image and never even reached quirc (gray24 mark10 id0 dec0
+ * markers0). We let quirc do its own robust finder detection on 800x600
+ * instead of gating on the unreliable prefilter. See docs/qr-read-
+ * performance.md. */
+#define QR_HI_W CROP_W /* 800 */
+#define QR_HI_H CROP_H /* 600 */
 
 static bool mid_blit(const uint16_t *px)
 {
@@ -743,128 +751,80 @@ static bool qr_once(void)
     s_quirc = quirc_new();
     if (!s_quirc)
         return false;
-    if (quirc_resize(s_quirc, MID_W, MID_H) < 0) {
+    if (quirc_resize(s_quirc, QR_HI_W, QR_HI_H) < 0) {
         quirc_destroy(s_quirc);
         s_quirc = NULL;
         return false;
     }
-    if (!s_qr_yuv420_uv) {
-        size_t uv_sz = (size_t)MID_W * MID_H / 2;
-        s_qr_yuv420_uv = heap_caps_malloc(uv_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_qr_yuv420_uv)
-            memset(s_qr_yuv420_uv, 128, uv_sz); /* neutral chroma */
-    }
-    if (!s_qr_rgb565_from_yuv)
-        s_qr_rgb565_from_yuv = heap_caps_malloc((size_t)MID_W * MID_H * 2,
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return true;
 }
 
-static inline uint8_t clip_u8(int v)
+/* RGB565 -> 8-bit luma over a contiguous run. (A PIE SIMD kernel was
+ * evaluated and dropped: RGB565 field extraction needs a 16-bit lane shift
+ * the P4 PIE ISA lacks, forcing an s32 widen+narrow that halves the SIMD
+ * win, and quirc_end()'s ~127ms identify — not this ~72ms convert — is the
+ * dominant per-frame cost and blocks the preview thread regardless.) */
+static void rgb565_to_luma(const uint16_t *src, uint8_t *dst, int n)
 {
-    if (v < 0)
-        return 0;
-    if (v > 255)
-        return 255;
-    return (uint8_t)v;
+    for (int i = 0; i < n; i++)
+        dst[i] = luma565(src[i]);
 }
 
-/* Bench the software YUV420->RGB565 conversion on the same 400x300 analysis
- * image size used by preview/QR. Y comes from the current gray image; U/V are
- * fixed neutral chroma so the measured cost focuses on conversion work. */
-static void bench_yuv420_to_rgb565(const uint8_t *y, int y_stride, int64_t *y2r_us)
-{
-    if (!s_qr_yuv420_uv || !s_qr_rgb565_from_yuv)
-        return;
-    const uint8_t *u_plane = s_qr_yuv420_uv;
-    const uint8_t *v_plane = s_qr_yuv420_uv + (size_t)MID_W * MID_H / 4;
-    int64_t t0 = esp_timer_get_time();
-    for (int yy = 0; yy < MID_H; yy++) {
-        const uint8_t *row_y = y + (size_t)yy * y_stride;
-        uint16_t *row_rgb = s_qr_rgb565_from_yuv + (size_t)yy * MID_W;
-        int cidx = (yy >> 1) * (MID_W >> 1);
-        for (int xx = 0; xx < MID_W; xx++) {
-            int c = (int)row_y[xx] - 16;
-            int d = (int)u_plane[cidx + (xx >> 1)] - 128;
-            int e = (int)v_plane[cidx + (xx >> 1)] - 128;
-            if (c < 0)
-                c = 0;
-            int r = (298 * c + 409 * e + 128) >> 8;
-            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-            int b = (298 * c + 516 * d + 128) >> 8;
-            uint8_t rr = clip_u8(r);
-            uint8_t gg = clip_u8(g);
-            uint8_t bb = clip_u8(b);
-            row_rgb[xx] = (uint16_t)(((rr & 0xF8) << 8) |
-                                     ((gg & 0xFC) << 3) |
-                                     (bb >> 3));
-        }
-    }
-    *y2r_us += esp_timer_get_time() - t0;
-}
-
-static void log_qr_run_perf(int64_t gray_us, int64_t y2r_us, int64_t marker_us,
+static void log_qr_run_perf(int64_t gray_us, int64_t marker_us,
                             int64_t identify_us, int64_t decode_us,
                             int markers, int polarity, int candidates, bool found)
 {
     ESP_LOGW(TAG,
-             "qr run gray=%d y2r=%d mark=%d id=%d dec=%d markers=%d/%c candidates=%d found=%c",
-             (int)(gray_us / 1000), (int)(y2r_us / 1000), (int)(marker_us / 1000),
+             "qr run gray=%d mark=%d id=%d dec=%d markers=%d/%c candidates=%d found=%c",
+             (int)(gray_us / 1000), (int)(marker_us / 1000),
              (int)(identify_us / 1000), (int)(decode_us / 1000), markers,
              polarity ? 'I' : 'N', candidates, found ? 'Y' : 'N');
 }
 
-/* Decode the current center crop. The payload stays out of logs/status and is
- * copied only after rejecting binary/NUL data and oversized provisioning QR. */
-static bool qr_scan_mid(char *out, size_t cap, int *candidates,
-                        int *markers, int *polarity, int64_t *gray_us,
-                        int64_t *y2r_us, int64_t *marker_us, int64_t *identify_us,
-                        int64_t *decode_us)
+/* QR scan on the FULL-RES 800x600 center crop. quirc does its own finder
+ * detection + decode; the custom marker pass here is DIAGNOSTIC ONLY (it
+ * reports how many finders survive at this resolution and picks polarity)
+ * and never gates quirc — on-device the prefilter found markers=0 on the
+ * downscaled 400x300 and wrongly blocked the decode. The payload stays out
+ * of logs/status and is copied only after rejecting binary/NUL data and
+ * oversized provisioning QR. */
+static bool qr_scan(const uint16_t *px, int fw, int fh, char *out, size_t cap,
+                    int *candidates, int *markers, int *polarity,
+                    int64_t *gray_us, int64_t *marker_us, int64_t *identify_us,
+                    int64_t *decode_us)
 {
-    if (!qr_once())
+    if (!qr_once() || fw < CROP_X + QR_HI_W || fh < CROP_Y + QR_HI_H)
         return false;
 
     *candidates = 0;
-    int64_t gray0 = *gray_us, y2r0 = *y2r_us, mark0 = *marker_us;
+    *markers = 0;
+    *polarity = 0;
+    int64_t gray0 = *gray_us, mark0 = *marker_us;
     int64_t id0 = *identify_us, dec0 = *decode_us;
+
     int w, h;
-    int64_t t0 = esp_timer_get_time();
     uint8_t *gray = quirc_begin(s_quirc, &w, &h);
-    if (!gray || w < MID_W || h < MID_H) {
+    if (!gray || w < QR_HI_W || h < QR_HI_H) {
         if (gray)
             quirc_end(s_quirc);
-        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
-                        *identify_us - id0, *decode_us - dec0,
-                        0, 0, *candidates, false);
-        return false;
-    }
-    for (int y = 0; y < MID_H; y++)
-        for (int x = 0; x < MID_W; x++)
-            gray[y * w + x] = luma565(s_mid[y * MID_W + x]);
-    *gray_us += esp_timer_get_time() - t0;
-    bench_yuv420_to_rgb565(gray, w, y2r_us);
-
-    qr_marker_result_t mr = { 0 };
-    t0 = esp_timer_get_time();
-    bool marker_ok = qr_marker_detect(gray, MID_W, MID_H, &mr);
-    *marker_us += esp_timer_get_time() - t0;
-    *markers = mr.markers;
-    *polarity = mr.inverted ? 1 : 0;
-    if (!marker_ok) {
-        quirc_end(s_quirc);
-        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+        log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
                         *identify_us - id0, *decode_us - dec0,
                         *markers, *polarity, *candidates, false);
         return false;
     }
 
-    if (mr.inverted) {
-        t0 = esp_timer_get_time();
-        for (int y = 0; y < MID_H; y++)
-            for (int x = 0; x < MID_W; x++)
-                gray[y * w + x] = (uint8_t)(255 - gray[y * w + x]);
-        *gray_us += esp_timer_get_time() - t0;
+    /* full-res 800x600 center crop -> quirc gray buffer. No custom finder
+     * prefilter: on-device it found markers=0 even at 800x600 while quirc's
+     * own detection decoded fine, so the prefilter was pure overhead (mark
+     * 48ms/run). quirc_flip in the decode loop covers ECC-level inversion;
+     * provisioning QR is standard dark-on-light polarity. */
+    int64_t t0 = esp_timer_get_time();
+    for (int y = 0; y < QR_HI_H; y++) {
+        const uint16_t *srow = px + (size_t)(CROP_Y + y) * fw + CROP_X;
+        uint8_t *drow = gray + (size_t)y * w;
+        rgb565_to_luma(srow, drow, QR_HI_W);
     }
+    *gray_us += esp_timer_get_time() - t0;
 
     t0 = esp_timer_get_time();
     quirc_end(s_quirc);
@@ -886,13 +846,13 @@ static bool qr_scan_mid(char *out, size_t cap, int *candidates,
         memcpy(out, s_qr_data.payload, s_qr_data.payload_len);
         out[s_qr_data.payload_len] = '\0';
         *decode_us += esp_timer_get_time() - t0;
-        log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+        log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
                         *identify_us - id0, *decode_us - dec0,
                         *markers, *polarity, *candidates, true);
         return true;
     }
     *decode_us += esp_timer_get_time() - t0;
-    log_qr_run_perf(*gray_us - gray0, *y2r_us - y2r0, *marker_us - mark0,
+    log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
                     *identify_us - id0, *decode_us - dec0,
                     *markers, *polarity, *candidates, false);
     return false;
@@ -1034,7 +994,7 @@ static void scan_task(void *pv)
     /* per-stage averages, surfaced through camera.status() at scan end
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
-    int64_t t_qr_gray = 0, t_qr_y2r = 0, t_qr_marker = 0, t_qr_identify = 0,
+    int64_t t_qr_gray = 0, t_qr_marker = 0, t_qr_identify = 0,
             t_qr_decode = 0;
     int64_t scan_started = 0;
     int qr_candidates = 0, qr_markers = 0, qr_polarity = 0, qr_runs = 0;
@@ -1101,11 +1061,14 @@ static void scan_task(void *pv)
             if (s_req.mode == SCAN_QR) {
                 frame_no++;
                 n_frames++;
-                if (mid_ok && (frame_no % 2) == 0) {
-                    found = qr_scan_mid(code, sizeof code, &qr_candidates,
-                                        &qr_markers, &qr_polarity, &t_qr_gray,
-                                        &t_qr_y2r, &t_qr_marker, &t_qr_identify,
-                                        &t_qr_decode);
+                /* QR runs the full-res 800x600 pass, ~4x the work of a
+                   preview frame, so throttle to every 3rd frame to keep the
+                   viewfinder moving (a held QR still gets ~3-4 tries/sec). */
+                if (mid_ok && (frame_no % 3) == 0) {
+                    found = qr_scan(px, s_frame_w, s_frame_h, code, sizeof code,
+                                    &qr_candidates, &qr_markers, &qr_polarity,
+                                    &t_qr_gray, &t_qr_marker, &t_qr_identify,
+                                    &t_qr_decode);
                     qr_runs++;
                 }
                 ioctl(s_fd, VIDIOC_QBUF, &buf);
@@ -1181,14 +1144,12 @@ static void scan_task(void *pv)
     char perf[192] = "";
     if (qr_runs)
         snprintf(perf, sizeof perf,
-                 " [pv%d gray%d y2r%d mark%d id%d dec%d ms/run markers%d/%c candidates%d runs%d total%dms]",
+                 " [pv%d gray%d id%d dec%d ms/run candidates%d runs%d total%dms]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(t_qr_gray / qr_runs / 1000),
-                 (int)(t_qr_y2r / qr_runs / 1000),
-                 (int)(t_qr_marker / qr_runs / 1000),
                  (int)(t_qr_identify / qr_runs / 1000),
-                 (int)(t_qr_decode / qr_runs / 1000), qr_markers,
-                 qr_polarity ? 'I' : 'N', qr_candidates, qr_runs,
+                 (int)(t_qr_decode / qr_runs / 1000),
+                 qr_candidates, qr_runs,
                  (int)((esp_timer_get_time() - scan_started) / 1000));
     else if (n_frames)
         snprintf(perf, sizeof perf,
