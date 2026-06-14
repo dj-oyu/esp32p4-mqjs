@@ -82,6 +82,11 @@ void opus_p4_pie_probe(void)
              (long)out[20], (long)out[21], (long)out[22], (long)out[23]);
     ESP_LOGI("pie_probe", "usar+src.q.ld unaligned@in32[1] (exp 11,12,13,14)= %ld %ld %ld %ld",
              (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
+    ESP_LOGI("pie_probe", "vunzip.32 r (exp 10,12,14,16)= %ld %ld %ld %ld  i (exp 11,13,15,17)= %ld %ld %ld %ld",
+             (long)out[28], (long)out[29], (long)out[30], (long)out[31],
+             (long)out[32], (long)out[33], (long)out[34], (long)out[35]);
+    ESP_LOGI("pie_probe", "vzip.32 roundtrip (exp 10,11,12,13)= %ld %ld %ld %ld",
+             (long)out[36], (long)out[37], (long)out[38], (long)out[39]);
     opus_p4_comb_bench();
     opus_p4_denorm_bench();
     opus_p4_normres_bench();

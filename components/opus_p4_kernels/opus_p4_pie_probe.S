@@ -62,6 +62,20 @@ opus_p4_pie_probe_run:
     esp.src.q.ld.ip     q4, a4, 16, q3, q3 /* q4 = unaligned [in32[1..4]] = {11,12,13,14} */
     esp.vst.128.ip      q4, a2, 16      /* out[24..27] */
 
+    /* --- vunzip.32 / vzip.32 lane order (complex r/i de/interleave) ---
+     * in32[0..7]={10..17} read as 4 complex (10,11)(12,13)(14,15)(16,17).
+     * vunzip.32 should split even/odd 32-bit lanes:
+     *   q0 -> {10,12,14,16} (r's), q1 -> {11,13,15,17} (i's).
+     * vzip.32 should round-trip back to {10,11,12,13}/{14,15,16,17}. */
+    addi    a4, a1, -32                 /* back to &in32[0] (a1 advanced 32) */
+    esp.vld.128.ip      q0, a4, 16      /* {10,11,12,13} */
+    esp.vld.128.ip      q1, a4, 16      /* {14,15,16,17} */
+    esp.vunzip.32       q0, q1
+    esp.vst.128.ip      q0, a2, 16      /* out[28..31] expect 10,12,14,16 */
+    esp.vst.128.ip      q1, a2, 16      /* out[32..35] expect 11,13,15,17 */
+    esp.vzip.32         q0, q1
+    esp.vst.128.ip      q0, a2, 16      /* out[36..39] expect 10,11,12,13 */
+
     ret
 
     .size opus_p4_pie_probe_run, .-opus_p4_pie_probe_run
