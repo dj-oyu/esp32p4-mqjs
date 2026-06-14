@@ -573,6 +573,7 @@ components/cam_tab5/     Tab5 カメラとバーコード認識
 components/sshc/         wolfSSH クライアント
 examples/                配信して試せる JavaScript アプリ
 tools/                   鍵生成、MQTT 配信、Web UI、検証ツール
+tools/agents/skills/     AI エージェント向けスキル (ESP32-P4 PIE SIMD 参照を含む)
 docs/                    UI、ランチャー、SSH 端末などの設計文書
 ```
 
@@ -586,6 +587,7 @@ docs/                    UI、ランチャー、SSH 端末などの設計文書
 - [docs/ssh-terminal-design.md](docs/ssh-terminal-design.md): SSH 端末
 - [docs/system-settings-design.md](docs/system-settings-design.md): System Vault、デバイス設定、プロビジョニング QR
 - [docs/qr-read-performance.md](docs/qr-read-performance.md): QR 読み取り性能の評価方法と実機計測計画
+- [tools/agents/skills/esp32p4-pie-simd/SKILL.md](tools/agents/skills/esp32p4-pie-simd/SKILL.md): ESP32-P4 PIE SIMD スキル参照
 
 ## ライセンス
 
