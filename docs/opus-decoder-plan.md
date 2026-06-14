@@ -951,8 +951,10 @@ fft.* 主張は誤りだった**:
 | `esp.vadd/vsub.s32` | OK | C_ADD/C_SUB の 32bit modular |
 | `esp.cmul.s16` | OK | ただし **s16 data 用**（bfly3 は int32 data なので不適） |
 | `esp.ldxq.32` / `esp.stxq.32` | 存在するが operand 難（`select_4` 0..3 フィールド） | strided gather/scatter |
-| `esp.fft.cmul.s16` / `esp.fft.ams.s16` | **不在（unrecognized opcode）** | — |
-| `esp.fft.r2bf.s16` | 存在（operand 要調査、CELT は radix-2 ほぼ未使用） | radix-2 のみ |
+| `esp.fft.cmul.s16.ld.xp` / `.st.xp` | **存在**（fused 形のみ。bare 形は無く、前回 bare で probe して "unrecognized" と誤判定） | **s16 data 用** |
+| `esp.fft.ams.s16.ld.incp` 他 | **存在**（fused 形のみ） | real-FFT s16 用 |
+| `esp.vcmulas.s16.qacc.h` / `.l` | **OK（直接アセンブル可）** | complex MAC → QACC（**s16 data**） |
+| `esp.fft.r2bf.s16` | 存在（CELT は radix-2 ほぼ未使用） | radix-2 のみ |
 
 → **bfly3 asm は汎用命令で組む**（fft.* 専用命令は使えない）。設計:
 1. strided twiddle（tw1=tw[k·fstride], tw2=tw[k·2fstride]）は **scalar gather で
@@ -1019,6 +1021,34 @@ product を全て scratch 経由にせざるを得ず、mul 削減分を相殺�
 **butterflies は PIE register file に載らない**（複素 live state が多すぎ、
 FFT 複素乗算命令が無い）。fast と bit-exact を両立不能。wrapper は m に応じて
 _8（8-block）→ _4（4-remainder）→ scalar へ dispatch。両足場は将来参照用に残置。
+
+### 【再々検討 2026-06-14】完全 ISA reference（tools/agents/skills/esp32p4-pie-simd）で見直し
+
+main から merge した PIE skill の完全 instruction reference で butterfly を再評価。
+**前回の「fft.* 命令は不在」は誤りだった**（bare 形のみ probe して "unrecognized"
+と誤判定。実際は fused .ld.xp/.st.xp/.ld.incp 形で存在）。正しい ISA 像:
+
+- **FFT/複素命令は実在**: `cmul.s16`、`vcmulas.s16.qacc.h/.l`（complex MAC→QACC、
+  直接アセンブル確認）、`fft.cmul.s16.ld.xp/.st.xp`、`fft.ams.s16.ld.incp`、
+  `fft.r2bf.s16`。
+- **ただし全て s16 data 専用**。CELT fixed FFT は **32-bit complex data（kiss_fft_cpx
+  =int32 r,i）× 16-bit twiddle**。単一命令の複素ops は 32-bit data に使えない
+  （16×32 は依然 `vmul.s32.s16xs16` で分解必須）。← **これが真の blocker**
+  （「命令が無い」ではなく「16-bit data 用で 32-bit CELT FFT に不適」）。
+- **QACC（512-bit）も spill を救えない**: 取り出しは SRCMB/MOV.s16.qacc（s16 へ
+  飽和 narrow＝lossy）か ST.QACC（memory）のみ。32-bit 値を QR へ安価に戻せず、
+  32-bit scratch には使えない。`vcmulas.s16.qacc.H/.L` で 16×32 split を
+  H=t⊗d_hi / L=t⊗d_lo と分けて積む手は綺麗だが、32-bit 抽出が memory round-trip
+  ＝結局 spill。
+- **PIE で FFT を速くする唯一の道 = 16-bit block-floating-point FFT**（esp-dsp 方式）。
+  IMDCT 経路を stage 毎 exponent 管理つき s16 へ書き換え、cmul.s16/fft.cmul.s16/
+  vcmulas.s16.qacc/fft.ams.s16 を使う。**ただし大規模・非 bit-exact・段再帰で精度
+  累積リスク**。drop-in kernel ではなく MDCT 経路の研究的書き換え。opus_compare で
+  要評価。
+
+**結論（更新）**: bit-exact 32-bit butterfly は PIE 高速化不可（理由は精緻化された
+が結論は不変）。16-bit BFP-FFT 路線のみが唯一の余地だが、規模・精度リスクが大きく
+denorm 級の確実 win とは別カテゴリの投資。**butterflies は据え置き**を推奨。
 
 ### 当ブランチ PIE 最適化キャンペーン総括（2026-06-14）
 
