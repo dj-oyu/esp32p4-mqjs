@@ -29,3 +29,7 @@ tools/task_signing_key.pem
 sdkconfig.tab5*
 !sdkconfig.tab5.defaults.example
 build_tab5/
+build_*/
+
+# Python bytecode caches
+**/__pycache__/
