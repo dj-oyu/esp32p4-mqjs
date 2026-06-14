@@ -97,6 +97,23 @@ void opus_p4_normres_band_c(int16_t *X, const int32_t *iy, int N, int16_t g,
 void opus_p4_normres_band_p4(int16_t *X, const int32_t *iy, int N, int16_t g,
                              int k);
 
+/*
+ * CELT kf_bfly3 inner loop (FIXED_POINT, radix-3 inverse-FFT butterfly).
+ *
+ * Fout is one i-block of 3*m interleaved int32 complex {r,i}. For k in [0,m)
+ * the sub-vectors Fa=Fout[k], Fb=Fout[m+k], Fc=Fout[2m+k] are updated in place
+ * using twiddles tw1=tw[k*fstride], tw2=tw[k*2*fstride] (interleaved int16
+ * r,i) and the scalar epi3_i = (int16)-QCONST32(0.86602540, 15).
+ *
+ * Contract: bit-exact CELT behavior (S_MUL = MULT16_32_Q15, 32-bit modular
+ * adds/subs, arithmetic HALF_OF). Fout and tw do not overlap; tw must address
+ * up to tw[(m-1)*2*fstride]. The _p4 PIE body must stay bit-exact (fixed).
+ */
+void opus_p4_bfly3_c(int32_t *Fout, int m, const int16_t *tw, int fstride,
+                     int16_t epi3_i);
+void opus_p4_bfly3_p4(int32_t *Fout, int m, const int16_t *tw, int fstride,
+                      int16_t epi3_i);
+
 /* On-device PIE instruction-semantics probe (logs results; ESP32-P4 only,
  * no-op elsewhere). Used to confirm vmul.s32.s16xs16 / cmul.s16 behavior
  * before building the PIE butterfly/comb kernels. */

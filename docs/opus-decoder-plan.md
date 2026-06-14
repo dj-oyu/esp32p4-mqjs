@@ -931,6 +931,43 @@ normres pie_calls=46408 で engage 済み）。理由: **~7% の見積りは flo
 **教訓**: PIE 候補の ROI は **fixed re-profile を基準**にすべき（float profile の
 順位は fixed に転用不可）。次は fixed で確実に hot な MDCT/FFT butterflies（#3）。
 
+### PIE kf_bfly3 着手（2026-06-14）— foundation 完了、asm 設計確定
+
+候補 #3（最大利得・最難）に着手。まず bit-exact foundation を完了:
+- `opus_p4_bfly3_c`（`opus_p4_kernels.c`）: kf_bfly3 inner loop をマクロ展開と
+  ビット一致で実装（`p4_mult16_32_q15` + 32bit modular add/sub + arithmetic
+  HALF_OF）。ABI `(int32_t *Fout, int m, const int16_t *tw, int fstride,
+  int16_t epi3_i)`、Fout は interleaved int32 complex の 1 i-block（3m）。
+- host test `tools/test_opus_bfly3.c`: 独立 int64 complex golden と照合、
+  **10366 cases 0 fail**（overflow-wrap 境界含む）。
+
+**PIE 命令の実在確認（toolchain アセンブル、2026-06-14）— 前 §「【訂正】」の
+fft.* 主張は誤りだった**:
+
+| 命令 | 実在 | 用途 |
+|---|---|---|
+| `esp.vunzip.32` / `esp.vzip.32` | **OK** | complex int32 r/i の deinterleave/interleave |
+| `esp.vmul.s32.s16xs16` | OK（既出） | 16×32 Q15 S_MUL（comb 方式 signed split） |
+| `esp.vadd/vsub.s32` | OK | C_ADD/C_SUB の 32bit modular |
+| `esp.cmul.s16` | OK | ただし **s16 data 用**（bfly3 は int32 data なので不適） |
+| `esp.ldxq.32` / `esp.stxq.32` | 存在するが operand 難（`select_4` 0..3 フィールド） | strided gather/scatter |
+| `esp.fft.cmul.s16` / `esp.fft.ams.s16` | **不在（unrecognized opcode）** | — |
+| `esp.fft.r2bf.s16` | 存在（operand 要調査、CELT は radix-2 ほぼ未使用） | radix-2 のみ |
+
+→ **bfly3 asm は汎用命令で組む**（fft.* 専用命令は使えない）。設計:
+1. strided twiddle（tw1=tw[k·fstride], tw2=tw[k·2fstride]）は **scalar gather で
+   aligned temp へ**（ldxq の operand 難を回避。8 complex×4B=32B、後で ldxq 最適化可）。
+2. temp を `vld.128`→`vunzip.16` で tw_r/tw_i（各 8×s16）に分離。
+3. Fb/Fc（8 complex int32=64B=4 qreg）を `vld.128`×4→`vunzip.32` で r/i
+   （各 8×int32, 2 qreg）に分離。
+4. S_MUL=MULT16_32_Q15 は comb 方式 `m=(t·d_hi)·2+(t·d_lo)>>15`
+   （`vmul.s32.s16xs16` + signed split）。C_MUL=4 S_MUL、bfly3 で計 10 S_MUL/block。
+5. C_ADD/SUB/HALF/MULBYSCALAR は `vadd/vsub.s32` + arithmetic `vsr.s32`。
+6. 結果を `vzip.32` で r/i 再 interleave→Fa/Fb/Fc へ scatter store
+   （未整列は aligned temp+memcpy）。
+- **要 device 検証**: `vunzip.32`/`vzip.32` の lane 順、scalar-gather の正当性
+   （opus_p4_pie_probe に追加してから asm 着手）。bit-exact 必須（fixed）。
+
 ### 次カーネル候補（ROI 順・再開ガイド）
 
 各候補は comb 同様の手順: **C ref（bit-exact）→ host test → PIE asm（8要素/呼）→

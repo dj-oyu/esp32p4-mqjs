@@ -161,6 +161,74 @@ void opus_p4_normres_band_c(int16_t *X, const int32_t *iy, int N, int16_t g,
 uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
 uint32_t opus_p4_denorm_pie_calls, opus_p4_denorm_c_calls;
 uint32_t opus_p4_normres_pie_calls, opus_p4_normres_c_calls;
+uint32_t opus_p4_bfly3_pie_calls, opus_p4_bfly3_c_calls;
+
+static inline int32_t p4_add32(int32_t a, int32_t b)
+{
+    return (int32_t)((uint32_t)a + (uint32_t)b); /* ADD32_ovflw */
+}
+
+static inline int32_t p4_sub32(int32_t a, int32_t b)
+{
+    return (int32_t)((uint32_t)a - (uint32_t)b); /* SUB32_ovflw */
+}
+
+/* CELT kf_bfly3 inner loop (FIXED_POINT, OPUS_FAST_INT64=0), bit-exact.
+ *
+ * Fout is one i-block of interleaved int32 complex {r,i}; within it three
+ * sub-vectors Fa=Fout[k], Fb=Fout[m+k], Fc=Fout[2m+k] (k in [0,m)) are updated
+ * in place. tw is the interleaved int16 twiddle table; tw1=tw[k*fstride],
+ * tw2=tw[k*2*fstride]. epi3_i is the int16 scalar -QCONST32(0.866,15).
+ *
+ * S_MUL(d,t)=MULT16_32_Q15(t,d); C_MUL/C_ADD/C_SUB/C_ADDTO are 32-bit modular;
+ * HALF_OF is arithmetic >>1. See the "kf_bfly bit-exact 契約" doc section. */
+void opus_p4_bfly3_c(int32_t *Fout, int m, const int16_t *tw, int fstride,
+                     int16_t epi3_i)
+{
+    int m2 = 2 * m;
+    for (int k = 0; k < m; k++) {
+        int32_t *Fa = Fout + 2 * k;
+        int32_t *Fb = Fout + 2 * (m + k);
+        int32_t *Fc = Fout + 2 * (m2 + k);
+        const int16_t *tw1 = tw + 2 * (k * fstride);
+        const int16_t *tw2 = tw + 2 * (k * 2 * fstride);
+        int16_t t1r = tw1[0], t1i = tw1[1];
+        int16_t t2r = tw2[0], t2i = tw2[1];
+        int32_t far = Fa[0], fai = Fa[1];
+
+        /* C_MUL(s1, Fb, tw1); C_MUL(s2, Fc, tw2) */
+        int32_t s1r = p4_sub32(p4_mult16_32_q15(t1r, Fb[0]),
+                               p4_mult16_32_q15(t1i, Fb[1]));
+        int32_t s1i = p4_add32(p4_mult16_32_q15(t1r, Fb[1]),
+                               p4_mult16_32_q15(t1i, Fb[0]));
+        int32_t s2r = p4_sub32(p4_mult16_32_q15(t2r, Fc[0]),
+                               p4_mult16_32_q15(t2i, Fc[1]));
+        int32_t s2i = p4_add32(p4_mult16_32_q15(t2r, Fc[1]),
+                               p4_mult16_32_q15(t2i, Fc[0]));
+
+        /* C_ADD(s3,s1,s2); C_SUB(s0,s1,s2) */
+        int32_t s3r = p4_add32(s1r, s2r), s3i = p4_add32(s1i, s2i);
+        int32_t s0r = p4_sub32(s1r, s2r), s0i = p4_sub32(s1i, s2i);
+
+        /* Fb = Fa - HALF_OF(s3)  (uses old Fa) */
+        int32_t fbr = p4_sub32(far, s3r >> 1);
+        int32_t fbi = p4_sub32(fai, s3i >> 1);
+
+        /* C_MULBYSCALAR(s0, epi3_i) */
+        s0r = p4_mult16_32_q15(epi3_i, s0r);
+        s0i = p4_mult16_32_q15(epi3_i, s0i);
+
+        /* C_ADDTO(Fa, s3) */
+        Fa[0] = p4_add32(far, s3r);
+        Fa[1] = p4_add32(fai, s3i);
+
+        /* Fc = (Fb.r + s0.i, Fb.i - s0.r); Fb = (Fb.r - s0.i, Fb.i + s0.r) */
+        Fc[0] = p4_add32(fbr, s0i);
+        Fc[1] = p4_sub32(fbi, s0r);
+        Fb[0] = p4_sub32(fbr, s0i);
+        Fb[1] = p4_add32(fbi, s0r);
+    }
+}
 
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_comb8(int32_t *y, const int32_t *x, int T, int16_t g10,
