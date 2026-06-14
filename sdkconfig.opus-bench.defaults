@@ -1,0 +1,13 @@
+# Decoder-only real-fixture benchmark build.
+# Use after sdkconfig.defaults and the desired board defaults.
+CONFIG_MQJS_TAB5_AUDIO=y
+CONFIG_OPUS_PLAYER=y
+CONFIG_MQJS_OPUS_BENCHMARK=y
+CONFIG_MQJS_OPUS_BENCH_WARMUP_PASSES=1
+CONFIG_MQJS_OPUS_BENCH_PASSES=5
+CONFIG_MQJS_OPUS_BENCH_MAX_PACKETS=512
+
+# Keep playback and instrumentation out of the end-to-end baseline.
+# CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY is not set
+# CONFIG_OPUS_PLAYER_DIAGNOSTICS is not set
+# CONFIG_OPUS_P4_FUNCTION_PROFILE is not set

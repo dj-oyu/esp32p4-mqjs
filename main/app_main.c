@@ -27,6 +27,7 @@
 #include "ui_tab5.h"
 #include "cam_tab5.h"
 #include "audio_tab5.h"
+#include "opus_player.h"
 #include "wifi.h"
 
 static const char *TAG = "app";
@@ -102,6 +103,22 @@ static void js_task(void *arg)
     mqjs_runtime_run(dev_next_source, NULL); /* never returns */
 }
 
+static void tab5_ui_ready(void *arg)
+{
+    (void)arg;
+    cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
+    cam_tab5_probe_once();               /* boot-time camera/V4L2 diagnostics */
+
+#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+    audio_tab5_selftest_async();
+#endif
+
+#if CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY
+    if (!opus_player_play_boot())
+        ESP_LOGW(TAG, "failed to start boot Opus playback");
+#endif
+}
+
 void app_main(void)
 {
     /* boot-time micro-benches (2026-06-12): ppa_bench_run() /
@@ -111,11 +128,12 @@ void app_main(void)
        5.5-7x on row+/full blends, blend crossover w=36/38 at h=24
        (~900px ~ 4 cells); JS arena SRAM-vs-PSRAM ~4% (skip). -O2
        itself: pixel loops ~2x, JS ~20% vs -Og. */
+#if CONFIG_MQJS_OPUS_BENCHMARK
+    opus_player_bench_run();
+#endif
+
     board_tab5_power_init();   /* Tab5 only: C6 power rail (no-op elsewhere) */
-    ui_tab5_start();           /* Tab5 only: display + LVGL (no-op elsewhere) */
-    cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus
-                                            (no-op stubs elsewhere) */
-    cam_tab5_probe_once();     /* boot-time camera/V4L2 diagnostics */
+    ui_tab5_start(tab5_ui_ready, NULL); /* display + LVGL, then I2C users */
     mqjs_set_print_sink(ui_tab5_log); /* tee JS print to the UI console */
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
@@ -143,12 +161,6 @@ void app_main(void)
        does not use the C stack for JS frames, but the parser + bindings
        need headroom. Core 0: the LVGL task lives on Core 1 (see ui_tab5). */
     xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
-
-#if CONFIG_MQJS_TAB5_AUDIO_SELFTEST || CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
-    /* boot audio: the ES8388's shared I2C bus is up since ui_tab5_start()
-       and audio needs no network, so it is not gated on the Wi-Fi wait. */
-    audio_tab5_selftest_async();
-#endif
 
     /* Wi-Fi comes up in the background while the above already runs. Nothing
        blocks here on the network: the services that need it are released from

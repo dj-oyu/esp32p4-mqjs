@@ -34,4 +34,34 @@ menu "mqjs platform"
             No signature verification yet: on a public broker the topic
             name is the only secret, pick a non-guessable one.
 
+    config MQJS_OPUS_BENCHMARK
+        bool "Run real-fixture Opus decoder benchmark at boot"
+        default n
+        depends on OPUS_PLAYER
+        help
+            Decode the embedded 48 kbit/s stereo Ogg/Opus fixture without
+            audio output before normal application startup. Reports per-pass
+            decoder load, packet latency percentiles, and PCM checksums.
+
+    config MQJS_OPUS_BENCH_WARMUP_PASSES
+        int "Opus benchmark warmup passes"
+        default 1
+        range 0 10
+        depends on MQJS_OPUS_BENCHMARK
+
+    config MQJS_OPUS_BENCH_PASSES
+        int "Opus benchmark measured passes"
+        default 5
+        range 1 100
+        depends on MQJS_OPUS_BENCHMARK
+
+    config MQJS_OPUS_BENCH_MAX_PACKETS
+        int "Maximum packets per Opus benchmark fixture"
+        default 512
+        range 64 4096
+        depends on MQJS_OPUS_BENCHMARK
+        help
+            Bounds the benchmark task's packet-latency arrays. The current
+            fixture contains 317 audio packets.
+
 endmenu

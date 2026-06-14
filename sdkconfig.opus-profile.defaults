@@ -1,0 +1,3 @@
+# Function-level self-cycle profiling of the decode path. Layer last.
+# Adds substantial overhead; use only to rank kernels, not for absolute timing.
+CONFIG_OPUS_P4_FUNCTION_PROFILE=y

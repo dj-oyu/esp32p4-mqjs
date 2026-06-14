@@ -1,0 +1,39 @@
+menu "Opus playback"
+
+    config OPUS_PLAYER
+        bool "Enable Ogg Opus playback"
+        default n
+        depends on MQJS_TAB5_AUDIO
+        help
+            Decode an in-memory Ogg Opus stream with the float Opus
+            component and send signed 16-bit PCM to audio_tab5.
+
+    config OPUS_PLAYER_BOOT_OPUS
+        bool "Embed assets/audio/tab5-boot-48k.opus"
+        default n
+        depends on OPUS_PLAYER
+        help
+            Embed the 48 kbit/s stereo Opus fixture so it can be played
+            without a filesystem.
+
+    config OPUS_PLAYER_BOOT_AUTOPLAY
+        bool "Play the embedded Opus fixture at boot"
+        default n
+        depends on OPUS_PLAYER_BOOT_OPUS
+        depends on !MQJS_TAB5_AUDIO_SELFTEST
+        depends on !MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY
+        help
+            Start asynchronous playback from the UI/I2C ready event.
+            Intended for initial device verification.
+            The WAV autoplay and speaker self-test options must be off so
+            only one producer owns the PCM stream.
+
+    config OPUS_PLAYER_DIAGNOSTICS
+        bool "Log decoded PCM diagnostics"
+        default n
+        depends on OPUS_PLAYER
+        help
+            Log the first decoded samples, min/max, and an FNV-1a hash of
+            the first 4096 output frames. Intended for decoder validation.
+
+endmenu

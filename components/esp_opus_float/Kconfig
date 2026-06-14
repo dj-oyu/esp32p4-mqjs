@@ -1,0 +1,49 @@
+menu "Opus codec (esp_opus_float)"
+
+config OPUS_FIXED_POINT
+    bool "Build Opus in fixed-point arithmetic"
+    default n
+    help
+        Compile the Opus codec with -DFIXED_POINT: the CELT decoder uses
+        integer arithmetic and the SILK fixed-point encoder sources are built.
+
+        This is the prerequisite for ESP32-P4 PIE acceleration, whose SIMD is
+        integer-only (no float vector instructions). It changes the decoded
+        PCM bit-for-bit versus the float path, so validate fixed output
+        against the fixed C reference (not the float hash).
+
+        Default off keeps the float decode path and the OPUS_P4_KERNELS_FLOAT
+        anti-collapse kernel unchanged.
+
+config OPUS_P4_COMB_PIE
+    bool "Use the ESP32-P4 PIE comb filter (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route comb_filter_const_c through the PIE kernel opus_p4_comb8 (16x32
+        via vmul.s32.s16xs16, unaligned taps via src.q). ~2x faster than scalar
+        on the comb filter; relaxed (not bit-exact, ~-64 dB vs the C reference,
+        within opus_compare tolerance). Misaligned buffers fall back to C.
+
+config OPUS_P4_DENORM_PIE
+    bool "Use the ESP32-P4 PIE denormalise-bands kernel (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route the denormalise_bands common path (shift>=0) through the PIE
+        kernel opus_p4_denorm8 (16x32 via vmul.s32.s16xs16, contiguous int16
+        x via src.q). Relaxed (signed low-half split, ~-78 dB vs the C
+        reference, within opus_compare tolerance). The shift<0 extreme-gain
+        branch and the per-band tail stay on portable C.
+
+config OPUS_P4_NORMRES_PIE
+    bool "Use the ESP32-P4 PIE normalise_residual kernel (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route the normalise_residual hot loop through the PIE kernel
+        opus_p4_normres8 (16x16 via vmul.s32.s16xs16, int32 iy narrowed with
+        vunzip.16, round bias + arithmetic shift, int16 output). Bit-exact
+        with the C reference (no relaxed split).
+
+endmenu

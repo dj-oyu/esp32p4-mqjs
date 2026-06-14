@@ -1,5 +1,6 @@
 # ESP-IDF / CMake build outputs
 build/
+build_*/
 **/CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -28,8 +29,17 @@ managed_components/
 tools/task_signing_key.pem
 sdkconfig.tab5*
 !sdkconfig.tab5.defaults.example
-build_tab5/
-build_*/
-
 # Python bytecode caches
 **/__pycache__/
+
+build_opus_fixed_prof/*.sdkconfig
+sdkconfig.opus_asm
+sdkconfig.opus_bench
+sdkconfig.opus_fixed
+sdkconfig.opus_fixed_prof
+sdkconfig.opus_combpie
+sdkconfig.opus_denormpie
+sdkconfig.opus_normrespie
+sdkconfig.opus_playpie
+sdkconfig.opus_play
+build_opus_*_log.txt

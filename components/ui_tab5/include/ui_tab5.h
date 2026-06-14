@@ -85,10 +85,13 @@ typedef enum {
     UI_WK_SLIDER = 6, /* a=min b=max c=initial value                    */
 } ui_widget_kind_t;
 
+typedef void (*ui_tab5_ready_cb_t)(void *arg);
+
 #if CONFIG_MQJS_TAB5_UI
 
-/* Initialize panel + LVGL and start the UI task (call once, early). */
-void ui_tab5_start(void);
+/* Initialize panel + LVGL and start the UI task (call once, early).
+ * ready_cb runs once after touch/I2C init; it must not block. */
+void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg);
 /* Append one UTF-8 console line (thread-safe, copies, never blocks). */
 void ui_tab5_log(const char *line, size_t n);
 /* Publish a new status snapshot (thread-safe, copies). */
@@ -199,7 +202,11 @@ void ui_tab5_cam_set_dismiss_cb(void (*cb)(void));
 
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
 
-static inline void ui_tab5_start(void) {}
+static inline void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
+{
+    (void)ready_cb;
+    (void)arg;
+}
 static inline void ui_tab5_log(const char *line, size_t n)
 {
     (void)line;

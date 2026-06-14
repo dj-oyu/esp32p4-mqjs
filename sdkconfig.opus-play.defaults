@@ -1,0 +1,8 @@
+# Decode the embedded Opus fixture and play it through the Tab5 speaker at boot.
+# Layer after sdkconfig.tab5.defaults (+ sdkconfig.opus-fixed.defaults to hear
+# the fixed-point decoder). No benchmark/selftest producers.
+CONFIG_MQJS_TAB5_AUDIO=y
+CONFIG_OPUS_PLAYER=y
+CONFIG_OPUS_PLAYER_BOOT_OPUS=y
+CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY=y
+CONFIG_OPUS_PLAYER_DIAGNOSTICS=y

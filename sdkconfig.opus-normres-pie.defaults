@@ -1,0 +1,4 @@
+# Route the fixed-point normalise_residual hot loop through the PIE kernel.
+# Layer after sdkconfig.opus-fixed.defaults (alongside the comb/denorm PIE
+# defaults if those kernels are wanted too).
+CONFIG_OPUS_P4_NORMRES_PIE=y
