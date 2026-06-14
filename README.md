@@ -507,7 +507,7 @@ mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h
 /tmp/stdlib_tool -m64 > gen_pc/device_stdlib.h
 gcc -O2 -I. -Igen_pc -Imquickjs -o /tmp/run_pc tools/run_pc.c \
-  mqjs_runtime.c app/mqjs_app_manager.c mquickjs/mquickjs.c \
+  mqjs_runtime.c system_vault.c app/mqjs_app_manager.c mquickjs/mquickjs.c \
   mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c -lm
 
 /tmp/run_pc ../../examples/bench.js
@@ -584,6 +584,8 @@ docs/                    UI、ランチャー、SSH 端末などの設計文書
 - [docs/widget-framework-design.md](docs/widget-framework-design.md): ウィジェット UI
 - [docs/tab5-ui-design.md](docs/tab5-ui-design.md): Tab5 UI の構成
 - [docs/ssh-terminal-design.md](docs/ssh-terminal-design.md): SSH 端末
+- [docs/system-settings-design.md](docs/system-settings-design.md): System Vault、デバイス設定、プロビジョニング QR
+- [docs/qr-read-performance.md](docs/qr-read-performance.md): QR 読み取り性能の評価方法と実機計測計画
 
 ## ライセンス
 

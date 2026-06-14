@@ -138,8 +138,8 @@ function build() {
     var running = {};
     for (var i = 0; i < apps.length; i++) {
         running[apps[i].name] = true;
-        if (apps[i].name === "launcher")
-            continue; // 自分は載せない (PC テストでは slot 0 とは限らない)
+        if (apps[i].kind === "system")
+            continue; // system app は下の固定導線へ置く
         (function (app) {
             /* 行タップ = 即切替、行末の ✕ = 即停止 (確認ページなし。
                誤タップしても ○ 行 / チップから 1 タップで復活できる) */
@@ -163,6 +163,7 @@ function build() {
                  function () { openApp("dev"); });
     /* §9: ○ (停止中) の一覧はストアページへ移動 — メインは
        スイッチャー専念。停止中アプリはストア経由かチップで開く。 */
+    s.button("デバイス設定", function () { openApp("device_settings"); });
     s.button("ストア (インストール済み " + inst.length + " 本)", storePage);
     s.label("● タップで切替 / x で停止 ... バー長押しでいつでもここへ");
 

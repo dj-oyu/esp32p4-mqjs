@@ -38,6 +38,8 @@
 
 #include "bc_locate.h"
 #include "ean13.h"
+#include "qr_marker.h"
+#include "quirc.h"
 #include "ui_tab5.h"
 
 static const char *TAG = "cam_tab5";
@@ -56,13 +58,19 @@ static i2c_master_bus_handle_t s_bus;
 static bool s_video_ready;
 static volatile bool s_busy;
 static volatile bool s_cancel;
-static char s_status[128] = "idle";
+static char s_status[256] = "idle";
+
+typedef enum {
+    SCAN_EAN13,
+    SCAN_QR,
+} scan_mode_t;
 
 static struct {
     cam_tab5_cb_t cb;
     void *arg;
     uint32_t timeout_ms;
     char prefix[8];
+    scan_mode_t mode;
 } s_req;
 
 static void set_status(const char *fmt, const char *detail)
@@ -480,6 +488,10 @@ static bool ppa_once(void)
 #define MID_H (CROP_H / 2)
 
 static uint16_t *s_mid;
+static struct quirc *s_quirc;
+static struct quirc_code s_qr_code;
+static struct quirc_data s_qr_data;
+static uint8_t *s_qr_gray;
 
 static bool mid_blit(const uint16_t *px)
 {
@@ -521,6 +533,92 @@ static bool mid_blit(const uint16_t *px)
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
     return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
+}
+
+static bool qr_once(void)
+{
+    if (s_quirc)
+        return true;
+    s_quirc = quirc_new();
+    if (!s_quirc)
+        return false;
+    if (!s_qr_gray) {
+        s_qr_gray = heap_caps_malloc((size_t)MID_W * MID_H,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_qr_gray) {
+            quirc_destroy(s_quirc);
+            s_quirc = NULL;
+            return false;
+        }
+    }
+    if (quirc_resize(s_quirc, MID_W, MID_H) < 0) {
+        quirc_destroy(s_quirc);
+        s_quirc = NULL;
+        return false;
+    }
+    return true;
+}
+
+/* Decode the current center crop. The payload stays out of logs/status and is
+ * copied only after rejecting binary/NUL data and oversized provisioning QR. */
+static bool qr_scan_mid(char *out, size_t cap, int *candidates,
+                        int *markers, int *polarity, int64_t *gray_us,
+                        int64_t *marker_us, int64_t *identify_us,
+                        int64_t *decode_us)
+{
+    if (!qr_once())
+        return false;
+
+    *candidates = 0;
+    int64_t t0 = esp_timer_get_time();
+    for (int y = 0; y < MID_H; y++)
+        for (int x = 0; x < MID_W; x++)
+            s_qr_gray[y * MID_W + x] = luma565(s_mid[y * MID_W + x]);
+    *gray_us += esp_timer_get_time() - t0;
+
+    qr_marker_result_t mr = { 0 };
+    t0 = esp_timer_get_time();
+    bool marker_ok = qr_marker_detect(s_qr_gray, MID_W, MID_H, &mr);
+    *marker_us += esp_timer_get_time() - t0;
+    *markers = mr.markers;
+    *polarity = mr.inverted ? 1 : 0;
+    if (!marker_ok)
+        return false;
+
+    int w, h;
+    t0 = esp_timer_get_time();
+    uint8_t *gray = quirc_begin(s_quirc, &w, &h);
+    for (int y = 0; y < MID_H; y++)
+        for (int x = 0; x < MID_W; x++) {
+            uint8_t v = s_qr_gray[y * MID_W + x];
+            gray[y * w + x] = mr.inverted ? (uint8_t)(255 - v) : v;
+        }
+    *gray_us += esp_timer_get_time() - t0;
+
+    t0 = esp_timer_get_time();
+    quirc_end(s_quirc);
+    *identify_us += esp_timer_get_time() - t0;
+    *candidates = quirc_count(s_quirc);
+
+    t0 = esp_timer_get_time();
+    for (int i = 0; i < *candidates; i++) {
+        quirc_extract(s_quirc, i, &s_qr_code);
+        quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+        if (err == QUIRC_ERROR_DATA_ECC) {
+            quirc_flip(&s_qr_code);
+            err = quirc_decode(&s_qr_code, &s_qr_data);
+        }
+        if (err != QUIRC_SUCCESS || s_qr_data.payload_len <= 0 ||
+            (size_t)s_qr_data.payload_len >= cap ||
+            memchr(s_qr_data.payload, '\0', s_qr_data.payload_len))
+            continue;
+        memcpy(out, s_qr_data.payload, s_qr_data.payload_len);
+        out[s_qr_data.payload_len] = '\0';
+        *decode_us += esp_timer_get_time() - t0;
+        return true;
+    }
+    *decode_us += esp_timer_get_time() - t0;
+    return false;
 }
 
 /* Viewfinder = the rotated analysis image (sensor sits 90° to the
@@ -647,7 +745,7 @@ static void draw_overlay(uint16_t *pv, const FrameHit *hit)
 static void scan_task(void *pv)
 {
     static uint8_t line[CAM_W]; /* one scanner task at a time (s_busy) */
-    char code[14];
+    char code[CAM_TAB5_QR_PAYLOAD_MAX + 1];
     char lbl[112], lbl_cache[112];
     FrameHit disp, last_hit;
     bc_region_t cached;
@@ -659,6 +757,9 @@ static void scan_task(void *pv)
     /* per-stage averages, surfaced through camera.status() at scan end
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
+    int64_t t_qr_gray = 0, t_qr_marker = 0, t_qr_identify = 0, t_qr_decode = 0;
+    int64_t scan_started = 0;
+    int qr_candidates = 0, qr_markers = 0, qr_polarity = 0, qr_runs = 0;
     int n_loc = 0, n_frames = 0;
     s_fan_runs = 0;
     s_fan_hits = 0;
@@ -672,7 +773,8 @@ static void scan_task(void *pv)
            keeps every touch away from the UI behind, see ui_tab5) */
         ui_tab5_cam_set_dismiss_cb(cam_tab5_cancel);
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
-        set_status("scanning%s", NULL);
+        set_status(s_req.mode == SCAN_QR ? "scanning QR%s" : "scanning%s",
+                   NULL);
 
         /* The pipeline keeps streaming between scans, but with both
          * buffers DONE and nobody dequeuing, the driver stalls on the
@@ -691,10 +793,13 @@ static void scan_task(void *pv)
         }
 
         if (preview)
-            ui_tab5_cam_overlay_text("スキャン中 (緑=読取 黄=惜しい)");
+            ui_tab5_cam_overlay_text(s_req.mode == SCAN_QR
+                ? "QRコードを画面内に入れてください"
+                : "スキャン中 (緑=読取 黄=惜しい)");
 
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
+        scan_started = esp_timer_get_time();
         while (!s_cancel && esp_timer_get_time() < deadline && !found) {
             struct v4l2_buffer buf = { 0 };
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -708,6 +813,21 @@ static void scan_task(void *pv)
             bool mid_ok = s_frame_w == CAM_W && mid_blit(px);
             bool pv_ok = preview && mid_ok && preview_blit(preview);
             t_pv += esp_timer_get_time() - t0;
+            if (s_req.mode == SCAN_QR) {
+                frame_no++;
+                n_frames++;
+                if (mid_ok && (frame_no % 2) == 0) {
+                    found = qr_scan_mid(code, sizeof code, &qr_candidates,
+                                        &qr_markers, &qr_polarity, &t_qr_gray,
+                                        &t_qr_marker, &t_qr_identify,
+                                        &t_qr_decode);
+                    qr_runs++;
+                }
+                ioctl(s_fd, VIDIOC_QBUF, &buf);
+                if (pv_ok)
+                    ui_tab5_cam_canvas_update();
+                continue;
+            }
             /* localize on every 3rd frame (regions move at hand speed,
                not frame speed) and reuse the cached result between */
             if (mid_ok && (frame_no % 3) == 0) {
@@ -772,17 +892,31 @@ static void scan_task(void *pv)
         /* the pipeline stays up and streaming (see pipeline_once) */
     }
 
-    char done[128];
-    char perf[80] = "";
-    if (n_frames)
+    char done[256];
+    char perf[176] = "";
+    if (qr_runs)
+        snprintf(perf, sizeof perf,
+                 " [pv%d gray%d mark%d id%d dec%d ms/run markers%d/%c candidates%d runs%d total%dms]",
+                 (int)(t_pv / n_frames / 1000),
+                 (int)(t_qr_gray / qr_runs / 1000),
+                 (int)(t_qr_marker / qr_runs / 1000),
+                 (int)(t_qr_identify / qr_runs / 1000),
+                 (int)(t_qr_decode / qr_runs / 1000), qr_markers,
+                 qr_polarity ? 'I' : 'N', qr_candidates, qr_runs,
+                 (int)((esp_timer_get_time() - scan_started) / 1000));
+    else if (n_frames)
         snprintf(perf, sizeof perf,
                  " [pv%d loc%d scan%d ms/f %s fan%d/%d]",
                  (int)(t_pv / n_frames / 1000),
                  (int)(n_loc ? t_loc / n_loc / 1000 : 0),
                  (int)(t_scan / n_frames / 1000), bc_tensor_impl(),
                  s_fan_runs, s_fan_hits);
-    if (found)
-        snprintf(done, sizeof done, "found %s%s", code, perf);
+    if (found) {
+        if (s_req.mode == SCAN_QR)
+            snprintf(done, sizeof done, "found QR%s", perf);
+        else
+            snprintf(done, sizeof done, "found %.13s%s", code, perf);
+    }
     else if (fail)
         snprintf(done, sizeof done, "%s%s", fail, perf);
     else
@@ -800,8 +934,8 @@ static void scan_task(void *pv)
     vTaskDelete(NULL);
 }
 
-bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
-                         cam_tab5_cb_t cb, void *arg)
+static bool scan_start(uint32_t timeout_ms, const char *prefix,
+                       scan_mode_t mode, cam_tab5_cb_t cb, void *arg)
 {
     if (s_busy) {
         set_status("busy%s", NULL);
@@ -813,6 +947,7 @@ bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
     s_req.arg = arg;
     s_req.timeout_ms = timeout_ms ? timeout_ms : 15000;
     snprintf(s_req.prefix, sizeof s_req.prefix, "%s", prefix ? prefix : "");
+    s_req.mode = mode;
     s_cancel = false;
     s_busy = true;
     /* pinned to core 0 (with the JS task, which outranks it at prio 5):
@@ -825,6 +960,17 @@ bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
         return false;
     }
     return true;
+}
+
+bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
+                         cam_tab5_cb_t cb, void *arg)
+{
+    return scan_start(timeout_ms, prefix, SCAN_EAN13, cb, arg);
+}
+
+bool cam_tab5_qr_scan_start(uint32_t timeout_ms, cam_tab5_cb_t cb, void *arg)
+{
+    return scan_start(timeout_ms, NULL, SCAN_QR, cb, arg);
 }
 
 void cam_tab5_cancel(void)
@@ -844,6 +990,14 @@ bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
 {
     (void)timeout_ms;
     (void)prefix;
+    (void)cb;
+    (void)arg;
+    return false;
+}
+
+bool cam_tab5_qr_scan_start(uint32_t timeout_ms, cam_tab5_cb_t cb, void *arg)
+{
+    (void)timeout_ms;
     (void)cb;
     (void)arg;
     return false;

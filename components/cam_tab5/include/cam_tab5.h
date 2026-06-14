@@ -19,7 +19,9 @@
 extern "C" {
 #endif
 
-typedef void (*cam_tab5_cb_t)(const char *code13_or_null, void *arg);
+#define CAM_TAB5_QR_PAYLOAD_MAX 2048
+
+typedef void (*cam_tab5_cb_t)(const char *decoded_text_or_null, void *arg);
 
 /* SCCB rides the touch controller's I2C bus (port 1, SDA31/SCL32) —
  * pass ui_tab5's bus handle once at boot, before the first scan. */
@@ -29,6 +31,11 @@ void cam_tab5_set_i2c(void *i2c_master_bus_handle);
  * may be NULL (accept any EAN-13). */
 bool cam_tab5_scan_start(uint32_t timeout_ms, const char *prefix,
                          cam_tab5_cb_t cb, void *arg);
+
+/* Scan a QR code from the 400x300 center-crop analysis image. Text payloads
+ * up to CAM_TAB5_QR_PAYLOAD_MAX bytes are returned; binary/NUL payloads are
+ * rejected. The decoded payload is never included in status or logs. */
+bool cam_tab5_qr_scan_start(uint32_t timeout_ms, cam_tab5_cb_t cb, void *arg);
 
 void cam_tab5_cancel(void);
 

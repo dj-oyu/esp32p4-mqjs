@@ -476,10 +476,12 @@ static const JSClassDef js_clipboard_obj =
 
 /* ---- device API: camera object (Tab5 barcode scan over MIPI-CSI) ----
    scan(fn[, prefix]) -> 1/0: one-shot EAN-13 scan, fn(code|undefined);
-   prefix "97" = ISBN only. cancel() aborts; status() = last state
-   string (remote diagnosis). Stub (scan -> 0) without a camera. ---- */
+   scanQr(fn) is restricted at runtime to firmware-embedded system apps.
+   cancel() aborts; status() = last state string (without QR payload).
+   Stub (scan -> 0) without a camera. ---- */
 static const JSPropDef js_camera[] = {
     JS_CFUNC_DEF("scan", 2, js_camera_scan),
+    JS_CFUNC_DEF("scanQr", 1, js_camera_scan_qr),
     JS_CFUNC_DEF("cancel", 0, js_camera_cancel),
     JS_CFUNC_DEF("status", 0, js_camera_status),
     JS_PROP_END,
@@ -540,6 +542,21 @@ static const JSPropDef js_vault[] = {
 
 static const JSClassDef js_vault_obj =
     JS_OBJECT_DEF("Vault", js_vault);
+
+/* Firmware-embedded system apps only. Native bindings enforce the immutable
+   source trust bit; ordinary/MQTT apps see the object but calls are denied. */
+static const JSPropDef js_system[] = {
+    JS_CFUNC_DEF("wifiSet", 2, js_system_wifi_set),
+    JS_CFUNC_DEF("wifiStatus", 0, js_system_wifi_status),
+    JS_CFUNC_DEF("wifiForget", 0, js_system_wifi_forget),
+    JS_CFUNC_DEF("tailscaleSet", 1, js_system_tailscale_set),
+    JS_CFUNC_DEF("tailscaleStatus", 0, js_system_tailscale_status),
+    JS_CFUNC_DEF("tailscaleForget", 0, js_system_tailscale_forget),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_system_obj =
+    JS_OBJECT_DEF("System", js_system);
 
 /* ---- device API: sys object (heap telemetry W1-4; P4a lifecycle +
    app-to-app signals + foreground switching, launcher-multiapp design
@@ -636,6 +653,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
     JS_PROP_CLASS_DEF("vault", &js_vault_obj),
+    JS_PROP_CLASS_DEF("system", &js_system_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     JS_PROP_CLASS_DEF("camera", &js_camera_obj),
     JS_PROP_CLASS_DEF("audio", &js_audio_obj),

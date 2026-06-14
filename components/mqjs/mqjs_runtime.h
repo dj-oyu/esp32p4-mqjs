@@ -91,6 +91,14 @@ void mqjs_register_app_source(const char *name, const char *src,
                               size_t len);
 
 /*
+ * Register a firmware-embedded trusted system app. Unlike MQTT/LittleFS apps,
+ * its immutable source identity may call the purpose-built system.* settings
+ * API. It is launch-on-demand and may still be stopped/evicted.
+ */
+void mqjs_register_system_app_source(const char *name, const char *src,
+                                     size_t len);
+
+/*
  * Ask the launcher to open `name` (focus it if running, launch it
  * otherwise) — the status-bar chip / notification tap entry point.
  * Posts an open request to the resident launcher app; a no-op when no

@@ -34,6 +34,7 @@ static const char *TAG = "app";
 /* embedded by EMBED_TXTFILES (NUL-terminated) */
 extern const char _binary_task_js_start[];
 extern const char _binary_launcher_js_start[];
+extern const char _binary_device_settings_js_start[];
 
 /* current dev-slot source; owned here (the runtime only borrows it,
    so the buffer must outlive the running app — see mqjs_app_start) */
@@ -86,8 +87,11 @@ static void js_task(void *arg)
     mqjs_rt_init(); /* arenas (4 x 256KB PSRAM) + shared event queue */
 
     /* the scheduler keeps the registered "launcher" resident in slot 0 */
-    mqjs_register_app_source("launcher", _binary_launcher_js_start,
-                             strlen(_binary_launcher_js_start));
+    mqjs_register_system_app_source("launcher", _binary_launcher_js_start,
+                                    strlen(_binary_launcher_js_start));
+    mqjs_register_system_app_source("device_settings",
+                                    _binary_device_settings_js_start,
+                                    strlen(_binary_device_settings_js_start));
 
     /* a previously verified+persisted task takes over the embedded one.
        lengths are tracked explicitly: bytecode tasks contain NULs */

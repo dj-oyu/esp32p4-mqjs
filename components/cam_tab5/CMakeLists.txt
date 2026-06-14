@@ -6,7 +6,7 @@
 # like LVGL is on the Stamp: its sources compile to ~nothing without the
 # CSI/ISP kconfig options that sdkconfig.tab5.defaults enables.
 if(CONFIG_MQJS_CAMERA)
-    set(CAM_SRCS "cam_tab5.c" "ean13.c" "bc_locate.c")
+    set(CAM_SRCS "cam_tab5.c" "ean13.c" "bc_locate.c" "qr_marker.c")
     # PIE (xespv2p1) hand-fused structure-tensor kernel: P4-only. The .S
     # is fully guarded internally (CONFIG_IDF_TARGET_ESP32P4) so it is
     # harmless on other targets, but we only add it to the build on P4.
@@ -20,7 +20,7 @@ endif()
 idf_component_register(SRCS ${CAM_SRCS}
                        INCLUDE_DIRS "include"
                        PRIV_REQUIRES esp_driver_ledc esp_driver_i2c esp_timer
-                                     esp_driver_ppa ui_tab5)
+                                     esp_driver_ppa ui_tab5 quirc)
 
 # No per-file -march needed: the IDF P4 toolchain (GCC 15.2) already
 # assembles the PIE + hardware-loop mnemonics. Its global asmflags carry

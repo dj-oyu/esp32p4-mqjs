@@ -31,7 +31,8 @@ EXAMPLES = os.path.join(ROOT, "examples")
 MQJS_DIR = os.path.join(ROOT, "components", "mqjs")
 TOOL_DIR = "/tmp/mqjs_webui_tools"
 
-ENGINE_SRCS = ["mqjs_runtime.c", "mquickjs/mquickjs.c", "mquickjs/cutils.c",
+ENGINE_SRCS = ["mqjs_runtime.c", "system_vault.c", "app/mqjs_app_manager.c",
+               "mquickjs/mquickjs.c", "mquickjs/cutils.c",
                "mquickjs/dtoa.c", "mquickjs/libm.c"]
 
 status_log = deque(maxlen=200)

@@ -12,6 +12,8 @@ endif()
 # and started from the launcher.
 configure_file(${CMAKE_CURRENT_LIST_DIR}/../examples/launcher.js
                ${CMAKE_CURRENT_BINARY_DIR}/launcher.js COPYONLY)
+configure_file(${CMAKE_CURRENT_LIST_DIR}/../examples/device_settings.js
+               ${CMAKE_CURRENT_BINARY_DIR}/device_settings.js COPYONLY)
 
 # Copy to a fixed name so the embedded symbol (_binary_task_js_*) does not
 # depend on which script was selected. configure_file re-runs cmake when
@@ -26,4 +28,5 @@ idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                                      audio_tab5 audio_device esp_driver_ppa
                                      esp_timer
                        EMBED_TXTFILES ${CMAKE_CURRENT_BINARY_DIR}/task.js
-                                      ${CMAKE_CURRENT_BINARY_DIR}/launcher.js)
+                                      ${CMAKE_CURRENT_BINARY_DIR}/launcher.js
+                                      ${CMAKE_CURRENT_BINARY_DIR}/device_settings.js)

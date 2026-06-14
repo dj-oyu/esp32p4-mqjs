@@ -49,6 +49,7 @@
 #include "mqjs_runtime.h"
 #include "mqjs_classes.h"
 #include "mqjs_power.h"
+#include "system_vault.h"
 #include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
@@ -158,8 +159,8 @@ typedef struct {
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
-        struct { char code[14]; uint8_t ok; } cam; /* camera.scan result
-                       (13 digits inline: no heap ownership to manage) */
+        struct { char *text; uint32_t len; uint8_t ok; } cam; /* camera scan
+                       result: heap text owned by the event */
         struct { char *body; uint32_t len; int16_t status; } http; /* http.get
                        result: heap body owned by the event (dispatcher
                        frees it), status<=0 = request failed */
@@ -209,6 +210,7 @@ typedef struct {
     char name[32];
     char vault_id[32];        /* immutable source identity; setAppName cannot
                                  impersonate another app's vault */
+    bool trusted_system;       /* immutable: only firmware registry can set */
     uint8_t *mem;             /* fixed arena (design §3.6) */
     size_t mem_size;
     JSContext *ctx;
@@ -263,6 +265,7 @@ static int64_t s_run_deadline;   /* JS watchdog */
    sys.launch(name) resolves here first; "launcher" is kept resident. */
 typedef struct {
     bool used;
+    bool trusted_system;
     char name[32];
     const char *src;
     size_t len;
@@ -364,6 +367,24 @@ void mqjs_register_app_source(const char *name, const char *src, size_t len)
         if (as->used && strcmp(as->name, name) != 0)
             continue;
         as->used = true;
+        as->trusted_system = false;
+        snprintf(as->name, sizeof as->name, "%s", name);
+        as->src = src;
+        as->len = len;
+        return;
+    }
+}
+
+void mqjs_register_system_app_source(const char *name, const char *src,
+                                     size_t len)
+{
+    for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
+         i++) {
+        AppSource *as = &s_app_sources[i];
+        if (as->used && strcmp(as->name, name) != 0)
+            continue;
+        as->used = true;
+        as->trusted_system = true;
         snprintf(as->name, sizeof as->name, "%s", name);
         as->src = src;
         as->len = len;
@@ -2190,6 +2211,112 @@ JSValue js_vault_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_NewBool(ok);
 }
 
+/* ------------------------------------------------------------------ */
+/* system settings: immutable-system-app-only, purpose-built writes.   */
+/* Secrets are never returned to JS; status contains presence/public   */
+/* metadata only. See docs/system-settings-design.md.                   */
+/* ------------------------------------------------------------------ */
+
+static bool system_api_allowed(JSContext *ctx)
+{
+    if (s_cur_wk && s_cur_wk->trusted_system)
+        return true;
+    JS_ThrowTypeError(ctx, "system settings require an embedded system app");
+    return false;
+}
+
+JSValue js_system_wifi_set(JSContext *ctx, JSValue *this_val, int argc,
+                           JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    JSCStringBuf sbuf, pbuf;
+    size_t slen, plen;
+    const char *ssid = JS_ToCStringLen(ctx, &slen, argv[0], &sbuf);
+    if (!ssid)
+        return JS_EXCEPTION;
+    const char *pass = JS_ToCStringLen(ctx, &plen, argv[1], &pbuf);
+    if (!pass)
+        return JS_EXCEPTION;
+    if (!slen || slen > SYSTEM_VAULT_WIFI_SSID_MAX ||
+        plen > SYSTEM_VAULT_WIFI_PASS_MAX)
+        return JS_ThrowRangeError(ctx, "invalid Wi-Fi credential length");
+    return JS_NewBool(system_vault_wifi_set(ssid, pass));
+}
+
+JSValue js_system_wifi_status(JSContext *ctx, JSValue *this_val, int argc,
+                              JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    bool configured = system_vault_wifi_has();
+    char ssid[SYSTEM_VAULT_WIFI_SSID_MAX + 1] = "";
+    if (configured)
+        system_vault_wifi_ssid(ssid, sizeof ssid);
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "configured", JS_NewBool(configured));
+    JS_SetPropertyStr(ctx, obj_ref.val, "ssid", JS_NewString(ctx, ssid));
+    JS_SetPropertyStr(ctx, obj_ref.val, "state",
+                      JS_NewString(ctx, configured ? "configured"
+                                                   : "not-configured"));
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+}
+
+JSValue js_system_wifi_forget(JSContext *ctx, JSValue *this_val, int argc,
+                              JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    return JS_NewBool(system_vault_wifi_forget());
+}
+
+JSValue js_system_tailscale_set(JSContext *ctx, JSValue *this_val, int argc,
+                                JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    JSCStringBuf buf;
+    size_t len;
+    const char *key = JS_ToCStringLen(ctx, &len, argv[0], &buf);
+    if (!key)
+        return JS_EXCEPTION;
+    if (!len || len > SYSTEM_VAULT_TS_AUTH_MAX)
+        return JS_ThrowRangeError(ctx, "invalid Tailscale auth key length");
+    return JS_NewBool(system_vault_tailscale_set(key));
+}
+
+JSValue js_system_tailscale_status(JSContext *ctx, JSValue *this_val, int argc,
+                                   JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    bool configured = system_vault_tailscale_has();
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "configured", JS_NewBool(configured));
+    JS_SetPropertyStr(ctx, obj_ref.val, "state",
+                      JS_NewString(ctx, configured ? "configured"
+                                                   : "not-configured"));
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+}
+
+JSValue js_system_tailscale_forget(JSContext *ctx, JSValue *this_val, int argc,
+                                   JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    return JS_NewBool(system_vault_tailscale_forget());
+}
+
 /* copy the key argument onto the stack; NVS keys are at most 15 chars */
 static int store_key(JSContext *ctx, JSValue v, char *dst /*[16]*/)
 {
@@ -2563,11 +2690,19 @@ static void cam_done_cb(const char *code, void *arg)
     (void)arg;
     MqjsEvent ev = { .type = EV_CAM, .worker = s_cam_worker, .gen = s_cam_gen };
     if (code) {
-        snprintf(ev.u.cam.code, sizeof ev.u.cam.code, "%s", code);
-        ev.u.cam.ok = 1;
+        size_t len = strnlen(code, CAM_TAB5_QR_PAYLOAD_MAX + 1);
+        if (len <= CAM_TAB5_QR_PAYLOAD_MAX) {
+            ev.u.cam.text = malloc(len + 1);
+            if (ev.u.cam.text) {
+                memcpy(ev.u.cam.text, code, len + 1);
+                ev.u.cam.len = len;
+                ev.u.cam.ok = 1;
+            }
+        }
     }
     s_cam_active = false;
-    ev_post(&ev, 0);
+    if (!ev_post(&ev, 0))
+        free(ev.u.cam.text);
 }
 #endif
 
@@ -2609,6 +2744,40 @@ JSValue js_camera_scan(JSContext *ctx, JSValue *this_val, int argc,
 #endif
 }
 
+/* camera.scanQr(fn) -> trusted system apps only. The decoded text is passed
+   to the callback for on-device provisioning tests, but never logged. */
+JSValue js_camera_scan_qr(JSContext *ctx, JSValue *this_val, int argc,
+                          JSValue *argv)
+{
+#if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    if (s_cam_active)
+        return JS_NewBool(0);
+    JSValue r = register_cb(ctx, argv[0], &s_cur_wk->cam_used,
+                            &s_cur_wk->cam_cb);
+    if (JS_IsException(r))
+        return r;
+    s_cam_worker = s_cur_wk->idx;
+    s_cam_gen = s_cur_wk->gen;
+    s_cam_active = true;
+    if (!cam_tab5_qr_scan_start(45000, cam_done_cb, NULL)) {
+        s_cam_active = false;
+        s_cur_wk->cam_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->cam_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    return JS_NewBool(0);
+#endif
+}
+
 /* camera.cancel(): abort the running scan; its callback still fires
    (with undefined) through the normal event path. */
 JSValue js_camera_cancel(JSContext *ctx, JSValue *this_val, int argc,
@@ -2642,14 +2811,18 @@ JSValue js_camera_status(JSContext *ctx, JSValue *this_val, int argc,
 static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
 {
     JSContext *ctx = app->ctx;
-    if (!app->cam_used)
+    if (!app->cam_used) {
+        free(ev->u.cam.text);
         return;
+    }
     if (JS_StackCheck(ctx, 3)) {
+        free(ev->u.cam.text);
         dump_error(ctx);
         return;
     }
-    JS_PushArg(ctx, ev->u.cam.ok ? JS_NewString(ctx, ev->u.cam.code)
-                                 : JS_UNDEFINED);                /* arg0 */
+    JS_PushArg(ctx, ev->u.cam.ok
+                    ? JS_NewStringLen(ctx, ev->u.cam.text, ev->u.cam.len)
+                    : JS_UNDEFINED);                            /* arg0 */
     JS_PushArg(ctx, app->cam_cb.val);                            /* func */
     JS_PushArg(ctx, JS_NULL);                                    /* this */
     /* one-shot: release before the call (the arg stack roots the fn) so
@@ -2658,6 +2831,7 @@ static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
     JS_DeleteGCRef(ctx, &app->cam_cb);
     arm_watchdog();
     JSValue ret = JS_Call(ctx, 1);
+    free(ev->u.cam.text);
     if (JS_IsException(ret))
         dump_error(ctx);
 }
@@ -3097,7 +3271,7 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 /* ---- P4b: launcher support (apps/launch/stop/setAppName/notify) ---- */
 
 static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
-                              const char *name);
+                              const char *name, bool trusted_system);
 static void app_stop_internal(MqjsWorker *app);
 static void app_stop_internal_r(MqjsWorker *app, mqjs_app_stop_reason_t reason);
 static void switch_foreground(int new_slot);
@@ -3400,8 +3574,7 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     int n = 0;
     for (int i = 0; i < (int)(sizeof s_app_sources / sizeof s_app_sources[0]);
          i++) {
-        if (!s_app_sources[i].used ||
-            !strcmp(s_app_sources[i].name, "launcher"))
+        if (!s_app_sources[i].used || s_app_sources[i].trusted_system)
             continue;
         size_t hlen = s_app_sources[i].len < 512 ? s_app_sources[i].len : 512;
         if (installed_push(ctx, &arr_ref, n, s_app_sources[i].name,
@@ -3582,7 +3755,7 @@ static int start_from_file(int slot, const char *arg, const char *name)
     }
     fclose(f);
     buf[flen] = '\0';
-    if (app_start_internal(&s_workers[slot], buf, (size_t)flen, name)) {
+    if (app_start_internal(&s_workers[slot], buf, (size_t)flen, name, false)) {
         free(buf);
         return -1;
     }
@@ -3690,7 +3863,8 @@ static int sys_launch_core(const char *arg)
 
     const AppSource *as = app_source_find(name);
     if (as) {
-        if (app_start_internal(&s_workers[slot], as->src, as->len, as->name))
+        if (app_start_internal(&s_workers[slot], as->src, as->len, as->name,
+                               as->trusted_system))
             return -1;
         return slot;
     }
@@ -4863,7 +5037,7 @@ static void app_stop_internal(MqjsWorker *app)
 }
 
 static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
-                              const char *name)
+                              const char *name, bool trusted_system)
 {
     if (app->used || !app->mem)
         return -1;
@@ -4886,6 +5060,7 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     app->sink_len = 0;
     snprintf(app->name, sizeof app->name, "%s", name ? name : "app");
     snprintf(app->vault_id, sizeof app->vault_id, "%s", name ? name : "app");
+    app->trusted_system = trusted_system;
 
     JSContext *ctx = JS_NewContext(app->mem, app->mem_size, &js_stdlib);
     if (!ctx)
@@ -4938,9 +5113,16 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
         snprintf(s_last_dev_name, sizeof s_last_dev_name, "%s", app->name);
     /* App record: find-or-create, state -> RUNNING (Phase 2). */
     mqjs_app_record_on_start(app->name, app->idx,
-                             app->idx == MQJS_WORKER_LAUNCHER
-                                 ? MQJS_APP_KIND_SYSTEM : MQJS_APP_KIND_APP,
+                             trusted_system ? MQJS_APP_KIND_SYSTEM
+                                            : MQJS_APP_KIND_APP,
                              time_ms());
+    /* Only the launcher is resident. Other embedded system screens are
+       trusted but launch-on-demand and may release their worker. */
+    if (trusted_system && app->idx != MQJS_WORKER_LAUNCHER)
+        mqjs_app_record_set_policy(
+            app->name, MQJS_APP_EVICTABLE | MQJS_APP_STOPPABLE,
+            MQJS_APP_AUTOSTART | MQJS_APP_RESTART_ON_EXIT |
+                MQJS_APP_KEEP_ALIVE);
     /* Phase 3: the dev task's classic natural-end auto-rerun is policy
        now — every (re)start arms it; an explicit sys.stop clears it. */
     if (app->idx == MQJS_WORKER_DEV)
@@ -5045,6 +5227,9 @@ static void free_event_payload(MqjsEvent *ev)
         break;
     case EV_HTTP:
         free(ev->u.http.body);
+        break;
+    case EV_CAM:
+        free(ev->u.cam.text);
         break;
     default:
         break;
@@ -5225,7 +5410,7 @@ int mqjs_app_start(int slot, const char *src, size_t src_len,
     s_workers[slot].idx = (uint8_t)slot;
     if (!app_ensure_mem(&s_workers[slot]))
         return -1;
-    return app_start_internal(&s_workers[slot], src, src_len, name);
+    return app_start_internal(&s_workers[slot], src, src_len, name, false);
 }
 
 void mqjs_app_stop(int slot)
@@ -5357,7 +5542,7 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
                 const AppSource *as = app_source_find("launcher");
                 if (as)
                     app_start_internal(&s_workers[MQJS_WORKER_LAUNCHER],
-                                       as->src, as->len, "launcher");
+                                       as->src, as->len, "launcher", true);
             }
             s_launcher_retry_at = time_ms() + 1000;
         }
@@ -5410,7 +5595,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
     dev->mem_size = mem_size;
 
     s_stop_req = false;
-    if (app_start_internal(dev, src, src_len, name))
+    if (app_start_internal(dev, src, src_len, name, false))
         return -1;
 
     for (;;) {
