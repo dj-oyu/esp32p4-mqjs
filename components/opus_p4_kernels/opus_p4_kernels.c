@@ -47,6 +47,7 @@ void opus_p4_pie_probe_run(const int16_t *in, const int32_t *in32, int32_t *out)
 void opus_p4_comb_bench(void);
 void opus_p4_denorm_bench(void);
 void opus_p4_normres_bench(void);
+void opus_p4_bfly3_bench(void);
 
 void opus_p4_pie_probe(void)
 {
@@ -90,6 +91,7 @@ void opus_p4_pie_probe(void)
     opus_p4_comb_bench();
     opus_p4_denorm_bench();
     opus_p4_normres_bench();
+    opus_p4_bfly3_bench();
 }
 #else
 void opus_p4_pie_probe(void) {}
@@ -476,6 +478,183 @@ void opus_p4_normres_bench(void)
              "imax=%d iy=%ld Xc=%d Xp=%d | Xc[0..3]= %d %d %d %d",
              imax, (long)iy[imax], Xc[imax], Xp[imax], Xc[0], Xc[1], Xc[2],
              Xc[3]);
+}
+
+/* Relaxed S_MUL matching the PIE kernel's signed low-half split (vunzip.16
+ * gives a signed s16 low half, vs the codec's unsigned MULT16_16SU). Used only
+ * to confirm the asm structure is bit-exact against its own (relaxed) contract;
+ * the relaxation is ~-75 dB, like comb/denorm. */
+static inline int32_t p4_mult16_32_q15_rx(int16_t a, int32_t b)
+{
+    int32_t hi = (int32_t)((uint32_t)((int32_t)a * (int32_t)(int16_t)(b >> 16))
+                           << 1);
+    int32_t lo = ((int32_t)a * (int32_t)(int16_t)(b & 0xffffu)) >> 15;
+    return (int32_t)((uint32_t)hi + (uint32_t)lo);
+}
+
+static void opus_p4_bfly3_c_rx(int32_t *Fout, int m, const int16_t *tw,
+                               int fstride, int16_t epi3_i)
+{
+    int m2 = 2 * m;
+    for (int k = 0; k < m; k++) {
+        int32_t *Fa = Fout + 2 * k;
+        int32_t *Fb = Fout + 2 * (m + k);
+        int32_t *Fc = Fout + 2 * (m2 + k);
+        const int16_t *t1 = tw + 2 * (k * fstride);
+        const int16_t *t2 = tw + 2 * (k * 2 * fstride);
+        int32_t far = Fa[0], fai = Fa[1];
+        int32_t s1r = p4_sub32(p4_mult16_32_q15_rx(t1[0], Fb[0]),
+                               p4_mult16_32_q15_rx(t1[1], Fb[1]));
+        int32_t s1i = p4_add32(p4_mult16_32_q15_rx(t1[0], Fb[1]),
+                               p4_mult16_32_q15_rx(t1[1], Fb[0]));
+        int32_t s2r = p4_sub32(p4_mult16_32_q15_rx(t2[0], Fc[0]),
+                               p4_mult16_32_q15_rx(t2[1], Fc[1]));
+        int32_t s2i = p4_add32(p4_mult16_32_q15_rx(t2[0], Fc[1]),
+                               p4_mult16_32_q15_rx(t2[1], Fc[0]));
+        int32_t s3r = p4_add32(s1r, s2r), s3i = p4_add32(s1i, s2i);
+        int32_t s0r = p4_sub32(s1r, s2r), s0i = p4_sub32(s1i, s2i);
+        int32_t fbr = p4_sub32(far, s3r >> 1), fbi = p4_sub32(fai, s3i >> 1);
+        s0r = p4_mult16_32_q15_rx(epi3_i, s0r);
+        s0i = p4_mult16_32_q15_rx(epi3_i, s0i);
+        Fa[0] = p4_add32(far, s3r);
+        Fa[1] = p4_add32(fai, s3i);
+        Fc[0] = p4_add32(fbr, s0i);
+        Fc[1] = p4_sub32(fbi, s0r);
+        Fb[0] = p4_sub32(fbr, s0i);
+        Fb[1] = p4_add32(fbi, s0r);
+    }
+}
+
+void opus_p4_bfly3_4(int32_t *fa, int32_t *fb, int32_t *fc, const int16_t *tw1,
+                     const int16_t *tw2, int16_t epi3);
+
+void opus_p4_bfly3_p4(int32_t *Fout, int m, const int16_t *tw, int fstride,
+                      int16_t epi3_i)
+{
+    int m2 = 2 * m;
+    int k = 0;
+    int32_t fa_t[8] __attribute__((aligned(16)));
+    int32_t fb_t[8] __attribute__((aligned(16)));
+    int32_t fc_t[8] __attribute__((aligned(16)));
+    int16_t tw1_t[8] __attribute__((aligned(16)));
+    int16_t tw2_t[8] __attribute__((aligned(16)));
+    extern uint32_t opus_p4_bfly3_pie_calls;
+    if (m >= 4)
+        opus_p4_bfly3_pie_calls++;
+    for (; k + 4 <= m; k += 4) {
+        for (int j = 0; j < 4; j++) {
+            const int16_t *t1 = tw + 2 * ((k + j) * fstride);
+            const int16_t *t2 = tw + 2 * ((k + j) * 2 * fstride);
+            tw1_t[2 * j] = t1[0];
+            tw1_t[2 * j + 1] = t1[1];
+            tw2_t[2 * j] = t2[0];
+            tw2_t[2 * j + 1] = t2[1];
+        }
+        memcpy(fa_t, Fout + 2 * k, sizeof(fa_t));
+        memcpy(fb_t, Fout + 2 * (m + k), sizeof(fb_t));
+        memcpy(fc_t, Fout + 2 * (m2 + k), sizeof(fc_t));
+        opus_p4_bfly3_4(fa_t, fb_t, fc_t, tw1_t, tw2_t, epi3_i);
+        memcpy(Fout + 2 * k, fa_t, sizeof(fa_t));
+        memcpy(Fout + 2 * (m + k), fb_t, sizeof(fb_t));
+        memcpy(Fout + 2 * (m2 + k), fc_t, sizeof(fc_t));
+    }
+    /* scalar tail when m is not a multiple of 4 */
+    for (; k < m; k++) {
+        int32_t *Fa = Fout + 2 * k;
+        int32_t *Fb = Fout + 2 * (m + k);
+        int32_t *Fc = Fout + 2 * (m2 + k);
+        const int16_t *t1 = tw + 2 * (k * fstride);
+        const int16_t *t2 = tw + 2 * (k * 2 * fstride);
+        int32_t far = Fa[0], fai = Fa[1];
+        int32_t s1r = p4_sub32(p4_mult16_32_q15(t1[0], Fb[0]),
+                               p4_mult16_32_q15(t1[1], Fb[1]));
+        int32_t s1i = p4_add32(p4_mult16_32_q15(t1[0], Fb[1]),
+                               p4_mult16_32_q15(t1[1], Fb[0]));
+        int32_t s2r = p4_sub32(p4_mult16_32_q15(t2[0], Fc[0]),
+                               p4_mult16_32_q15(t2[1], Fc[1]));
+        int32_t s2i = p4_add32(p4_mult16_32_q15(t2[0], Fc[1]),
+                               p4_mult16_32_q15(t2[1], Fc[0]));
+        int32_t s3r = p4_add32(s1r, s2r), s3i = p4_add32(s1i, s2i);
+        int32_t s0r = p4_sub32(s1r, s2r), s0i = p4_sub32(s1i, s2i);
+        int32_t fbr = p4_sub32(far, s3r >> 1), fbi = p4_sub32(fai, s3i >> 1);
+        s0r = p4_mult16_32_q15(epi3_i, s0r);
+        s0i = p4_mult16_32_q15(epi3_i, s0i);
+        Fa[0] = p4_add32(far, s3r);
+        Fa[1] = p4_add32(fai, s3i);
+        Fc[0] = p4_add32(fbr, s0i);
+        Fc[1] = p4_sub32(fbi, s0r);
+        Fb[0] = p4_sub32(fbr, s0i);
+        Fb[1] = p4_add32(fbi, s0r);
+    }
+}
+
+void opus_p4_bfly3_bench(void)
+{
+    enum { M = 32, FSTRIDE = 1, NC = 3 * M };
+    static int32_t F0[NC * 2] __attribute__((aligned(16)));
+    static int32_t Fc[NC * 2] __attribute__((aligned(16)));
+    static int32_t Fp[NC * 2] __attribute__((aligned(16)));
+    static int16_t tw[M * 4 + 16] __attribute__((aligned(16)));
+    int16_t epi3 = -28377;
+    uint32_t seed = 7777u;
+    for (int i = 0; i < NC * 2; i++) {
+        seed = 1664525u * seed + 1013904223u;
+        F0[i] = (int32_t)seed >> 3;
+    }
+    for (int i = 0; i < (int)(sizeof(tw) / sizeof(tw[0])); i++) {
+        seed = 1664525u * seed + 1013904223u;
+        tw[i] = (int16_t)seed;
+    }
+    const int iters = 2000;
+
+    /* correctness: PIE vs the bit-exact C ref (relaxed diff expected) AND vs
+     * the relaxed C ref (must be 0 -> asm structurally correct). */
+    static int32_t Fr[NC * 2] __attribute__((aligned(16)));
+    memcpy(Fc, F0, sizeof(F0));
+    memcpy(Fp, F0, sizeof(F0));
+    memcpy(Fr, F0, sizeof(F0));
+    opus_p4_bfly3_c(Fc, M, tw, FSTRIDE, epi3);
+    opus_p4_bfly3_p4(Fp, M, tw, FSTRIDE, epi3);
+    opus_p4_bfly3_c_rx(Fr, M, tw, FSTRIDE, epi3);
+    int32_t maxdiff = 0, maxdiff_rx = 0;
+    int imax = 0;
+    for (int i = 0; i < NC * 2; i++) {
+        int32_t d = Fc[i] - Fp[i];
+        if (d < 0)
+            d = -d;
+        if (d > maxdiff) {
+            maxdiff = d;
+            imax = i;
+        }
+        int32_t dr = Fr[i] - Fp[i];
+        if (dr < 0)
+            dr = -dr;
+        if (dr > maxdiff_rx)
+            maxdiff_rx = dr;
+    }
+
+    /* timing: in place, data evolves (same op count per iter) */
+    memcpy(Fc, F0, sizeof(F0));
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_bfly3_c(Fc, M, tw, FSTRIDE, epi3);
+    uint32_t tc = esp_cpu_get_cycle_count() - t0;
+
+    memcpy(Fp, F0, sizeof(F0));
+    t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_bfly3_p4(Fp, M, tw, FSTRIDE, epi3);
+    uint32_t tp = esp_cpu_get_cycle_count() - t0;
+
+    ESP_LOGI("bfly3_bench",
+             "M=%d iters=%d  C=%lu (%.1f/call)  PIE=%lu (%.1f/call)  "
+             "speedup=%.2fx  maxdiff_exactC=%ld imax=%d  maxdiff_relaxedC=%ld",
+             M, iters, (unsigned long)tc, (double)tc / iters,
+             (unsigned long)tp, (double)tp / iters, (double)tc / (double)tp,
+             (long)maxdiff, imax, (long)maxdiff_rx);
+    ESP_LOGI("bfly3_bench", "Fc[0..5]= %ld %ld %ld %ld %ld %ld",
+             (long)Fc[0], (long)Fc[1], (long)Fc[2], (long)Fc[3], (long)Fc[4],
+             (long)Fc[5]);
 }
 #endif
 

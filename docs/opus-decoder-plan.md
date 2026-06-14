@@ -984,6 +984,49 @@ accumulator が乗らない。対策（採用予定）:
 - 規模感: 本 kernel は comb/denorm/normres より大きい（~10 S_MUL/8-block +
    spill + 複素 marshaling、~100+ 命令）。複数 device cycle を要する見込み。
 
+### PIE kf_bfly3 4-wide 結果（2026-06-14）— 構造正・但し非採用（overhead-bound）
+
+ユーザー選択に従い 4-wide を実装（`opus_p4_bfly3_4.S` 265 instr、4 complex/呼、
+lanes 0-3、s1/s2/s3/s0 と data split を stack scratch へ spill、wrapper が
+twiddle scalar-gather + data memcpy で aligned temp 化）。実機 microbench
+（M=32、COM8）:
+
+| 比較対象 | maxdiff | 解釈 |
+|---|---:|---|
+| **relaxed-C（signed-lo）** | **0** | **構造はビット一致＝asm 正しい** |
+| exact-C（unsigned-lo） | 181038 | relaxed split のみ（~-75dB、comb/denorm 同質） |
+
+速度 **0.94x（scalar より遅い）**。原因: (1) 4-wide は vmul.s32.s16xs16 の
+8-lane を半分しか使わない、(2) QR 8 本制約で全 product を stack spill、
+(3) wrapper の per-block memcpy（192B）+ gather。overhead が scalar 相当の演算を
+帳消し。
+
+**非採用（codec 未統合・CONFIG 無し）**。理由 2 つ:
+1. 0.94x で win でない。
+2. **relaxed split は FFT では不可**: butterflies は stage 再帰適用なので
+   ~-75dB が累積し得る（doc 契約は bfly bit-exact 必須）。bit-exact 化には
+   unsigned-lo 補正（MULT16_16SU）が要り更に遅くなる。signed-split 方式は
+   bfly では fast と bit-exact を両立できない。
+
+→ `opus_p4_bfly3_4.S` は **microbench 検証済みの足場**として残置（将来の
+bit-exact 8-wide・spill-free・in-place 版の参照）。adopt は 8-wide 路線が
+overhead を amortize できるか次第。**butterflies は現状の PIE primitive とは
+相性が悪い**のが本質的結論（fft.* 専用命令が存在しないため）。
+
+### 当ブランチ PIE 最適化キャンペーン総括（2026-06-14）
+
+| kernel | microbench | end-to-end | 採用 |
+|---|---:|---|---|
+| comb_filter_const | 1.73x | -3.85% (729.9→701.8) | ✅ |
+| **denormalise_bands** | **2.03x** | **-0.73% 増分（累積 -4.55%）** | ✅ |
+| normalise_residual | 1.74x | 中立 | ❌ scaffold |
+| kf_bfly3 (4-wide) | 0.94x | — | ❌ scaffold |
+
+**確定 win: float→fixed (-13.5%) + comb + denorm = 693.8 cyc/frame
+（vs float 844.2 で -17.8%、10.82x realtime）**。教訓: PIE は連続 16/32-bit の
+単純 MAC（comb/denorm）で勝ち、複素・小 N・gather/scatter・narrowing の多い
+kernel（normres/bfly）では overhead 律速になりやすい。
+
 ### 次カーネル候補（ROI 順・再開ガイド）
 
 各候補は comb 同様の手順: **C ref（bit-exact）→ host test → PIE asm（8要素/呼）→
