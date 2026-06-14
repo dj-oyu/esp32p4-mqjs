@@ -36,6 +36,7 @@
 #include "hal/isp_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "linux/videodev2.h"
 
 #include "bc_locate.h"
@@ -702,6 +703,20 @@ static struct quirc_data s_qr_data;
 #define QR_HI_W CROP_W /* 800 */
 #define QR_HI_H CROP_H /* 600 */
 
+/* QR decode (gray convert + quirc, ~220ms) runs on a worker task so it never
+ * blocks the camera/preview loop. scan_task copies the 800x600 RGB565 crop
+ * into s_qr_rgb, hands it over via s_qr_go, and collects the result via
+ * s_qr_result (non-blocking poll) — the preview keeps running at frame rate
+ * while quirc grinds in the background on the otherwise-idle core-0 slack. */
+static uint16_t *s_qr_rgb;          /* 800x600 RGB565 crop, scan_task -> worker */
+static TaskHandle_t s_qr_task;
+static SemaphoreHandle_t s_qr_go;   /* scan_task gives a frame to the worker */
+static SemaphoreHandle_t s_qr_result; /* worker signals a finished decode */
+static volatile bool s_qr_hit;      /* worker decoded a valid payload */
+static char s_qr_payload[CAM_TAB5_QR_PAYLOAD_MAX + 1];
+static volatile int64_t s_qr_gray_us, s_qr_id_us, s_qr_dec_us; /* worker timing */
+static volatile int s_qr_candidates, s_qr_runs;
+
 static bool mid_blit(const uint16_t *px)
 {
     if (!s_mid) {
@@ -744,95 +759,41 @@ static bool mid_blit(const uint16_t *px)
     return ppa_do_scale_rotate_mirror(s_ppa, &srm) == ESP_OK;
 }
 
-static bool qr_once(void)
-{
-    if (s_quirc)
-        return true;
-    s_quirc = quirc_new();
-    if (!s_quirc)
-        return false;
-    if (quirc_resize(s_quirc, QR_HI_W, QR_HI_H) < 0) {
-        quirc_destroy(s_quirc);
-        s_quirc = NULL;
-        return false;
-    }
-    return true;
-}
-
 /* RGB565 -> 8-bit luma over a contiguous run. (A PIE SIMD kernel was
- * evaluated and dropped: RGB565 field extraction needs a 16-bit lane shift
- * the P4 PIE ISA lacks, forcing an s32 widen+narrow that halves the SIMD
- * win, and quirc_end()'s ~127ms identify — not this ~72ms convert — is the
- * dominant per-frame cost and blocks the preview thread regardless.) */
+ * evaluated and dropped: the P4 PIE ISA lacks a 16-bit lane shift, and
+ * quirc_end()'s identify — not this convert — dominates each run anyway.) */
 static void rgb565_to_luma(const uint16_t *src, uint8_t *dst, int n)
 {
     for (int i = 0; i < n; i++)
         dst[i] = luma565(src[i]);
 }
 
-static void log_qr_run_perf(int64_t gray_us, int64_t marker_us,
-                            int64_t identify_us, int64_t decode_us,
-                            int markers, int polarity, int candidates, bool found)
+/* Worker body: convert the handed-over 800x600 crop to luma straight into
+ * quirc's buffer, then identify + decode. Runs off the camera loop. */
+static void qr_decode_once(void)
 {
-    ESP_LOGW(TAG,
-             "qr run gray=%d mark=%d id=%d dec=%d markers=%d/%c candidates=%d found=%c",
-             (int)(gray_us / 1000), (int)(marker_us / 1000),
-             (int)(identify_us / 1000), (int)(decode_us / 1000), markers,
-             polarity ? 'I' : 'N', candidates, found ? 'Y' : 'N');
-}
-
-/* QR scan on the FULL-RES 800x600 center crop. quirc does its own finder
- * detection + decode; the custom marker pass here is DIAGNOSTIC ONLY (it
- * reports how many finders survive at this resolution and picks polarity)
- * and never gates quirc — on-device the prefilter found markers=0 on the
- * downscaled 400x300 and wrongly blocked the decode. The payload stays out
- * of logs/status and is copied only after rejecting binary/NUL data and
- * oversized provisioning QR. */
-static bool qr_scan(const uint16_t *px, int fw, int fh, char *out, size_t cap,
-                    int *candidates, int *markers, int *polarity,
-                    int64_t *gray_us, int64_t *marker_us, int64_t *identify_us,
-                    int64_t *decode_us)
-{
-    if (!qr_once() || fw < CROP_X + QR_HI_W || fh < CROP_Y + QR_HI_H)
-        return false;
-
-    *candidates = 0;
-    *markers = 0;
-    *polarity = 0;
-    int64_t gray0 = *gray_us, mark0 = *marker_us;
-    int64_t id0 = *identify_us, dec0 = *decode_us;
-
     int w, h;
     uint8_t *gray = quirc_begin(s_quirc, &w, &h);
     if (!gray || w < QR_HI_W || h < QR_HI_H) {
         if (gray)
             quirc_end(s_quirc);
-        log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
-                        *identify_us - id0, *decode_us - dec0,
-                        *markers, *polarity, *candidates, false);
-        return false;
+        s_qr_runs++;
+        return;
     }
+    int64_t t = esp_timer_get_time();
+    for (int y = 0; y < QR_HI_H; y++)
+        rgb565_to_luma(s_qr_rgb + (size_t)y * QR_HI_W, gray + (size_t)y * w,
+                       QR_HI_W);
+    s_qr_gray_us += esp_timer_get_time() - t;
 
-    /* full-res 800x600 center crop -> quirc gray buffer. No custom finder
-     * prefilter: on-device it found markers=0 even at 800x600 while quirc's
-     * own detection decoded fine, so the prefilter was pure overhead (mark
-     * 48ms/run). quirc_flip in the decode loop covers ECC-level inversion;
-     * provisioning QR is standard dark-on-light polarity. */
-    int64_t t0 = esp_timer_get_time();
-    for (int y = 0; y < QR_HI_H; y++) {
-        const uint16_t *srow = px + (size_t)(CROP_Y + y) * fw + CROP_X;
-        uint8_t *drow = gray + (size_t)y * w;
-        rgb565_to_luma(srow, drow, QR_HI_W);
-    }
-    *gray_us += esp_timer_get_time() - t0;
-
-    t0 = esp_timer_get_time();
+    t = esp_timer_get_time();
     quirc_end(s_quirc);
-    *identify_us += esp_timer_get_time() - t0;
-    *candidates = quirc_count(s_quirc);
+    s_qr_id_us += esp_timer_get_time() - t;
+    int n = quirc_count(s_quirc);
+    s_qr_candidates = n;
 
-    t0 = esp_timer_get_time();
-    for (int i = 0; i < *candidates; i++) {
+    t = esp_timer_get_time();
+    for (int i = 0; i < n; i++) {
         quirc_extract(s_quirc, i, &s_qr_code);
         quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
         if (err == QUIRC_ERROR_DATA_ECC) {
@@ -840,22 +801,57 @@ static bool qr_scan(const uint16_t *px, int fw, int fh, char *out, size_t cap,
             err = quirc_decode(&s_qr_code, &s_qr_data);
         }
         if (err != QUIRC_SUCCESS || s_qr_data.payload_len <= 0 ||
-            (size_t)s_qr_data.payload_len >= cap ||
+            (size_t)s_qr_data.payload_len >= sizeof s_qr_payload ||
             memchr(s_qr_data.payload, '\0', s_qr_data.payload_len))
             continue;
-        memcpy(out, s_qr_data.payload, s_qr_data.payload_len);
-        out[s_qr_data.payload_len] = '\0';
-        *decode_us += esp_timer_get_time() - t0;
-        log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
-                        *identify_us - id0, *decode_us - dec0,
-                        *markers, *polarity, *candidates, true);
-        return true;
+        memcpy(s_qr_payload, s_qr_data.payload, s_qr_data.payload_len);
+        s_qr_payload[s_qr_data.payload_len] = '\0';
+        s_qr_hit = true;
+        break;
     }
-    *decode_us += esp_timer_get_time() - t0;
-    log_qr_run_perf(*gray_us - gray0, *marker_us - mark0,
-                    *identify_us - id0, *decode_us - dec0,
-                    *markers, *polarity, *candidates, false);
-    return false;
+    s_qr_dec_us += esp_timer_get_time() - t;
+    s_qr_runs++;
+}
+
+static void qr_worker(void *arg)
+{
+    for (;;) {
+        xSemaphoreTake(s_qr_go, portMAX_DELAY);
+        if (s_quirc)
+            qr_decode_once();
+        xSemaphoreGive(s_qr_result);
+    }
+}
+
+static bool qr_once(void)
+{
+    if (s_quirc)
+        return true;
+    struct quirc *q = quirc_new();
+    if (!q)
+        return false;
+    if (quirc_resize(q, QR_HI_W, QR_HI_H) < 0) {
+        quirc_destroy(q);
+        return false;
+    }
+    s_qr_rgb = heap_caps_aligned_alloc(64, (size_t)QR_HI_W * QR_HI_H * 2,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_qr_go = xSemaphoreCreateBinary();
+    s_qr_result = xSemaphoreCreateBinary();
+    if (!s_qr_rgb || !s_qr_go || !s_qr_result) {
+        quirc_destroy(q);
+        return false;
+    }
+    /* core 0 (with scan_task at prio 4), one below it: scan_task preempts to
+     * keep the viewfinder at frame rate, the worker takes the slack. Off
+     * core 1 so it never steals LVGL render time. */
+    if (xTaskCreatePinnedToCore(qr_worker, "qr_worker", 12288, NULL, 3,
+                                &s_qr_task, 0) != pdPASS) {
+        quirc_destroy(q);
+        return false;
+    }
+    s_quirc = q; /* publish last: worker checks s_quirc before touching it */
+    return true;
 }
 
 /* Viewfinder = the rotated analysis image (sensor sits 90° to the
@@ -994,10 +990,7 @@ static void scan_task(void *pv)
     /* per-stage averages, surfaced through camera.status() at scan end
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
-    int64_t t_qr_gray = 0, t_qr_marker = 0, t_qr_identify = 0,
-            t_qr_decode = 0;
     int64_t scan_started = 0;
-    int qr_candidates = 0, qr_markers = 0, qr_polarity = 0, qr_runs = 0;
     int n_loc = 0, n_frames = 0;
     s_fan_runs = 0;
     s_fan_hits = 0;
@@ -1035,6 +1028,15 @@ static void scan_task(void *pv)
                 ? "QRコードを画面内に入れてください"
                 : "スキャン中 (緑=読取 黄=惜しい)");
 
+        bool qr_outstanding = false;
+        if (s_req.mode == SCAN_QR && qr_once()) {
+            xSemaphoreTake(s_qr_result, 0); /* drop any stale completion */
+            s_qr_hit = false;
+            s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
+            s_qr_runs = 0;
+            s_qr_candidates = 0;
+        }
+
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         scan_started = esp_timer_get_time();
@@ -1061,17 +1063,28 @@ static void scan_task(void *pv)
             if (s_req.mode == SCAN_QR) {
                 frame_no++;
                 n_frames++;
-                /* QR runs the full-res 800x600 pass, ~4x the work of a
-                   preview frame, so throttle to every 3rd frame to keep the
-                   viewfinder moving (a held QR still gets ~3-4 tries/sec). */
-                if (mid_ok && (frame_no % 3) == 0) {
-                    found = qr_scan(px, s_frame_w, s_frame_h, code, sizeof code,
-                                    &qr_candidates, &qr_markers, &qr_polarity,
-                                    &t_qr_gray, &t_qr_marker, &t_qr_identify,
-                                    &t_qr_decode);
-                    qr_runs++;
+                /* Hand a fresh full-res crop to the decode worker when it is
+                   idle. The heavy gray+quirc work (~220ms) runs off this loop,
+                   so the viewfinder keeps updating every frame instead of
+                   freezing for a fifth of a second per QR attempt. */
+                if (mid_ok && !qr_outstanding && s_qr_rgb &&
+                    (frame_no % 2) == 0) {
+                    for (int y = 0; y < QR_HI_H; y++)
+                        memcpy(s_qr_rgb + (size_t)y * QR_HI_W,
+                               px + (size_t)(CROP_Y + y) * s_frame_w + CROP_X,
+                               (size_t)QR_HI_W * 2);
+                    qr_outstanding = true;
+                    xSemaphoreGive(s_qr_go);
                 }
-                ioctl(s_fd, VIDIOC_QBUF, &buf);
+                ioctl(s_fd, VIDIOC_QBUF, &buf); /* worker has its own copy */
+                if (qr_outstanding &&
+                    xSemaphoreTake(s_qr_result, 0) == pdTRUE) {
+                    qr_outstanding = false;
+                    if (s_qr_hit) {
+                        memcpy(code, s_qr_payload, sizeof code);
+                        found = true;
+                    }
+                }
                 if (pv_ok)
                     ui_tab5_cam_canvas_update();
                 continue;
@@ -1136,20 +1149,22 @@ static void scan_task(void *pv)
             if (pv_ok)
                 ui_tab5_cam_canvas_update();
         }
+        if (qr_outstanding)
+            xSemaphoreTake(s_qr_result, portMAX_DELAY); /* let the worker drain */
         ui_tab5_cam_canvas_hide();
         /* the pipeline stays up and streaming (see pipeline_once) */
     }
 
     char done[256];
     char perf[192] = "";
-    if (qr_runs)
+    if (s_req.mode == SCAN_QR && s_qr_runs)
         snprintf(perf, sizeof perf,
                  " [pv%d gray%d id%d dec%d ms/run candidates%d runs%d total%dms]",
-                 (int)(t_pv / n_frames / 1000),
-                 (int)(t_qr_gray / qr_runs / 1000),
-                 (int)(t_qr_identify / qr_runs / 1000),
-                 (int)(t_qr_decode / qr_runs / 1000),
-                 qr_candidates, qr_runs,
+                 (int)(t_pv / (n_frames ? n_frames : 1) / 1000),
+                 (int)(s_qr_gray_us / s_qr_runs / 1000),
+                 (int)(s_qr_id_us / s_qr_runs / 1000),
+                 (int)(s_qr_dec_us / s_qr_runs / 1000),
+                 s_qr_candidates, s_qr_runs,
                  (int)((esp_timer_get_time() - scan_started) / 1000));
     else if (n_frames)
         snprintf(perf, sizeof perf,
