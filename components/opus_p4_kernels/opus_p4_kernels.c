@@ -239,9 +239,17 @@ void opus_p4_denorm_band_p4(int32_t *f, const int16_t *x, int N, int32_t g,
     extern uint32_t opus_p4_denorm_pie_calls;
     if (n8 > 0)
         opus_p4_denorm_pie_calls++;
-    for (; i < n8; i += 8) {
-        opus_p4_denorm8(tmp, x + i, g, shift);
-        memcpy(f + i, tmp, 8 * sizeof(int32_t));
+    if (((uintptr_t)f & 15) == 0) {
+        /* f base is 16-aligned, so every 8-block (f+i, i a multiple of 8 ->
+         * 32*k bytes) is aligned too: denorm8 can vst.128 straight to f and
+         * skip the temp + memcpy. */
+        for (; i < n8; i += 8)
+            opus_p4_denorm8(f + i, x + i, g, shift);
+    } else {
+        for (; i < n8; i += 8) {
+            opus_p4_denorm8(tmp, x + i, g, shift);
+            memcpy(f + i, tmp, 8 * sizeof(int32_t));
+        }
     }
     for (; i < N; i++)
         f[i] = p4_mult16_32_q15(x[i], g) >> shift;

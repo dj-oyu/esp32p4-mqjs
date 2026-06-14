@@ -883,9 +883,20 @@ int16 を未整列 `src.q` で1ロード→`vmul.s32.s16xs16` の 16×32 signed 
 - 増分は comb 比 **-0.73%**（~5 cyc/frame）、fixed-C 比累積 **-4.55%**。profile の
   denormalise rank #4（~6%）に対し end-to-end が小さいのは、(1) common-path inner
   loop は denormalise_bands の一部（per-band setup/exp2/zero-fill/OPUS_CLEAR は別）、
-  (2) **block 毎 memcpy が律速**（kernel 自体は軽い）。f が 16-aligned な band では
-  直接 `vst.128` 可（f base が整列なら i=8k blocks も整列）→ memcpy 回避で更に伸長
-  可能（comb の §「comb 速度最適化」と同種の低リスク最適化）。
+  (2) **block 毎 memcpy が律速**（kernel 自体は軽い）。
+
+**memcpy 回避最適化（2026-06-14、適用済み）**: `f` base が 16-aligned な band
+では 8-block（f+i, i=8k → 32k byte）も整列するので `denorm8` が直接 `vst.128`
+→ temp+memcpy をスキップ。`(uintptr_t)f & 15` で分岐。結果:
+
+| | microbench | decode cyc/frame | realtime | pcm |
+|---|---:|---:|---:|---|
+| memcpy 版 | 1.48x | 696.7 | 10.77x | fd9b..1204→hash同 |
+| **整列直書き版** | **2.03x** | **693.8** | **10.81x** | `fd9bdb764d639e5c`（不変） |
+
+pcm hash 不変＝直書き path は memcpy path とビット同一（正当性保証）。end-to-end
+増分は小（~3 cyc、整列 band のみ fast path）だが無コスト・無回帰。累積 vs fixed-C
+**-4.95%**、vs float **-17.8%**。実機再生 OK（underruns=0, ESP_OK）。
 
 確立した追加知見:
 - `esp.vldbc.16.ip` の post-inc 即値は **step 4**（or 0）必須。±2 は
