@@ -25,4 +25,15 @@ config OPUS_P4_COMB_PIE
         on the comb filter; relaxed (not bit-exact, ~-64 dB vs the C reference,
         within opus_compare tolerance). Misaligned buffers fall back to C.
 
+config OPUS_P4_DENORM_PIE
+    bool "Use the ESP32-P4 PIE denormalise-bands kernel (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route the denormalise_bands common path (shift>=0) through the PIE
+        kernel opus_p4_denorm8 (16x32 via vmul.s32.s16xs16, contiguous int16
+        x via src.q). Relaxed (signed low-half split, ~-78 dB vs the C
+        reference, within opus_compare tolerance). The shift<0 extreme-gain
+        branch and the per-band tail stay on portable C.
+
 endmenu

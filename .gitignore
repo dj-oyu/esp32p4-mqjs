@@ -36,5 +36,7 @@ sdkconfig.opus_bench
 sdkconfig.opus_fixed
 sdkconfig.opus_fixed_prof
 sdkconfig.opus_combpie
+sdkconfig.opus_denormpie
 sdkconfig.opus_playpie
 sdkconfig.opus_play
+build_opus_*_log.txt

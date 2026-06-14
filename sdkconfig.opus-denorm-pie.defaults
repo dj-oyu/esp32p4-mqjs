@@ -1,0 +1,4 @@
+# Route the fixed-point denormalise_bands common path through the PIE kernel.
+# Layer after sdkconfig.opus-fixed.defaults (and alongside
+# sdkconfig.opus-comb-pie.defaults if both kernels are wanted).
+CONFIG_OPUS_P4_DENORM_PIE=y

@@ -59,6 +59,25 @@ void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
 void opus_p4_comb_filter_const_p4(int32_t *y, const int32_t *x, int T, int N,
                                   int16_t g10, int16_t g11, int16_t g12);
 
+/*
+ * CELT denormalise_bands common-path kernel (FIXED_POINT, shift>=0).
+ *
+ *   f[j] = SHR32(MULT16_32_Q15(x[j], g), shift)   for j in [0, N)
+ *
+ * Contract:
+ * - x points at N contiguous celt_norm (int16); f at N writable celt_sig
+ *   (int32). x and f do not overlap.
+ * - g is the band-constant int32 gain; shift >= 0 (the common path; the
+ *   shift<0 extreme-gain branch stays in C).
+ * - The _c reference is bit-exact CELT behavior (same MULT16_32_Q15 and
+ *   arithmetic SHR32). The _p4 PIE body is relaxed within opus_compare
+ *   tolerance (signed low-half split, like the comb kernel).
+ */
+void opus_p4_denorm_band_c(int32_t *f, const int16_t *x, int N, int32_t g,
+                           int shift);
+void opus_p4_denorm_band_p4(int32_t *f, const int16_t *x, int N, int32_t g,
+                            int shift);
+
 /* On-device PIE instruction-semantics probe (logs results; ESP32-P4 only,
  * no-op elsewhere). Used to confirm vmul.s32.s16xs16 / cmul.s16 behavior
  * before building the PIE butterfly/comb kernels. */

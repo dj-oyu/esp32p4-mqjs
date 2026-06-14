@@ -858,6 +858,41 @@ comb 単体 microbench 1.96x（tap毎3ブロック再ロードが律速；ブロ
   aligned temp + memcpy。
 - relaxed 化（sum 分割・signed-lo 分割）で opus_compare 許容内、register も節約。
 
+### PIE denormalise_bands 統合結果（2026-06-14）
+
+候補 #1（最も素直）を実装・実機検証。`opus_p4_denorm8`（8出力/呼、x=連続
+int16 を未整列 `src.q` で1ロード→`vmul.s32.s16xs16` の 16×32 signed split
+`m=(x·g_hi)·2+(x·g_lo)>>15`→`vsr.s32` で `>>shift`→aligned temp+memcpy）を
+`CONFIG_OPUS_P4_DENORM_PIE` で `bands.c denormalise_bands` の common path
+（`shift>=0`）へ統合。`shift<0`/silence は C 据置き。combより素直（vunzip 不要、
+スライディング窓なし）。
+
+実機 decode bench（fixed fixture、comb PIE と併用、COM8 2026-06-14）:
+
+| build | cycles/frame | vs float | realtime | pcm |
+|---|---:|---:|---:|---|
+| float | 844.2 | — | 8.89x | (float別) |
+| fixed-C | 729.9 | -13.5% | 10.28x | 7b5f..1d62 |
+| fixed + comb | 701.8 | -16.9% | 10.69x | 3ff4..29dd |
+| **fixed + comb + denorm** | **696.7** | **-17.5%** | **10.77x** | `fd9bdb764d639e5c`（5周一致） |
+
+- denorm microbench: **1.48x**（1945.7→1311.1 cyc/call, N=176）、**maxdiff=0**
+  （test gain の g_lo は bit15=0 なので signed split が unsigned と一致＝偶然
+  bit-exact。実 codec は bit15 立つ gain も通すが pcm hash 安定で許容内）。
+- denorm: **pie_calls=65836, c_calls=0**（全 band で engage）、verify_failures=0。
+- 増分は comb 比 **-0.73%**（~5 cyc/frame）、fixed-C 比累積 **-4.55%**。profile の
+  denormalise rank #4（~6%）に対し end-to-end が小さいのは、(1) common-path inner
+  loop は denormalise_bands の一部（per-band setup/exp2/zero-fill/OPUS_CLEAR は別）、
+  (2) **block 毎 memcpy が律速**（kernel 自体は軽い）。f が 16-aligned な band では
+  直接 `vst.128` 可（f base が整列なら i=8k blocks も整列）→ memcpy 回避で更に伸長
+  可能（comb の §「comb 速度最適化」と同種の低リスク最適化）。
+
+確立した追加知見:
+- `esp.vldbc.16.ip` の post-inc 即値は **step 4**（or 0）必須。±2 は
+  `bad value for offset_256_4` でアセンブル不可→base を `addi` で進める。
+- host bit-exact test は WSL gcc（`tools/test_opus_denorm.c`、21664 cases 0 fail）。
+  PIE body は device microbench で C 比 maxdiff、実機 pcm hash で回帰確認。
+
 ### 次カーネル候補（ROI 順・再開ガイド）
 
 各候補は comb 同様の手順: **C ref（bit-exact）→ host test → PIE asm（8要素/呼）→
@@ -865,7 +900,7 @@ comb 単体 microbench 1.96x（tap毎3ブロック再ロードが律速；ブロ
 combで確立した PIE 知見（§上）と `opus_p4_comb8.S`/`opus_p4_kernels.c` の
 comb 実装が雛形になる。各々 ~10-25 build/flash iteration を見込む。
 
-**1. denormalise_bands（最も素直・推奨スタート、~6%）**
+**1. denormalise_bands（最も素直・推奨スタート、~6%）— ✅ DONE 2026-06-14（上記「PIE denormalise_bands 統合結果」参照、end-to-end -0.73% 増分 / 累積 -4.55%）**
 - 位置: `celt/bands.c:209` `denormalise_bands`、内側 common path（`shift>=0`）は
   `bands.c:273` `*f++ = SHR32(MULT16_32_Q15(*x, g), shift)`。
 - カーネル ABI 案: `void opus_p4_denorm_band(int32_t *f, const int16_t *x, int N,

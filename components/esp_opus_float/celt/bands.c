@@ -270,10 +270,22 @@ void denormalise_bands(const CELTMode *m, const celt_norm * OPUS_RESTRICT X,
       } else
 #endif
          /* Be careful of the fixed-point "else" just above when changing this code */
+#if defined(OPUS_P4_DENORM_PIE) && defined(FIXED_POINT)
+      {
+         void opus_p4_denorm_band_p4(opus_int32 *f, const opus_int16 *x, int N,
+                                     opus_int32 g, int shift);
+         int Nb = band_end - j;
+         opus_p4_denorm_band_p4(f, x, Nb, g, shift);
+         f += Nb;
+         x += Nb;
+         j = band_end;
+      }
+#else
          do {
             *f++ = SHR32(MULT16_32_Q15(*x, g), shift);
             x++;
          } while (++j<band_end);
+#endif
    }
    celt_assert(start <= end);
    OPUS_CLEAR(&freq[bound], N-bound);

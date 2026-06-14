@@ -4,6 +4,7 @@ set(OPUS_P4_KERNEL_SRCS "opus_p4_kernels.c")
 # instruction semantics on silicon before building the PIE kernels.
 list(APPEND OPUS_P4_KERNEL_SRCS "opus_p4_pie_probe.S")
 list(APPEND OPUS_P4_KERNEL_SRCS "opus_p4_comb8.S")
+list(APPEND OPUS_P4_KERNEL_SRCS "opus_p4_denorm8.S")
 
 if(CONFIG_OPUS_P4_KERNEL_ASM OR CONFIG_OPUS_P4_KERNEL_ASM_VERIFY)
     list(APPEND OPUS_P4_KERNEL_SRCS "opus_p4_anti_collapse_noise_p4.S")

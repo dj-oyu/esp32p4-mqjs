@@ -45,6 +45,7 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_pie_probe_run(const int16_t *in, const int32_t *in32, int32_t *out);
 void opus_p4_comb_bench(void);
+void opus_p4_denorm_bench(void);
 
 void opus_p4_pie_probe(void)
 {
@@ -81,6 +82,7 @@ void opus_p4_pie_probe(void)
     ESP_LOGI("pie_probe", "usar+src.q.ld unaligned@in32[1] (exp 11,12,13,14)= %ld %ld %ld %ld",
              (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
     opus_p4_comb_bench();
+    opus_p4_denorm_bench();
 }
 #else
 void opus_p4_pie_probe(void) {}
@@ -124,7 +126,20 @@ void opus_p4_comb_filter_const_c(int32_t *y, const int32_t *x, int T, int N,
     }
 }
 
+/* CELT denormalise_bands common path (FIXED_POINT, shift>=0):
+ *   f[j] = SHR32(MULT16_32_Q15(x[j], g), shift)
+ * x is celt_norm (int16), g is opus_val32 (int32, band-constant), shift>=0.
+ * Bit-exact reference: same MULT16_32_Q15 decomposition as the codec and the
+ * arithmetic SHR32. */
+void opus_p4_denorm_band_c(int32_t *f, const int16_t *x, int N, int32_t g,
+                           int shift)
+{
+    for (int j = 0; j < N; j++)
+        f[j] = p4_mult16_32_q15(x[j], g) >> shift;
+}
+
 uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
+uint32_t opus_p4_denorm_pie_calls, opus_p4_denorm_c_calls;
 
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_comb8(int32_t *y, const int32_t *x, int T, int16_t g10,
@@ -208,6 +223,78 @@ void opus_p4_comb_bench(void)
     ESP_LOGI("comb_bench", "yc[0..7]= %ld %ld %ld %ld %ld %ld %ld %ld",
              (long)yc[0], (long)yc[1], (long)yc[2], (long)yc[3], (long)yc[4],
              (long)yc[5], (long)yc[6], (long)yc[7]);
+}
+
+void opus_p4_denorm8(int32_t *f, const int16_t *x, int32_t g, int shift);
+
+void opus_p4_denorm_band_p4(int32_t *f, const int16_t *x, int N, int32_t g,
+                            int shift)
+{
+    int i = 0;
+    int n8 = N & ~7;
+    /* denorm8 reads unaligned x (src.q) but stores 8 int32 with vst.128
+     * (aligned). The codec's f drifts out of 16-alignment per band, so write
+     * each block to an aligned temp and memcpy it out. */
+    int32_t tmp[8] __attribute__((aligned(16)));
+    extern uint32_t opus_p4_denorm_pie_calls;
+    if (n8 > 0)
+        opus_p4_denorm_pie_calls++;
+    for (; i < n8; i += 8) {
+        opus_p4_denorm8(tmp, x + i, g, shift);
+        memcpy(f + i, tmp, 8 * sizeof(int32_t));
+    }
+    for (; i < N; i++)
+        f[i] = p4_mult16_32_q15(x[i], g) >> shift;
+}
+
+void opus_p4_denorm_bench(void)
+{
+    enum { N = 176 }; /* a wide CELT band width at M=4 (eBands spacing) */
+    static int16_t xbuf[N + 8] __attribute__((aligned(16)));
+    static int32_t fc[N + 8] __attribute__((aligned(16)));
+    static int32_t fp[N + 8] __attribute__((aligned(16)));
+    uint32_t seed = 9001u;
+    for (int i = 0; i < N + 8; i++) {
+        seed = 1664525u * seed + 1013904223u;
+        xbuf[i] = (int16_t)seed; /* full +/- int16 range */
+    }
+    /* Exercise an unaligned x base (band offset) -- start at xbuf[3]. */
+    const int16_t *x = &xbuf[3];
+    int32_t g = 0x2ab40000 + 0x1d8b; /* arbitrary 32-bit gain, both halves set */
+    int shift = 6;
+    const int iters = 4000;
+
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_denorm_band_c(fc, x, N, g, shift);
+    uint32_t tc = esp_cpu_get_cycle_count() - t0;
+
+    t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_denorm_band_p4(fp, x, N, g, shift);
+    uint32_t tp = esp_cpu_get_cycle_count() - t0;
+
+    int32_t maxdiff = 0;
+    int imax = 0;
+    for (int i = 0; i < N; i++) {
+        int32_t d = fc[i] - fp[i];
+        if (d < 0)
+            d = -d;
+        if (d > maxdiff) {
+            maxdiff = d;
+            imax = i;
+        }
+    }
+    ESP_LOGI("denorm_bench",
+             "N=%d iters=%d  C=%lu (%.1f/call)  PIE=%lu (%.1f/call)  "
+             "speedup=%.2fx  maxdiff=%ld",
+             N, iters, (unsigned long)tc, (double)tc / iters,
+             (unsigned long)tp, (double)tp / iters, (double)tc / (double)tp,
+             (long)maxdiff);
+    ESP_LOGI("denorm_bench",
+             "imax=%d x=%d fc=%ld fp=%ld | fc[0..3]= %ld %ld %ld %ld",
+             imax, x[imax], (long)fc[imax], (long)fp[imax], (long)fc[0],
+             (long)fc[1], (long)fc[2], (long)fc[3]);
 }
 #endif
 
