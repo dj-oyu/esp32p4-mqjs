@@ -904,6 +904,33 @@ pcm hash 不変＝直書き path は memcpy path とビット同一（正当性�
 - host bit-exact test は WSL gcc（`tools/test_opus_denorm.c`、21664 cases 0 fail）。
   PIE body は device microbench で C 比 maxdiff、実機 pcm hash で回帰確認。
 
+### PIE normalise_residual 結果（2026-06-14）— 正しいが end-to-end 中立
+
+候補 #2 を実装・実機検証。`opus_p4_normres8`（8出力/呼、int32 iy を未整列
+`src.q`×2→`vunzip.16` で s16 narrow、`vmul.s32.s16xs16` で 16×16 raw、明示
+round bias `1<<k` + `vsr.s32` arithmetic shift で PSHR32、出力は `vunzip.16`
+低位取り＝truncating EXTRACT16）。**完全 bit-exact**（relaxed split 不要）。
+`CONFIG_OPUS_P4_NORMRES_PIE`（既定 off）で `vq.c normalise_residual` hot loop
+へ統合、aligned-X 直書き fast path 付き。
+
+実機（COM8、comb+denorm PIE と併用）:
+
+| | microbench | decode cyc/frame | realtime | pcm |
+|---|---:|---:|---:|---|
+| comb+denorm | — | 693.8 | 10.81x | fd9b..1204 |
+| **+normres** | **1.74x（maxdiff=0）** | **693.8** | 10.82x | `fd9bdb764d639e5c`（不変） |
+
+normres microbench は 1.74x・bit-exact だが **end-to-end は変化なし**（693.8、
+normres pie_calls=46408 で engage 済み）。理由: **~7% の見積りは float profile
+（§12 rank#3）由来で、fixed re-profile（§14 表）では normalise_residual は
+"entropy/VQ — PIE 対象外" 群**＝fixed CELT では hot でない。実 band の N は小さく
+（低周波 band 多数）、8-wide kernel の per-call setup（broadcast/src.q）が利得を
+相殺。→ **採用見送り**（既定 off の検証済み scaffold として残置、pcm bit-exact
+ゆえ有効化しても無回帰）。speech/SILK fixture では別評価の価値あり。
+
+**教訓**: PIE 候補の ROI は **fixed re-profile を基準**にすべき（float profile の
+順位は fixed に転用不可）。次は fixed で確実に hot な MDCT/FFT butterflies（#3）。
+
 ### 次カーネル候補（ROI 順・再開ガイド）
 
 各候補は comb 同様の手順: **C ref（bit-exact）→ host test → PIE asm（8要素/呼）→
@@ -925,7 +952,7 @@ comb 実装が雛形になる。各々 ~10-25 build/flash iteration を見込む
   （~-78dB）。edge（`shift<0`/silence/gain cap）は C フォールバック。
 - スライディング窓なし＝comb の最難所が無い。**最初に着手すべき**。
 
-**2. normalise_residual（~7%）**
+**2. normalise_residual（~7%）— ✅ 実装済 2026-06-14、ただし end-to-end 中立で採用見送り（上記「PIE normalise_residual 結果」参照）。fixed では非 hot。**
 - 位置: `celt/vq.c:121`、`X[i] = EXTRACT16(PSHR32(MULT16_16(g, iy[i]), k+1))`。
 - 16×16（g,iy とも s16 に収まる）→ round-shift(k+1) → clamp16。出力 int16。
 - PIE-native（`vmulas.s16`+`srs` 向き）だが **出力 int16 の narrowing**（s32→s16

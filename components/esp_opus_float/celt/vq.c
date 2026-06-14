@@ -135,9 +135,17 @@ static void normalise_residual(int * OPUS_RESTRICT iy, celt_norm * OPUS_RESTRICT
    g = MULT32_32_Q31(celt_rsqrt_norm(t),gain);
 
    i=0;
+#if defined(OPUS_P4_NORMRES_PIE) && defined(FIXED_POINT)
+   {
+      void opus_p4_normres_band_p4(opus_int16 *X, const int *iy, int N,
+                                   opus_int16 g, int k);
+      opus_p4_normres_band_p4(X, iy, N, g, k);
+   }
+#else
    do
       X[i] = EXTRACT16(PSHR32(MULT16_16(g, iy[i]), k+1));
    while (++i < N);
+#endif
 }
 
 static unsigned extract_collapse_mask(int *iy, int N, int B)

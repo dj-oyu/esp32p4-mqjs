@@ -36,4 +36,14 @@ config OPUS_P4_DENORM_PIE
         reference, within opus_compare tolerance). The shift<0 extreme-gain
         branch and the per-band tail stay on portable C.
 
+config OPUS_P4_NORMRES_PIE
+    bool "Use the ESP32-P4 PIE normalise_residual kernel (fixed-point)"
+    default n
+    depends on OPUS_FIXED_POINT && IDF_TARGET_ESP32P4
+    help
+        Route the normalise_residual hot loop through the PIE kernel
+        opus_p4_normres8 (16x16 via vmul.s32.s16xs16, int32 iy narrowed with
+        vunzip.16, round bias + arithmetic shift, int16 output). Bit-exact
+        with the C reference (no relaxed split).
+
 endmenu

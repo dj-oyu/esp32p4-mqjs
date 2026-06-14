@@ -240,10 +240,13 @@ static void run_fixture_benchmark(void)
     {
         extern uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
         extern uint32_t opus_p4_denorm_pie_calls, opus_p4_denorm_c_calls;
+        extern uint32_t opus_p4_normres_pie_calls, opus_p4_normres_c_calls;
         ESP_LOGI(TAG, "comb: pie_calls=%" PRIu32 " c_calls=%" PRIu32,
                  opus_p4_comb_pie_calls, opus_p4_comb_c_calls);
         ESP_LOGI(TAG, "denorm: pie_calls=%" PRIu32 " c_calls=%" PRIu32,
                  opus_p4_denorm_pie_calls, opus_p4_denorm_c_calls);
+        ESP_LOGI(TAG, "normres: pie_calls=%" PRIu32 " c_calls=%" PRIu32,
+                 opus_p4_normres_pie_calls, opus_p4_normres_c_calls);
     }
 
 #if CONFIG_OPUS_P4_FUNCTION_PROFILE

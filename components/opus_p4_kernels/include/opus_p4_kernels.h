@@ -78,6 +78,25 @@ void opus_p4_denorm_band_c(int32_t *f, const int16_t *x, int N, int32_t g,
 void opus_p4_denorm_band_p4(int32_t *f, const int16_t *x, int N, int32_t g,
                             int shift);
 
+/*
+ * CELT normalise_residual hot loop (FIXED_POINT).
+ *
+ *   X[i] = EXTRACT16(PSHR32(MULT16_16(g, iy[i]), k+1))   for i in [0, N)
+ *        = (int16)(( g*(int16)iy[i] + (1<<k) ) >> (k+1))
+ *
+ * Contract:
+ * - iy points at N contiguous int32 VQ pulses (|iy[i]| < 2^15); X at N
+ *   writable int16 (celt_norm). iy and X do not overlap.
+ * - g is int16; k >= 0 (shift = k+1 >= 1). EXTRACT16 is a truncating cast.
+ * - The _c reference is bit-exact CELT behavior. The _p4 PIE body is
+ *   bit-exact too (16x16 raw product + explicit round bias + arithmetic
+ *   shift + truncating narrow -- no relaxed split is needed here).
+ */
+void opus_p4_normres_band_c(int16_t *X, const int32_t *iy, int N, int16_t g,
+                            int k);
+void opus_p4_normres_band_p4(int16_t *X, const int32_t *iy, int N, int16_t g,
+                             int k);
+
 /* On-device PIE instruction-semantics probe (logs results; ESP32-P4 only,
  * no-op elsewhere). Used to confirm vmul.s32.s16xs16 / cmul.s16 behavior
  * before building the PIE butterfly/comb kernels. */

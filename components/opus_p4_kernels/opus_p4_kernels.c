@@ -46,6 +46,7 @@ uint32_t opus_p4_anti_collapse_noise_f32_c(float *x, int n, int stride, float r,
 void opus_p4_pie_probe_run(const int16_t *in, const int32_t *in32, int32_t *out);
 void opus_p4_comb_bench(void);
 void opus_p4_denorm_bench(void);
+void opus_p4_normres_bench(void);
 
 void opus_p4_pie_probe(void)
 {
@@ -83,6 +84,7 @@ void opus_p4_pie_probe(void)
              (long)out[24], (long)out[25], (long)out[26], (long)out[27]);
     opus_p4_comb_bench();
     opus_p4_denorm_bench();
+    opus_p4_normres_bench();
 }
 #else
 void opus_p4_pie_probe(void) {}
@@ -138,8 +140,27 @@ void opus_p4_denorm_band_c(int32_t *f, const int16_t *x, int N, int32_t g,
         f[j] = p4_mult16_32_q15(x[j], g) >> shift;
 }
 
+/* CELT normalise_residual hot loop (FIXED_POINT):
+ *   X[i] = EXTRACT16(PSHR32(MULT16_16(g, iy[i]), k+1))
+ *        = (int16)(( g*(int16)iy[i] + (1<<k) ) >> (k+1))
+ * iy is int32 (VQ pulses, |iy[i]| < 2^15 so the int16 cast is lossless), g is
+ * int16, output X is int16 (celt_norm). k >= 0, shift = k+1 >= 1. EXTRACT16 is
+ * a truncating cast (no saturation); the algorithm keeps the result in range.
+ * Bit-exact reference. */
+void opus_p4_normres_band_c(int16_t *X, const int32_t *iy, int N, int16_t g,
+                            int k)
+{
+    int shift = k + 1;
+    int32_t bias = (int32_t)1 << k; /* EXTEND32(1)<<shift>>1 == 1<<k */
+    for (int i = 0; i < N; i++) {
+        int32_t p = (int32_t)g * (int32_t)(int16_t)iy[i];
+        X[i] = (int16_t)((p + bias) >> shift);
+    }
+}
+
 uint32_t opus_p4_comb_pie_calls, opus_p4_comb_c_calls;
 uint32_t opus_p4_denorm_pie_calls, opus_p4_denorm_c_calls;
+uint32_t opus_p4_normres_pie_calls, opus_p4_normres_c_calls;
 
 #if defined(ESP_PLATFORM) && CONFIG_IDF_TARGET_ESP32P4
 void opus_p4_comb8(int32_t *y, const int32_t *x, int T, int16_t g10,
@@ -303,6 +324,85 @@ void opus_p4_denorm_bench(void)
              "imax=%d x=%d fc=%ld fp=%ld | fc[0..3]= %ld %ld %ld %ld",
              imax, x[imax], (long)fc[imax], (long)fp[imax], (long)fc[0],
              (long)fc[1], (long)fc[2], (long)fc[3]);
+}
+
+void opus_p4_normres8(int16_t *X, const int32_t *iy, int16_t g, int k);
+
+void opus_p4_normres_band_p4(int16_t *X, const int32_t *iy, int N, int16_t g,
+                             int k)
+{
+    int i = 0;
+    int n8 = N & ~7;
+    int16_t tmp[8] __attribute__((aligned(16)));
+    extern uint32_t opus_p4_normres_pie_calls;
+    if (n8 > 0)
+        opus_p4_normres_pie_calls++;
+    if (((uintptr_t)X & 15) == 0) {
+        for (; i < n8; i += 8)
+            opus_p4_normres8(X + i, iy + i, g, k);
+    } else {
+        for (; i < n8; i += 8) {
+            opus_p4_normres8(tmp, iy + i, g, k);
+            memcpy(X + i, tmp, 8 * sizeof(int16_t));
+        }
+    }
+    {
+        int shift = k + 1;
+        int32_t bias = (int32_t)1 << k;
+        for (; i < N; i++) {
+            int32_t p = (int32_t)g * (int32_t)(int16_t)iy[i];
+            X[i] = (int16_t)((p + bias) >> shift);
+        }
+    }
+}
+
+void opus_p4_normres_bench(void)
+{
+    enum { N = 176 };
+    static int32_t iybuf[N + 8] __attribute__((aligned(16)));
+    static int16_t Xc[N + 8] __attribute__((aligned(16)));
+    static int16_t Xp[N + 8] __attribute__((aligned(16)));
+    uint32_t seed = 4242u;
+    for (int i = 0; i < N + 8; i++) {
+        seed = 1664525u * seed + 1013904223u;
+        iybuf[i] = (int16_t)seed; /* VQ-like signed pulses */
+    }
+    const int32_t *iy = &iybuf[3]; /* unaligned base -> exercise src.q */
+    int16_t g = 21000;
+    int k = 9;
+    const int iters = 4000;
+
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_normres_band_c(Xc, iy, N, g, k);
+    uint32_t tc = esp_cpu_get_cycle_count() - t0;
+
+    t0 = esp_cpu_get_cycle_count();
+    for (int it = 0; it < iters; it++)
+        opus_p4_normres_band_p4(Xp, iy, N, g, k);
+    uint32_t tp = esp_cpu_get_cycle_count() - t0;
+
+    int32_t maxdiff = 0;
+    int imax = 0;
+    for (int i = 0; i < N; i++) {
+        int32_t d = Xc[i] - Xp[i];
+        if (d < 0)
+            d = -d;
+        if (d > maxdiff) {
+            maxdiff = d;
+            imax = i;
+        }
+    }
+    ESP_LOGI("normres_bench",
+             "N=%d iters=%d  C=%lu (%.1f/call)  PIE=%lu (%.1f/call)  "
+             "speedup=%.2fx  maxdiff=%ld",
+             N, iters, (unsigned long)tc, (double)tc / iters,
+             (unsigned long)tp, (double)tp / iters, (double)tc / (double)tp,
+             (long)maxdiff);
+    ESP_LOGI("normres_bench",
+             "imax=%d iy=%ld Xc=%d Xp=%d | Xc[0..3]= %d %d %d %d",
+             imax, (long)iy[imax], Xc[imax], Xp[imax], Xc[0], Xc[1], Xc[2],
+             Xc[3]);
 }
 #endif
 
