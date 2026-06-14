@@ -20,7 +20,8 @@ endif()
 idf_component_register(SRCS ${CAM_SRCS}
                        INCLUDE_DIRS "include"
                        PRIV_REQUIRES esp_driver_ledc esp_driver_i2c esp_timer
-                                     esp_driver_ppa ui_tab5 quirc)
+                                     esp_driver_ppa ui_tab5 quirc
+                                     esp_hal_cam soc)
 
 # No per-file -march needed: the IDF P4 toolchain (GCC 15.2) already
 # assembles the PIE + hardware-loop mnemonics. Its global asmflags carry

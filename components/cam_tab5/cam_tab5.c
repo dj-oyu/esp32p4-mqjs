@@ -33,6 +33,7 @@
 #include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "hal/isp_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "linux/videodev2.h"
@@ -490,6 +491,68 @@ static void log_s_fmt_diag(int fd, uint32_t req_pixfmt, const char *label)
              fmt.fmt.pix.bytesperline, fmt.fmt.pix.sizeimage);
 }
 
+/* ISP gamma tone-correction, applied directly to the HW registers.
+ *
+ * Why not the normal path: esp_ipa 2.1.0 + the IDF 6.0 ISP driver produce a
+ * gamma curve whose 16 uniform width-16 segments sum to 256, so the final x
+ * boundary is 256. The P4 ISP HW rejects that (its x space is 8-bit 0..255)
+ * and floods "ISP: gamma xcoord error" every frame -- a driver-vs-silicon gap
+ * (the driver's validation and register-writer both special-case the last
+ * point as 256, the HW doesn't). Device-verified: a curve whose power-of-2
+ * widths sum to *255* (last boundary 255) is accepted with no error. The IPA
+ * gamma block is removed from our vendored sensor config, so nothing reprograms
+ * gamma behind us; we own it here.
+ *
+ * Curve: widths [1,2,4,8, 16x9, 32x3] (powers below) -> cumulative x ending at
+ * 255, finer at the low end where the gamma curve bends most. y is a power-law
+ * gamma (~sensor's original 0.5-0.65 range). Registers are encoded exactly like
+ * isp_ll_gamma_set_correction_curve (3-bit log2 width per segment in gamma_x1/2,
+ * 8-bit y per point in gamma_y1..4). */
+#define CAM_ISP_GAMMA 0.55f
+
+static void apply_isp_gamma(void)
+{
+    static const uint8_t pw[16] = { 0, 1, 2, 3, 4, 4, 4, 4,
+                                    4, 4, 4, 4, 4, 5, 5, 5 };
+    static const uint8_t xc[16] = { 1, 3, 7, 15, 31, 47, 63, 79,
+                                    95, 111, 127, 143, 159, 191, 223, 255 };
+    uint8_t yy[16];
+    for (int i = 0; i < 16; i++) {
+        float y = powf((float)xc[i] / 255.0f, CAM_ISP_GAMMA) * 255.0f + 0.5f;
+        yy[i] = (uint8_t)(y > 255.0f ? 255.0f : y);
+    }
+    uint32_t x1 = 0, x2 = 0, y1 = 0, y2 = 0, y3 = 0, y4 = 0;
+    for (int i = 0; i < 8; i++)
+        x1 |= ((uint32_t)pw[i] << (21 - i * 3));
+    for (int i = 8; i < 16; i++)
+        x2 |= ((uint32_t)pw[i] << (21 - (i - 8) * 3));
+    for (int i = 0; i < 4; i++)
+        y1 |= ((uint32_t)yy[i] << (24 - i * 8));
+    for (int i = 4; i < 8; i++)
+        y2 |= ((uint32_t)yy[i] << (24 - (i - 4) * 8));
+    for (int i = 8; i < 12; i++)
+        y3 |= ((uint32_t)yy[i] << (24 - (i - 8) * 8));
+    for (int i = 12; i < 16; i++)
+        y4 |= ((uint32_t)yy[i] << (24 - (i - 12) * 8));
+
+    isp_dev_t *hw = ISP_LL_GET_HW(0);
+    for (int ch = 0; ch < 3; ch++) {
+        hw->gamma_rgb_x[ch].gamma_x1.val = x1;
+        hw->gamma_rgb_x[ch].gamma_x2.val = x2;
+        hw->gamma_rgb_y[ch].gamma_y1.val = y1;
+        hw->gamma_rgb_y[ch].gamma_y2.val = y2;
+        hw->gamma_rgb_y[ch].gamma_y3.val = y3;
+        hw->gamma_rgb_y[ch].gamma_y4.val = y4;
+    }
+    hw->gamma_ctrl.gamma_update = 1;
+    while (hw->gamma_ctrl.gamma_update)
+        ;
+    isp_ll_gamma_enable(hw, true);
+    ESP_LOGI(TAG, "ISP gamma applied (en=%d x1=%08lx, 255-boundary workaround)",
+             (int)hw->cntl.gamma_en,
+             (unsigned long)hw->gamma_rgb_x[0].gamma_x1.val);
+}
+
 static bool pipeline_once(void)
 {
     if (s_fd >= 0)
@@ -580,6 +643,7 @@ static bool pipeline_once(void)
         return false;
     }
     s_fd = fd;
+    apply_isp_gamma(); /* HW gamma the driver can't program (256-boundary bug) */
     char dims[20];
     snprintf(dims, sizeof dims, "%dx%d", s_frame_w, s_frame_h);
     s_logged_dqbuf_bytes = false;
