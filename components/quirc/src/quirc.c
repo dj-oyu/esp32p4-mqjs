@@ -18,6 +18,34 @@
 #include <string.h>
 #include "quirc_internal.h"
 
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+/* The QR analysis image is the hottest buffer in identify() (the region
+ * flood-fill rereads it constantly), so prefer internal SRAM — cache-friendly,
+ * no PSRAM-cache stalls — and fall back to the default heap (PSRAM via SPIRAM
+ * malloc) when a contiguous internal block isn't available. cam_tab5 frees
+ * internal by suspending the radio for QR scans (docs/camera-lifecycle-plan.md
+ * §8). Logs the placement + the contiguous block at alloc time (M1/M3). */
+static void *quirc_image_alloc(size_t n)
+{
+	size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+	void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	ESP_LOGI("quirc", "image %u B: internal largest-free=%u -> %s",
+		 (unsigned)n, (unsigned)largest,
+		 p ? "INTERNAL SRAM" : "PSRAM (fallback)");
+	if (!p)
+		p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (!p)
+		p = malloc(n);
+	if (p)
+		memset(p, 0, n);
+	return p;
+}
+#else
+static void *quirc_image_alloc(size_t n) { return calloc(1, n); }
+#endif
+
 const char *quirc_version(void)
 {
 	return "1.0";
@@ -66,7 +94,7 @@ int quirc_resize(struct quirc *q, int w, int h)
 	 * alloc a new buffer for q->image. We avoid realloc(3) because we want
 	 * on failure to be leave `q` in a consistant, unmodified state.
 	 */
-	image = calloc(w, h);
+	image = quirc_image_alloc((size_t)w * h);
 	if (!image)
 		goto fail;
 

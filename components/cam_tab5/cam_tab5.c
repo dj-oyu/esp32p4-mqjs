@@ -719,23 +719,39 @@ static uint16_t *s_mid;
 static struct quirc *s_quirc;
 static struct quirc_code s_qr_code;
 static struct quirc_data s_qr_data;
-/* QR decode runs on the FULL-RES 800x600 center crop straight from the
- * captured frame — the same resolution advantage EAN already enjoys by
- * scanning px directly. The old 0.5x s_mid (400x300) threw away the modules
- * quirc needs: on-device the custom finder prefilter found markers=0 on the
- * downscaled image and never even reached quirc (gray24 mark10 id0 dec0
- * markers0). We let quirc do its own robust finder detection on 800x600
- * instead of gating on the unreliable prefilter. See docs/qr-read-
- * performance.md. */
-#define QR_HI_W CROP_W /* 800 */
-#define QR_HI_H CROP_H /* 600 */
+/* QR decode crop: a NATIVE-RES reticle window (camera-lifecycle-plan §6), NOT a
+ * downscale. The old 400x300 failed because it DOWNSCALED the 800x600 crop 0.5x,
+ * dropping module density below quirc's finder threshold. We instead CROP a
+ * window at the sensor's native resolution (full pixel density per module).
+ *
+ * Sizing is decode-quality-driven (M2), NOT buffer-size-driven: M1 showed the
+ * 156KB quirc image can't fit internal SRAM here (esp-hosted holds the P4
+ * internal in lwIP/SDIO; largest contiguous free ≈ 34KB), so the SRAM win is off
+ * the table and there's no reason to keep the crop tiny. 400x400 proved too
+ * small for the dense provisioning QR (version 12 = 65 modules): a ~350px QR
+ * gives only ~4.6 px/module → quirc detects it but ECC-fails. 640x640 lets a
+ * QR filling the reticle (~540px) reach ~8 px/module — comfortably above the
+ * ~6 px/module decode threshold for v12. Buffer ≈ 800KB RGB565 + ~400KB quirc
+ * image (PSRAM). See docs/qr-read-performance.md, camera-lifecycle-plan §6/§8. */
+#define QR_HI_W 640
+#define QR_HI_H 640
+/* decode window centered in the 1600x1200 frame, in absolute frame coordinates.
+ * Read straight from the captured frame (independent of the 800x600 preview
+ * crop), so it may extend slightly past what the viewfinder shows. */
+#define QR_CROP_X ((CAM_W - QR_HI_W) / 2) /* 480 */
+#define QR_CROP_Y ((CAM_H - QR_HI_H) / 2) /* 280 */
+/* visible reticle, drawn smaller than the decode window: the ~50px native slack
+ * each side (~6 modules of a v12 QR) absorbs aiming error and gives the QR's
+ * quiet zone room inside the decode crop. M2 sweeps the smallest reliable size. */
+#define QR_RETICLE_W 540
+#define QR_RETICLE_H 540
 
-/* QR decode (gray convert + quirc, ~220ms) runs on a worker task so it never
- * blocks the camera/preview loop. scan_task copies the 800x600 RGB565 crop
- * into s_qr_rgb, hands it over via s_qr_go, and collects the result via
- * s_qr_result (non-blocking poll) — the preview keeps running at frame rate
- * while quirc grinds in the background on the otherwise-idle core-0 slack. */
-static uint16_t *s_qr_rgb;          /* 800x600 RGB565 crop, scan_task -> worker */
+/* QR decode (gray convert + quirc) runs on a worker task so it never blocks the
+ * camera/preview loop. scan_task copies the 640x640 native-res reticle crop into
+ * s_qr_rgb, hands it over via s_qr_go, and collects the result via s_qr_result
+ * (non-blocking poll) — the preview keeps running at frame rate while quirc
+ * grinds in the background on the otherwise-idle core-0 slack. */
+static uint16_t *s_qr_rgb;          /* 640x640 RGB565 reticle crop, scan -> worker */
 static TaskHandle_t s_qr_task;
 static SemaphoreHandle_t s_qr_go;   /* scan_task gives a frame to the worker */
 static SemaphoreHandle_t s_qr_result; /* worker signals a finished decode */
@@ -743,6 +759,11 @@ static volatile bool s_qr_hit;      /* worker decoded a valid payload */
 static char s_qr_payload[CAM_TAB5_QR_PAYLOAD_MAX + 1];
 static volatile int64_t s_qr_gray_us, s_qr_id_us, s_qr_dec_us; /* worker timing */
 static volatile int s_qr_candidates, s_qr_runs;
+/* decode diagnostics: last quirc_decode error + extracted grid size (cells/side
+ * = QR version), surfaced in the scan-end MEAS line so a "detected but not
+ * decoded" (candidates>0, dec0) can be told apart: ECC failure = read quality
+ * (blur / resolution / glare), invalid grid = bad extraction (clipped / skew). */
+static volatile int s_qr_last_err, s_qr_last_size;
 
 static bool mid_blit(const uint16_t *px)
 {
@@ -795,7 +816,7 @@ static void rgb565_to_luma(const uint16_t *src, uint8_t *dst, int n)
         dst[i] = luma565(src[i]);
 }
 
-/* Worker body: convert the handed-over 800x600 crop to luma straight into
+/* Worker body: convert the handed-over 640x640 crop to luma straight into
  * quirc's buffer, then identify + decode. Runs off the camera loop. */
 static void qr_decode_once(void)
 {
@@ -827,6 +848,8 @@ static void qr_decode_once(void)
             quirc_flip(&s_qr_code);
             err = quirc_decode(&s_qr_code, &s_qr_data);
         }
+        s_qr_last_err = err;             /* diag (last candidate wins) */
+        s_qr_last_size = s_qr_code.size; /* diag: QR cells/side */
         if (err != QUIRC_SUCCESS || s_qr_data.payload_len <= 0 ||
             (size_t)s_qr_data.payload_len >= sizeof s_qr_payload ||
             memchr(s_qr_data.payload, '\0', s_qr_data.payload_len))
@@ -1002,6 +1025,31 @@ static void draw_overlay(uint16_t *pv, const FrameHit *hit)
            col); /* ひげ線 → ラベルへ */
 }
 
+/* QR aiming reticle (Phase 2 §6): the decode window is QR_HI_W×QR_HI_H centered
+ * in the finder crop, so it maps to the preview center; draw the smaller display
+ * reticle there as corner brackets. Same §932 transpose: a frame ROW span maps
+ * to preview X, a frame COLUMN span to preview Y. Both square here, and the
+ * reticle is centered, so we just inset from the preview center by half the
+ * display size (PV_MAP is identity at PV_SCALE=2). Redrawn every frame after the
+ * PPA blit, like draw_region/draw_overlay. */
+static void draw_qr_reticle(uint16_t *pv)
+{
+    int hx = PV_MAP(QR_RETICLE_H) / 2; /* rows -> preview x */
+    int hy = PV_MAP(QR_RETICLE_W) / 2; /* cols -> preview y */
+    int x0 = PV_W / 2 - hx, x1 = PV_W / 2 + hx;
+    int y0 = PV_H / 2 - hy, y1 = PV_H / 2 + hy;
+    int lx = (x1 - x0) / 4, ly = (y1 - y0) / 4; /* bracket leg length */
+    const uint16_t c = 0xFFFF;                  /* white */
+    pv_seg(pv, x0, y0, x0 + lx, y0, c); /* TL */
+    pv_seg(pv, x0, y0, x0, y0 + ly, c);
+    pv_seg(pv, x1 - lx, y0, x1, y0, c); /* TR */
+    pv_seg(pv, x1, y0, x1, y0 + ly, c);
+    pv_seg(pv, x0, y1 - ly, x0, y1, c); /* BL */
+    pv_seg(pv, x0, y1, x0 + lx, y1, c);
+    pv_seg(pv, x1 - lx, y1, x1, y1, c); /* BR */
+    pv_seg(pv, x1, y1 - ly, x1, y1, c);
+}
+
 /* bounded DQBUF (camera-lifecycle-plan §1/§2.6): VIDIOC_S_DQBUF_TIMEOUT makes
  * VIDIOC_DQBUF return after this long with no frame, so control returns to the
  * owner to re-check the deadline/cancel. The old unbounded DQBUF hung 113s past
@@ -1110,7 +1158,7 @@ static void cam_run_scan(void)
 
         if (preview)
             ui_tab5_cam_overlay_text(s_req.mode == SCAN_QR
-                ? "QRコードを画面内に入れてください"
+                ? "QRコードを枠の中に入れてください"
                 : "スキャン中 (緑=読取 黄=惜しい)");
 
         if (s_req.mode == SCAN_QR && qr_once()) {
@@ -1119,6 +1167,8 @@ static void cam_run_scan(void)
             s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
             s_qr_runs = 0;
             s_qr_candidates = 0;
+            s_qr_last_err = 0; /* QUIRC_SUCCESS */
+            s_qr_last_size = 0;
         }
 
         int dq_fail = 0;
@@ -1164,7 +1214,7 @@ static void cam_run_scan(void)
                     (frame_no % 2) == 0) {
                     for (int y = 0; y < QR_HI_H; y++)
                         memcpy(s_qr_rgb + (size_t)y * QR_HI_W,
-                               px + (size_t)(CROP_Y + y) * s_frame_w + CROP_X,
+                               px + (size_t)(QR_CROP_Y + y) * s_frame_w + QR_CROP_X,
                                (size_t)QR_HI_W * 2);
                     qr_outstanding = true;
                     xSemaphoreGive(s_qr_go);
@@ -1178,8 +1228,10 @@ static void cam_run_scan(void)
                         found = true;
                     }
                 }
-                if (pv_ok)
+                if (pv_ok) {
+                    draw_qr_reticle(preview);
                     ui_tab5_cam_canvas_update();
+                }
                 continue;
             }
             /* localize on every 3rd frame (regions move at hand speed,
@@ -1261,12 +1313,13 @@ static void cam_run_scan(void)
     char perf[192] = "";
     if (s_req.mode == SCAN_QR && s_qr_runs)
         snprintf(perf, sizeof perf,
-                 " [pv%d gray%d id%d dec%d ms/run candidates%d runs%d total%dms]",
+                 " [pv%d gray%d id%d dec%d ms/run cand%d runs%d sz%d/%s total%dms]",
                  (int)(t_pv / (n_frames ? n_frames : 1) / 1000),
                  (int)(s_qr_gray_us / s_qr_runs / 1000),
                  (int)(s_qr_id_us / s_qr_runs / 1000),
                  (int)(s_qr_dec_us / s_qr_runs / 1000),
                  s_qr_candidates, s_qr_runs,
+                 s_qr_last_size, quirc_strerror((quirc_decode_error_t)s_qr_last_err),
                  (int)((esp_timer_get_time() - scan_started) / 1000));
     else if (n_frames)
         snprintf(perf, sizeof perf,
