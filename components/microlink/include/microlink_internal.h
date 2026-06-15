@@ -73,8 +73,14 @@ extern "C" {
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
 
 /* DERP */
-#define ML_DERP_REGION          9       /* Dallas (dfw) */
-#define ML_DERP_HOST            "derp9e.tailscale.com"
+/* VENDOR PATCH (2026-06-15): default home region Dallas(9)->Tokyo(7). The
+ * control plane assigns our HomeDERP from the PreferredDERP we advertise
+ * (ML_DERP_REGION), and microlink has no latency-based auto-selection, so a
+ * device in Japan otherwise relays through Dallas (high RTT + CPU load,
+ * tripping ml_wg_mgr's task_wdt even for same-LAN peers). ML_DERP_HOST is the
+ * pre-DERPMap bootstrap host for the same region (derp7e = Tokyo node "7e"). */
+#define ML_DERP_REGION          7       /* Tokyo (tok) */
+#define ML_DERP_HOST            "derp7e.tailscale.com"
 #define ML_DERP_PORT            443
 
 /* Tailscale control plane */

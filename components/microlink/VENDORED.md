@@ -44,3 +44,14 @@ component discovery). Rationale and the full de-risking record:
    Runtime caveat: PSA ChaCha20-Poly1305 must be enabled in sdkconfig
    (`CONFIG_MBEDTLS_CHACHAPOLY_C` / `PSA_WANT_ALG_CHACHA20_POLY1305`); compile
    passes regardless but `psa_aead_*` returns `PSA_ERROR_NOT_SUPPORTED` if off.
+
+5. **Default DERP home region Dallas(9) → Tokyo(7)** —
+   `include/microlink_internal.h`: `ML_DERP_REGION 9`→`7`, `ML_DERP_HOST
+   "derp9e..."`→`"derp7e.tailscale.com"`. The control plane sets our HomeDERP
+   from the `PreferredDERP` we advertise (NetInfo), and microlink has no
+   latency-based DERP auto-selection (real Tailscale clients ping all regions
+   and pick the nearest). With the upstream default a device in Japan relays
+   through Dallas — high RTT and enough CPU load to trip `ml_wg_mgr`'s task
+   watchdog even for same-LAN peers. Region 7 (`tok`) is Tokyo. `ML_DERP_HOST`
+   is only the pre-DERPMap bootstrap host; once the control plane's DERPMap is
+   parsed, `ml_derp_connect()` looks up the home region's nodes by `RegionID`.
