@@ -18,7 +18,8 @@
 
 static const char *TAG = "ts_adapter";
 
-#define TS_MAX_RETRIES 5
+#define TS_MAX_RETRIES   5
+#define TS_MAX_NTP_WAITS 18   /* ~180s: first NTP sync over a fresh link is slow */
 #define TS_TICK_US     (10 * 1000 * 1000)   /* 10s connect-watchdog tick */
 #define TS_DEVICE_NAME "m5stack-tab5"
 
@@ -29,6 +30,7 @@ static char *s_session_key;          /* heap-owned, alive for the session */
 static char s_state[20] = "not-configured";
 static char s_detail[64];
 static int s_retries;
+static int s_ntp_waits;              /* ticks spent waiting for the clock */
 static bool s_connected_once;
 static bool s_net_up;
 static bool s_starting;              /* armed: waiting for time sync / connecting */
@@ -36,13 +38,19 @@ static bool s_skip_autostart;        /* set when a prior boot reset mid-connect 
 
 /* Crash-loop guard in RTC memory: survives a watchdog/SW reset, is random on a
    cold (power-on) boot. We "arm" it right before starting microlink and clear
-   it on a successful connect. If a boot finds it still armed, the previous boot
-   reset while connecting (a crash) — so skip auto-start until the next
-   power-cycle, instead of boot-looping on the same crash. */
-#define TS_GUARD_MAGIC  0x7a11c0deu
-#define TS_GUARD_ARMED  0xa5a5a5a5u
+   it on a successful connect. A boot that finds it still armed means the
+   previous boot reset while connecting. We count CONSECUTIVE such resets and
+   only skip auto-start after TS_GUARD_MAX_FAILS of them — so a one-off reset
+   (e.g. a reflash's watchdog-reset, or a transient) still retries, while a real
+   connect-crash boot-loop is still broken. A successful connect, or an explicit
+   user enable/reauth, resets the counter. Bump TS_GUARD_MAGIC whenever the set
+   of RTC guard vars changes so a firmware update starts from a clean count. */
+#define TS_GUARD_MAGIC      0x7a11c0dfu   /* bumped: added s_guard_fails */
+#define TS_GUARD_ARMED      0xa5a5a5a5u
+#define TS_GUARD_MAX_FAILS  3
 static RTC_NOINIT_ATTR uint32_t s_guard_magic;
 static RTC_NOINIT_ATTR uint32_t s_guard_state;
+static RTC_NOINIT_ATTR uint32_t s_guard_fails;   /* consecutive mid-connect resets */
 
 static bool time_is_valid(void)
 {
@@ -86,6 +94,7 @@ static void on_ml_state(microlink_t *ml, microlink_state_t st, void *ud)
         s_retries = 0;
         s_starting = false;
         s_guard_state = 0;   /* connected OK -> disarm the crash-loop guard */
+        s_guard_fails = 0;   /* and reset the consecutive-reset counter */
         /* keep the watchdog ticking: its connected branch logs heap (measurement) */
         if (s_watchdog) {
             esp_timer_stop(s_watchdog);
@@ -168,24 +177,40 @@ static void watchdog_tick(void *arg)
         unlock();
         return;
     }
+    /* Not connected. Two distinct phases with separate budgets. */
+    if (s_starting && !s_ml) {
+        /* NTP-wait: poll the clock directly — don't depend only on the SNTP
+         * sync_cb (it can be missed, and the first sync over a fresh link is
+         * slow). Start microlink the moment the clock is valid; be patient
+         * before giving up (TS_MAX_NTP_WAITS, separate from connect retries). */
+        if (time_is_valid()) {
+            start_microlink();
+            unlock();
+            return;
+        }
+        if (++s_ntp_waits >= TS_MAX_NTP_WAITS) {
+            stop_session();
+            set_status("error", "時刻同期できません（ネットワーク確認）");
+            ESP_LOGW(TAG, "tailnet time-sync gave up after %d ticks", TS_MAX_NTP_WAITS);
+        } else {
+            char d[64];
+            snprintf(d, sizeof d, "時刻同期中… (%d)", s_ntp_waits);
+            set_status("connecting", d);
+        }
+        unlock();
+        return;
+    }
+    /* Connect-retry: microlink is running, waiting to reach CONNECTED. */
     s_retries++;
     if (s_retries >= TS_MAX_RETRIES) {
-        bool waiting_ntp = (s_ml == NULL);
         stop_session();
         char d[64];
-        if (waiting_ntp)
-            snprintf(d, sizeof d, "時刻同期できません（ネットワーク確認）");
-        else
-            snprintf(d, sizeof d, "接続失敗（%d回）auth key/接続先を確認", TS_MAX_RETRIES);
+        snprintf(d, sizeof d, "接続失敗（%d回）auth key/接続先を確認", TS_MAX_RETRIES);
         set_status("error", d);
-        ESP_LOGW(TAG, "tailnet %s gave up after %d ticks",
-                 waiting_ntp ? "time-sync" : "connect", TS_MAX_RETRIES);
+        ESP_LOGW(TAG, "tailnet connect gave up after %d ticks", TS_MAX_RETRIES);
     } else {
         char d[64];
-        if (s_ml)
-            snprintf(d, sizeof d, "接続中… 試行%d回", s_retries);
-        else
-            snprintf(d, sizeof d, "時刻同期中… (%d)", s_retries);
+        snprintf(d, sizeof d, "接続中… 試行%d回", s_retries);
         set_status("connecting", d);
     }
     unlock();
@@ -223,6 +248,7 @@ static void begin_connect(void)
 #else
     s_starting = true;
     s_retries = 0;
+    s_ntp_waits = 0;
     if (s_watchdog)
         esp_timer_start_periodic(s_watchdog, TS_TICK_US);
     if (time_is_valid())
@@ -249,14 +275,20 @@ static void refresh_idle_status(void)
 
 void tailscale_adapter_init(void)
 {
-    if (s_guard_magic != TS_GUARD_MAGIC) {   /* cold boot: RTC mem is random */
+    if (s_guard_magic != TS_GUARD_MAGIC) {   /* cold boot / fw update: RTC random */
         s_guard_magic = TS_GUARD_MAGIC;
         s_guard_state = 0;
+        s_guard_fails = 0;
+    } else if (s_guard_state == TS_GUARD_ARMED) {
+        s_guard_fails++;             /* last boot armed but never disarmed */
+    } else {
+        s_guard_fails = 0;           /* last boot ended cleanly */
     }
-    s_skip_autostart = (s_guard_state == TS_GUARD_ARMED);
+    s_guard_state = 0;               /* start this boot disarmed */
+    s_skip_autostart = (s_guard_fails >= TS_GUARD_MAX_FAILS);
     if (s_skip_autostart)
-        ESP_LOGW(TAG, "previous boot reset mid-connect -> skipping auto-start "
-                      "(power-cycle or re-enable to retry)");
+        ESP_LOGW(TAG, "%u consecutive resets mid-connect -> skipping auto-start "
+                      "(power-cycle or re-enable to retry)", (unsigned)s_guard_fails);
     s_lock = xSemaphoreCreateRecursiveMutex();
     const esp_timer_create_args_t a = {
         .callback = watchdog_tick, .name = "ts_wd",
@@ -313,6 +345,7 @@ bool tailscale_adapter_enable(void)
         return false;
     lock();
     s_skip_autostart = false;   /* explicit user action: clear the crash guard */
+    s_guard_fails = 0;
     if (system_vault_tailscale_has() && s_net_up)
         begin_connect();
     else
@@ -336,6 +369,7 @@ void tailscale_adapter_reauth(void)
 {
     lock();
     s_skip_autostart = false;   /* new key = explicit retry: clear the crash guard */
+    s_guard_fails = 0;
     stop_session();
     if (system_vault_tailscale_has() && system_vault_tailscale_enabled() && s_net_up)
         begin_connect();
