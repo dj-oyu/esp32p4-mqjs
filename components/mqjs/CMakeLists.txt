@@ -15,6 +15,7 @@ file(MAKE_DIRECTORY ${GEN_DIR})
 
 idf_component_register(
     SRCS "mqjs_power.c" "device_stdlib.c" "mqjs_runtime.c" "system_vault.c"
+         "tailscale_adapter.c"
          "app/mqjs_app_manager.c"
          "${MQJS_DIR}/mquickjs.c"
          "${MQJS_DIR}/cutils.c"
@@ -24,6 +25,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS "${MQJS_DIR}" "${GEN_DIR}"
     PRIV_REQUIRES driver esp_driver_gpio esp_driver_i2c esp_timer nvs_flash
                   ui_tab5 sshc cam_tab5 audio_tab5 esp_http_client esp-tls mbedtls
+                  microlink esp_netif
 )
 
 # Vendored engine: uint32_t is 'long unsigned int' on riscv32, so the

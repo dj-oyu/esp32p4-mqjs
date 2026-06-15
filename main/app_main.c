@@ -29,6 +29,7 @@
 #include "audio_tab5.h"
 #include "opus_player.h"
 #include "wifi.h"
+#include "tailscale_adapter.h"
 
 static const char *TAG = "app";
 
@@ -81,6 +82,7 @@ static void on_net_up(void)
 {
     task_source_start();   /* accept replacement tasks over MQTT */
     mqjs_notify_net_up();  /* drain the net.onReady wait queue (JS apps) */
+    tailscale_adapter_on_net_up();  /* start tailnet (NTP->microlink) if armed */
 }
 
 static void js_task(void *arg)
@@ -161,6 +163,10 @@ void app_main(void)
        does not use the C stack for JS frames, but the parser + bindings
        need headroom. Core 0: the LVGL task lives on Core 1 (see ui_tab5). */
     xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
+
+    /* Arm the Tailscale lifecycle before the network is up so its got-IP hook
+       in on_net_up() can start the NTP->microlink chain (no-op without a key). */
+    tailscale_adapter_init();
 
     /* Wi-Fi comes up in the background while the above already runs. Nothing
        blocks here on the network: the services that need it are released from
