@@ -14,6 +14,8 @@
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include <time.h>
 
 static const char *TAG = "ts_adapter";
@@ -23,11 +25,30 @@ static const char *TAG = "ts_adapter";
 #define TS_TICK_US     (10 * 1000 * 1000)   /* 10s connect-watchdog tick */
 #define TS_DEVICE_NAME "m5stack-tab5"
 
+/* Connection state: the fixed set the UI/JS reflects. set_status() takes this
+ * enum (type-safe; no stringly-typed strcmp), while the freeform detail stays a
+ * string. ts_state_str() maps to the JS-facing string at the get_status edge. */
+typedef enum {
+    TS_ST_NOT_CONFIGURED,
+    TS_ST_DISABLED,
+    TS_ST_CONNECTING,
+    TS_ST_CONNECTED,
+    TS_ST_ERROR,
+} ts_state_t;
+
+/* Lifecycle commands posted to the single-owner lifecycle_task. */
+typedef enum {
+    TS_LIFECYCLE_CMD_START,
+    TS_LIFECYCLE_CMD_STOP,
+    TS_LIFECYCLE_CMD_REAUTH,
+    TS_LIFECYCLE_CMD_FORGET,
+} ts_lifecycle_cmd_t;
+
 static SemaphoreHandle_t s_lock;
 static esp_timer_handle_t s_watchdog;
 static microlink_t *s_ml;
 static char *s_session_key;          /* heap-owned, alive for the session */
-static char s_state[20] = "not-configured";
+static ts_state_t s_state = TS_ST_NOT_CONFIGURED;
 static char s_detail[64];
 static int s_retries;
 static int s_ntp_waits;              /* ticks spent waiting for the clock */
@@ -60,9 +81,21 @@ static bool time_is_valid(void)
 static void lock(void)   { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
 static void unlock(void) { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
 
-static void set_status(const char *state, const char *detail)
+static const char *ts_state_str(ts_state_t s)
 {
-    snprintf(s_state, sizeof s_state, "%s", state);
+    switch (s) {
+    case TS_ST_DISABLED:   return "disabled";
+    case TS_ST_CONNECTING: return "connecting";
+    case TS_ST_CONNECTED:  return "connected";
+    case TS_ST_ERROR:      return "error";
+    case TS_ST_NOT_CONFIGURED:
+    default:               return "not-configured";
+    }
+}
+
+static void set_status(ts_state_t state, const char *detail)
+{
+    s_state = state;
     snprintf(s_detail, sizeof s_detail, "%s", detail ? detail : "");
 }
 
@@ -105,10 +138,10 @@ static void on_ml_state(microlink_t *ml, microlink_state_t st, void *ud)
             microlink_ip_to_str(microlink_get_vpn_ip(s_ml), ip);
         char d[64];
         snprintf(d, sizeof d, "接続済み %s", ip);
-        set_status("connected", d);
+        set_status(TS_ST_CONNECTED, d);
         ESP_LOGI(TAG, "tailnet connected: %s", ip);
     } else if (st == ML_STATE_RECONNECTING && s_connected_once) {
-        set_status("connecting", "再接続中");
+        set_status(TS_ST_CONNECTING, "再接続中");
     }
     unlock();
 }
@@ -131,7 +164,7 @@ static void start_microlink(void)
     if (!s_session_key ||
         !system_vault_tailscale_read(s_session_key, SYSTEM_VAULT_TS_AUTH_MAX + 1)) {
         if (s_session_key) { free(s_session_key); s_session_key = NULL; }
-        set_status("not-configured", "");
+        set_status(TS_ST_NOT_CONFIGURED, "");
         s_starting = false;
         return;
     }
@@ -146,16 +179,72 @@ static void start_microlink(void)
     s_ml = microlink_init(&cfg);
     if (!s_ml) {
         stop_session();
-        set_status("error", "初期化に失敗しました");
+        set_status(TS_ST_ERROR, "初期化に失敗しました");
         return;
     }
     microlink_set_state_callback(s_ml, on_ml_state, NULL);
     if (microlink_start(s_ml) != ESP_OK) {
         stop_session();
-        set_status("error", "起動に失敗しました");
+        set_status(TS_ST_ERROR, "起動に失敗しました");
         return;
     }
-    set_status("connecting", "接続中…");
+    set_status(TS_ST_CONNECTING, "接続中…");
+}
+
+/* ---- lifecycle command queue: single owner of microlink ------------------
+ * Callbacks (the SNTP sync_cb runs in lwIP's tcpip_thread; the connect
+ * watchdog runs in the esp_timer task) and the public API must NOT run
+ * start_microlink()/stop_session() themselves: start_microlink opens lwIP
+ * sockets, and lwIP's socket API self-deadlocks if called from tcpip_thread.
+ * Instead every path POSTs a command (non-blocking, any context) and the
+ * resident lifecycle_task is the ONLY code that drives microlink — so the
+ * blocking lwIP work always runs in a plain task context, and all START/STOP/
+ * REAUTH/FORGET transitions are serialized through one owner. */
+static QueueHandle_t s_lifecycle_queue;
+static void begin_connect(void);          /* fwd: REAUTH re-arms */
+static void refresh_idle_status(void);    /* fwd: STOP reflects idle state */
+
+static bool lifecycle_post_cmd(ts_lifecycle_cmd_t cmd)   /* safe from any context */
+{
+    return s_lifecycle_queue &&
+           xQueueSend(s_lifecycle_queue, &cmd, 0) == pdTRUE;
+}
+
+static void lifecycle_handle_cmd(ts_lifecycle_cmd_t cmd) /* lifecycle_task only */
+{
+    lock();
+    switch (cmd) {
+    case TS_LIFECYCLE_CMD_START:   /* launch microlink once armed + clock valid */
+        if (!s_ml && s_starting && time_is_valid())
+            start_microlink();
+        break;
+    case TS_LIFECYCLE_CMD_STOP:    /* user turned it off */
+        stop_session();
+        refresh_idle_status();
+        break;
+    case TS_LIFECYCLE_CMD_REAUTH:  /* new key: tear down, then re-arm */
+        stop_session();
+        if (system_vault_tailscale_has() &&
+            system_vault_tailscale_enabled() && s_net_up)
+            begin_connect();
+        else
+            refresh_idle_status();
+        break;
+    case TS_LIFECYCLE_CMD_FORGET:  /* credentials cleared */
+        stop_session();
+        set_status(TS_ST_NOT_CONFIGURED, "未設定");
+        break;
+    }
+    unlock();
+}
+
+static void lifecycle_task(void *arg)
+{
+    (void)arg;
+    ts_lifecycle_cmd_t cmd;
+    for (;;)
+        if (xQueueReceive(s_lifecycle_queue, &cmd, portMAX_DELAY) == pdTRUE)
+            lifecycle_handle_cmd(cmd);
 }
 
 /* connect watchdog: bounds the time-sync wait (before microlink starts) AND
@@ -165,7 +254,7 @@ static void watchdog_tick(void *arg)
 {
     (void)arg;
     lock();
-    if (!strcmp(s_state, "connected")) {
+    if (s_state == TS_ST_CONNECTED) {
         /* connected: log heap periodically (measurement) instead of stopping */
         ESP_LOGW(TAG, "connected heap: INTERNAL free=%u largest=%u | DMA free=%u "
                       "largest=%u | PSRAM free=%u",
@@ -184,18 +273,18 @@ static void watchdog_tick(void *arg)
          * slow). Start microlink the moment the clock is valid; be patient
          * before giving up (TS_MAX_NTP_WAITS, separate from connect retries). */
         if (time_is_valid()) {
-            start_microlink();
+            lifecycle_post_cmd(TS_LIFECYCLE_CMD_START);
             unlock();
             return;
         }
         if (++s_ntp_waits >= TS_MAX_NTP_WAITS) {
             stop_session();
-            set_status("error", "時刻同期できません（ネットワーク確認）");
+            set_status(TS_ST_ERROR, "時刻同期できません（ネットワーク確認）");
             ESP_LOGW(TAG, "tailnet time-sync gave up after %d ticks", TS_MAX_NTP_WAITS);
         } else {
             char d[64];
             snprintf(d, sizeof d, "時刻同期中… (%d)", s_ntp_waits);
-            set_status("connecting", d);
+            set_status(TS_ST_CONNECTING, d);
         }
         unlock();
         return;
@@ -206,12 +295,12 @@ static void watchdog_tick(void *arg)
         stop_session();
         char d[64];
         snprintf(d, sizeof d, "接続失敗（%d回）auth key/接続先を確認", TS_MAX_RETRIES);
-        set_status("error", d);
+        set_status(TS_ST_ERROR, d);
         ESP_LOGW(TAG, "tailnet connect gave up after %d ticks", TS_MAX_RETRIES);
     } else {
         char d[64];
         snprintf(d, sizeof d, "接続中… 試行%d回", s_retries);
-        set_status("connecting", d);
+        set_status(TS_ST_CONNECTING, d);
     }
     unlock();
 }
@@ -222,8 +311,10 @@ static void watchdog_tick(void *arg)
 void tailscale_adapter_on_time_synced(void)
 {
     lock();
+    /* runs in lwIP tcpip_thread — must NOT touch lwIP sockets here; just post
+       a command for the lifecycle task to start microlink in a safe context. */
     if (s_starting && !s_ml && time_is_valid())
-        start_microlink();
+        lifecycle_post_cmd(TS_LIFECYCLE_CMD_START);
     unlock();
 }
 
@@ -243,7 +334,7 @@ static void begin_connect(void)
     if (s_ml || s_starting)
         return;
 #if !TS_CONNECT_ENABLED
-    set_status("error", "一時無効（SDIO RAM調整中）");
+    set_status(TS_ST_ERROR, "一時無効（SDIO RAM調整中）");
     return;
 #else
     s_starting = true;
@@ -252,9 +343,9 @@ static void begin_connect(void)
     if (s_watchdog)
         esp_timer_start_periodic(s_watchdog, TS_TICK_US);
     if (time_is_valid())
-        start_microlink();
+        lifecycle_post_cmd(TS_LIFECYCLE_CMD_START);
     else
-        set_status("connecting", "時刻同期中…");
+        set_status(TS_ST_CONNECTING, "時刻同期中…");
 #endif
 }
 
@@ -264,13 +355,13 @@ static void begin_connect(void)
 static void refresh_idle_status(void)
 {
     if (!system_vault_tailscale_has())
-        set_status("not-configured", "未設定");
+        set_status(TS_ST_NOT_CONFIGURED, "未設定");
     else if (!system_vault_tailscale_enabled())
-        set_status("disabled", "オフ");
+        set_status(TS_ST_DISABLED, "オフ");
     else if (!s_net_up)
-        set_status("connecting", "ネットワーク待ち");
+        set_status(TS_ST_CONNECTING, "ネットワーク待ち");
     else
-        set_status("connecting", "接続準備中");
+        set_status(TS_ST_CONNECTING, "接続準備中");
 }
 
 void tailscale_adapter_init(void)
@@ -294,6 +385,10 @@ void tailscale_adapter_init(void)
         .callback = watchdog_tick, .name = "ts_wd",
     };
     esp_timer_create(&a, &s_watchdog);
+    /* single-owner lifecycle: all microlink start/stop runs on this task, so
+       lwIP sockets never get opened from a callback (tcpip_thread) context. */
+    s_lifecycle_queue = xQueueCreate(4, sizeof(ts_lifecycle_cmd_t));
+    xTaskCreate(lifecycle_task, "ts_lifecycle", 4096, NULL, 5, NULL);
     lock();
     refresh_idle_status();
     unlock();
@@ -312,7 +407,7 @@ void tailscale_adapter_on_net_up(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     if (system_vault_tailscale_has() && system_vault_tailscale_enabled()) {
         if (s_skip_autostart)   /* prior boot reset mid-connect: don't loop */
-            set_status("error", "前回接続中にリセット。手動で再試行/電源入れ直し");
+            set_status(TS_ST_ERROR, "前回接続中にリセット。手動で再試行/電源入れ直し");
         else
             begin_connect();
     } else {
@@ -324,12 +419,12 @@ void tailscale_adapter_on_net_up(void)
 void tailscale_adapter_get_status(tailscale_status_t *out)
 {
     lock();
-    snprintf(out->state, sizeof out->state, "%s", s_state);
+    snprintf(out->state, sizeof out->state, "%s", ts_state_str(s_state));
     snprintf(out->detail, sizeof out->detail, "%s", s_detail);
     out->retries = s_retries;
     out->configured = system_vault_tailscale_has();
     out->enabled = system_vault_tailscale_enabled();
-    if (s_ml && !strcmp(s_state, "connected")) {
+    if (s_ml && s_state == TS_ST_CONNECTED) {
         microlink_ip_to_str(microlink_get_vpn_ip(s_ml), out->ip);
         out->peers = microlink_get_peer_count(s_ml);
     } else {
@@ -358,10 +453,8 @@ bool tailscale_adapter_disable(void)
 {
     if (!system_vault_tailscale_set_enabled(false))
         return false;
-    lock();
-    stop_session();
-    set_status("disabled", "オフ");
-    unlock();
+    /* teardown (microlink_stop/destroy) runs on the lifecycle task */
+    lifecycle_post_cmd(TS_LIFECYCLE_CMD_STOP);
     return true;
 }
 
@@ -370,20 +463,13 @@ void tailscale_adapter_reauth(void)
     lock();
     s_skip_autostart = false;   /* new key = explicit retry: clear the crash guard */
     s_guard_fails = 0;
-    stop_session();
-    if (system_vault_tailscale_has() && system_vault_tailscale_enabled() && s_net_up)
-        begin_connect();
-    else
-        refresh_idle_status();
     unlock();
+    lifecycle_post_cmd(TS_LIFECYCLE_CMD_REAUTH);
 }
 
 void tailscale_adapter_forget(void)
 {
-    lock();
-    stop_session();
-    set_status("not-configured", "未設定");
-    unlock();
+    lifecycle_post_cmd(TS_LIFECYCLE_CMD_FORGET);
 }
 
 #else  /* CONFIG_MQJS_TAILSCALE off or host build: no-op stubs */
