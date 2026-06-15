@@ -223,6 +223,10 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
 
 ### Phase 3: microlink
 
+実装方針・選択肢調査・de-risking 手順は
+[`tailscale-microlink-plan.md`](tailscale-microlink-plan.md)。採用候補は MicroLink
+(ネイティブ C の Tailscale 互換クライアント、`tskey-auth` をそのまま消費)。
+
 - microlink adapter と lifecycle task
 - auth key の消費・保持方針を microlink の永続状態仕様に合わせる
 - Tailscale IP、hostname、状態、logout/re-auth
@@ -246,9 +250,22 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
     ~101KB/最大連続31KB に入らない)。id(quirc identify ~145ms) は本質コスト
     なのでオフロードが唯一の実効策。
 - system app 専用 one-shot scan API **(DONE: `camera.scanQr`)**
-- v1 parser、期限/対象確認、秘密を伏せた確認画面 **(未: 現状は復号テキストを
-  一時表示するのみ。MQJSP1 envelope 検証と確認画面は未実装)**
-- 明示確認後に用途別 API へ投入 **(未)**
+- v1 parser、期限/対象確認、秘密を伏せた確認画面 **(DONE)**
+  - `device_settings.js` が `MQJSP1:` envelope を base64url+UTF-8 復号し、
+    `mqjs_provision_qr.py` の `validate_payload()` と同じ検査
+    (v=1のみ・未知フィールド拒否・wifi/tailscaleのキー集合と UTF-8 byte長・
+    少なくとも一方必須) を JS 側で行う。不正時はフィールド名のみのエラー文を
+    表示し、復号した秘密値や JSON.parse の例外文（秘密を引用しうる）は出さない。
+  - 確認画面は対象端末/ID/有効期限と Wi-Fi SSID を表示し、パスワードと
+    Tailscale auth key は「設定あり（非表示）」とだけ表示する。有効期限は SNTP
+    前で時刻未同期なら「確認不可」、同期済みなら有効/期限切れを表示する
+    (best-effort; 期限切れは警告のみで適用はユーザの明示確認に委ねる)。
+  - host test: `tools/test_provision_parse.mjs` (28 ケース、Python 生成 wire text
+    の往復・拒否・秘密非漏洩・clock相対 expiry)。**device 実機確認は未**。
+- 明示確認後に用途別 API へ投入 **(DONE)**
+  - 「この設定を適用」で `system.wifiSet(ssid, password)` /
+    `system.tailscaleSet(authKey)` を呼び、結果(秘密を含まない)を表示。適用後は
+    payload 内の secret 参照を空にして寿命を縮める。
 
 ## 検証基準
 

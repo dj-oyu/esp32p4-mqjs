@@ -34,9 +34,18 @@ int main(void)
     assert(system_vault_tailscale_read(key, sizeof key));
     assert(!strcmp(key, "tskey-auth-test"));
     memset(key, 0, sizeof key);
+
+    /* enabled flag: defaults ON, toggles, and forget resets to ON */
+    assert(system_vault_tailscale_enabled());           /* default ON */
+    assert(system_vault_tailscale_set_enabled(false));
+    assert(!system_vault_tailscale_enabled());
+    assert(system_vault_tailscale_set_enabled(true));
+    assert(system_vault_tailscale_enabled());
+    assert(system_vault_tailscale_set_enabled(false));
     assert(system_vault_tailscale_forget());
     assert(!system_vault_tailscale_has());
+    assert(system_vault_tailscale_enabled());           /* forget -> default ON */
 
-    puts("PASS: System Vault set/read/forget and limits");
+    puts("PASS: System Vault set/read/forget, enabled flag, and limits");
     return 0;
 }

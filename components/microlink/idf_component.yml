@@ -1,0 +1,4 @@
+dependencies:
+  # IDF 6.0 dropped cJSON from core IDF; microlink's CMakeLists REQUIRES it.
+  # The managed component registers as `cjson` (hence REQUIRES json -> cjson).
+  espressif/cjson: "*"

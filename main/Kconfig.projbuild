@@ -19,6 +19,17 @@ menu "mqjs platform"
             (PI4IOE5V6408 @0x44, internal I2C). Enable for Tab5 builds
             so WiFi works; leave off for Stamp-P4.
 
+    config MQJS_TAILSCALE
+        bool "Tailscale (microlink) VPN client"
+        default n
+        help
+            Build the microlink-based Tailscale client + lifecycle adapter
+            and let the device join a tailnet from the System Vault auth key
+            (started via the Wi-Fi got-IP callback chain). Pulls microlink and
+            its WireGuard/cJSON/HTTP deps into the image. Off by default; when
+            disabled the adapter compiles to no-op stubs so Stamp builds are
+            unaffected. Needs PSA ChaCha20-Poly1305 (MBEDTLS_CHACHAPOLY_C).
+
     config MQJS_TASK_BROKER
         string "Task source MQTT broker URI"
         default "mqtt://test.mosquitto.org"

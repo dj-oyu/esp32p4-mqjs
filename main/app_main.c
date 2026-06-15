@@ -29,6 +29,7 @@
 #include "audio_tab5.h"
 #include "opus_player.h"
 #include "wifi.h"
+#include "tailscale_adapter.h"
 
 static const char *TAG = "app";
 
@@ -81,6 +82,7 @@ static void on_net_up(void)
 {
     task_source_start();   /* accept replacement tasks over MQTT */
     mqjs_notify_net_up();  /* drain the net.onReady wait queue (JS apps) */
+    tailscale_adapter_on_net_up();  /* start tailnet (NTP->microlink) if armed */
 }
 
 static void js_task(void *arg)
@@ -107,7 +109,10 @@ static void tab5_ui_ready(void *arg)
 {
     (void)arg;
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
-    cam_tab5_probe_once();               /* boot-time camera/V4L2 diagnostics */
+    /* No boot-time probe: it brought the CSI/ISP pipeline up and left it
+       STREAMING forever (~57MB/s MIPI->ISP->PSRAM DMA + per-frame ISP CCM
+       errors), competing with esp_hosted's SDIO DMA. The pipeline is now
+       brought up lazily on the first camera.scan and never at boot. */
 
 #if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     audio_tab5_selftest_async();
@@ -161,6 +166,17 @@ void app_main(void)
        does not use the C stack for JS frames, but the parser + bindings
        need headroom. Core 0: the LVGL task lives on Core 1 (see ui_tab5). */
     xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
+
+    /* Arm the Tailscale lifecycle before the network is up so its got-IP hook
+       in on_net_up() can start the time-sync->microlink chain (no-op without a
+       key). wifi.c owns SNTP; chain its sync callback to the adapter. */
+    tailscale_adapter_init();
+    wifi_set_time_sync_cb(tailscale_adapter_on_time_synced);
+    /* Camera <-> network mutual exclusion (camera-lifecycle-plan §4): a scan
+       suspends the microlink session (which otherwise starves the camera to
+       0.2 fps) and resumes it on teardown. cam_tab5 stays network-agnostic;
+       it calls these hooks. No-ops when Tailscale is off. */
+    cam_tab5_set_net_hooks(tailscale_adapter_suspend, tailscale_adapter_resume);
 
     /* Wi-Fi comes up in the background while the above already runs. Nothing
        blocks here on the network: the services that need it are released from

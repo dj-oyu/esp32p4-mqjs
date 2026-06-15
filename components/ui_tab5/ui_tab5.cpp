@@ -170,7 +170,9 @@ typedef struct {
     char text[UI_LOG_LINE_STORE + 2]; /* +closing '#' +NUL */
 } ui_log_line_t;
 
-static ui_log_line_t s_log[UI_LOG_LINES];
+/* 64KB console scrollback: PSRAM-resident (text only, never DMA/ISR) to keep
+   internal SRAM free for DMA-capable allocations (esp_hosted SDIO RX path). */
+static ui_log_line_t *s_log;
 static uint32_t s_log_head; /* total lines ever written (monotonic) */
 static SemaphoreHandle_t s_log_mtx;
 
@@ -1249,6 +1251,8 @@ public:
            the producer's worst-case wait tiny. Static: LVGL task only. */
         static ui_log_line_t batch[16];
         size_t got = 0;
+        if (!s_log_mtx)
+            return;
         xSemaphoreTake(s_log_mtx, portMAX_DELAY);
         if (s_log_head - _tail > UI_LOG_LINES)
             _tail = s_log_head - UI_LOG_LINES; /* ring lapped the reader */
@@ -2227,7 +2231,11 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     /* the data plane must exist before app_main registers the print
        sink, and must stay usable even if the panel init below fails
        (ui_tab5_log/set_status/cmd no-op while these are NULL) */
-    s_log_mtx = xSemaphoreCreateMutex();
+    /* allocate the scrollback in PSRAM; gate the mutex on success so the
+       NULL-mtx guards in the writer/reader also cover a failed allocation. */
+    s_log = (ui_log_line_t *)heap_caps_calloc(UI_LOG_LINES, sizeof(ui_log_line_t),
+                                              MALLOC_CAP_SPIRAM);
+    s_log_mtx = s_log ? xSemaphoreCreateMutex() : NULL;
     s_status_mtx = xSemaphoreCreateMutex();
     s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
 

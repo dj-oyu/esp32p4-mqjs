@@ -27,6 +27,18 @@ typedef void (*cam_tab5_cb_t)(const char *decoded_text_or_null, void *arg);
  * pass ui_tab5's bus handle once at boot, before the first scan. */
 void cam_tab5_set_i2c(void *i2c_master_bus_handle);
 
+/* Optional network-exclusion hooks. A scan suspends the heavy network traffic
+ * (Tailscale/microlink) that otherwise starves the camera (measured: 0.2 fps,
+ * quirc identify 26 s while a tailnet session is connected — see
+ * docs/camera-lifecycle-plan.md §1). suspend() MUST block until the network is
+ * observably stopped (the camera then owns the CPU/DMA bus before it streams);
+ * resume() re-arms it during scan teardown. Either may be NULL (no exclusion).
+ * Register once at boot, before the first scan; keeps cam_tab5 network-agnostic
+ * (no component dependency on the Tailscale adapter). */
+typedef void (*cam_tab5_net_hook_t)(void);
+void cam_tab5_set_net_hooks(cam_tab5_net_hook_t suspend_cb,
+                            cam_tab5_net_hook_t resume_cb);
+
 /* Boot-time probe for diagnostics: initialize esp_video and keep the capture
  * pipeline streaming so V4L2 format logs are emitted without a manual scan. */
 bool cam_tab5_probe_once(void);

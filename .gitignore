@@ -46,3 +46,6 @@ build_opus_*_log.txt
 
 # host QR investigation scratch (raw gray corpus)
 .qrtmp/
+
+# generated provisioning QR — embeds real Wi-Fi/Tailscale secrets, never commit
+docs/qr-test/provision.png

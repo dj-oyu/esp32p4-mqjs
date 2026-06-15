@@ -552,6 +552,8 @@ static const JSPropDef js_system[] = {
     JS_CFUNC_DEF("tailscaleSet", 1, js_system_tailscale_set),
     JS_CFUNC_DEF("tailscaleStatus", 0, js_system_tailscale_status),
     JS_CFUNC_DEF("tailscaleForget", 0, js_system_tailscale_forget),
+    JS_CFUNC_DEF("tailscaleEnable", 0, js_system_tailscale_enable),
+    JS_CFUNC_DEF("tailscaleDisable", 0, js_system_tailscale_disable),
     JS_PROP_END,
 };
 
