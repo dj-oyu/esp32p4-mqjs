@@ -70,7 +70,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
            Once only; reconnects keep the already-set clock. */
         if (!s_sntp_inited) {
             s_sntp_inited = true;
-            esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+                2, ESP_SNTP_SERVER_LIST("pool.ntp.org", "time.google.com"));
             sntp_cfg.sync_cb = sntp_synced;
             esp_netif_sntp_init(&sntp_cfg);
         }
