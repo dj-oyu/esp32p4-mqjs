@@ -42,6 +42,8 @@ typedef enum {
     TS_LIFECYCLE_CMD_STOP,
     TS_LIFECYCLE_CMD_REAUTH,
     TS_LIFECYCLE_CMD_FORGET,
+    TS_LIFECYCLE_CMD_SUSPEND,   /* external exclusive user (camera): stop, stay armed */
+    TS_LIFECYCLE_CMD_RESUME,    /* exclusive user done: re-arm if still enabled */
 } ts_lifecycle_cmd_t;
 
 static SemaphoreHandle_t s_lock;
@@ -56,6 +58,8 @@ static bool s_connected_once;
 static bool s_net_up;
 static bool s_starting;              /* armed: waiting for time sync / connecting */
 static bool s_skip_autostart;        /* set when a prior boot reset mid-connect */
+static bool s_suspended;             /* external exclusive user (camera) owns the radio */
+static SemaphoreHandle_t s_suspend_done; /* SUSPEND stop-completion -> suspend() */
 
 /* Crash-loop guard in RTC memory: survives a watchdog/SW reset, is random on a
    cold (power-on) boot. We "arm" it right before starting microlink and clear
@@ -215,12 +219,32 @@ static void lifecycle_handle_cmd(ts_lifecycle_cmd_t cmd) /* lifecycle_task only 
     lock();
     switch (cmd) {
     case TS_LIFECYCLE_CMD_START:   /* launch microlink once armed + clock valid */
-        if (!s_ml && s_starting && time_is_valid())
+        if (!s_suspended && !s_ml && s_starting && time_is_valid())
             start_microlink();
         break;
     case TS_LIFECYCLE_CMD_STOP:    /* user turned it off */
         stop_session();
         refresh_idle_status();
+        break;
+    case TS_LIFECYCLE_CMD_SUSPEND: { /* camera scan owns the radio: stop, stay armed */
+        bool had_session = (s_state == TS_ST_CONNECTED || s_state == TS_ST_CONNECTING);
+        s_suspended = true;
+        stop_session();            /* synchronous: tasks/sockets/DMA down on return */
+        if (had_session)           /* only override status if there was one to pause */
+            set_status(TS_ST_CONNECTING, "カメラ起動のため一時停止");
+        else
+            refresh_idle_status(); /* disabled / not-configured: stay honest */
+        if (s_suspend_done)
+            xSemaphoreGive(s_suspend_done);  /* observable stop-completion */
+        break;
+    }
+    case TS_LIFECYCLE_CMD_RESUME:  /* camera done: re-arm if still wanted */
+        s_suspended = false;
+        if (system_vault_tailscale_has() && system_vault_tailscale_enabled() &&
+            s_net_up && !s_skip_autostart)
+            begin_connect();
+        else
+            refresh_idle_status();
         break;
     case TS_LIFECYCLE_CMD_REAUTH:  /* new key: tear down, then re-arm */
         stop_session();
@@ -254,6 +278,10 @@ static void watchdog_tick(void *arg)
 {
     (void)arg;
     lock();
+    if (s_suspended) {   /* camera owns the radio: the timer is stopped, ignore strays */
+        unlock();
+        return;
+    }
     if (s_state == TS_ST_CONNECTED) {
         /* connected: log heap periodically (measurement) instead of stopping */
         ESP_LOGW(TAG, "connected heap: INTERNAL free=%u largest=%u | DMA free=%u "
@@ -313,7 +341,7 @@ void tailscale_adapter_on_time_synced(void)
     lock();
     /* runs in lwIP tcpip_thread — must NOT touch lwIP sockets here; just post
        a command for the lifecycle task to start microlink in a safe context. */
-    if (s_starting && !s_ml && time_is_valid())
+    if (!s_suspended && s_starting && !s_ml && time_is_valid())
         lifecycle_post_cmd(TS_LIFECYCLE_CMD_START);
     unlock();
 }
@@ -331,7 +359,7 @@ void tailscale_adapter_on_time_synced(void)
 
 static void begin_connect(void)
 {
-    if (s_ml || s_starting)
+    if (s_ml || s_starting || s_suspended)
         return;
 #if !TS_CONNECT_ENABLED
     set_status(TS_ST_ERROR, "一時無効（SDIO RAM調整中）");
@@ -381,6 +409,7 @@ void tailscale_adapter_init(void)
         ESP_LOGW(TAG, "%u consecutive resets mid-connect -> skipping auto-start "
                       "(power-cycle or re-enable to retry)", (unsigned)s_guard_fails);
     s_lock = xSemaphoreCreateRecursiveMutex();
+    s_suspend_done = xSemaphoreCreateBinary();
     const esp_timer_create_args_t a = {
         .callback = watchdog_tick, .name = "ts_wd",
     };
@@ -472,6 +501,31 @@ void tailscale_adapter_forget(void)
     lifecycle_post_cmd(TS_LIFECYCLE_CMD_FORGET);
 }
 
+/* Camera scan exclusion. Posts SUSPEND and BLOCKS (bounded) on the lifecycle
+ * task's stop-completion: when this returns, microlink's tasks/sockets/DMA are
+ * down (or there was no session) and auto-start is inhibited until resume().
+ * Runs on the camera owner task — never inside the lifecycle task — so there is
+ * no self-wait. The persisted enabled flag / crash guard are untouched. */
+void tailscale_adapter_suspend(void)
+{
+    if (!s_lifecycle_queue || !s_suspend_done)
+        return;                              /* not initialized: nothing to stop */
+    xSemaphoreTake(s_suspend_done, 0);       /* drop any stale completion */
+    if (!lifecycle_post_cmd(TS_LIFECYCLE_CMD_SUSPEND))
+        return;
+    /* bounded wait: the SUSPEND handler runs stop_session() synchronously, but a
+       START already queued ahead of it (start_microlink opens lwIP sockets) can
+       delay processing — 8s covers that. A timeout only means slightly noisier
+       contention for this scan, never a hang. */
+    if (xSemaphoreTake(s_suspend_done, pdMS_TO_TICKS(8000)) != pdTRUE)
+        ESP_LOGW(TAG, "suspend: stop-completion timed out");
+}
+
+void tailscale_adapter_resume(void)
+{
+    lifecycle_post_cmd(TS_LIFECYCLE_CMD_RESUME);
+}
+
 #else  /* CONFIG_MQJS_TAILSCALE off or host build: no-op stubs */
 
 void tailscale_adapter_init(void) {}
@@ -484,6 +538,8 @@ void tailscale_adapter_get_status(tailscale_status_t *out)
 }
 bool tailscale_adapter_enable(void) { return false; }
 bool tailscale_adapter_disable(void) { return false; }
+void tailscale_adapter_suspend(void) {}
+void tailscale_adapter_resume(void) {}
 void tailscale_adapter_reauth(void) {}
 void tailscale_adapter_forget(void) {}
 

@@ -54,6 +54,19 @@ void tailscale_adapter_get_status(tailscale_status_t *out);
 bool tailscale_adapter_enable(void);
 bool tailscale_adapter_disable(void);
 
+/* Temporary network exclusion for an external exclusive user (the camera
+ * scanner). suspend() stops the live microlink session WITHOUT touching the
+ * user's persisted enabled flag or the crash-loop guard, and BLOCKS (bounded)
+ * until the session is observably stopped — the stop-completion point the
+ * camera owner needs before relying on the exclusion. resume() re-arms the
+ * session if it is still configured + enabled + the network is up. One
+ * exclusive user (no nesting); both are idempotent and safe to call when
+ * Tailscale is not configured/enabled (suspend still blocks auto-start for the
+ * window and returns promptly). One-way dependency: the camera owner waits on
+ * this adapter; this adapter never waits on the camera. */
+void tailscale_adapter_suspend(void);
+void tailscale_adapter_resume(void);
+
 /* Re-start the session after the auth key changed (tailscaleSet). */
 void tailscale_adapter_reauth(void);
 

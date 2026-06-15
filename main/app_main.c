@@ -172,6 +172,11 @@ void app_main(void)
        key). wifi.c owns SNTP; chain its sync callback to the adapter. */
     tailscale_adapter_init();
     wifi_set_time_sync_cb(tailscale_adapter_on_time_synced);
+    /* Camera <-> network mutual exclusion (camera-lifecycle-plan §4): a scan
+       suspends the microlink session (which otherwise starves the camera to
+       0.2 fps) and resumes it on teardown. cam_tab5 stays network-agnostic;
+       it calls these hooks. No-ops when Tailscale is off. */
+    cam_tab5_set_net_hooks(tailscale_adapter_suspend, tailscale_adapter_resume);
 
     /* Wi-Fi comes up in the background while the above already runs. Nothing
        blocks here on the network: the services that need it are released from

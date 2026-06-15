@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "driver/i2c_master.h"
@@ -33,9 +34,11 @@
 #include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "esp_video_ioctl.h"   /* VIDIOC_S_DQBUF_TIMEOUT (bounded DQBUF) */
 #include "hal/isp_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "linux/videodev2.h"
 
@@ -68,13 +71,30 @@ typedef enum {
     SCAN_QR,
 } scan_mode_t;
 
-static struct {
+/* One scan request, posted to the resident owner task's command queue. Cancel
+ * is a separate atomic flag (s_cancel), NOT a queued command (see §7 of
+ * docs/camera-lifecycle-plan.md): teardown must run on the owner, so cancel
+ * only requests a stop. */
+typedef struct {
     cam_tab5_cb_t cb;
     void *arg;
     uint32_t timeout_ms;
     char prefix[8];
     scan_mode_t mode;
-} s_req;
+} cam_scan_req_t;
+
+static cam_scan_req_t s_req;   /* current scan, published by the owner task */
+
+/* network-exclusion hooks (cam_tab5_set_net_hooks): suspend()/resume() the
+ * heavy Tailscale/microlink traffic that starves the camera. */
+static cam_tab5_net_hook_t s_net_suspend, s_net_resume;
+
+void cam_tab5_set_net_hooks(cam_tab5_net_hook_t suspend_cb,
+                            cam_tab5_net_hook_t resume_cb)
+{
+    s_net_suspend = suspend_cb;
+    s_net_resume = resume_cb;
+}
 
 static void set_status(const char *fmt, const char *detail)
 {
@@ -849,9 +869,9 @@ static bool qr_once(void)
         quirc_destroy(q);
         return false;
     }
-    /* core 0 (with scan_task at prio 4), one below it: scan_task preempts to
-     * keep the viewfinder at frame rate, the worker takes the slack. Off
-     * core 1 so it never steals LVGL render time. */
+    /* core 0 (with the cam_owner task at prio 4), one below it: the owner
+     * preempts to keep the viewfinder at frame rate, the worker takes the
+     * slack. Off core 1 so it never steals LVGL render time. */
     if (xTaskCreatePinnedToCore(qr_worker, "qr_worker", 12288, NULL, 3,
                                 &s_qr_task, 0) != pdPASS) {
         quirc_destroy(q);
@@ -982,9 +1002,44 @@ static void draw_overlay(uint16_t *pv, const FrameHit *hit)
            col); /* ひげ線 → ラベルへ */
 }
 
-static void scan_task(void *pv)
+/* bounded DQBUF (camera-lifecycle-plan §1/§2.6): VIDIOC_S_DQBUF_TIMEOUT makes
+ * VIDIOC_DQBUF return after this long with no frame, so control returns to the
+ * owner to re-check the deadline/cancel. The old unbounded DQBUF hung 113s past
+ * the 45s deadline under network contention. CAM_DQBUF_MAX_FAILS consecutive
+ * empty waits (≈ that many × the timeout) means the stream is dead → bail early
+ * instead of spinning to the full deadline. */
+#define CAM_DQBUF_TIMEOUT_MS 500
+#define CAM_DQBUF_MAX_FAILS  12   /* ≈6s of zero frames before "stalled" */
+
+/* Network exclusion taken for this scan (resumed on teardown). Phase 1 suspends
+ * microlink for both modes; the QR-only full Wi-Fi-off (§4/§8) is a Phase 2
+ * measured experiment, so CAM_NET_WIFI is reserved but not yet wired. */
+typedef enum {
+    CAM_NET_NONE,
+    CAM_NET_MICROLINK,
+    CAM_NET_WIFI,
+} cam_net_policy_t;
+
+/* Per-scan ownership ledger: exactly what cam_run_scan acquired, so teardown
+ * releases the same set on every exit path (success / timeout / cancel /
+ * init-failure). Persistent resources (esp_video, REQBUFS/mmap, the PPA client,
+ * the quirc worker + decode buffers) are NOT here — they are acquire-once and
+ * kept (see pipeline_once / qr_once and the esp_video re-REQBUFS constraint,
+ * §9). STREAMON likewise stays on between scans (per-scan STREAMOFF is a Phase 2
+ * measured item). */
+typedef struct {
+    cam_net_policy_t net;   /* network suspended via the hook (resume on exit) */
+    bool dismiss_cb;        /* ui_tab5_cam_set_dismiss_cb installed */
+    bool canvas;            /* viewfinder canvas shown */
+} cam_ledger_t;
+
+/* One bounded scan, start to finish, on the resident owner task: acquire
+ * per-scan resources (network exclusion, UI), run the capture/decode loop, tear
+ * the ledger down on every exit, then publish the result. Returns (does NOT
+ * delete the task) — the owner loops for the next command. */
+static void cam_run_scan(void)
 {
-    static uint8_t line[CAM_W]; /* one scanner task at a time (s_busy) */
+    static uint8_t line[CAM_W]; /* one scan at a time (s_busy) */
     char code[CAM_TAB5_QR_PAYLOAD_MAX + 1];
     char lbl[112], lbl_cache[112];
     FrameHit disp, last_hit;
@@ -993,7 +1048,8 @@ static void scan_task(void *pv)
     int frame_no = 0;
     bool found = false;
     const char *fail = NULL;
-    bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+    cam_ledger_t led = { 0 };
+    bool qr_outstanding = false;
     /* per-stage averages, surfaced through camera.status() at scan end
        — the remote optimization telemetry (no serial in the field) */
     int64_t t_pv = 0, t_loc = 0, t_scan = 0;
@@ -1006,11 +1062,33 @@ static void scan_task(void *pv)
     last_hit.kind = 0;
     cached.found = 0;
 
+    /* §4 mutual exclusion: own the CPU/DMA bus BEFORE streaming. The hook BLOCKS
+       until the network owner reports stop-completion (microlink tasks/sockets/
+       DMA down), so the camera is not fighting DERP traffic when it starts —
+       that contention drove the camera to 0.2 fps (quirc identify 26s). Barcode
+       keeps Wi-Fi up for the post-scan NDL lookup; QR's full Wi-Fi-off is the
+       Phase 2 experiment — Phase 1 suspends microlink for both, which removes
+       the measured contender. */
+    if (s_net_suspend) {
+        s_net_suspend();
+        led.net = CAM_NET_MICROLINK;
+    }
+
+    bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+
     if (pipe_ok) {
+        /* bound DQBUF so the loop's deadline/cancel check actually runs */
+        struct timeval dqto = {
+            .tv_sec = 0, .tv_usec = CAM_DQBUF_TIMEOUT_MS * 1000,
+        };
+        ioctl(s_fd, VIDIOC_S_DQBUF_TIMEOUT, &dqto);
+
         /* web-modal viewfinder: tap outside it = cancel (and the scrim
            keeps every touch away from the UI behind, see ui_tab5) */
         ui_tab5_cam_set_dismiss_cb(cam_tab5_cancel);
+        led.dismiss_cb = true;
         uint16_t *preview = ui_tab5_cam_canvas(PV_W, PV_H);
+        led.canvas = true;
         set_status(s_req.mode == SCAN_QR ? "scanning QR%s" : "scanning%s",
                    NULL);
 
@@ -1019,15 +1097,15 @@ static void scan_task(void *pv)
          * first two frames captured right AFTER the previous scan
          * ended — typically the user still aiming at the book. Without
          * this flush those ghosts decode instantly on the next scan
-         * ("face in view, yet it found the ISBN of the last book"). */
-        for (int i = 0; i < CAM_BUFS && !fail; i++) {
+         * ("face in view, yet it found the ISBN of the last book").
+         * A timed-out DQBUF here just means nothing stale is queued. */
+        for (int i = 0; i < CAM_BUFS; i++) {
             struct v4l2_buffer buf = { 0 };
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
             if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0)
-                fail = "DQBUF failed (flush)";
-            else
-                ioctl(s_fd, VIDIOC_QBUF, &buf);
+                break;
+            ioctl(s_fd, VIDIOC_QBUF, &buf);
         }
 
         if (preview)
@@ -1035,7 +1113,6 @@ static void scan_task(void *pv)
                 ? "QRコードを画面内に入れてください"
                 : "スキャン中 (緑=読取 黄=惜しい)");
 
-        bool qr_outstanding = false;
         if (s_req.mode == SCAN_QR && qr_once()) {
             xSemaphoreTake(s_qr_result, 0); /* drop any stale completion */
             s_qr_hit = false;
@@ -1044,6 +1121,7 @@ static void scan_task(void *pv)
             s_qr_candidates = 0;
         }
 
+        int dq_fail = 0;
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         scan_started = esp_timer_get_time();
@@ -1052,9 +1130,17 @@ static void scan_task(void *pv)
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
             if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0) {
-                fail = "DQBUF failed";
-                break;
+                /* bounded timeout: re-check the loop condition. cancel/deadline
+                   is a normal end; a run of empty waits = a dead stream. */
+                if (s_cancel || esp_timer_get_time() >= deadline)
+                    break;
+                if (++dq_fail >= CAM_DQBUF_MAX_FAILS) {
+                    fail = "no frames (camera stalled)";
+                    break;
+                }
+                continue;
             }
+            dq_fail = 0;
             if (!s_logged_dqbuf_bytes) {
                 char fourcc[5];
                 ESP_LOGI(TAG, "DQBUF sample fmt=%s idx=%u bytesused=%u seq=%u",
@@ -1156,11 +1242,20 @@ static void scan_task(void *pv)
             if (pv_ok)
                 ui_tab5_cam_canvas_update();
         }
-        if (qr_outstanding)
-            xSemaphoreTake(s_qr_result, portMAX_DELAY); /* let the worker drain */
-        ui_tab5_cam_canvas_hide();
-        /* the pipeline stays up and streaming (see pipeline_once) */
     }
+
+    /* ---- teardown: release the ledger on EVERY exit path, in completion order
+       (decode drain -> UI dismiss -> network resume -> busy release -> result
+       callback; §12). Persistent resources are kept; the pipeline stays
+       streaming (see pipeline_once / §9). */
+    if (qr_outstanding)
+        xSemaphoreTake(s_qr_result, portMAX_DELAY); /* worker stops touching bufs */
+    if (led.canvas)
+        ui_tab5_cam_canvas_hide();
+    if (led.dismiss_cb)
+        ui_tab5_cam_set_dismiss_cb(NULL);
+    if (led.net != CAM_NET_NONE && s_net_resume)
+        s_net_resume();   /* re-arm the network now the camera released the bus */
 
     char done[256];
     char perf[192] = "";
@@ -1212,10 +1307,46 @@ static void scan_task(void *pv)
     cam_tab5_cb_t cb = s_req.cb;
     void *arg = s_req.arg;
     s_req.cb = NULL;
-    s_busy = false;
+    s_busy = false;          /* release before the callback so a re-scan can arm */
     if (cb)
         cb(found ? code : NULL, arg);
-    vTaskDelete(NULL);
+    /* resident owner: no vTaskDelete — loop back for the next command */
+}
+
+/* ---- single-owner lifecycle (camera-lifecycle-plan §3) -------------------
+   One resident task owns every scan: it serializes start/teardown (no
+   scan-vs-cancel double-free races), and — unlike the old self-deleting
+   per-scan task — survives between scans so repeated-cycle behavior is
+   observable. A second SCAN while busy is rejected at post time (the public
+   API returns 0), never queued (§3). Cancel is the atomic s_cancel flag, not a
+   command. */
+static QueueHandle_t s_cam_queue;
+static TaskHandle_t s_cam_owner;
+
+static void cam_owner_task(void *arg)
+{
+    (void)arg;
+    for (;;)
+        if (xQueueReceive(s_cam_queue, &s_req, portMAX_DELAY) == pdTRUE)
+            cam_run_scan();   /* publishes s_req, runs bounded, tears down, fires cb */
+}
+
+static bool cam_owner_once(void)
+{
+    if (s_cam_owner)
+        return true;
+    if (!s_cam_queue) {
+        /* depth 1: the busy-reject guarantees at most one outstanding scan */
+        s_cam_queue = xQueueCreate(1, sizeof(cam_scan_req_t));
+        if (!s_cam_queue)
+            return false;
+    }
+    /* core 0, prio 4 (JS task at prio 5 outranks it; unpinned it competed with
+       the core-1 LVGL render task) — same placement as the old per-scan task. */
+    if (xTaskCreatePinnedToCore(cam_owner_task, "cam_owner", 16384, NULL, 4,
+                                &s_cam_owner, 0) != pdPASS)
+        return false;
+    return true;
 }
 
 static bool scan_start(uint32_t timeout_ms, const char *prefix,
@@ -1227,20 +1358,22 @@ static bool scan_start(uint32_t timeout_ms, const char *prefix,
     }
     if (!video_init_once())
         return false;
-    s_req.cb = cb;
-    s_req.arg = arg;
-    s_req.timeout_ms = timeout_ms ? timeout_ms : 15000;
-    snprintf(s_req.prefix, sizeof s_req.prefix, "%s", prefix ? prefix : "");
-    s_req.mode = mode;
+    if (!cam_owner_once()) {
+        set_status("owner task create failed%s", NULL);
+        return false;
+    }
+    cam_scan_req_t req = {
+        .cb = cb,
+        .arg = arg,
+        .timeout_ms = timeout_ms ? timeout_ms : 15000,
+        .mode = mode,
+    };
+    snprintf(req.prefix, sizeof req.prefix, "%s", prefix ? prefix : "");
     s_cancel = false;
-    s_busy = true;
-    /* pinned to core 0 (with the JS task, which outranks it at prio 5):
-       unpinned it competed with the core-1 LVGL task for render time */
-    if (xTaskCreatePinnedToCore(scan_task, "cam_scan", 16384, NULL, 4, NULL,
-                                0) != pdPASS) {
+    s_busy = true;   /* set before posting so a second immediate call rejects */
+    if (xQueueSend(s_cam_queue, &req, 0) != pdTRUE) {
         s_busy = false;
-        s_req.cb = NULL;
-        set_status("task create failed%s", NULL);
+        set_status("scan queue full%s", NULL);
         return false;
     }
     return true;
@@ -1267,6 +1400,13 @@ void cam_tab5_cancel(void)
 void cam_tab5_set_i2c(void *i2c_master_bus_handle)
 {
     (void)i2c_master_bus_handle;
+}
+
+void cam_tab5_set_net_hooks(cam_tab5_net_hook_t suspend_cb,
+                            cam_tab5_net_hook_t resume_cb)
+{
+    (void)suspend_cb;
+    (void)resume_cb;
 }
 
 bool cam_tab5_probe_once(void)

@@ -1,8 +1,45 @@
 # Camera pipeline lifecycle redesign (QR / barcode) — design plan
 
-Status: **design** (2026-06-15). Implementation pending. Supersedes the ad-hoc
-`cam_tab5` scan path. Companion to the just-landed `tailscale_adapter`
-single-owner lifecycle refactor (commit `aa58c85`), whose pattern this mirrors.
+Status: **Phase 1 implemented** (2026-06-16), pending on-device verification.
+Phase 2 (QR reticle window + internal-SRAM quirc + full Wi-Fi-off) remains
+design, gated on the M1/M2/M3 device measurements. Supersedes the ad-hoc
+`cam_tab5` scan path. Companion to the `tailscale_adapter` single-owner
+lifecycle refactor (commit `aa58c85`), whose pattern this mirrors.
+
+## Phase 1 — what landed (code, not yet device-verified)
+
+- **Single-owner camera task.** `cam_tab5.c` now has a resident `cam_owner_task`
+  + `cam_cmd_queue` (`cam_scan_req_t`, depth 1). `scan_start` posts a request
+  instead of spawning a self-deleting task; a SCAN while busy is rejected at post
+  time (public API returns 0), never queued. `cam_run_scan()` returns; the owner
+  loops. Cancel stays the atomic `s_cancel` flag (§7), not a command.
+- **Camera ↔ network mutual exclusion.** `cam_tab5_set_net_hooks(suspend,
+  resume)` keeps cam_tab5 network-agnostic; `main/app_main.c` registers
+  `tailscale_adapter_suspend/resume`. `tailscale_adapter` gained SUSPEND/RESUME
+  lifecycle commands + an `s_suspended` flag that inhibits every auto-start path
+  (START handler, `begin_connect`, watchdog, on-net-up, on-time-synced). suspend()
+  posts SUSPEND and **blocks (≤8s) on a stop-completion semaphore** — the
+  cross-owner handshake (§3). The persisted enabled flag / crash guard are
+  untouched; one-way dependency (camera waits on the adapter, never the reverse).
+  Phase 1 suspends **microlink for both modes** (the measured heavy contender);
+  the QR-only full Wi-Fi-off (§4/§8) is deferred to Phase 2.
+- **Ownership ledger.** `cam_ledger_t {net, dismiss_cb, canvas}` records exactly
+  what each scan acquired; teardown releases the same set on **every** exit path
+  (found / timeout / cancel / init-failure) in the §12 completion order: decode
+  drain → UI dismiss → network resume → busy release → result callback.
+- **Bounded ownership (§2.6).** `VIDIOC_S_DQBUF_TIMEOUT` (500 ms) makes DQBUF
+  return so the loop re-checks the deadline/cancel — the old unbounded DQBUF hung
+  113 s past the 45 s deadline. A consecutive-empty-wait cap (≈6 s) bails on a
+  dead stream before the full deadline.
+- **Kept as-is (Phase 2 / §9 open items):** esp_video stays acquire-once
+  (no re-REQBUFS) and **keeps streaming between scans** (per-scan STREAMOFF is a
+  measured item); QR still decodes the full-res 800×600 crop in PSRAM (no reticle
+  window, no internal-SRAM quirc yet).
+
+Verify list for the device: scan while a tailnet session is connected →
+microlink suspends → fps recovers (was 0.2) → resumes after with no leak, for
+both barcode and QR; repeated found/timeout/cancel cycles return to idle; no
+heap/largest-block downward trend across cycles (MEAS line).
 
 ---
 
