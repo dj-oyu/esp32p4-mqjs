@@ -11,6 +11,7 @@
 #define NS "mqjs_sysvault"
 #define K_WIFI      "wifi"
 #define K_TS_AUTH   "ts_auth"
+#define K_TS_ENABLED "ts_on"
 
 typedef struct {
     uint8_t version;
@@ -82,6 +83,7 @@ static bool wifi_get(wifi_credential_t *out)
 static char s_wifi_ssid[SYSTEM_VAULT_WIFI_SSID_MAX + 1];
 static char s_wifi_pass[SYSTEM_VAULT_WIFI_PASS_MAX + 1];
 static char s_ts_auth[SYSTEM_VAULT_TS_AUTH_MAX + 1];
+static bool s_ts_enabled = true;  /* default ON */
 
 static bool copy_if_set(const char *src, char *dst, size_t cap)
 {
@@ -221,9 +223,37 @@ bool system_vault_tailscale_read(char *dst, size_t cap)
 bool system_vault_tailscale_forget(void)
 {
 #ifdef ESP_PLATFORM
-    return erase_key(K_TS_AUTH);
+    bool auth = erase_key(K_TS_AUTH);
+    bool en = erase_key(K_TS_ENABLED);  /* back to default ON */
+    return auth && en;
 #else
     memset(s_ts_auth, 0, sizeof s_ts_auth);
+    s_ts_enabled = true;
+    return true;
+#endif
+}
+
+bool system_vault_tailscale_enabled(void)
+{
+#ifdef ESP_PLATFORM
+    uint8_t v;
+    if (!vault_open() || nvs_get_u8(s_handle, K_TS_ENABLED, &v) != ESP_OK)
+        return true;  /* never set -> default ON */
+    return v != 0;
+#else
+    return s_ts_enabled;
+#endif
+}
+
+bool system_vault_tailscale_set_enabled(bool enabled)
+{
+#ifdef ESP_PLATFORM
+    if (!vault_open() ||
+        nvs_set_u8(s_handle, K_TS_ENABLED, enabled ? 1 : 0) != ESP_OK)
+        return false;
+    return nvs_commit(s_handle) == ESP_OK;
+#else
+    s_ts_enabled = enabled;
     return true;
 #endif
 }

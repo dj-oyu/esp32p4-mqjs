@@ -30,6 +30,12 @@ bool system_vault_tailscale_has(void);
 bool system_vault_tailscale_read(char *dst, size_t cap);
 bool system_vault_tailscale_forget(void);
 
+/* User on/off preference for the Tailscale session, persisted alongside the
+ * auth key. Defaults to ON (enabled) when never set, so setting a key starts a
+ * session without an extra toggle. tailscale_forget() clears it back to ON. */
+bool system_vault_tailscale_enabled(void);
+bool system_vault_tailscale_set_enabled(bool enabled);
+
 #ifdef __cplusplus
 }
 #endif
