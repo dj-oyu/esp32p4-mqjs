@@ -369,8 +369,13 @@ microlink は内部で自動再接続 (~5-10s) し、`ERROR`/`RECONNECTING` は 
    `clearInterval`) + オン/オフ トグル + 保存(→自動接続)/削除、mainPage 行に状態 — **済
    (Node ロード検証 + 最終 firmware ビルド グリーン)**
 
-**Phase 3 本実装 (②③④) はコード完了・全ビルド検証グリーン。残りは実機接続テスト
-(レイヤ2 以降: 実 Tab5 COM8 + ephemeral auth key)。**
+**Phase 3 本実装 (②③④) はコード完了・全ビルド検証グリーン。**
+
+**実機検証 (2026-06-15, Tab5 COM8 フラッシュ済み):** 無効キー入りのデモ provisioning QR を
+実機でスキャン→適用したところ、QR デコード→確認画面 (key マスク)→Vault投入→NTP同期→
+microlink 起動→**きっちり 5 回で接続失敗して停止** (無限リトライせず) を確認。
+失敗パス全経路が device-verified。残りは **実 auth key での成功パス** (PSA AEAD が正しい
+ciphertext を出して実際に tailnet 参加・VPN IP 取得・直結/DERP) — 実キーが要るため未。
 
 ### 将来タスク (Phase 3 スコープ外)
 

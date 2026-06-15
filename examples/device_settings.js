@@ -186,7 +186,7 @@ function mainPage() {
              wifiPage);
     list.add("Tailscale    " + (ts.configured ? tsShort(ts) : "未設定"),
              tailscalePage);
-    list.add("QR読み取りテスト", qrTestPage);
+    list.add("QRで設定を読み込む", qrTestPage);
     s.label("この画面は端末ファームウェアに組み込まれています。");
     s.button("アプリ一覧へ戻る", function () {
         clearTsTimer();
