@@ -52,16 +52,25 @@ boot-probe regression we already removed).
 
 ## 2. Design goals
 
-1. **On-demand**: nothing camera-related runs at boot or between scans (no
-   continuous CSI/ISP DMA, no buffers held).
+1. **On-demand activity**: nothing camera-related runs at boot, and no continuous
+   CSI/ISP DMA runs between scans. Any persistent buffers or driver state must be
+   measured and justified by the esp_video lifecycle constraint.
 2. **QR / barcode modes**, each with its own resource policy (§4).
-3. **Forget-proof resource release**: acquisition and release are paired in one
-   place each, and release is *mechanically guaranteed* on every exit path —
-   the C analogue of Go `defer` / Java/Python try-with-resources. (Past bug: a
-   one-shot boot probe left `STREAMON` running forever.)
+3. **Auditable resource release**: acquisition and release are paired and every
+   exit path is observable in measurement. The exact mechanism is intentionally
+   left open until the lifecycle experiments below establish what the drivers
+   and worker tasks actually guarantee. (Past bug: a one-shot boot probe left
+   `STREAMON` running forever.)
 4. **Camera ↔ network mutual exclusion** to kill the contention.
 5. Single owner serializes all transitions (no scan-vs-cancel / double-start
    races).
+6. **Bounded ownership** (requirement, not a tuning knob): the owner must never
+   block indefinitely in a driver or worker call. Frame wait, stream stop,
+   network stop/resume, and worker completion all use bounded waits (e.g.
+   `select` timeout / non-blocking `DQBUF`). This is settled by §1: the current
+   blocking `DQBUF` hung **113 s past the 45 s deadline** because control never
+   returned to the owner to re-check it. The §12 "blocked operations" items
+   verify each call actually meets its bound.
 
 ---
 
@@ -78,20 +87,26 @@ cam_owner_task (resident)  ← cam_cmd_queue
 - Public `camera.scan/scanQr` → `cam_cmd_post(SCAN{...})` (non-blocking).
 - The owner runs **one scan at a time**; a second SCAN while busy → immediate
   `cb(busy)` (not queued).
-- The owner calls `cam_run_scan()` — a function that **returns** (so the
-  `cleanup` attribute fires; see §5). The owner then loops. (The current
-  `scan_task` ends in `vTaskDelete(NULL)`, which never returns and would defeat
-  `__attribute__((cleanup))` — hence the resident owner.)
+- The owner runs one bounded scan operation, completes its teardown, publishes
+  the result, and then loops. The exact teardown mechanism remains open (§5);
+  unlike the current self-deleting `scan_task`, the resident owner preserves a
+  context in which completion and repeated-cycle behavior can be observed.
+- **Cross-owner handshake**: the camera owner and the `tailscale_adapter` owner
+  coordinate across tasks. The camera owner suspends the network by command, but
+  must wait for an observable **stop-completion** from the network owner before
+  relying on the exclusion — posting STOP is not "stopped" (§12 suspend
+  completion). Resume is the symmetric step during teardown. Avoid a circular
+  wait between the two owners (define a one-way dependency).
 
 ---
 
-## 4. Mode-specific resource policy
+## 4. Mode-specific resource policy candidates
 
 | | **Barcode (EAN-13)** | **QR** |
 |---|---|---|
-| Network suspend | **microlink only** (Wi-Fi stays up) | **Wi-Fi fully off** |
+| Network suspend | **microlink only** (Wi-Fi stays up) | **Wi-Fi fully off target** |
 | Capture region | **no crop** (full 800×600 center, θ-fan line scan) | **crop to reticle window** (small, native-res) |
-| Decode buffer | n/a (no quirc; line scan) | quirc image → **internal SRAM** |
+| Decode buffer | n/a (no quirc; line scan) | quirc image → **internal SRAM target** |
 | Aiming | none (current behavior, already fast) | reticle overlay (§6) |
 
 Rationale:
@@ -99,15 +114,16 @@ Rationale:
   remove the microlink CPU contention. Wi-Fi stays up so the post-scan
   **NDL book lookup** can run (it may show "問い合わせ中" and finish async — the
   user confirmed waiting is acceptable).
-- **QR** benefits from a small native crop (fits internal SRAM, faster decode)
+- **QR** may benefit from a small native crop (target: internal SRAM, faster decode)
   and there is no need for the network *during* the scan: the QR result
   (provisioning: Wi-Fi/Tailscale keys) is processed **after** the pipeline stops,
-  in the callback. So Wi-Fi can be fully off, which (a) frees the most CPU/DMA
-  bandwidth and (b) frees enough internal SRAM to host the quirc buffer (§8).
+  in the callback. Full Wi-Fi-off is therefore the first candidate to measure:
+  it should free the most CPU/DMA bandwidth and may free enough internal SRAM to
+  host the quirc buffer (§8).
 
 ---
 
-## 5. Forget-proof resource model — `__attribute__((cleanup))` defer
+## 5. Resource ownership model
 
 Two tiers (the split is forced by an esp_video constraint, §9):
 
@@ -115,59 +131,24 @@ Two tiers (the split is forced by an esp_video constraint, §9):
   `REQBUFS`/mmap + PPA client. esp_video cannot be torn down and re-`REQBUFS`'d
   (§9), so these are brought up on the first scan and kept. They do **not** stream
   by themselves — streaming = `STREAMON`, which is per-scan.
-- **Per-scan (defer-managed — released on every exit)**: `STREAMON`↔`STREAMOFF`,
-  the busy flag, preview canvas + dismiss-cb registration, the network suspend
-  (§4), and (QR) the quirc worker + quirc/crop buffers.
+- **Per-scan (must be released before completion is published)**:
+  `STREAMON`↔`STREAMOFF`, the busy state, preview canvas + dismiss callback,
+  network suspension (§4), and (QR) the decoder worker + decode buffers.
 
-The mechanism:
+The intended ownership rule is simple: the camera owner acquires per-scan
+resources, is the only context allowed to release them, and does not publish the
+scan result until teardown has reached a known state. Acquisition must record
+what actually succeeded so partial-start failures can be unwound and measured.
 
-```c
-typedef enum { CAM_MODE_BARCODE, CAM_MODE_QR } cam_mode_t;
+The exact teardown mechanism is deliberately not selected here. A scope cleanup
+helper, explicit state machine, or another mechanism is acceptable only after it
+demonstrates the same behavior for success, timeout, cancel, initialization
+failure, decode-worker failure, and network-resume failure.
 
-/* acquisition ledger: cam_scan_begin records what it actually acquired;
-   cam_scan_end releases exactly that (idempotent, safe on partial-begin). */
-typedef struct {
-    bool active;        /* begin got far enough to run */
-    bool streaming;     /* STREAMON issued      -> STREAMOFF */
-    bool net_suspended; /* microlink/Wi-Fi off  -> resume    */
-    bool qr;            /* quirc + worker + crop -> free      */
-    bool canvas;        /* preview canvas/dismiss-cb -> unregister */
-} cam_scan_t;
-
-static cam_scan_t cam_scan_begin(cam_mode_t mode, uint32_t timeout_ms);
-static void       cam_scan_end(cam_scan_t *s);   /* the single teardown */
-
-static void cam_run_scan(cam_mode_t mode, uint32_t to, cam_cb_t cb, void *arg)
-{
-    cam_scan_t scan __attribute__((cleanup(cam_scan_end)))
-        = cam_scan_begin(mode, to);
-    if (!scan.active) { cb(arg, FAIL); return; }   /* cleanup still runs (idempotent) */
-
-    /* ... DQBUF/QBUF loop: decode, check s_cancel + deadline ... */
-    /* On ANY exit (found / timeout / cancel / error / early return) the compiler
-       runs cam_scan_end(&scan): STREAMOFF → free QR bufs → unregister canvas →
-       resume network → busy=false. Impossible to forget. */
-    cb(arg, result);
-}
-```
-
-```c
-static void cam_scan_end(cam_scan_t *s)            /* one place, symmetric */
-{
-    if (s->canvas)        ui_tab5_cam_set_dismiss_cb(NULL);  /* + hide canvas */
-    if (s->qr)            { /* worker delete, quirc_destroy, free crop/qr bufs */ }
-    if (s->streaming)     ioctl(s_fd, VIDIOC_STREAMOFF, &type);
-    if (s->net_suspended) net_resume(s->mode);     /* §4: microlink or Wi-Fi */
-    s_busy = false; s->active = false;
-}
-```
-
-**Key invariant**: resource *safety* (no leak, network always resumed) is
-guaranteed by `cam_scan_end` + the `cleanup` attribute + the scan **deadline**
-(every scan ends → `cam_run_scan` returns → cleanup fires). It does **not**
-depend on cancel being observed. The boot-probe class of bug (acquire-and-forget)
-is structurally impossible: there is no code path that acquires without the
-paired cleanup.
+The deadline bounds normal scans, but it is not by itself a resource-safety
+guarantee: a blocked driver call or worker that does not finish can prevent the
+owner from reaching teardown. Those cases are lifecycle verification items, not
+assumed solved.
 
 ---
 
@@ -202,12 +183,12 @@ Open item **M2**: find the smallest reticle that reliably captures an aligned QR
   `while (!s_cancel && now < deadline && !found)`; it waits on the fd with a
   bounded timeout (~50 ms `select`) so the flag is checked promptly even at low
   fps.
-- The **only** teardown ("suicide") function is `cam_scan_end`, run **on the
-  owner task** via `cleanup`. Resources are owned by the running scan, so freeing
-  them from another task = use-after-free. Cancel therefore *requests* a stop; the
-  owner reaches `cam_scan_end` and tears down. ("Request suicide; the owner dies",
-  not "kill from outside".)
-- Even if a cancel is missed, the **deadline** guarantees teardown → no leak.
+- Teardown runs on the owner task. Resources are owned by the running scan, so
+  freeing them from another task risks use-after-free. Cancel therefore requests
+  a stop; the owner performs teardown after outstanding operations reach a known
+  state.
+- A deadline bounds the normal scan loop, but cancel latency and teardown still
+  depend on blocking driver/worker operations returning. Measure these paths.
 - (Optional, only if low-fps cancel latency matters: `STREAMOFF` from cancel
   unblocks a stuck `DQBUF` — V4L2's documented unblock — but needs the careful
   "invalidate → wait for the select cycle → free" ordering, cf. microlink
@@ -232,9 +213,9 @@ Internal heap budget (measured):
   `QUIRC_PIXEL_ALIAS_IMAGE`, uint8 regions), so total ≈ H×W + small flood-fill vars.
 - **Full-res 800×600 = 469 KB > 293 KB ceiling → cannot fit internal, ever**
   (cache already minimal; reducing static 283 KB enough is unrealistic).
-- **Cropped 400×400 = 160 KB**: with Wi-Fi off freeing the esp_hosted/lwIP/microlink
-  runtime internal (~60–100 KB) and camera buffers in PSRAM, a contiguous ~160 KB
-  internal block should be available → quirc image fits internal.
+- **Cropped 400×400 = 160 KB**: Wi-Fi off may free enough esp_hosted/lwIP/
+  microlink runtime internal memory for the image, but total free bytes do not
+  imply a contiguous block or that the allocator will place the image there.
 
 Open item **M1**: measure `heap_caps_get_largest_free_block(INTERNAL)` with Wi-Fi
 off + camera buffers in PSRAM to confirm the achievable contiguous block.
@@ -274,11 +255,14 @@ decode/preview. (Verify need after Phase 1.)
 
 ## 11. Phasing
 
-- **Phase 1 — owner + defer + mutual exclusion (the fps fix).**
-  - `tailscale_adapter_suspend()/resume()` (post to the TS lifecycle queue;
-    auto-resume; do not touch enabled/guard; status "一時停止").
-  - `cam_owner_task` + `cam_cmd_queue`; `cam_run_scan()` returns; `cam_scan_t`
-    `cleanup` ledger with `net_suspended` (barcode: microlink / QR: Wi-Fi).
+- **Phase 1 — owner + auditable teardown + mutual exclusion (the fps fix).**
+  - Add temporary network suspension without changing the user's enabled/guard
+    state; determine the required stop-completion and resume semantics by
+    measurement.
+  - `cam_owner_task` + `cam_cmd_queue`; `cam_run_scan()` returns; an ownership
+    ledger that records the per-scan resources actually acquired, incl. network
+    state (barcode: microlink / QR: Wi-Fi). (Ledger as a concept; the teardown
+    mechanism stays open per §5.)
   - `scan_start` posts SCAN instead of spawning a task.
   - Verify: scan while connected → network suspends → fps recovers → resumes
     after (no leak), barcode and QR.
@@ -288,7 +272,71 @@ decode/preview. (Verify need after Phase 1.)
 
 ---
 
-## 12. Open questions / verification items
+## 12. Lifecycle and memory investigation
+
+This section records problems to resolve while implementing and measuring. It
+does not prescribe APIs or teardown code before the device behavior is known.
+
+### Lifecycle management
+
+- **Suspend completion**: posting a network-stop request is not proof that its
+  tasks, sockets, DMA, or callbacks have stopped. Determine the observable point
+  at which camera start is safe.
+- **Starts during suspension**: account for reconnects, delayed lifecycle
+  commands, time-sync callbacks, and user configuration changes arriving while
+  a scan owns the exclusion window.
+- **Completion ordering**: define and measure the order between decoder drain,
+  camera stream stop, UI dismissal, network resume, busy-state release, and
+  result callback. In particular, result handling must not race resources still
+  owned by the previous scan.
+- **Worker shutdown**: a QR timeout or cancel may occur while decode is running.
+  Verify that the worker has stopped touching shared buffers before they are
+  released or reused.
+- **Blocked operations**: verify bounded behavior for frame wait, stream stop,
+  network stop/resume, and worker completion. The scan deadline only works if
+  control returns to the owner.
+- **Partial acquisition**: inject failure after each acquisition step and verify
+  that the system returns to a usable idle state.
+- **Repeated cycles**: run scan/cancel/timeout/found loops and confirm no stale
+  frames, duplicate callbacks, stuck busy state, lost network resume, or gradual
+  latency growth.
+- **Wi-Fi full-off semantics**: determine how disconnect callbacks, automatic
+  reconnect, DHCP, SNTP, microlink, and other network users behave across a QR
+  scan. Full-off remains a hypothesis until this is repeatable.
+- **esp_video state boundary**: establish which combination of persistent setup,
+  queued buffers, and stream state survives repeated scans. Do not assume either
+  full teardown or keep-streaming fallback is acceptable before measurement.
+
+### Memory management
+
+- **Peak, not steady-state, budget**: record internal/DMA/PSRAM free bytes and
+  largest blocks before, during, and after every acquisition and teardown step.
+- **Fragmentation**: repeated Wi-Fi/microlink and QR worker cycles may return the
+  same total bytes while shrinking the largest usable block. Track both values
+  over long cycle tests.
+- **Placement guarantee**: verify where each large allocation actually lands.
+  Requesting or expecting internal SRAM is not sufficient without an observed
+  placement guarantee.
+- **Overlapping lifetimes**: identify the true peak when old network resources
+  are still draining while camera/QR resources begin, and again during resume
+  before camera resources are fully released.
+- **Persistent cost**: quantify the memory retained by lazy camera initialization,
+  mapped V4L2 buffers, PPA state, task stacks, queues, and synchronization
+  objects between scans.
+- **Stack headroom**: measure owner and decoder worker high-water marks on normal,
+  failure, and cancellation paths.
+- **Allocation failure behavior**: every large allocation failure must leave the
+  next scan and network resume usable; validate with deliberate low-memory runs.
+- **quirc policy**: choose crop size, allocation placement, and reuse-vs-release
+  policy only after M1/M3 and fragmentation measurements.
+
+Exit criteria for a lifecycle choice: repeated found/timeout/cancel/failure
+cycles return to the same observable idle state, network service recovers, no
+resource metric trends downward, and the next scan behaves like the first.
+
+---
+
+## 13. Open questions / verification items
 
 - **M1**: contiguous internal free with Wi-Fi off + camera PSRAM buffers (does
   the 400×400 quirc image fit?).
@@ -300,10 +348,15 @@ decode/preview. (Verify need after Phase 1.)
   style wait, but confirm UX.
 - Barcode microlink-suspend: confirm WiFi-idle SDIO DMA doesn't itself starve the
   camera (expected fine; microlink was the heavy contender).
+- Suspend/resume completion points and callbacks that can race the exclusion
+  window.
+- Result callback ordering relative to camera teardown and network resume.
+- QR worker drain/cancel behavior and bounded teardown latency.
+- Long-run heap fragmentation and stack high-water marks across repeated cycles.
 
 ---
 
-## 13. References
+## 14. References
 
 - `tailscale_adapter.c` single-owner lifecycle + `ts_lifecycle_cmd_t` (commit
   `aa58c85`) — the pattern this mirrors; also the tcpip_thread deadlock write-up.
