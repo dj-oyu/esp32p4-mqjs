@@ -10,6 +10,7 @@
 #include "microlink.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <time.h>
@@ -92,6 +93,13 @@ static void start_microlink(void)
 {
     if (s_ml)
         return;
+    /* internal-RAM watermark: esp_hosted's SDIO RX path needs internal DMA RAM;
+       a small largest-block here is what makes the handshake-time alloc fail. */
+    ESP_LOGW(TAG, "start: INTERNAL free=%u largest=%u | DMA free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     s_retries = 0;   /* fresh budget for the connect phase */
     s_session_key = malloc(SYSTEM_VAULT_TS_AUTH_MAX + 1);
     if (!s_session_key ||
