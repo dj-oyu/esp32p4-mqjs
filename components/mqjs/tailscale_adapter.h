@@ -37,9 +37,14 @@ typedef struct {
 /* Call once at boot, before wifi_start(). */
 void tailscale_adapter_init(void);
 
-/* Hook from on_net_up() (got-IP event context). Begins the NTP -> microlink
- * chain when a key is present and enabled; otherwise no-op. */
+/* Hook from on_net_up() (got-IP event context). Arms the session when a key is
+ * present and enabled; otherwise no-op. The actual microlink start waits for
+ * time sync (TAI64N), driven by tailscale_adapter_on_time_synced(). */
 void tailscale_adapter_on_net_up(void);
+
+/* Hook from the Wi-Fi SNTP sync callback (wifi_set_time_sync_cb). Starts
+ * microlink once the wall clock is valid and the session is armed. */
+void tailscale_adapter_on_time_synced(void);
 
 /* Snapshot the current status (copied; safe to read any time). */
 void tailscale_adapter_get_status(tailscale_status_t *out);

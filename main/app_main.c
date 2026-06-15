@@ -165,8 +165,10 @@ void app_main(void)
     xTaskCreatePinnedToCore(js_task, "mqjs", 16384, NULL, 5, NULL, 0);
 
     /* Arm the Tailscale lifecycle before the network is up so its got-IP hook
-       in on_net_up() can start the NTP->microlink chain (no-op without a key). */
+       in on_net_up() can start the time-sync->microlink chain (no-op without a
+       key). wifi.c owns SNTP; chain its sync callback to the adapter. */
     tailscale_adapter_init();
+    wifi_set_time_sync_cb(tailscale_adapter_on_time_synced);
 
     /* Wi-Fi comes up in the background while the above already runs. Nothing
        blocks here on the network: the services that need it are released from

@@ -371,11 +371,28 @@ microlink は内部で自動再接続 (~5-10s) し、`ERROR`/`RECONNECTING` は 
 
 **Phase 3 本実装 (②③④) はコード完了・全ビルド検証グリーン。**
 
-**実機検証 (2026-06-15, Tab5 COM8 フラッシュ済み):** 無効キー入りのデモ provisioning QR を
-実機でスキャン→適用したところ、QR デコード→確認画面 (key マスク)→Vault投入→NTP同期→
-microlink 起動→**きっちり 5 回で接続失敗して停止** (無限リトライせず) を確認。
-失敗パス全経路が device-verified。残りは **実 auth key での成功パス** (PSA AEAD が正しい
-ciphertext を出して実際に tailnet 参加・VPN IP 取得・直結/DERP) — 実キーが要るため未。
+**実機検証 (2026-06-15, Tab5 COM8):**
+
+- 無効キーのデモ QR: デコード→確認(key マスク)→Vault投入→**5回で停止**(無限リトライせず)。
+  失敗パス device-verified。起動音(Opus)/ISP gamma の regression も実機で修正確認 (gamma 0 件)。
+- **実 auth key で接続を試行 → 2 つの SNTP バグが発覚 (修正済み)**:
+  1. **SNTP 二重初期化**: `wifi.c` が既に `esp_netif_sntp_init` 済みなのに adapter も呼び
+     「already initialized」で失敗 → time-sync コールバック未登録 → **microlink が起動せず**
+     5回で諦め (「本物キーで失敗」の真因; キーは無実)。修正: adapter は再 init せず、
+     `wifi.c` の SNTP sync_cb を `wifi_set_time_sync_cb` で adapter に連結 (コールバックチェーン)。
+  2. **SNTP が IP 取得前に init + 1h ポーリング**: 初回要求が空振りし時刻が同期しない。
+     修正: `esp_netif_sntp_init` を **got-IP ハンドラへ移設** (ネット確立後に init → 初回成功)。
+- **修正後: microlink が起動し STUN✓ / controlplane DNS✓ / TCP✓ / Noise msg1 構築・送信 まで
+  到達** = **PSA 暗号・auth key・SNTP が全て正しく動作**。
+- **残ブロッカー (Tailscale 接続の最終課題): esp_hosted SDIO の内部 DMA RAM 枯渇クラッシュ**。
+  ハンドシェイク送信時、`sdio_drv.c:953` で `_h_malloc_align(4608, 64)` が NULL →
+  `assert(*buf)` → クラッシュ。microlink タスク群+カメラ+LVGL+mqjs で内部 SRAM 逼迫
+  (memory: 空き ~101KB / 最大連続 31KB)。auto-start なので **クラッシュ→再起動のブートループ**。
+  → **`begin_connect` を `TS_CONNECT_ENABLED=0` で一時ゲート** (auto/manual とも microlink を
+  起動しない安定版)。**次タスク = 内部 RAM を空ける** (prior-art tab5-camera-viewer は linear
+  バッファを PSRAM へ移し +94KB 確保して microlink+カメラ共存; 候補: microlink/カメラ/LVGL の
+  内部割当を PSRAM 化、esp_hosted SDIO RX 最適化モード変更、microlink タスクスタック調整、
+  実機 `heap_caps` 計測)。これが解ければ `TS_CONNECT_ENABLED=1` に戻して成功パス検証。
 
 ### 将来タスク (Phase 3 スコープ外)
 

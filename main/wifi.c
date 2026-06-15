@@ -33,7 +33,20 @@ int esp_hosted_init(void);
    its own connection on demand and self-retries, so nothing else needs to
    gate boot on the link. */
 static void (*s_on_got_ip)(void);
+static void (*s_on_time_sync)(void);
 static bool s_ip_announced;
+static bool s_sntp_inited;
+
+void wifi_set_time_sync_cb(void (*cb)(void)) { s_on_time_sync = cb; }
+
+/* esp_netif_sntp sync_cb: fires when SNTP sets the wall clock. Fan out to the
+   registered chain (the time-string arg is unused; consumers read time()). */
+static void sntp_synced(struct timeval *tv)
+{
+    (void)tv;
+    if (s_on_time_sync)
+        s_on_time_sync();
+}
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -49,6 +62,18 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         char ip[16];
         snprintf(ip, sizeof ip, IPSTR, IP2STR(&e->ip_info.ip));
         ui_status_set_net(true, ip);
+        /* Start SNTP now that the link is up (NOT in wifi_start): initialising
+           it before the IP exists wastes the first request and then waits a
+           full 1h poll before retrying, so the clock stays unset for a long
+           time. Starting it here makes the first sync succeed promptly —
+           Tailscale's ts2021 handshake (TAI64N) and JS Date need real time.
+           Once only; reconnects keep the already-set clock. */
+        if (!s_sntp_inited) {
+            s_sntp_inited = true;
+            esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            sntp_cfg.sync_cb = sntp_synced;
+            esp_netif_sntp_init(&sntp_cfg);
+        }
         if (!s_ip_announced && s_on_got_ip) {
             s_ip_announced = true;
             s_on_got_ip();   /* e.g. task_source_start() — runs in the event
@@ -100,10 +125,9 @@ void wifi_start(void (*on_got_ip)(void))
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* wall clock for JS Date (and the Tab5 clock demo): background SNTP,
-       syncs whenever the link is up and re-syncs periodically */
-    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    ESP_ERROR_CHECK(esp_netif_sntp_init(&sntp_cfg));
+    /* SNTP is started from the got-IP handler (on_event), not here: starting
+       it before the link is up wastes the first request and defers the retry
+       by a full poll interval. See the IP_EVENT_STA_GOT_IP branch. */
 
     ESP_LOGI(TAG, "connecting to \"%s\" in background...", CONFIG_MQJS_WIFI_SSID);
 }

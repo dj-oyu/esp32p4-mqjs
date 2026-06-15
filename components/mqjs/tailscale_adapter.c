@@ -10,9 +10,9 @@
 #include "microlink.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <time.h>
 
 static const char *TAG = "ts_adapter";
 
@@ -29,9 +29,12 @@ static char s_detail[64];
 static int s_retries;
 static bool s_connected_once;
 static bool s_net_up;
-static bool s_time_synced;
-static bool s_sntp_started;
-static bool s_starting;              /* connect sequence in flight */
+static bool s_starting;              /* armed: waiting for time sync / connecting */
+
+static bool time_is_valid(void)
+{
+    return time(NULL) > 1700000000;  /* ~2023-11; SNTP has set the clock */
+}
 
 static void lock(void)   { if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY); }
 static void unlock(void) { if (s_lock) xSemaphoreGiveRecursive(s_lock); }
@@ -84,9 +87,12 @@ static void on_ml_state(microlink_t *ml, microlink_state_t st, void *ud)
     unlock();
 }
 
-/* caller holds the lock; key must already be in the vault + s_time_synced */
+/* caller holds the lock; time must be valid and a key present in the vault */
 static void start_microlink(void)
 {
+    if (s_ml)
+        return;
+    s_retries = 0;   /* fresh budget for the connect phase */
     s_session_key = malloc(SYSTEM_VAULT_TS_AUTH_MAX + 1);
     if (!s_session_key ||
         !system_vault_tailscale_read(s_session_key, SYSTEM_VAULT_TS_AUTH_MAX + 1)) {
@@ -118,8 +124,9 @@ static void start_microlink(void)
     set_status("connecting", "接続中…");
 }
 
-/* periodic connect-watchdog: microlink never reports "auth rejected" distinctly
- * and auto-reconnects forever, so bound the initial connect ourselves. */
+/* connect watchdog: bounds the time-sync wait (before microlink starts) AND
+ * microlink's connect attempts (it auto-reconnects forever and can't flag auth
+ * rejection). Success is driven by callbacks, not this tick. */
 static void watchdog_tick(void *arg)
 {
     (void)arg;
@@ -131,58 +138,81 @@ static void watchdog_tick(void *arg)
     }
     s_retries++;
     if (s_retries >= TS_MAX_RETRIES) {
+        bool waiting_ntp = (s_ml == NULL);
         stop_session();
         char d[64];
-        snprintf(d, sizeof d, "接続失敗（%d回試行）auth keyを確認", TS_MAX_RETRIES);
+        if (waiting_ntp)
+            snprintf(d, sizeof d, "時刻同期できません（ネットワーク確認）");
+        else
+            snprintf(d, sizeof d, "接続失敗（%d回）auth key/接続先を確認", TS_MAX_RETRIES);
         set_status("error", d);
-        ESP_LOGW(TAG, "tailnet connect gave up after %d tries", TS_MAX_RETRIES);
+        ESP_LOGW(TAG, "tailnet %s gave up after %d ticks",
+                 waiting_ntp ? "time-sync" : "connect", TS_MAX_RETRIES);
     } else {
         char d[64];
-        snprintf(d, sizeof d, "接続中… 試行%d回", s_retries);
+        if (s_ml)
+            snprintf(d, sizeof d, "接続中… 試行%d回", s_retries);
+        else
+            snprintf(d, sizeof d, "時刻同期中… (%d)", s_retries);
         set_status("connecting", d);
     }
     unlock();
 }
 
-static void on_sntp_sync(struct timeval *tv)
+/* Wi-Fi SNTP sync callback chain (wifi_set_time_sync_cb). Start microlink once
+ * the clock is valid and we're armed — the callback-driven start (no polling).
+ * Public: called from wifi.c's sntp_synced(). */
+void tailscale_adapter_on_time_synced(void)
 {
-    (void)tv;
     lock();
-    s_time_synced = true;
-    if (s_starting && !s_ml)
+    if (s_starting && !s_ml && time_is_valid())
         start_microlink();
     unlock();
 }
 
-/* caller holds the lock: begin the connect sequence (NTP then microlink). */
+/* caller holds the lock: arm the session. wifi.c owns SNTP; microlink starts
+ * now if time is already valid, else on the next time-sync callback. */
+/* TEMPORARILY GATED (2026-06-15): microlink's connect handshake exhausts
+   esp_hosted's SDIO DMA RX buffer pool under load — `assert(*buf)` in
+   sdio_drv.c after a ~4.6KB _h_malloc_align fails (internal DMA RAM is starved
+   by microlink tasks + camera + LVGL + mqjs). That crash + boot auto-start =
+   a boot loop. Everything up to "Sending Noise handshake" works (crypto, key,
+   SNTP, STUN, controlplane TCP), so this is purely an internal-RAM budget
+   issue. Set TS_CONNECT_ENABLED=1 once internal RAM headroom is fixed. */
+#define TS_CONNECT_ENABLED 0
+
 static void begin_connect(void)
 {
     if (s_ml || s_starting)
         return;
+#if !TS_CONNECT_ENABLED
+    set_status("error", "一時無効（SDIO RAM調整中）");
+    return;
+#else
     s_starting = true;
     s_retries = 0;
-    set_status("connecting", "時刻同期中…");
     if (s_watchdog)
         esp_timer_start_periodic(s_watchdog, TS_TICK_US);
-    if (s_time_synced) {
+    if (time_is_valid())
         start_microlink();
-        return;
-    }
-    if (!s_sntp_started) {
-        esp_sntp_config_t c = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-        c.sync_cb = on_sntp_sync;
-        if (esp_netif_sntp_init(&c) == ESP_OK)
-            s_sntp_started = true;
-    }
+    else
+        set_status("connecting", "時刻同期中…");
+#endif
 }
 
-/* reflect "key present + enabled" into the idle state strings */
+/* reflect "key present + enabled + network up" into the idle state strings.
+ * Armed but Wi-Fi not up yet (failure case: Wi-Fi never connects) shows a
+ * network-wait rather than a misleading "connecting". */
 static void refresh_idle_status(void)
 {
     if (!system_vault_tailscale_has())
         set_status("not-configured", "未設定");
     else if (!system_vault_tailscale_enabled())
         set_status("disabled", "オフ");
+    else if (!s_net_up)
+        set_status("connecting", "ネットワーク待ち");
+    else
+        set_status("connecting", "接続準備中");
 }
 
 void tailscale_adapter_init(void)
@@ -273,6 +303,7 @@ void tailscale_adapter_forget(void)
 
 void tailscale_adapter_init(void) {}
 void tailscale_adapter_on_net_up(void) {}
+void tailscale_adapter_on_time_synced(void) {}
 void tailscale_adapter_get_status(tailscale_status_t *out)
 {
     memset(out, 0, sizeof *out);
