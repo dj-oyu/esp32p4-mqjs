@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <time.h>
@@ -31,6 +32,17 @@ static int s_retries;
 static bool s_connected_once;
 static bool s_net_up;
 static bool s_starting;              /* armed: waiting for time sync / connecting */
+static bool s_skip_autostart;        /* set when a prior boot reset mid-connect */
+
+/* Crash-loop guard in RTC memory: survives a watchdog/SW reset, is random on a
+   cold (power-on) boot. We "arm" it right before starting microlink and clear
+   it on a successful connect. If a boot finds it still armed, the previous boot
+   reset while connecting (a crash) — so skip auto-start until the next
+   power-cycle, instead of boot-looping on the same crash. */
+#define TS_GUARD_MAGIC  0x7a11c0deu
+#define TS_GUARD_ARMED  0xa5a5a5a5u
+static RTC_NOINIT_ATTR uint32_t s_guard_magic;
+static RTC_NOINIT_ATTR uint32_t s_guard_state;
 
 static bool time_is_valid(void)
 {
@@ -73,8 +85,12 @@ static void on_ml_state(microlink_t *ml, microlink_state_t st, void *ud)
         s_connected_once = true;
         s_retries = 0;
         s_starting = false;
-        if (s_watchdog)
+        s_guard_state = 0;   /* connected OK -> disarm the crash-loop guard */
+        /* keep the watchdog ticking: its connected branch logs heap (measurement) */
+        if (s_watchdog) {
             esp_timer_stop(s_watchdog);
+            esp_timer_start_periodic(s_watchdog, TS_TICK_US);
+        }
         char ip[16] = "";
         if (s_ml)
             microlink_ip_to_str(microlink_get_vpn_ip(s_ml), ip);
@@ -93,6 +109,7 @@ static void start_microlink(void)
 {
     if (s_ml)
         return;
+    s_guard_state = TS_GUARD_ARMED;  /* arm: about to run risky microlink network */
     /* internal-RAM watermark: esp_hosted's SDIO RX path needs internal DMA RAM;
        a small largest-block here is what makes the handshake-time alloc fail. */
     ESP_LOGW(TAG, "start: INTERNAL free=%u largest=%u | DMA free=%u largest=%u",
@@ -140,7 +157,14 @@ static void watchdog_tick(void *arg)
     (void)arg;
     lock();
     if (!strcmp(s_state, "connected")) {
-        esp_timer_stop(s_watchdog);
+        /* connected: log heap periodically (measurement) instead of stopping */
+        ESP_LOGW(TAG, "connected heap: INTERNAL free=%u largest=%u | DMA free=%u "
+                      "largest=%u | PSRAM free=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         unlock();
         return;
     }
@@ -187,7 +211,7 @@ void tailscale_adapter_on_time_synced(void)
    a boot loop. Everything up to "Sending Noise handshake" works (crypto, key,
    SNTP, STUN, controlplane TCP), so this is purely an internal-RAM budget
    issue. Set TS_CONNECT_ENABLED=1 once internal RAM headroom is fixed. */
-#define TS_CONNECT_ENABLED 0
+#define TS_CONNECT_ENABLED 1
 
 static void begin_connect(void)
 {
@@ -225,6 +249,14 @@ static void refresh_idle_status(void)
 
 void tailscale_adapter_init(void)
 {
+    if (s_guard_magic != TS_GUARD_MAGIC) {   /* cold boot: RTC mem is random */
+        s_guard_magic = TS_GUARD_MAGIC;
+        s_guard_state = 0;
+    }
+    s_skip_autostart = (s_guard_state == TS_GUARD_ARMED);
+    if (s_skip_autostart)
+        ESP_LOGW(TAG, "previous boot reset mid-connect -> skipping auto-start "
+                      "(power-cycle or re-enable to retry)");
     s_lock = xSemaphoreCreateRecursiveMutex();
     const esp_timer_create_args_t a = {
         .callback = watchdog_tick, .name = "ts_wd",
@@ -239,10 +271,21 @@ void tailscale_adapter_on_net_up(void)
 {
     lock();
     s_net_up = true;
-    if (system_vault_tailscale_has() && system_vault_tailscale_enabled())
-        begin_connect();
-    else
+    /* measurement (fires even when connect is gated): the internal/DMA headroom
+       available to esp_hosted's SDIO RX path once the network + apps are up. */
+    ESP_LOGW(TAG, "net-up heap: INTERNAL free=%u largest=%u | DMA free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    if (system_vault_tailscale_has() && system_vault_tailscale_enabled()) {
+        if (s_skip_autostart)   /* prior boot reset mid-connect: don't loop */
+            set_status("error", "前回接続中にリセット。手動で再試行/電源入れ直し");
+        else
+            begin_connect();
+    } else {
         refresh_idle_status();
+    }
     unlock();
 }
 
@@ -269,6 +312,7 @@ bool tailscale_adapter_enable(void)
     if (!system_vault_tailscale_set_enabled(true))
         return false;
     lock();
+    s_skip_autostart = false;   /* explicit user action: clear the crash guard */
     if (system_vault_tailscale_has() && s_net_up)
         begin_connect();
     else
@@ -291,6 +335,7 @@ bool tailscale_adapter_disable(void)
 void tailscale_adapter_reauth(void)
 {
     lock();
+    s_skip_autostart = false;   /* new key = explicit retry: clear the crash guard */
     stop_session();
     if (system_vault_tailscale_has() && system_vault_tailscale_enabled() && s_net_up)
         begin_connect();
