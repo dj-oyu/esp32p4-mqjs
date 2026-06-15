@@ -558,6 +558,13 @@ static bool pipeline_once(void)
 {
     if (s_fd >= 0)
         return true;
+    /* Lazy bring-up: esp_video_init was previously done by a boot-time probe in
+       app_main, which left the CSI/ISP streaming (and DMAing ~57MB/s to PSRAM)
+       forever. It is now deferred to the first scan, so a device that never
+       scans pays zero camera cost. esp_video can't be torn down + re-REQBUFS'd
+       (see the persistent-pipeline note above), so this still happens once. */
+    if (!video_init_once())
+        return false;
 
     const char *fail = NULL;
     int fd = -1;

@@ -109,7 +109,10 @@ static void tab5_ui_ready(void *arg)
 {
     (void)arg;
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
-    cam_tab5_probe_once();               /* boot-time camera/V4L2 diagnostics */
+    /* No boot-time probe: it brought the CSI/ISP pipeline up and left it
+       STREAMING forever (~57MB/s MIPI->ISP->PSRAM DMA + per-frame ISP CCM
+       errors), competing with esp_hosted's SDIO DMA. The pipeline is now
+       brought up lazily on the first camera.scan and never at boot. */
 
 #if CONFIG_MQJS_TAB5_AUDIO_SELFTEST
     audio_tab5_selftest_async();
