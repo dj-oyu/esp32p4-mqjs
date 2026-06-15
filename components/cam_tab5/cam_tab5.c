@@ -1194,6 +1194,21 @@ static void scan_task(void *pv)
     if (pipe_ok || fail)
         set_status("%s", done);
 
+    /* MEASUREMENT (S0): scan summary + FPS + heap to serial, for the on-demand /
+       contention / quirc-window investigation. */
+    {
+        int64_t scan_ms = scan_started ? (esp_timer_get_time() - scan_started) / 1000 : 0;
+        int fps10 = (scan_ms > 0 && n_frames) ? (int)((int64_t)n_frames * 10000 / scan_ms) : 0;
+        ESP_LOGW(TAG, "MEAS scan-end: %s | %d frames %d.%dfps in %lldms | "
+                      "INT free=%u largest=%u | DMA free=%u largest=%u | PSRAM free=%u",
+                 done, n_frames, fps10 / 10, fps10 % 10, (long long)scan_ms,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+
     cam_tab5_cb_t cb = s_req.cb;
     void *arg = s_req.arg;
     s_req.cb = NULL;
