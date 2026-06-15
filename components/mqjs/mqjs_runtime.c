@@ -50,6 +50,7 @@
 #include "mqjs_classes.h"
 #include "mqjs_power.h"
 #include "system_vault.h"
+#include "tailscale_adapter.h"
 #include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
@@ -2287,7 +2288,10 @@ JSValue js_system_tailscale_set(JSContext *ctx, JSValue *this_val, int argc,
         return JS_EXCEPTION;
     if (!len || len > SYSTEM_VAULT_TS_AUTH_MAX)
         return JS_ThrowRangeError(ctx, "invalid Tailscale auth key length");
-    return JS_NewBool(system_vault_tailscale_set(key));
+    bool ok = system_vault_tailscale_set(key);
+    if (ok)
+        tailscale_adapter_reauth();   /* (re)start the session with the new key */
+    return JS_NewBool(ok);
 }
 
 JSValue js_system_tailscale_status(JSContext *ctx, JSValue *this_val, int argc,
@@ -2295,16 +2299,25 @@ JSValue js_system_tailscale_status(JSContext *ctx, JSValue *this_val, int argc,
 {
     if (!system_api_allowed(ctx))
         return JS_EXCEPTION;
-    bool configured = system_vault_tailscale_has();
+    tailscale_status_t st;
+    tailscale_adapter_get_status(&st);
     JSGCRef obj_ref;
     JSValue obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return obj;
     JS_PUSH_VALUE(ctx, obj);
-    JS_SetPropertyStr(ctx, obj_ref.val, "configured", JS_NewBool(configured));
-    JS_SetPropertyStr(ctx, obj_ref.val, "state",
-                      JS_NewString(ctx, configured ? "configured"
-                                                   : "not-configured"));
+    JS_SetPropertyStr(ctx, obj_ref.val, "configured", JS_NewBool(st.configured));
+    JS_SetPropertyStr(ctx, obj_ref.val, "enabled", JS_NewBool(st.enabled));
+    JS_SetPropertyStr(ctx, obj_ref.val, "retries", JS_NewInt32(ctx, st.retries));
+    JS_SetPropertyStr(ctx, obj_ref.val, "peers", JS_NewInt32(ctx, st.peers));
+    /* Strings created in their own statement so any GC during JS_NewString
+       updates obj_ref.val before JS_SetPropertyStr reads it (moving GC). */
+    JSValue v_state = JS_NewString(ctx, st.state);
+    JS_SetPropertyStr(ctx, obj_ref.val, "state", v_state);
+    JSValue v_detail = JS_NewString(ctx, st.detail);
+    JS_SetPropertyStr(ctx, obj_ref.val, "detail", v_detail);
+    JSValue v_ip = JS_NewString(ctx, st.ip);
+    JS_SetPropertyStr(ctx, obj_ref.val, "ip", v_ip);
     JS_POP_VALUE(ctx, obj);
     return obj;
 }
@@ -2314,7 +2327,24 @@ JSValue js_system_tailscale_forget(JSContext *ctx, JSValue *this_val, int argc,
 {
     if (!system_api_allowed(ctx))
         return JS_EXCEPTION;
+    tailscale_adapter_forget();   /* stop session first, then clear the vault */
     return JS_NewBool(system_vault_tailscale_forget());
+}
+
+JSValue js_system_tailscale_enable(JSContext *ctx, JSValue *this_val, int argc,
+                                   JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    return JS_NewBool(tailscale_adapter_enable());
+}
+
+JSValue js_system_tailscale_disable(JSContext *ctx, JSValue *this_val, int argc,
+                                    JSValue *argv)
+{
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    return JS_NewBool(tailscale_adapter_disable());
 }
 
 /* copy the key argument onto the stack; NVS keys are at most 15 chars */

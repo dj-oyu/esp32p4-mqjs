@@ -354,12 +354,23 @@ microlink は内部で自動再接続 (~5-10s) し、`ERROR`/`RECONNECTING` は 
 
 ### 実装単位
 
-1. `system_vault` に `enabled` フラグ (+ host テスト) — **自己完結・先行実装**
-2. `microlink_adapter.{c,h}` (上記チェーン + リトライ + 状態 struct、auth key ゼロクリア)
-3. JS バインディング: `tailscaleStatus` 拡張 + `tailscaleEnable/Disable`、`tailscaleForget`
-   更新 (ROM 再生成が要る — [[p4-multiapp-design]] の JS_NewString ネスト禁止等の罠注意)
-4. `device_settings.js` UI: トグル + 状況表示
-5. `on_net_up()` に `tailscale_adapter_on_net_up()` を連結
+1. `system_vault` に `enabled` フラグ (+ host テスト) — **済 (commit ceef896, host PASS)**
+2. `tailscale_adapter.{c,h}` (上記チェーン + リトライ + 状態 struct、auth key はヒープの
+   セッション鍵を所有し stop で zero+free) — **済 (compile/link 検証グリーン)**。
+   `CONFIG_MQJS_TAILSCALE` ゲート (OFF で stub、Stamp 無影響)。microlink が auth_key を
+   strdup せずポインタ保持するため、鍵は active セッション中のみ RAM に置き stop で消す。
+5. `on_net_up()` に `tailscale_adapter_on_net_up()` 連結 + `tailscale_adapter_init()` を
+   boot で呼ぶ — **済 (app_main.c)**
+3. JS バインディング: `tailscaleStatus` 拡張 ({configured,enabled,state,detail,retries,ip,peers})
+   + `tailscaleEnable/Disable`、`tailscaleSet`→reauth、`tailscaleForget`→stop+vault削除 — **済
+   (compile/link 検証グリーン)**。ROM は WSL で再生成 (`gen/device_stdlib.h`/`mquickjs_atom.h`)。
+   文字列プロパティは moving-GC 安全のため分離生成。
+4. `device_settings.js` UI: Tailscale ページにライブ状況表示 (2s `setInterval`、画面遷移で
+   `clearInterval`) + オン/オフ トグル + 保存(→自動接続)/削除、mainPage 行に状態 — **済
+   (Node ロード検証 + 最終 firmware ビルド グリーン)**
+
+**Phase 3 本実装 (②③④) はコード完了・全ビルド検証グリーン。残りは実機接続テスト
+(レイヤ2 以降: 実 Tab5 COM8 + ephemeral auth key)。**
 
 ### 将来タスク (Phase 3 スコープ外)
 

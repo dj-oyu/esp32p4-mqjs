@@ -155,7 +155,27 @@ function expiryInfo(p) {
     return { expired: false, note: "（有効）" };
 }
 
+// --- Tailscale live status UI ---------------------------------------------
+var tsTimer = 0;
+function clearTsTimer() {
+    if (tsTimer) { clearInterval(tsTimer); tsTimer = 0; }
+}
+function tsShort(st) {
+    if (st.state === "connected") return "接続済み";
+    if (st.state === "connecting") return "接続中";
+    if (st.state === "error") return "エラー";
+    if (st.state === "disabled") return "オフ";
+    return "未設定";
+}
+function tsStatusLine(st) {
+    var line = st.detail || tsShort(st);
+    if (st.state === "connected" && st.peers)
+        line += " / peers " + st.peers;
+    return line;
+}
+
 function mainPage() {
+    clearTsTimer();
     unwind();
     var s = ui.screen("デバイス設定");
     s.label("ネットワーク");
@@ -164,12 +184,12 @@ function mainPage() {
     var ts = system.tailscaleStatus();
     list.add("Wi-Fi    " + (wifi.configured ? wifi.ssid : "未設定"),
              wifiPage);
-    list.add("Tailscale    " + (ts.configured ? "設定済み" : "未設定"),
+    list.add("Tailscale    " + (ts.configured ? tsShort(ts) : "未設定"),
              tailscalePage);
     list.add("QR読み取りテスト", qrTestPage);
     s.label("この画面は端末ファームウェアに組み込まれています。");
-    s.label("現在は保存モックです。接続処理はまだ変更しません。");
     s.button("アプリ一覧へ戻る", function () {
+        clearTsTimer();
         sys.open("launcher");
     });
 }
@@ -238,7 +258,7 @@ function applyProvisioning(p) {
             (okt ? "保存しました" : "保存できませんでした") + "\n";
         p.tailscale.authKey = "";
     }
-    return msg + "\n接続処理は未実装です。保存のみ行いました。";
+    return msg + "\n適用しました。Tailscaleは自動で接続を開始します。";
 }
 
 function provisionResultPage(text) {
@@ -278,32 +298,52 @@ function wifiPage() {
 }
 
 function tailscalePage() {
-    var status = system.tailscaleStatus();
+    clearTsTimer();
     var s = ui.screen("Tailscale");
-    var message = s.label(status.configured
-        ? "Auth keyは設定済みです"
-        : "Auth keyは未設定です");
-    var authKey = s.field("Auth key", { secret: true });
+    var st = system.tailscaleStatus();
+    var status = s.label(tsStatusLine(st));
+
+    if (st.configured) {
+        s.button(st.enabled ? "オフにする" : "オンにする", function () {
+            clearTsTimer();
+            if (st.enabled) system.tailscaleDisable();
+            else system.tailscaleEnable();
+            tailscalePage();
+        });
+    }
+
+    var authKey = s.field(st.configured ? "Auth key（差し替え）" : "Auth key",
+                          { secret: true });
     s.button("保存", function () {
         if (!authKey.value()) {
-            message.setText("Auth keyを入力してください");
+            status.setText("Auth keyを入力してください");
             return;
         }
         if (system.tailscaleSet(authKey.value())) {
-            message.setText("保存しました。microlink接続は未実装です");
             authKey.setText("");
+            clearTsTimer();
+            tailscalePage();   // now configured + connecting
         } else {
-            message.setText("保存できませんでした");
+            status.setText("保存できませんでした（長さを確認）");
         }
     });
-    if (status.configured) {
+
+    if (st.configured) {
         s.button("保存済みAuth keyを削除", function () {
-            message.setText(system.tailscaleForget()
-                ? "削除しました"
-                : "削除できませんでした");
+            clearTsTimer();
+            system.tailscaleForget();
+            tailscalePage();
         });
     }
-    s.button("戻る", mainPage);
+    s.button("戻る", function () {
+        clearTsTimer();
+        mainPage();
+    });
+
+    // live status: shows "接続中… 試行N回" -> "接続済み 100.x.y.z / peers M"
+    tsTimer = setInterval(function () {
+        status.setText(tsStatusLine(system.tailscaleStatus()));
+    }, 2000);
 }
 
 sys.onForeground(mainPage);
