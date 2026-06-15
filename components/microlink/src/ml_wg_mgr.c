@@ -1497,6 +1497,15 @@ static void disco_periodic_probes(microlink_t *ml) {
  * WG Manager Task
  * ========================================================================== */
 
+/* Max RX packets drained per queue per loop iteration. A multi-peer DISCO
+ * storm relayed via DERP (slow PONGs -> peers retry -> more traffic) can flood
+ * these queues; draining them all in one pass runs software ChaCha20-Poly1305
+ * for seconds without reaching the loop's vTaskDelay, starving IDLE and the UI
+ * (task_wdt: ml_wg_mgr on CPU1). Bounding the drain guarantees a yield each
+ * iteration; leftovers are handled next tick. At the 10ms loop rate this still
+ * sustains ~3.2k pkt/s per queue, far above any Tab5 tunnel workload. */
+#define ML_WG_RX_DRAIN_BUDGET 32
+
 void ml_wg_mgr_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
@@ -1598,16 +1607,20 @@ void ml_wg_mgr_task(void *arg) {
             __atomic_store_n(&ml->zc.rx_tail, tail, __ATOMIC_RELEASE);
         }
 #endif
-        /* Queue-based path: DISCO from DERP relay + fallback when zero-copy disabled */
+        /* Queue-based path: DISCO from DERP relay + fallback when zero-copy
+         * disabled. Bounded drain (see ML_WG_RX_DRAIN_BUDGET) so a flood can't
+         * monopolize the CPU for seconds and trip the task watchdog. */
         ml_rx_packet_t disco_pkt;
-        while (xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE) {
+        int drain = ML_WG_RX_DRAIN_BUDGET;
+        while (drain-- > 0 && xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE) {
             process_disco_packet(ml, &disco_pkt);
             free(disco_pkt.data);
         }
 
-        /* Process WireGuard packets */
+        /* Process WireGuard packets (bounded drain — heavy per-packet crypto) */
         ml_rx_packet_t wg_pkt;
-        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+        drain = ML_WG_RX_DRAIN_BUDGET;
+        while (drain-- > 0 && xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
             process_wg_packet(ml, &wg_pkt);
         }
 
