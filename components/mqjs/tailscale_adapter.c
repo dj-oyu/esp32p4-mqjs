@@ -109,7 +109,8 @@ static void stop_session(void)
     if (s_watchdog)
         esp_timer_stop(s_watchdog);
     if (s_ml) {
-        microlink_stop(s_ml);
+        /* destroy stops internally (joins the workers, then frees) — do NOT
+         * call microlink_stop() separately or the worker join runs twice. */
         microlink_destroy(s_ml);   /* stops using the auth key */
         s_ml = NULL;
     }

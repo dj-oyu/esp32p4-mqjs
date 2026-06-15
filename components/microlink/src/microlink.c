@@ -508,15 +508,43 @@ rebind_wg_update:
 esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
+    /* Idempotent: a completed stop NULLs every task handle. If they are all
+     * already NULL the workers are gone — skip, or the join below would block
+     * the full safety timeout waiting for acks that will never come.
+     * (microlink_destroy() also calls us, and the net-switch rebind path may
+     * stop twice.) Do NOT key this off ml->state: IDLE is also the pre-connect
+     * state, so a stop right after start would wrongly no-op. */
+    if (!ml->net_io_task && !ml->derp_tx_task &&
+        !ml->coord_task && !ml->wg_mgr_task)
+        return ESP_OK;
+
     ESP_LOGI(TAG, "Stopping...");
+    /* Ask every worker to exit, then JOIN on their exit acks — state, not a
+     * blind delay. Clear stale acks first (belt-and-suspenders for a reused
+     * event group). Tasks set their ack bit as the last thing before
+     * vTaskDelete(NULL); we never call vTaskDelete() on them (that would crash
+     * in uxListRemove on an already-invalid node), we only observe the acks
+     * and NULL the handles. */
+    xEventGroupClearBits(ml->events, ML_EVT_ALL_TASKS_EXITED);
     xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    /* Interrupt any in-flight blocking socket IO so a worker mid-(re)connect
+     * bails to its loop and sees the shutdown bit NOW, rather than finishing a
+     * multi-second connect sequence first. Without this, a fast reconnect can
+     * outlast the join below — we would then free ml out from under a still-
+     * running coord task (use-after-free -> interrupt-WDT panic). shutdown()
+     * only half-closes the fd; the owning task still close()s it on exit, so
+     * there is no double-close. */
+    if (ml->coord_sock >= 0)
+        shutdown(ml->coord_sock, SHUT_RDWR);
+
+    /* 3s is now only a safety cap for a wedged task, not the common path —
+     * workers normally ack within a few ms of seeing the shutdown bit. */
+    EventBits_t acked = xEventGroupWaitBits(ml->events, ML_EVT_ALL_TASKS_EXITED,
+                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(3000));
+    if ((acked & ML_EVT_ALL_TASKS_EXITED) != ML_EVT_ALL_TASKS_EXITED)
+        ESP_LOGW(TAG, "stop: worker join timed out (acks=0x%03x), proceeding",
+                 (unsigned)(acked & ML_EVT_ALL_TASKS_EXITED));
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;

@@ -187,6 +187,17 @@ typedef struct {
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
 
+/* Worker exit acknowledgements: each task sets its bit immediately before
+ * vTaskDelete(NULL), so microlink_stop() JOINs on real state instead of a
+ * blind fixed delay. Keep one bit per task that self-deletes on shutdown. */
+#define ML_EVT_NETIO_EXITED         BIT9
+#define ML_EVT_DERP_EXITED          BIT10
+#define ML_EVT_COORD_EXITED         BIT11
+#define ML_EVT_WGMGR_EXITED         BIT12
+#define ML_EVT_ALL_TASKS_EXITED \
+    (ML_EVT_NETIO_EXITED | ML_EVT_DERP_EXITED | \
+     ML_EVT_COORD_EXITED | ML_EVT_WGMGR_EXITED)
+
 /* ============================================================================
  * Queue Message Types
  * ========================================================================== */
