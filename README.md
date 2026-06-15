@@ -573,7 +573,8 @@ components/cam_tab5/     Tab5 カメラとバーコード認識
 components/sshc/         wolfSSH クライアント
 examples/                配信して試せる JavaScript アプリ
 tools/                   鍵生成、MQTT 配信、Web UI、検証ツール
-tools/agents/skills/     AI エージェント向けスキル (ESP32-P4 PIE SIMD 参照を含む)
+tools/agents/skills/     AI エージェント向けスキル (canonical / ESP32-P4 PIE SIMD 参照を含む)
+.claude/skills/          Claude Code プロジェクトスキル (tools/agents/skills/ から tools/sync-claude-skills.sh で再生成。手編集しない)
 docs/                    UI、ランチャー、SSH 端末などの設計文書
 ```
 
