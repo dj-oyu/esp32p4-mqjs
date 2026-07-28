@@ -116,10 +116,18 @@ void ui_tab5_text_size(const char *utf8, int *w, int *h);
  * used by ui.cells/UI_CMD_CELLS. 0x0 when the UI is off. Const tables only. */
 void ui_tab5_cell_size(int *w, int *h);
 /* Pixels the keyboard overlay reserves at the canvas bottom in `mode`
- * (0/1/2, see UI_CMD_KEYBOARD). Constant per mode; 0 when the UI is
- * off. Synchronous (ui.keyboard's return value: the JS terminal sizes
- * its grid with it). */
+ * (0/1/2, see UI_CMD_KEYBOARD); 0 when the UI is off. Synchronous
+ * (ui.keyboard's return value: the JS terminal sizes its grid with it).
+ * Depends on the keyboard dock: docked, mode 1 reserves nothing (the
+ * dock types directly) and mode 2 only the control bar's height. */
 int ui_tab5_kb_reserved(int mode);
+
+/* Keyboard dock presence (kbd_tab5): while set, ui.keyboard() requests
+ * raise no on-screen keyboard — mode 2 keeps only the control bar
+ * (F-keys/copy/paste have no dock equivalent) — and the foreground
+ * app's last requested mode is re-applied immediately. Apps stay
+ * unaware; their ui.keyboard() return value does the sizing. */
+void ui_tab5_set_hw_keyboard(bool present);
 
 /* Create a widget screen (flex column + title), retain the previously
  * active screen on the navigation stack and slide the new one in.

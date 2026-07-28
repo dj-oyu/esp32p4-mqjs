@@ -107,9 +107,12 @@ static void js_task(void *arg)
 }
 
 #if CONFIG_MQJS_TAB5_KEYBOARD
-/* Dock attach/detach -> screen orientation (kbd_tab5 task context) */
+/* Dock attach/detach -> input policy + screen orientation (kbd_tab5
+   task context). Policy first: the landscape flip re-applies the
+   foreground app's keyboard mode, and must do so under the new rule. */
 static void kbd_dock_changed(bool present)
 {
+    ui_tab5_set_hw_keyboard(present);
     ui_tab5_set_landscape(present);
 }
 #endif

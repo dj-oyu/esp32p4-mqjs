@@ -379,6 +379,10 @@ static int s_canvas_w, s_canvas_h; /* set once the display is up */
    resolution change on its own. */
 static lv_display_t *s_disp;
 static bool s_landscape;
+static bool s_hw_kb;      /* keyboard dock present: on-screen keys off */
+static int s_app_kb_mode; /* the ui.keyboard mode the app last asked for
+                             (0/1/2) — re-applied when the dock
+                             (dis)appears; apps stay unaware of it */
 static lv_obj_t *s_sb_bar, *s_sb_row, *s_sb_event; /* status bar chrome */
 static lv_obj_t *s_console_panel;
 static lv_obj_t *s_js_canvas;      /* CanvasApp presentation object */
@@ -462,6 +466,13 @@ extern "C" int __wrap_esp_hosted_init(void)
    if the device shows it upside down, flip this one constant to
    LV_DISPLAY_ROTATION_270. */
 #define UI_ROT_LANDSCAPE LV_DISPLAY_ROTATION_90
+
+/* current logical width — overlays created after a rotation must size
+   themselves to this, not the compile-time portrait width */
+static inline int ui_cur_hres(void)
+{
+    return s_landscape ? UI_LCD_V_RES : UI_LCD_H_RES;
+}
 #define UI_DSI_LANES        2
 #define UI_DPHY_LDO_CHAN    3
 #define UI_DPHY_LDO_MV      2500
@@ -1424,8 +1435,7 @@ static void cbar_show(bool show)
     if (!s_cbar) {
         s_cbar = lv_buttonmatrix_create(s_root_scr ? s_root_scr
                                                    : lv_screen_active());
-        lv_obj_set_size(s_cbar, UI_LCD_H_RES, UI_CB_H);
-        lv_obj_align(s_cbar, LV_ALIGN_BOTTOM_MID, 0, -UI_KB_H);
+        lv_obj_set_size(s_cbar, ui_cur_hres(), UI_CB_H);
         lv_obj_set_style_pad_all(s_cbar, 4, 0);
         lv_obj_set_style_pad_gap(s_cbar, 4, 0);
         lv_obj_set_style_text_font(s_cbar, ui_font(), 0);
@@ -1493,6 +1503,9 @@ static void cbar_show(bool show)
             },
             LV_EVENT_VALUE_CHANGED, nullptr);
     }
+    /* above the on-screen keyboard normally; at the very bottom when
+       the dock types for us and no keyboard will be raised */
+    lv_obj_align(s_cbar, LV_ALIGN_BOTTOM_MID, 0, s_hw_kb ? 0 : -UI_KB_H);
     lv_obj_remove_flag(s_cbar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_cbar);
 }
@@ -1504,6 +1517,8 @@ extern "C" int ui_tab5_kb_reserved(int mode)
 {
     if (!s_canvas_w || mode <= 0)
         return 0;
+    if (s_hw_kb) /* dock types directly; mode 2 keeps only the bar */
+        return mode == 1 ? 0 : UI_CB_H;
     return mode == 1 ? UI_KB_H : UI_KB_H + UI_CB_H;
 }
 
@@ -1723,7 +1738,7 @@ static void spanel_show(bool show)
     if (!s_spanel)
         spanel_build();
     int h = ui_tab5_kb_reserved(s_kb_mode ? s_kb_mode : 2);
-    lv_obj_set_size(s_spanel, UI_LCD_H_RES, h);
+    lv_obj_set_size(s_spanel, ui_cur_hres(), h);
     lv_obj_align(s_spanel, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_remove_flag(s_spanel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_spanel);
@@ -1744,14 +1759,23 @@ static void kb_collapse(void)
 
 /* mode: 0 = hide (OFF: stats panel gone too), 1 = keyboard,
    2 = keyboard + terminal control bar. Showing always lifts the
-   keyboard over a collapsed panel (T3c SHOWN state). */
+   keyboard over a collapsed panel (T3c SHOWN state).
+   Keyboard dock present (s_hw_kb): the app's request is honored in
+   spirit without any app change — mode 1 raises nothing (the dock
+   types directly), mode 2 keeps only the slim control bar, whose
+   F-keys / copy / paste have no physical equivalent on the dock.
+   ui_tab5_kb_reserved returns matching heights, so ui.keyboard()'s
+   synchronous return already sizes the app's grid correctly. */
 static void kb_show(int mode)
 {
+    s_app_kb_mode = mode > 0 ? mode : 0; /* re-applied on dock change */
     cbar_show(mode >= 2);
     spanel_show(false);
-    if (mode <= 0) {
+    if (mode <= 0 || s_hw_kb) {
         if (s_kb)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+        if (mode > 0)
+            s_kb_mode = mode; /* dock removed later: ⌨ restores this */
         return;
     }
     s_kb_mode = mode; /* what the panel's ⌨ button restores */
@@ -1765,7 +1789,7 @@ static void kb_show(int mode)
        switches maps before our callback could read the key, so replace
        it wholesale: mode switching is redone below via set_mode */
     lv_obj_remove_event_cb(s_kb, lv_keyboard_def_event_cb);
-    lv_obj_set_size(s_kb, UI_LCD_H_RES, UI_KB_H);
+    lv_obj_set_size(s_kb, ui_cur_hres(), UI_KB_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_text_font(s_kb, ui_font(), 0);
     /* dark system palette — the default light theme made every
@@ -2300,6 +2324,23 @@ extern "C" bool ui_tab5_landscape(void)
     return s_landscape;
 }
 
+/* Keyboard dock present: stop raising the on-screen keyboard (mode 1
+   shows nothing, mode 2 keeps only the control bar) and re-apply the
+   foreground app's last requested mode under the new policy. Kept
+   separate from ui_tab5_set_landscape on purpose — orientation and
+   input policy are coupled by the dock today, not by the UI. */
+extern "C" void ui_tab5_set_hw_keyboard(bool present)
+{
+    if (s_hw_kb == present)
+        return;
+    s_hw_kb = present;
+    if (!s_disp || !s_canvas_w)
+        return;
+    lvgl_port_lock(0);
+    kb_show(s_app_kb_mode);
+    lvgl_port_unlock();
+}
+
 extern "C" void ui_tab5_set_landscape(bool on)
 {
     if (!s_disp || !s_canvas_w || s_landscape == on)
@@ -2323,9 +2364,10 @@ extern "C" void ui_tab5_set_landscape(bool on)
     if (s_console_panel)
         lv_obj_set_size(s_console_panel, hres, vres - UI_STATUSBAR_H);
 
-    /* lazily built overlays are sized at creation: drop them, the next
-       kb_show/cbar_show/spanel_show rebuilds at the new width */
-    kb_show(0); /* also clears the one-shot latch state machine */
+    /* lazily built overlays are sized at creation: drop them and
+       re-apply the app's keyboard mode below, which rebuilds them at
+       the new width under the current dock policy */
+    int app_kb = s_app_kb_mode;
     if (s_kb) {
         lv_obj_delete(s_kb);
         s_kb = nullptr;
@@ -2359,6 +2401,10 @@ extern "C" void ui_tab5_set_landscape(bool on)
         lv_obj_set_pos(s_js_canvas, 0, UI_STATUSBAR_H);
         lv_obj_add_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
     }
+
+    /* rebuild the overlays the app had up, at the new width and under
+       the (possibly changed) dock policy */
+    kb_show(app_kb);
     lvgl_port_unlock();
 
     ESP_LOGI(TAG, "rotation: %s (canvas %dx%d)",
