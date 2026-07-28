@@ -1389,9 +1389,16 @@ private:
    not, and LVGL's own per-object intersect (lv_refr.c) now rejects the
    2-3 rows a chunk misses before any of that runs — the same rejection
    a clip test inside the loop would achieve, without forking LVGL.
-   MEASURED on branch perf/kb-row-split-bench (portrait, -O2): map swap
-   draw 16.06 -> 11.30 ms, and the clean walk test — one key's ctrl bit,
-   identical pixels, 10 buttons walked instead of 36 — 1.04 -> 0.62 ms.
+   MEASURED on device, same session A/B against main (portrait, -O2,
+   draw us / chunks). Note main's "map swap (case)" re-maps all four
+   rows, so the honest pair is that against "all 4 rows":
+                          main (one matrix)   split
+     one key invalidate      1085 / 1          561 / 1   -48%
+     map swap, all 4 rows   17142 / 15        9955 / 16  -42%
+     map swap, sym          16029 / 15        9987 / 16  -38%
+     whole screen           33294 / 52       28418 / 52  -15%
+   and the case flip — three rows re-mapped, which is what a Shift lock
+   actually does — 7940 / 12, i.e. 17.1 -> 7.9 ms, -54%.
    s_kb stays the handle the rest of the file uses: it is now the
    container the rows live in, and it paints the background (the rows
    only cover from the first key down). */
@@ -2357,8 +2364,10 @@ static void kb_show(int mode)
    0.4 ms — about 6 ms of a 15-chunk map swap.
    FIXED by the row split (see s_kb_row): one matrix per row lets
    LVGL's own per-object intersect reject the rows a chunk misses.
-   Measured on the prototype: map swap draw 16.06 -> 11.30 ms, one key
-   1.04 -> 0.62 ms, and a real case flip (three rows re-mapped) 8.75.
+   Device A/B against main: map swap draw 17.14 -> 9.96 ms, one key
+   1.09 -> 0.56, and a real case flip (three rows re-mapped) 7.94.
+   The per-key ITEMS radius of 4 costs 1.24 ms of that 9.96 (radius 0
+   measures 8.66) and the 36 labels 3.13 ms (r0-no-text measures 5.54).
    The other half of that 6 ms — halving the chunk count with a 50-line
    draw buffer — is still on the table but costs 36KB internal, since
    sw_rotate has esp_lvgl_port allocate a PPA scratch of the same size
