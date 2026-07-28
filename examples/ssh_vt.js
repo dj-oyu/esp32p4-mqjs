@@ -853,11 +853,26 @@ if (SELFTEST) {
        これを実装していなかったので、起動時の寸法のまま描き続けていた
        — 横で採寸したまま縦に来ると 23 行しか描かず、下に 160px 余った
        (実機報告)。逆向きなら下端がキーの裏に隠れる。 */
-    function relayout() {
+    /* 負数 = 純クエリ (表示を変えない)。0 は「まだ答えられない」
+       (キャンバス未生成) であって「キーボードが無い」ではない —
+       そのまま信じると画面いっぱいに行を敷いてキーの裏に潜り込む
+       ので、直前の値を保つ。 */
+    var currentKb = function () {
+        var v = ui.keyboard(-2);
+        return v > 0 ? v : KB_H;
+    };
+
+    /* NB: `var f = function(){}`, not `function f(){}` — mquickjs does
+       not hoist a block-level function declaration out to where the
+       timers and callbacks below can see it, and the failure is a
+       ReferenceError at call time, i.e. invisible until the event
+       actually fires. The rest of this block is written the same way
+       for the same reason. */
+    var relayout = function () {
         var s2 = ui.size();
         W = s2[0] || W;
         H = s2[1] || H;
-        KB_H = ui.keyboard(-2) || 0; /* 負数 = 純クエリ、表示は変えない */
+        KB_H = currentKb();
         VIEW_H = H - KB_H;
         COLS = (W / CW) | 0;
         GRID_ROWS = (VIEW_H / LH) | 0;
@@ -878,7 +893,7 @@ if (SELFTEST) {
             sessions[actIdx].term.markAll();
             drawTabs();
         }
-    }
+    };
 
     ui.onKey(function (k) {
         /* レイアウト変更はセッションが無くても処理する (下の actIdx
@@ -1084,6 +1099,16 @@ if (SELFTEST) {
     });
 
     setInterval(function () {
+        /* レイアウト追従は "\x00rotate" だけに頼らない。トークンは
+           フォアグラウンドのアプリにしか届かず、届かなかった一回が
+           そのままズレっぱなしになる (実機で下端が余ったまま戻らな
+           かった)。ここで実測値を突き合わせれば、回転・ドック抜き差
+           し・キーボードモード変更のどれで来ても自己修復する。
+           ui.size() と ui.keyboard(-n) はどちらも副作用の無いクエリ
+           なので、40fps で回しても副作用は無い。 */
+        var s2 = ui.size();
+        if (s2[0] !== W || s2[1] !== H || currentKb() !== KB_H)
+            relayout();
         if (actIdx >= 0 && actIdx < sessions.length) {
             sessions[actIdx].term.flush();
             drawSel(); /* 受信出力に上書きされたハイライトの自己修復 */
