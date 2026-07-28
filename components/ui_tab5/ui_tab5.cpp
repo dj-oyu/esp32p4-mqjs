@@ -34,6 +34,10 @@
 #include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+/* private to esp_lvgl_port; on the include path via its COMPONENT_DIR
+   (see CMakeLists) so __wrap_lvgl_port_ppa_create gets the real cfg
+   type instead of a hand-copied one that could drift */
+#include "lcd_ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -478,12 +482,39 @@ static inline int ui_cur_hres(void)
 #define UI_DPHY_LDO_CHAN    3
 #define UI_DPHY_LDO_MV      2500
 #define UI_BACKLIGHT_GPIO   22
-/* 25 lines (was 50): sw_rotate makes esp_lvgl_port allocate a second,
-   equally sized PPA rotation buffer with the same caps (internal DMA),
-   so halve the draw buffer to keep the total internal footprint at the
-   pre-rotation 72KB — internal SRAM is the scarcest pool on this build
-   (esp-hosted SDIO owns most of it). */
-#define UI_LVGL_BUF_LINES   25
+/* 50 lines. This was halved to 25 because sw_rotate makes esp_lvgl_port
+   allocate a second, equally sized PPA rotation scratch with the SAME
+   caps (internal DMA), so a 50-line buffer cost 144KB of the scarcest
+   pool on this build (esp-hosted SDIO owns most of internal SRAM).
+   __wrap_lvgl_port_ppa_create now puts that scratch in PSRAM, so the
+   internal footprint is 72KB either way — the same as before — and the
+   draw buffer gets all of it. Fewer, taller chunks: a keyboard map swap
+   goes from 16 chunks to 8, and every chunk is a fresh walk of the
+   widget tree (see s_kb_row). */
+#define UI_LVGL_BUF_LINES   50
+
+/* The rotation scratch is written by the PPA and read by the LCD DMA —
+   never by the CPU — so PSRAM costs it bandwidth, not cache misses, and
+   only in landscape. Landscape means the keyboard dock is attached,
+   which is exactly when the on-screen keyboard is suppressed and the
+   repaints are cheap. The draw buffers themselves stay internal: PSRAM
+   for those was measured at ~2x the render time (see below).
+   The port gives the scratch and the draw buffers one shared pair of
+   caps flags (lvgl_port_display_cfg_t has a single buff_dma/buff_spiram
+   for both), so splitting them means intercepting the one call that
+   allocates it. P4 PSRAM is DMA-capable (SOC_PSRAM_DMA_CAPABLE=1), so
+   asking for DMA|SPIRAM together is legal here. */
+extern "C" lvgl_port_ppa_handle_t
+__real_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg);
+extern "C" lvgl_port_ppa_handle_t
+__wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
+{
+    lvgl_port_ppa_cfg_t in_psram = *cfg;
+    in_psram.flags.buff_spiram = 1;
+    ESP_LOGI(TAG, "PPA rotation scratch -> PSRAM (%u bytes)",
+             (unsigned)in_psram.buffer_size);
+    return __real_lvgl_port_ppa_create(&in_psram);
+}
 /* Touch sampling period. LVGL's default is LV_DEF_REFR_PERIOD (33 ms),
    which is too coarse to catch a quick tap — see lvgl_port_add_touch. */
 #define UI_TOUCH_READ_MS    10
