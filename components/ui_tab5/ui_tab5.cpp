@@ -1532,6 +1532,7 @@ static void cbar_show(bool show)
                                   LV_PART_ITEMS);
         lv_obj_set_style_text_color(s_cbar, lv_color_hex(UI_COL_TEXT),
                                     LV_PART_ITEMS);
+        lv_obj_set_style_shadow_width(s_cbar, 0, LV_PART_ITEMS); /* see s_kb */
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_FLASH),
                                   (uint32_t)LV_PART_ITEMS |
                                       (uint32_t)LV_STATE_PRESSED);
@@ -2132,6 +2133,12 @@ static void kb_show(int mode)
                               LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_kb, lv_color_hex(UI_COL_TEXT),
                                 LV_PART_ITEMS);
+    /* The default theme gives every button a BLURRED DROP SHADOW, and
+       LV_DRAW_SW_SHADOW_CACHE_SIZE is 0 — so all 36 keys re-blurred
+       theirs on every repaint. lv_keyboard's own theme strips them
+       (lv_theme_default.c keyboard_button_bg); a raw button matrix
+       keeps them. Invisible on this dark palette, so pure cost. */
+    lv_obj_set_style_shadow_width(s_kb, 0, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_FLASH),
                               (uint32_t)LV_PART_ITEMS |
                                   (uint32_t)LV_STATE_PRESSED);
@@ -2204,14 +2211,20 @@ static void kb_show(int mode)
    actually cost on this panel? (single draw buffer, 25-line chunks,
    PPA rotate per flush). Times the render+flush by forcing it. */
 /* Flip to 1 to re-measure after touching the keyboard or the display
-   pipeline. Measured on this panel:
-     -Og, portrait   key 3 ms | map swap 63 ms | screen  99 ms
-     -O2, landscape  key 3 ms | map swap 80 ms | screen 124 ms
-   Landscape draws 1.8x the keyboard pixels and PPA-rotates every flush,
-   so per pixel -O2 is ~40% faster on the button/text-heavy keyboard
-   (4.0 -> 5.6 Mpx/s) while a flat full-screen fill is memory-bound and
-   does not improve. The flush path — one draw buffer, 25-line chunks,
-   no overlap — is what sets the floor, not the compiler. */
+   pipeline. Measured on this panel (ms: one key | map swap | screen):
+     -Og portrait,  shadows      3 | 63 |  99
+     -O2 landscape, shadows      3 | 81 | 125   (1.8x the pixels, + PPA
+                                                 rotate, so per pixel
+                                                 -O2 is ~40% faster on
+                                                 button/text content;
+                                                 flat fills are memory
+                                                 bound and unchanged)
+     -O2 landscape, no shadows   1 | 47 |  85   <- shipped
+     ... + PSRAM draw buffers    3 | 85 | 160   (frees 72KB internal,
+                                                 costs ~2x render)
+     ... + double buffer (int)   1 | 40 |  73   (costs 36KB internal)
+   The flush path — draw buffer count and size — sets the floor; the
+   compiler and the styles set the slope. */
 #ifndef UI_KB_BENCH
 #define UI_KB_BENCH 0
 #endif
@@ -2880,12 +2893,24 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     disp_cfg.io_handle = io;
     disp_cfg.panel_handle = panel;
     disp_cfg.buffer_size = UI_LCD_H_RES * UI_LVGL_BUF_LINES;
+    /* MEASURED 2026-07-28: double_buffer=true overlaps render with the
+       DMA flush and is worth ~15% on big repaints (keyboard map swap
+       47 -> 40 ms, whole screen 85 -> 73 ms) for another 36KB of
+       internal DMA — largest contiguous internal block drops 80KB ->
+       46KB at network-up. Not taken: the camera and esp-hosted need
+       that headroom more than the keyboard needs 7 ms, now that the
+       repaint is off the typing path entirely. */
     disp_cfg.double_buffer = false;
     disp_cfg.hres = UI_LCD_H_RES;
     disp_cfg.vres = UI_LCD_V_RES;
     disp_cfg.monochrome = false;
     disp_cfg.color_format = LV_COLOR_FORMAT_RGB565;
     disp_cfg.flags.buff_dma = true;
+    /* MEASURED 2026-07-28: PSRAM draw buffers (flags.buff_spiram, legal
+       here since P4 PSRAM is DMA-capable) free the ~72KB of internal DMA
+       these two buffers hold — and cost roughly 2x the render time
+       (keyboard map swap 47 -> 85 ms, whole screen 85 -> 160 ms). The
+       buffers stay internal. */
     /* keyboard-dock landscape: PPA rotates each flush (needs
        CONFIG_LVGL_PORT_ENABLE_PPA; without it the port falls back to a
        CPU rotate through draw_buffs[2] — same memory, more CPU) */
