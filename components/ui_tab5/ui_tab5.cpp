@@ -1528,6 +1528,7 @@ static void cbar_show(bool show)
            the overlay — user-reported on app switches) */
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_BG), 0);
         lv_obj_set_style_border_width(s_cbar, 0, 0);
+        lv_obj_set_style_radius(s_cbar, 0, LV_PART_MAIN); /* see s_kb */
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_BAR),
                                   LV_PART_ITEMS);
         lv_obj_set_style_text_color(s_cbar, lv_color_hex(UI_COL_TEXT),
@@ -2130,6 +2131,13 @@ static void kb_show(int mode)
        keyboard (re)appearance a bright blue-white flash */
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BG), 0);
     lv_obj_set_style_border_width(s_kb, 0, 0);
+    /* MAIN, not ITEMS: the theme's card radius (10px at this DPI) was
+       still on the matrix's own background, and a rounded background is
+       not a COVER — so LVGL could not skip the console under any chunk
+       the keyboard's corners touch, and drew both. The corners sit on
+       UI_COL_BG either way, so squaring them changes no pixel unless a
+       JS canvas is showing, where ~86px of it were console before. */
+    lv_obj_set_style_radius(s_kb, 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BAR),
                               LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_kb, lv_color_hex(UI_COL_TEXT),
