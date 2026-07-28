@@ -484,6 +484,9 @@ static inline int ui_cur_hres(void)
    pre-rotation 72KB — internal SRAM is the scarcest pool on this build
    (esp-hosted SDIO owns most of it). */
 #define UI_LVGL_BUF_LINES   25
+/* Touch sampling period. LVGL's default is LV_DEF_REFR_PERIOD (33 ms),
+   which is too coarse to catch a quick tap — see lvgl_port_add_touch. */
+#define UI_TOUCH_READ_MS    10
 /* UI_STATUSBAR_H lives in ui_tab5_internal.h (shared with ui_widgets.cpp) */
 
 /* Tab5 shipped with different panels over time; the variant is identified
@@ -693,11 +696,21 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
     touch_cfg.disp = disp;
     touch_cfg.handle = tp;
     s_touch_indev = lvgl_port_add_touch(&touch_cfg);
-    if (!s_touch_indev)
+    if (!s_touch_indev) {
         ESP_LOGE(TAG, "lvgl_port_add_touch failed");
-    else
-        ESP_LOGI(TAG, "touch up (%s)",
-                 variant == UI_PANEL_ILI9881C ? "GT911" : "ST7123");
+    } else {
+        /* LVGL samples the panel from the same timer loop it renders in,
+           every LV_DEF_REFR_PERIOD (33 ms) by default. That is coarser
+           than a quick tap: press and release can both fall between two
+           samples, which is why typing fast on the on-screen keyboard
+           dropped keys and a double-tap could not be landed at all. One
+           small I2C read every 10 ms buys three times the resolution. */
+        lv_timer_set_period(lv_indev_get_read_timer(s_touch_indev),
+                            UI_TOUCH_READ_MS);
+        ESP_LOGI(TAG, "touch up (%s, %d ms sampling)",
+                 variant == UI_PANEL_ILI9881C ? "GT911" : "ST7123",
+                 UI_TOUCH_READ_MS);
+    }
 }
 
 /* runs in the LVGL task (from the mooncake lv_timer): mirror the indev
@@ -1360,8 +1373,9 @@ static lv_obj_t *s_kb_clip_lbl;
 static lv_obj_t *s_kb_lock_lbl; /* which modifiers are latched, in words */
 static lv_timer_t *s_kb_clip_tmr; /* another app may replace the value */
 static bool s_kb_sym;        /* symbol layer showing */
-static int s_kb_map_shown = -1; /* layer+lock the matrix currently draws;
+static int s_kb_map_shown = -1; /* layer the matrix currently draws;
                                    -1 = none yet (also after a rebuild) */
+static uint32_t s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE; /* Shift key */
 static lv_obj_t *s_cbar;     /* T3a terminal control bar (mode 2) */
 static bool s_cbar_fn;       /* current map: false = main, true = F1-F12 */
 static int s_cbar_map_fn = -1; /* map the bar actually draws; -1 = none */
@@ -1376,7 +1390,8 @@ static lv_obj_t *s_root_scr; /* console screen: fixed parent for s_kb (a
    deliberately different things. LVGL task only, hence no locking. */
 static kbd_mods_t s_ui_mods;
 
-static void kb_apply_map(void);     /* fwd: the bar spends Shift one-shots */
+static void kb_apply_map(void);        /* fwd: the bar spends Shift */
+static void kb_apply_shift_flag(void); /* fwd: ... and must show it */
 static void kb_lock_refresh(void);  /* fwd: which modifiers are latched */
 static void ui_kb_refresh(void);    /* fwd: deferred map/label work */
 
@@ -1571,7 +1586,7 @@ static void cbar_show(bool show)
                 kbd_mods_mark_chord(&s_ui_mods);
                 kbd_mods_consume(&s_ui_mods); /* one-shots are spent */
                 cbar_apply_mods();
-                ui_kb_refresh();
+                kb_apply_shift_flag(); /* no map work: faces track locks */
             },
             LV_EVENT_VALUE_CHANGED, nullptr);
     }
@@ -1870,22 +1885,44 @@ static const char *KB_MAP_SYM[] = {
     KB_LBL_ABC, "\"", "'", KB_SPACE, ">", "[", "]", "",
 };
 
-/* Point the matrix at the layer the current state implies. The letter
-   case IS the Shift indicator — a one-shot flips back to lower case
-   after one key while a lock stays upper, which is the difference the
-   strip's LOCK line names in words. set_map wipes per-button widths and
-   (when the key count changes) the ctrl flags, so both are restored
-   here. Skipped when nothing visible changed: this runs after every
-   keystroke and repainting the keyboard is not free. */
+/* Shift shown on the Shift key alone: one ctrl bit and one button
+   invalidated, measured at 3 ms — against 63 ms to swap the whole map
+   (see kb_apply_map). Cheap enough to run inside an event callback,
+   which is what makes a one-shot feel instant. */
+static void kb_apply_shift_flag(void)
+{
+    if (!s_kb || s_kb_shift_id == LV_BUTTONMATRIX_BUTTON_NONE)
+        return;
+    if (kbd_mod_armed(&s_ui_mods.shift))
+        lv_buttonmatrix_set_button_ctrl(s_kb, s_kb_shift_id,
+                                        LV_BUTTONMATRIX_CTRL_CHECKED);
+    else
+        lv_buttonmatrix_clear_button_ctrl(s_kb, s_kb_shift_id,
+                                          LV_BUTTONMATRIX_CTRL_CHECKED);
+}
+
+/* Point the matrix at the layer the current state implies.
+   Uppercase FACES are shown for a Shift LOCK only, never for a one-shot.
+   Measured on this panel (single draw buffer, 25-line chunks, PPA
+   rotate per flush): a map swap costs 63 ms — two touch samples' worth
+   of blackout, since LVGL reads the panel from the same loop it renders
+   in. Paying that on every one-shot put it right inside the gesture the
+   user was still performing, which is what made a double-tap
+   impossible; a lock is a deliberate, rare toggle and lands after the
+   gesture is over. The one-shot still shows on the Shift key itself and
+   in the strip's LOCK line.
+   set_map wipes per-button widths and (when the key count changes) the
+   ctrl flags, so both are restored here. */
 static void kb_apply_map(void)
 {
     if (!s_kb)
         return;
-    bool upper = kbd_mod_armed(&s_ui_mods.shift);
+    bool upper = s_ui_mods.shift.lock;
     int want = s_kb_sym ? 2 : upper ? 1 : 0;
     if (want == s_kb_map_shown)
         return;
     s_kb_map_shown = want;
+    s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
 
     lv_buttonmatrix_set_map(s_kb, s_kb_sym ? KB_MAP_SYM
                                   : upper  ? KB_MAP_UPPER
@@ -1906,18 +1943,13 @@ static void kb_apply_map(void)
             !strcmp(t, LV_SYMBOL_NEW_LINE) || !strcmp(t, LV_SYMBOL_COPY))
             lv_buttonmatrix_set_button_ctrl(s_kb, id,
                                             LV_BUTTONMATRIX_CTRL_NO_REPEAT);
-        if (!shift)
-            continue;
-        /* clear as well as set: swapping between two maps with the same
-           key count keeps the old flags (LVGL only reallocates when the
-           count changes), which used to leave Shift stuck amber */
-        if (upper)
-            lv_buttonmatrix_set_button_ctrl(s_kb, id,
-                                            LV_BUTTONMATRIX_CTRL_CHECKED);
-        else
-            lv_buttonmatrix_clear_button_ctrl(s_kb, id,
-                                              LV_BUTTONMATRIX_CTRL_CHECKED);
+        if (shift)
+            s_kb_shift_id = id; /* the layers move it around */
     }
+    /* set AND clear: swapping between two maps of the same key count
+       keeps the old flags (LVGL only reallocates when the count
+       changes), which used to leave Shift stuck amber */
+    kb_apply_shift_flag();
 }
 
 /* Which modifiers are LATCHED, spelled out. A one-shot and a lock look
@@ -2008,7 +2040,7 @@ static void kb_top_create(void)
                 mqjs_post_key(seq, n);
             kbd_mods_consume(&s_ui_mods);
             cbar_apply_mods();
-            ui_kb_refresh();
+            kb_apply_shift_flag();
         },
         LV_EVENT_CLICKED, nullptr);
 
@@ -2131,8 +2163,9 @@ static void kb_show(int mode)
             }
             if (!strcmp(txt, KB_LBL_SHIFT)) {
                 kbd_mod_tap(&s_ui_mods.shift, true);
-                kb_lock_refresh(); /* cheap, so the latch shows at once */
-                ui_kb_refresh();
+                kb_apply_shift_flag(); /* 3 ms: the tap answers at once */
+                kb_lock_refresh();
+                ui_kb_refresh(); /* a lock also swaps the faces, later */
                 return;
             }
 
@@ -2159,12 +2192,61 @@ static void kb_show(int mode)
                 mqjs_post_key(seq, n);
             kbd_mods_mark_chord(&s_ui_mods); /* breaks pending tap chains */
             kbd_mods_consume(&s_ui_mods);
-            cbar_apply_mods(); /* un-highlight bar Ctrl/Alt at once */
-            ui_kb_refresh();   /* a spent Shift returns to lower case */
+            /* both cheap, and the spent one-shots must stop showing now */
+            kb_apply_shift_flag();
+            cbar_apply_mods();
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
     kb_apply_map(); /* widths, and whatever state survived an app switch */
 }
+
+/* Temporary instrumentation: what does each kind of keyboard repaint
+   actually cost on this panel? (single draw buffer, 25-line chunks,
+   PPA rotate per flush). Times the render+flush by forcing it. */
+/* Flip to 1 to re-measure after touching the keyboard or the display
+   pipeline. Numbers on this panel, portrait: single key 3 ms, map swap
+   63 ms, whole screen 99 ms, keyboard first draw 106 ms. */
+#ifndef UI_KB_BENCH
+#define UI_KB_BENCH 0
+#endif
+#if UI_KB_BENCH
+static void kb_bench(void)
+{
+    int64_t t0;
+#define KB_BENCH_STEP(label, body)                                        \
+    do {                                                                  \
+        t0 = esp_timer_get_time();                                        \
+        body;                                                             \
+        lv_refr_now(s_disp);                                              \
+        ESP_LOGW(TAG, "bench %-22s %5lld ms", label,                      \
+                 (esp_timer_get_time() - t0) / 1000);                     \
+    } while (0)
+
+    KB_BENCH_STEP("kb create+first draw", kb_show(2));
+    KB_BENCH_STEP("one key invalidate",
+                  lv_buttonmatrix_set_button_ctrl(
+                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+    KB_BENCH_STEP("one key invalidate #2",
+                  lv_buttonmatrix_clear_button_ctrl(
+                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+    KB_BENCH_STEP("map swap (case)", {
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
+    });
+    KB_BENCH_STEP("map swap (sym, realloc)", {
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_SYM);
+    });
+    KB_BENCH_STEP("strip label", kb_lock_refresh());
+    KB_BENCH_STEP("clip label", kb_clip_refresh());
+    KB_BENCH_STEP("whole screen", lv_obj_invalidate(lv_screen_active()));
+    ESP_LOGW(TAG, "bench indev read period %d ms, refr %d ms",
+             (int)LV_DEF_REFR_PERIOD, (int)LV_DEF_REFR_PERIOD);
+    s_kb_map_shown = -1;
+    kb_show(0);
+#undef KB_BENCH_STEP
+}
+#endif
 
 /* Phase 2: JS-drawable canvas over the console area. Hidden until the
    running script issues its first ui.* command; hides again (and
@@ -2826,6 +2908,14 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
 
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
+
+#if UI_KB_BENCH
+    {
+        lv_timer_t *t = lv_timer_create(
+            [](lv_timer_t *) { kb_bench(); }, 6000, nullptr);
+        lv_timer_set_repeat_count(t, 1);
+    }
+#endif
     if (ready_cb)
         ready_cb(arg);
 
