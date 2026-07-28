@@ -22,7 +22,7 @@ idf_component_register(SRCS ${UI_SRCS}
                        PRIV_INCLUDE_DIRS "vendor"
                        PRIV_REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio
                                      esp_driver_ledc esp_driver_ppa esp_timer
-                                     mooncake smooth_ui_toolkit)
+                                     kbd_core mooncake smooth_ui_toolkit)
 
 if(CONFIG_MQJS_TAB5_UI)
     # the lv_font_conv-generated font selects #include "lvgl.h" via this guard
