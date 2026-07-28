@@ -116,10 +116,18 @@ void ui_tab5_text_size(const char *utf8, int *w, int *h);
  * used by ui.cells/UI_CMD_CELLS. 0x0 when the UI is off. Const tables only. */
 void ui_tab5_cell_size(int *w, int *h);
 /* Pixels the keyboard overlay reserves at the canvas bottom in `mode`
- * (0/1/2, see UI_CMD_KEYBOARD). Constant per mode; 0 when the UI is
- * off. Synchronous (ui.keyboard's return value: the JS terminal sizes
- * its grid with it). */
+ * (0/1/2, see UI_CMD_KEYBOARD); 0 when the UI is off. Synchronous
+ * (ui.keyboard's return value: the JS terminal sizes its grid with it).
+ * Depends on the keyboard dock: docked, mode 1 reserves nothing (the
+ * dock types directly) and mode 2 only the control bar's height. */
 int ui_tab5_kb_reserved(int mode);
+
+/* Keyboard dock presence (kbd_tab5): while set, ui.keyboard() requests
+ * raise no on-screen keyboard — mode 2 keeps only the control bar
+ * (F-keys/copy/paste have no dock equivalent) — and the foreground
+ * app's last requested mode is re-applied immediately. Apps stay
+ * unaware; their ui.keyboard() return value does the sizing. */
+void ui_tab5_set_hw_keyboard(bool present);
 
 /* Create a widget screen (flex column + title), retain the previously
  * active screen on the navigation stack and slide the new one in.
@@ -174,6 +182,17 @@ void ui_tab5_w_commit(void);
  * when the UI is down). Third element of sys.heap() — the W1-4 thrash
  * metric lives inside the preallocated pool, invisible to heap_caps. */
 size_t ui_tab5_lv_mem_free(void);
+
+/* Landscape rotation (keyboard dock). Flips the whole UI between
+ * portrait (720x1280) and landscape (1280x720, panel content PPA-
+ * rotated per flush): status bar/console/canvas re-size, the lazily
+ * built overlays (on-screen keyboard, control bar, stats panel) are
+ * rebuilt at the new width on next use, and the foreground app gets a
+ * "\x00rotate" key token — its ui.size() has changed. Callable from
+ * any task (takes the LVGL lock); no-op before the UI is up or when
+ * already in the requested orientation. */
+void ui_tab5_set_landscape(bool on);
+bool ui_tab5_landscape(void);
 
 /* The touch controller's I2C master bus handle (port 1, SDA31/SCL32) —
  * the internal bus the camera's SCCB also lives on. void* so this

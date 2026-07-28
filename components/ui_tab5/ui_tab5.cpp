@@ -122,7 +122,9 @@ static ppa_client_handle_t s_ppa_fill;
    ui_blend565's a/15 math exactly. One full text row max. */
 #define UI_PPA_CELLS_MIN_CELLS 6
 static ppa_client_handle_t s_ppa_blend;
-/* 720 = canvas width; 64B-aligned (and 64B-multiple) for PPA cache ops */
+/* 720px = 80 cells: the max PPA segment (cells_run splits longer runs,
+   e.g. 142-cell landscape rows); 64B-aligned (and 64B-multiple) for PPA
+   cache ops. Deliberately NOT grown for landscape: internal SRAM. */
 static uint8_t s_cells_a8[720 * UI_CELL_H] __attribute__((aligned(64)));
 
 /* minimal UTF-8 decode, shared by both cells paths */
@@ -371,6 +373,22 @@ static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
 static int s_canvas_w, s_canvas_h; /* set once the display is up */
 
+/* Landscape rotation (keyboard dock). The handles below are the few
+   fixed-size widgets that ui_tab5_set_landscape must re-size by hand —
+   everything else is LV_PCT/flex/align-based and follows the display's
+   resolution change on its own. */
+static lv_display_t *s_disp;
+static bool s_landscape;
+static bool s_hw_kb;      /* keyboard dock present: on-screen keys off */
+static int s_app_kb_mode; /* the ui.keyboard mode the app last asked for
+                             (0/1/2) — re-applied when the dock
+                             (dis)appears; apps stay unaware of it */
+static lv_obj_t *s_sb_bar, *s_sb_row, *s_sb_event; /* status bar chrome */
+static lv_obj_t *s_console_panel;
+static lv_obj_t *s_js_canvas;      /* CanvasApp presentation object */
+static uint16_t *s_js_canvas_buf;  /* ... and its pixel buffer */
+static size_t s_js_canvas_bytes;   /* allocation size (portrait = max) */
+
 extern "C" bool ui_tab5_cmd(const ui_cmd_t *cmd)
 {
     if (!s_cmd_queue || !cmd)
@@ -440,11 +458,31 @@ extern "C" int __wrap_esp_hosted_init(void)
 /* --- Tab5 display constants (M5Tab5-UserDemo BSP) --- */
 #define UI_LCD_H_RES        720
 #define UI_LCD_V_RES        1280
+
+/* Landscape support (keyboard dock): the panel scans portrait, content
+   is PPA-rotated per flush by esp_lvgl_port (flags.sw_rotate +
+   CONFIG_LVGL_PORT_ENABLE_PPA). The dock holds the Tab5 turned 90° to
+   the left (CCW), so content must rotate clockwise into panel coords —
+   if the device shows it upside down, flip this one constant to
+   LV_DISPLAY_ROTATION_270. */
+#define UI_ROT_LANDSCAPE LV_DISPLAY_ROTATION_90
+
+/* current logical width — overlays created after a rotation must size
+   themselves to this, not the compile-time portrait width */
+static inline int ui_cur_hres(void)
+{
+    return s_landscape ? UI_LCD_V_RES : UI_LCD_H_RES;
+}
 #define UI_DSI_LANES        2
 #define UI_DPHY_LDO_CHAN    3
 #define UI_DPHY_LDO_MV      2500
 #define UI_BACKLIGHT_GPIO   22
-#define UI_LVGL_BUF_LINES   50
+/* 25 lines (was 50): sw_rotate makes esp_lvgl_port allocate a second,
+   equally sized PPA rotation buffer with the same caps (internal DMA),
+   so halve the draw buffer to keep the total internal footprint at the
+   pre-rotation 72KB — internal SRAM is the scarcest pool on this build
+   (esp-hosted SDIO owns most of it). */
+#define UI_LVGL_BUF_LINES   25
 /* UI_STATUSBAR_H lives in ui_tab5_internal.h (shared with ui_widgets.cpp) */
 
 /* Tab5 shipped with different panels over time; the variant is identified
@@ -921,6 +959,7 @@ public:
         lv_obj_remove_style_all(bar);
         lv_obj_set_pos(bar, 0, 0);
         lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
+        s_sb_bar = bar; /* resized on rotation */
         lv_obj_set_style_bg_color(bar, lv_color_hex(UI_COL_BAR), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
         lv_obj_add_flag(bar, LV_OBJ_FLAG_CLICKABLE);
@@ -932,6 +971,7 @@ public:
         lv_obj_remove_style_all(row);
         lv_obj_set_pos(row, 0, 0);
         lv_obj_set_size(row, UI_LCD_H_RES, 44);
+        s_sb_row = row; /* resized on rotation */
         /* hit-testing falls through to the bar's press state machine */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_pad_hor(row, UI_PAD, 0);
@@ -986,6 +1026,7 @@ public:
         _event_lbl = make_label(bar, UI_COL_EVENT);
         lv_obj_set_pos(_event_lbl, UI_PAD, 48);
         lv_obj_set_width(_event_lbl, UI_LCD_H_RES - 2 * UI_PAD);
+        s_sb_event = _event_lbl; /* resized on rotation */
         lv_obj_set_style_pad_hor(_event_lbl, 6, 0);
         lv_obj_set_style_radius(_event_lbl, 4, 0);
         lv_obj_set_style_bg_color(_event_lbl, lv_color_hex(UI_COL_FLASH), 0);
@@ -1036,7 +1077,9 @@ public:
         if (_pressed) {
             uint32_t held = lv_tick_elaps(_press_tick);
             uint32_t capped = held > UI_HOLD_MS ? UI_HOLD_MS : held;
-            int w = (int)((uint32_t)UI_LCD_H_RES * capped / UI_HOLD_MS);
+            /* bar width, not UI_LCD_H_RES: tracks landscape rotation */
+            int w = (int)((uint32_t)lv_obj_get_width(s_sb_bar) * capped /
+                          UI_HOLD_MS);
             lv_obj_set_width(_strip, w < 8 ? 8 : w);
             lv_obj_remove_flag(_strip, LV_OBJ_FLAG_HIDDEN);
             if (!_armed && held >= UI_HOLD_MS) {
@@ -1233,6 +1276,7 @@ public:
         lv_obj_remove_style_all(_panel);
         lv_obj_set_pos(_panel, 0, UI_STATUSBAR_H);
         lv_obj_set_size(_panel, UI_LCD_H_RES, UI_LCD_V_RES - UI_STATUSBAR_H);
+        s_console_panel = _panel; /* resized on rotation */
         lv_obj_set_style_bg_color(_panel, lv_color_hex(UI_COL_BG), 0);
         lv_obj_set_style_bg_opa(_panel, LV_OPA_COVER, 0);
         /* slim side padding: console lines should use the full width
@@ -1391,8 +1435,7 @@ static void cbar_show(bool show)
     if (!s_cbar) {
         s_cbar = lv_buttonmatrix_create(s_root_scr ? s_root_scr
                                                    : lv_screen_active());
-        lv_obj_set_size(s_cbar, UI_LCD_H_RES, UI_CB_H);
-        lv_obj_align(s_cbar, LV_ALIGN_BOTTOM_MID, 0, -UI_KB_H);
+        lv_obj_set_size(s_cbar, ui_cur_hres(), UI_CB_H);
         lv_obj_set_style_pad_all(s_cbar, 4, 0);
         lv_obj_set_style_pad_gap(s_cbar, 4, 0);
         lv_obj_set_style_text_font(s_cbar, ui_font(), 0);
@@ -1460,6 +1503,9 @@ static void cbar_show(bool show)
             },
             LV_EVENT_VALUE_CHANGED, nullptr);
     }
+    /* above the on-screen keyboard normally; at the very bottom when
+       the dock types for us and no keyboard will be raised */
+    lv_obj_align(s_cbar, LV_ALIGN_BOTTOM_MID, 0, s_hw_kb ? 0 : -UI_KB_H);
     lv_obj_remove_flag(s_cbar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_cbar);
 }
@@ -1471,6 +1517,8 @@ extern "C" int ui_tab5_kb_reserved(int mode)
 {
     if (!s_canvas_w || mode <= 0)
         return 0;
+    if (s_hw_kb) /* dock types directly; mode 2 keeps only the bar */
+        return mode == 1 ? 0 : UI_CB_H;
     return mode == 1 ? UI_KB_H : UI_KB_H + UI_CB_H;
 }
 
@@ -1690,7 +1738,7 @@ static void spanel_show(bool show)
     if (!s_spanel)
         spanel_build();
     int h = ui_tab5_kb_reserved(s_kb_mode ? s_kb_mode : 2);
-    lv_obj_set_size(s_spanel, UI_LCD_H_RES, h);
+    lv_obj_set_size(s_spanel, ui_cur_hres(), h);
     lv_obj_align(s_spanel, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_remove_flag(s_spanel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_spanel);
@@ -1711,14 +1759,23 @@ static void kb_collapse(void)
 
 /* mode: 0 = hide (OFF: stats panel gone too), 1 = keyboard,
    2 = keyboard + terminal control bar. Showing always lifts the
-   keyboard over a collapsed panel (T3c SHOWN state). */
+   keyboard over a collapsed panel (T3c SHOWN state).
+   Keyboard dock present (s_hw_kb): the app's request is honored in
+   spirit without any app change — mode 1 raises nothing (the dock
+   types directly), mode 2 keeps only the slim control bar, whose
+   F-keys / copy / paste have no physical equivalent on the dock.
+   ui_tab5_kb_reserved returns matching heights, so ui.keyboard()'s
+   synchronous return already sizes the app's grid correctly. */
 static void kb_show(int mode)
 {
+    s_app_kb_mode = mode > 0 ? mode : 0; /* re-applied on dock change */
     cbar_show(mode >= 2);
     spanel_show(false);
-    if (mode <= 0) {
+    if (mode <= 0 || s_hw_kb) {
         if (s_kb)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+        if (mode > 0)
+            s_kb_mode = mode; /* dock removed later: ⌨ restores this */
         return;
     }
     s_kb_mode = mode; /* what the panel's ⌨ button restores */
@@ -1732,7 +1789,7 @@ static void kb_show(int mode)
        switches maps before our callback could read the key, so replace
        it wholesale: mode switching is redone below via set_mode */
     lv_obj_remove_event_cb(s_kb, lv_keyboard_def_event_cb);
-    lv_obj_set_size(s_kb, UI_LCD_H_RES, UI_KB_H);
+    lv_obj_set_size(s_kb, ui_cur_hres(), UI_KB_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_text_font(s_kb, ui_font(), 0);
     /* dark system palette — the default light theme made every
@@ -1837,6 +1894,11 @@ public:
                              LV_COLOR_FORMAT_RGB565);
         lv_obj_set_pos(_canvas, 0, UI_STATUSBAR_H);
         lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+        /* rotation rebinds the same allocation with swapped dims (boot
+           is always portrait, whose w*h is the larger of the two) */
+        s_js_canvas = _canvas;
+        s_js_canvas_buf = _buf;
+        s_js_canvas_bytes = bytes;
     }
 
     void onRunning() override
@@ -2084,7 +2146,10 @@ private:
     /* Draw a run of cells (one fg/bg) starting at (col,row) using the
        monospace grid font. UTF-8 decoded to codepoints. Long runs that
        sit fully on the grid go compose-then-one-PPA-blend; short runs
-       and any PPA failure use the per-glyph CPU blit. */
+       and any PPA failure use the per-glyph CPU blit. Runs wider than
+       the A8 compose buffer (80 cells = the portrait width; landscape
+       rows are 142) are split into segments so the PPA path keeps
+       winning instead of falling back to the CPU wholesale. */
     void cells(const ui_cmd_t &cmd)
     {
         if (!cmd.text)
@@ -2100,8 +2165,29 @@ private:
         for (const uint8_t *p = s; *p; p++)
             if ((*p & 0xC0) != 0x80)
                 n++;
+        fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W,
+                  UI_CELL_H, bg);
+
+        const int seg_max = (int)(sizeof(s_cells_a8) /
+                                  ((size_t)UI_CELL_W * UI_CELL_H));
+        while (n > seg_max) {
+            const uint8_t *p = s;
+            for (int c = 0; c < seg_max; c++)
+                cells_utf8_next(p); /* advance past this segment */
+            cells_run(col, row, s, p, seg_max, fg);
+            s = p;
+            col += seg_max;
+            n -= seg_max;
+        }
+        cells_run(col, row, s, nullptr, n, fg);
+    }
+
+    /* One ≤80-cell segment: PPA compose+blend when it qualifies, else
+       per-glyph CPU blit. `e` bounds the UTF-8 walk (nullptr = NUL). */
+    void cells_run(int col, int row, const uint8_t *s, const uint8_t *e,
+                   int n, uint16_t fg)
+    {
         int x0 = col * UI_CELL_W, y0 = row * UI_CELL_H, bw = n * UI_CELL_W;
-        fill_rect(x0, y0, bw, UI_CELL_H, bg);
 
         if (s_ppa_blend && n >= UI_PPA_CELLS_MIN_CELLS && x0 >= 0 &&
             y0 >= 0 && x0 + bw <= s_canvas_w &&
@@ -2109,7 +2195,7 @@ private:
             (size_t)bw * UI_CELL_H <= sizeof(s_cells_a8)) {
             memset(s_cells_a8, 0, (size_t)bw * UI_CELL_H);
             const uint8_t *p = s;
-            for (int c = 0; *p; c++)
+            for (int c = 0; *p && (!e || p < e); c++)
                 compose_glyph_a8(s_cells_a8, bw, c * UI_CELL_W,
                                  cells_utf8_next(p));
             ppa_blend_oper_config_t op = {};
@@ -2148,7 +2234,7 @@ private:
         }
 
         int c = col;
-        while (*s) {
+        while (*s && (!e || s < e)) {
             uint32_t cp = cells_utf8_next(s);
             blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg);
             c++;
@@ -2226,6 +2312,109 @@ private:
     char _origin[sizeof(ui_status_t::task_origin)] = "";
 };
 
+/* ------------------------------------------------------------------ */
+/* Landscape rotation (keyboard dock). Callable from any task; takes   */
+/* the LVGL port lock. Content is PPA-rotated per flush by             */
+/* esp_lvgl_port (sw_rotate), touch is rotated by LVGL itself          */
+/* (lv_indev applies the display rotation to pointer coords).          */
+/* ------------------------------------------------------------------ */
+
+extern "C" bool ui_tab5_landscape(void)
+{
+    return s_landscape;
+}
+
+/* Keyboard dock present: stop raising the on-screen keyboard (mode 1
+   shows nothing, mode 2 keeps only the control bar) and re-apply the
+   foreground app's last requested mode under the new policy. Kept
+   separate from ui_tab5_set_landscape on purpose — orientation and
+   input policy are coupled by the dock today, not by the UI. */
+extern "C" void ui_tab5_set_hw_keyboard(bool present)
+{
+    if (s_hw_kb == present)
+        return;
+    s_hw_kb = present;
+    if (!s_disp || !s_canvas_w)
+        return;
+    lvgl_port_lock(0);
+    kb_show(s_app_kb_mode);
+    lvgl_port_unlock();
+}
+
+extern "C" void ui_tab5_set_landscape(bool on)
+{
+    if (!s_disp || !s_canvas_w || s_landscape == on)
+        return;
+    lvgl_port_lock(0);
+    s_landscape = on;
+    int hres = on ? UI_LCD_V_RES : UI_LCD_H_RES;
+    int vres = on ? UI_LCD_H_RES : UI_LCD_V_RES;
+
+    lv_display_set_rotation(s_disp, on ? UI_ROT_LANDSCAPE
+                                       : LV_DISPLAY_ROTATION_0);
+
+    /* the few fixed-size chrome widgets (everything else is pct/flex
+       and follows the resolution change on its own) */
+    if (s_sb_bar)
+        lv_obj_set_size(s_sb_bar, hres, UI_STATUSBAR_H);
+    if (s_sb_row)
+        lv_obj_set_width(s_sb_row, hres);
+    if (s_sb_event)
+        lv_obj_set_width(s_sb_event, hres - 2 * UI_PAD);
+    if (s_console_panel)
+        lv_obj_set_size(s_console_panel, hres, vres - UI_STATUSBAR_H);
+
+    /* lazily built overlays are sized at creation: drop them and
+       re-apply the app's keyboard mode below, which rebuilds them at
+       the new width under the current dock policy */
+    int app_kb = s_app_kb_mode;
+    if (s_kb) {
+        lv_obj_delete(s_kb);
+        s_kb = nullptr;
+    }
+    if (s_cbar) {
+        lv_obj_delete(s_cbar);
+        s_cbar = nullptr;
+        s_cbar_fn = false;
+        s_mod_ctrl = s_mod_alt = false;
+    }
+    if (s_sp_timer) {
+        lv_timer_delete(s_sp_timer);
+        s_sp_timer = nullptr;
+    }
+    if (s_spanel) {
+        lv_obj_delete(s_spanel);
+        s_spanel = nullptr;
+        s_sp_stats = s_sp_clip = s_sp_pct = nullptr;
+        s_sp_arc = nullptr;
+    }
+
+    /* JS canvas: rebind the same allocation with swapped dims (boot is
+       always portrait, whose w*h is the larger of the two) and drop to
+       the console until the app redraws — same hygiene as UI_CMD_RESET */
+    s_canvas_w = hres;
+    s_canvas_h = vres - UI_STATUSBAR_H;
+    if (s_js_canvas && s_js_canvas_buf &&
+        (size_t)s_canvas_w * s_canvas_h * 2 <= s_js_canvas_bytes) {
+        lv_canvas_set_buffer(s_js_canvas, s_js_canvas_buf, s_canvas_w,
+                             s_canvas_h, LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_pos(s_js_canvas, 0, UI_STATUSBAR_H);
+        lv_obj_add_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* rebuild the overlays the app had up, at the new width and under
+       the (possibly changed) dock policy */
+    kb_show(app_kb);
+    lvgl_port_unlock();
+
+    ESP_LOGI(TAG, "rotation: %s (canvas %dx%d)",
+             on ? "landscape" : "portrait", s_canvas_w, s_canvas_h);
+
+    /* tell the foreground app its ui.size() changed (same token channel
+       as the control bar; apps that don't care just ignore it) */
+    mqjs_post_key("\x00rotate", 7);
+}
+
 extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
 {
     /* the data plane must exist before app_main registers the print
@@ -2269,6 +2458,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     disp_cfg.monochrome = false;
     disp_cfg.color_format = LV_COLOR_FORMAT_RGB565;
     disp_cfg.flags.buff_dma = true;
+    /* keyboard-dock landscape: PPA rotates each flush (needs
+       CONFIG_LVGL_PORT_ENABLE_PPA; without it the port falls back to a
+       CPU rotate through draw_buffs[2] — same memory, more CPU) */
+    disp_cfg.flags.sw_rotate = true;
 
     lvgl_port_display_dsi_cfg_t dsi_cfg = {};
     dsi_cfg.flags.avoid_tearing = false;
@@ -2278,6 +2471,7 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         ESP_LOGE(TAG, "lvgl_port_add_disp_dsi failed");
         return;
     }
+    s_disp = disp; /* ui_tab5_set_landscape rotates this display */
 
     /* JS-visible canvas resolution (everything below the status bar);
        published before js_task starts, so ui.size() is always valid */

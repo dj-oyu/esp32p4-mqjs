@@ -1520,6 +1520,12 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 void mqjs_post_key(const char *utf8, size_t len)
 {
 #ifdef ESP_PLATFORM
+    /* keys feed the device idle clock like touch does (matters for the
+       keyboard dock: typing must keep the screen awake). kind 2 = a
+       discrete event with no gesture to eat through; a key that wakes a
+       blanked screen is swallowed here, exactly like the wake tap. */
+    if (mqjs_power_note_input(2))
+        return;
     MqjsEvent ev = { .type = EV_KEY };
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
     if (!s_event_queue || !fg->used || !fg->key_used || !utf8)
