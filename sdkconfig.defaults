@@ -56,3 +56,11 @@ CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
 # falls back to a CPU rotate — same extra buffer, much more CPU. Only
 # exists on SOC_PPA_SUPPORTED targets (P4); ignored on Stamp.
 CONFIG_LVGL_PORT_ENABLE_PPA=y
+
+# Build at -O2 rather than IDF's default -Og. Measured on the Tab5: the
+# button/text-heavy UI rasterises ~40% faster per pixel (flat fills are
+# memory-bound and unchanged), and GCC's stronger analysis at this level
+# found a real format-truncation bug that -Og could not see. Assertions
+# stay on; only a fresh sdkconfig picks this up, an existing one keeps
+# whatever it already has.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
