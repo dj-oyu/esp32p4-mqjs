@@ -55,7 +55,13 @@ static const char *TAG = "kbd_tab5";
 #define KB_REG_MODE      0x10
 #define KB_REG_RGB_MODE  0x11
 #define KB_REG_KEY_EVENT 0x20
-#define KB_REG_RGB_BASE  0x60 /* RGB1_B,G,R, RGB2_B,G,R */
+#define KB_REG_RGB1      0x60 /* RGB1_B,G,R at 0x60..0x62 */
+#define KB_REG_RGB2      0x64 /* RGB2_B,G,R at 0x64..0x66 — NOT 0x63!
+                                 Device-verified: a 6-byte write at
+                                 0x60 shifted LED2 by one channel (red
+                                 came out green); the protocol sheet's
+                                 register grid indeed leaves 0x63
+                                 empty. */
 #define KB_REG_VERSION   0xFE
 
 #define KB_MODE_NORMAL    0
@@ -132,36 +138,42 @@ static bool uppercase_active(void)
 }
 
 /* ---- modifier LEDs --------------------------------------------------
- * Two WS2812s via the dock's RGB custom mode, split by role so the
- * colors never mask each other:
- *   LED1 = momentary layer:  sym=blue > ctrl=cyan > alt=gray
- *   LED2 = uppercase state:  red while Aa is held / one-shot / locked
- * (held and locked show the same color on purpose — the lock IS "still
- * held" to the typist). */
+ * Two WS2812s via the dock's RGB custom mode, split by DURATION rather
+ * than by which key, so the transient and the latched state can never
+ * be confused (they were indistinguishable while both shared one LED):
+ *   LED1 (left)  = active for the next keystroke only — a physically
+ *                  held modifier, or Aa's one-shot.
+ *   LED2 (right) = LATCHED by double-tap; stays lit hands-off until
+ *                  tapped again.
+ * Colors in both: sym=blue, ctrl=cyan, alt=gray, Aa=red. */
+#define KB_COL_SYM  0x0000FF
+#define KB_COL_CTRL 0x00FFFF
+#define KB_COL_ALT  0x808080
+#define KB_COL_AA   0xFF0000
 
 static uint64_t s_led_state = 1; /* impossible initial: force 1st write */
 
 static void led_update(void)
 {
-    uint32_t led1;
-    if (mod_active(&s_sym))
-        led1 = 0x0000FF; /* sym: blue */
-    else if (mod_active(&s_ctrl))
-        led1 = 0x00FFFF; /* ctrl: cyan */
-    else if (mod_active(&s_alt))
-        led1 = 0x808080; /* alt: gray */
-    else
-        led1 = 0x000000;
-    uint32_t led2 = uppercase_active() ? 0xFF0000 : 0x000000;
+    uint32_t led1 = s_sym.held                     ? KB_COL_SYM
+                    : s_ctrl.held                  ? KB_COL_CTRL
+                    : s_alt.held                   ? KB_COL_ALT
+                    : (s_aa.held || s_aa.oneshot)  ? KB_COL_AA
+                                                   : 0x000000;
+    uint32_t led2 = s_sym.lock    ? KB_COL_SYM
+                    : s_ctrl.lock ? KB_COL_CTRL
+                    : s_alt.lock  ? KB_COL_ALT
+                    : s_aa.lock   ? KB_COL_AA
+                                  : 0x000000;
 
     uint64_t state = ((uint64_t)led1 << 24) | led2;
     if (state == s_led_state)
         return;
-    uint8_t bgr2[6] = { /* regs 0x60..: B,G,R per LED */
-        (uint8_t)led1, (uint8_t)(led1 >> 8), (uint8_t)(led1 >> 16),
-        (uint8_t)led2, (uint8_t)(led2 >> 8), (uint8_t)(led2 >> 16),
-    };
-    if (wr_regs(KB_REG_RGB_BASE, bgr2, 6))
+    uint8_t bgr1[3] = { (uint8_t)led1, (uint8_t)(led1 >> 8),
+                        (uint8_t)(led1 >> 16) };
+    uint8_t bgr2[3] = { (uint8_t)led2, (uint8_t)(led2 >> 8),
+                        (uint8_t)(led2 >> 16) };
+    if (wr_regs(KB_REG_RGB1, bgr1, 3) && wr_regs(KB_REG_RGB2, bgr2, 3))
         s_led_state = state;
 }
 
