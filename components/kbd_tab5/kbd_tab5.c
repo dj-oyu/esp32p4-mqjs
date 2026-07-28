@@ -310,13 +310,55 @@ static void IRAM_ATTR kb_isr(void *arg)
         portYIELD_FROM_ISR();
 }
 
-/* Dock answering? Switch to Normal mode + custom RGB, clean queue. */
+/* Dock answering? Switch to Normal mode + custom RGB, clean queue.
+ *
+ * DO NOT reintroduce i2c_master_probe() here. It panics this board.
+ * IDF's i2c_master_probe() (6.0.1, still on master) differs from every
+ * other transaction entry point in two fatal ways:
+ *   - it publishes its own STACK-LOCAL 2-entry ops array into
+ *     bus->i2c_trans.ops (dangling as soon as it returns), and
+ *   - it does not reset read_buf_pos / read_len_static / contains_read,
+ *     which s_i2c_transaction_start() does for every real transaction.
+ * So a read that left contains_read=1 (a poll whose completion IRQ never
+ * ran the STOP-phase handler) makes the NEXT probe's completion IRQ take
+ * i2c_isr_receive_handler()'s non-READ branch and index ops[read_buf_pos]
+ * — read_buf_pos is 4 after any 1-byte transmit_receive — i.e. 64 bytes
+ * past a 2-entry array that lives in this task's stack. It then stores
+ * RX FIFO bytes through whatever pointer it finds there:
+ *   Store access fault, MTVAL 0x000030f0, i2c_master.c:766.
+ * Device-verified on Tab5 (I2C0 = the pogo/dock bus): 2-3 panics per
+ * 150 s once Wi-Fi/microlink is up. A plain register read is the
+ * presence test instead — it runs the ordinary synchronous path, which
+ * uses the driver-owned ops array and resets the ISR read state. A
+ * NACK from an absent dock is only ESP_LOGD, so this is not noisier. */
+/* A read that SUCCEEDS is not proof the dock is there. Something on the
+   pogo bus intermittently ACKs 0x6D and answers zeros: device-observed
+   as "dock attached (fw v0)" followed by "dock detached" 0.6 s later,
+   which rotated the screen to landscape and back and — because
+   ui_tab5_kb_reserved() drops from 480 to 80 px while a dock is
+   "present" — left the running app's grid sized for a keyboard that
+   then came back. Dropping i2c_master_probe() (see below) removed the
+   second gate that used to make this unlikely, so the value itself has
+   to be the gate now: a firmware version register reading 0x00 (all
+   zeros) or 0xFF (floating bus / NACK fill) is not a real report.
+   A false negative here is cheap — no dock typing, and the WARN says
+   why. A false positive is what breaks the UI. If a real dock is ever
+   rejected, this log names the value to allow. */
+static bool ver_is_plausible(uint8_t ver)
+{
+    if (ver != 0x00 && ver != 0xFF)
+        return true;
+    ESP_LOGW(TAG, "ignoring 0x%02X answer at 0x6D (fw v%u not plausible)",
+             KB_ADDR, ver);
+    return false;
+}
+
 static bool probe_and_init(void)
 {
-    if (i2c_master_probe(s_bus, KB_ADDR, 20) != ESP_OK)
-        return false;
     uint8_t ver = 0;
     if (!rd_reg(KB_REG_VERSION, &ver, 1))
+        return false;
+    if (!ver_is_plausible(ver))
         return false;
     if (!wr_reg(KB_REG_MODE, KB_MODE_NORMAL))
         return false;

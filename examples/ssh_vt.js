@@ -64,6 +64,12 @@ var TAB_ROWS = 1;                   /* タブバーの行数 */
 var ROWS = GRID_ROWS - TAB_ROWS;    /* 端末の行数 (= pty rows) */
 if (COLS < 1) COLS = 1;
 if (ROWS < 1) ROWS = 1;
+/* 空白 1 行ぶん。drawTabs がタブ行を消すのに使う。
+   3070a4e が行バッファを共有 SP 文字列から行ごとの blankChars() 配列に
+   変えたとき、この定義だけが消えて drawTabs の参照が残り、以来
+   drawTabs() は 1 行目で ReferenceError を投げ続けていた (実機ログで
+   確認)。COLS は回転で変わるので relayout でも張り直すこと。 */
+var SP = " ".repeat(COLS);
 
 /* ---- 配色 (コンソールと同じ 16 色パレット、暗背景向け) ---- */
 var BG = 0x0B0E11;
@@ -610,6 +616,55 @@ function makeTerm(reply) {
         prevCurRow = cy;
     }
 
+    /* 画面の向きやキーボードの予約高さが変わると COLS/ROWS が変わる。
+       グリッドを新しい寸法に張り替える。
+       中身は必ず引き継ぐこと。捨てて ssh.resize の SIGWINCH に任せる
+       と、vi や top は描き直すが素のシェルのプロンプトは描き直さない
+       — 実機で回転したら画面が真っ白になり、見えないまま打った exit
+       だけが通る、という形で出た。
+       rows は外から t.rows で掴まれているので、配列オブジェクトは
+       同じものを使い回して length だけ張り替えること。 */
+    function fitRow(src) {
+        if (!src)
+            return newRow();
+        if (src.ch.length === COLS)
+            return src;
+        var out = newRow();
+        var n = src.ch.length < COLS ? src.ch.length : COLS;
+        for (var c = 0; c < n; c++) {
+            out.ch[c] = src.ch[c];
+            out.fg[c] = src.fg[c];
+            out.bg[c] = src.bg[c];
+        }
+        return out;
+    }
+
+    function resizeTerm() {
+        var old = rows.slice(0);
+        /* 縮むとき、捨てるのは「カーソルを画面内に収めるのに必要な
+           ぶんだけ」上から。余りは末尾 (まだ何も無い行) を落とす。
+           無条件に上から捨てると、カーソルがまだ上のほうにある新しい
+           セッションで見えている行を丸ごと失う。 */
+        var excess = old.length > ROWS ? old.length - ROWS : 0;
+        var drop = cy - (ROWS - 1);
+        if (drop < 0) drop = 0;
+        if (drop > excess) drop = excess;
+        rows.length = ROWS;
+        dirty.length = ROWS;
+        dirtySeq.length = ROWS;
+        for (var r = 0; r < ROWS; r++)
+            rows[r] = fitRow(old[r + drop]);
+        cy -= drop;
+        if (cy < 0) cy = 0;
+        if (cy > ROWS - 1) cy = ROWS - 1;
+        if (cx > COLS - 1) cx = COLS - 1;
+        if (cx < 0) cx = 0;
+        savedCx = cx; savedCy = cy;
+        scrollTop = 0; scrollBot = ROWS - 1;
+        prevCurRow = cy;
+        markAll();
+    }
+
     function resetTerm() {
         for (var r = 0; r < ROWS; r++) {
             rows[r].ch = blankChars();
@@ -670,6 +725,7 @@ function makeTerm(reply) {
         markAll: markAll,
         markRow: markDirty,  /* T3b: 選択ハイライト解除後の行復元 */
         reset: resetTerm,
+        resize: resizeTerm,
         rows: rows,
         bracketed: function () { return bracketed; },
         cursor: function () { return [cx, cy]; }
@@ -827,7 +883,63 @@ if (SELFTEST) {
         f5: "\x1b[15~", f6: "\x1b[17~", f7: "\x1b[18~", f8: "\x1b[19~",
         f9: "\x1b[20~", f10: "\x1b[21~", f11: "\x1b[23~", f12: "\x1b[24~"
     };
+    /* 画面レイアウトが変わった: 回転、またはドックの抜き差し (ドックが
+       いる間はオンスクリーンキーボードが出ないので ui.keyboard() の
+       予約高さが 480 -> 80 px に変わる)。C は "\x00rotate" を投げる
+       だけで、桁数と行数を決め直すのはアプリの仕事。
+       これを実装していなかったので、起動時の寸法のまま描き続けていた
+       — 横で採寸したまま縦に来ると 23 行しか描かず、下に 160px 余った
+       (実機報告)。逆向きなら下端がキーの裏に隠れる。 */
+    /* 負数 = 純クエリ (表示を変えない)。0 は「まだ答えられない」
+       (キャンバス未生成) であって「キーボードが無い」ではない —
+       そのまま信じると画面いっぱいに行を敷いてキーの裏に潜り込む
+       ので、直前の値を保つ。 */
+    var currentKb = function () {
+        var v = ui.keyboard(-2);
+        return v > 0 ? v : KB_H;
+    };
+
+    /* NB: `var f = function(){}`, not `function f(){}` — mquickjs does
+       not hoist a block-level function declaration out to where the
+       timers and callbacks below can see it, and the failure is a
+       ReferenceError at call time, i.e. invisible until the event
+       actually fires. The rest of this block is written the same way
+       for the same reason. */
+    var relayout = function () {
+        var s2 = ui.size();
+        W = s2[0] || W;
+        H = s2[1] || H;
+        KB_H = currentKb();
+        VIEW_H = H - KB_H;
+        COLS = (W / CW) | 0;
+        GRID_ROWS = (VIEW_H / LH) | 0;
+        ROWS = GRID_ROWS - TAB_ROWS;
+        if (COLS < 1) COLS = 1;
+        if (ROWS < 1) ROWS = 1;
+        SP = " ".repeat(COLS); /* タブ行のクリア幅も新しい桁数に */
+        for (var i = 0; i < sessions.length; i++) {
+            sessions[i].term.resize();
+            /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
+            ssh.resize(sessions[i].id, COLS, ROWS);
+        }
+        /* フォーム表示中は端末を描き戻さない — メトリクスだけ直して
+           おき、returnTerminal() が戻ってきたときに描く */
+        if (inForm)
+            return;
+        ui.clear(BG);
+        if (actIdx >= 0 && actIdx < sessions.length) {
+            sessions[actIdx].term.markAll();
+            drawTabs();
+        }
+    };
+
     ui.onKey(function (k) {
+        /* レイアウト変更はセッションが無くても処理する (下の actIdx
+           ガードより前に置くこと) */
+        if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate") {
+            relayout();
+            return;
+        }
         if (actIdx < 0)
             return;
         var id = sessions[actIdx].id;
@@ -1025,6 +1137,16 @@ if (SELFTEST) {
     });
 
     setInterval(function () {
+        /* レイアウト追従は "\x00rotate" だけに頼らない。トークンは
+           フォアグラウンドのアプリにしか届かず、届かなかった一回が
+           そのままズレっぱなしになる (実機で下端が余ったまま戻らな
+           かった)。ここで実測値を突き合わせれば、回転・ドック抜き差
+           し・キーボードモード変更のどれで来ても自己修復する。
+           ui.size() と ui.keyboard(-n) はどちらも副作用の無いクエリ
+           なので、40fps で回しても副作用は無い。 */
+        var s2 = ui.size();
+        if (s2[0] !== W || s2[1] !== H || currentKb() !== KB_H)
+            relayout();
         if (actIdx >= 0 && actIdx < sessions.length) {
             sessions[actIdx].term.flush();
             drawSel(); /* 受信出力に上書きされたハイライトの自己修復 */

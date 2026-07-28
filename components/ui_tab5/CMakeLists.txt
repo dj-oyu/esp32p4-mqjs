@@ -29,6 +29,17 @@ if(CONFIG_MQJS_TAB5_UI)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)
     # defer esp-hosted's constructor-time transport init (see ui_tab5.cpp)
     target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_hosted_init")
+    # Put esp_lvgl_port's PPA rotation scratch in PSRAM (see
+    # __wrap_lvgl_port_ppa_create). The port sizes that scratch to the
+    # draw buffer and gives both the same caps, so without this the only
+    # way to enlarge the draw buffer is to pay for it twice in internal
+    # DMA. lcd_ppa.h is private to the component, hence the include dir.
+    idf_component_get_property(lvgl_port_dir espressif__esp_lvgl_port
+                               COMPONENT_DIR)
+    target_include_directories(${COMPONENT_LIB} PRIVATE
+                               "${lvgl_port_dir}/src/common/ppa")
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=lvgl_port_ppa_create")
 endif()
 
 # W1-1: back the LVGL builtin tlsf pool with PSRAM. lv_mem_init() (called
