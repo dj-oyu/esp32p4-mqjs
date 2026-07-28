@@ -610,6 +610,24 @@ function makeTerm(reply) {
         prevCurRow = cy;
     }
 
+    /* 画面の向きやキーボードの予約高さが変わると COLS/ROWS が変わる。
+       グリッドを新しい寸法で作り直す。中身は捨てる — ssh.resize が
+       リモートに SIGWINCH を送るので、TUI は自分で描き直す。
+       rows は外から t.rows で掴まれているので、配列オブジェクトは
+       同じものを使い回して length だけ張り替えること。 */
+    function resizeTerm() {
+        rows.length = ROWS;
+        dirty.length = ROWS;
+        dirtySeq.length = ROWS;
+        for (var r = 0; r < ROWS; r++)
+            rows[r] = newRow();
+        cx = 0; cy = 0;
+        savedCx = 0; savedCy = 0;
+        scrollTop = 0; scrollBot = ROWS - 1;
+        prevCurRow = 0;
+        markAll();
+    }
+
     function resetTerm() {
         for (var r = 0; r < ROWS; r++) {
             rows[r].ch = blankChars();
@@ -670,6 +688,7 @@ function makeTerm(reply) {
         markAll: markAll,
         markRow: markDirty,  /* T3b: 選択ハイライト解除後の行復元 */
         reset: resetTerm,
+        resize: resizeTerm,
         rows: rows,
         bracketed: function () { return bracketed; },
         cursor: function () { return [cx, cy]; }
@@ -827,7 +846,47 @@ if (SELFTEST) {
         f5: "\x1b[15~", f6: "\x1b[17~", f7: "\x1b[18~", f8: "\x1b[19~",
         f9: "\x1b[20~", f10: "\x1b[21~", f11: "\x1b[23~", f12: "\x1b[24~"
     };
+    /* 画面レイアウトが変わった: 回転、またはドックの抜き差し (ドックが
+       いる間はオンスクリーンキーボードが出ないので ui.keyboard() の
+       予約高さが 480 -> 80 px に変わる)。C は "\x00rotate" を投げる
+       だけで、桁数と行数を決め直すのはアプリの仕事。
+       これを実装していなかったので、起動時の寸法のまま描き続けていた
+       — 横で採寸したまま縦に来ると 23 行しか描かず、下に 160px 余った
+       (実機報告)。逆向きなら下端がキーの裏に隠れる。 */
+    function relayout() {
+        var s2 = ui.size();
+        W = s2[0] || W;
+        H = s2[1] || H;
+        KB_H = ui.keyboard(-2) || 0; /* 負数 = 純クエリ、表示は変えない */
+        VIEW_H = H - KB_H;
+        COLS = (W / CW) | 0;
+        GRID_ROWS = (VIEW_H / LH) | 0;
+        ROWS = GRID_ROWS - TAB_ROWS;
+        if (COLS < 1) COLS = 1;
+        if (ROWS < 1) ROWS = 1;
+        for (var i = 0; i < sessions.length; i++) {
+            sessions[i].term.resize();
+            /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
+            ssh.resize(sessions[i].id, COLS, ROWS);
+        }
+        /* フォーム表示中は端末を描き戻さない — メトリクスだけ直して
+           おき、returnTerminal() が戻ってきたときに描く */
+        if (inForm)
+            return;
+        ui.clear(BG);
+        if (actIdx >= 0 && actIdx < sessions.length) {
+            sessions[actIdx].term.markAll();
+            drawTabs();
+        }
+    }
+
     ui.onKey(function (k) {
+        /* レイアウト変更はセッションが無くても処理する (下の actIdx
+           ガードより前に置くこと) */
+        if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate") {
+            relayout();
+            return;
+        }
         if (actIdx < 0)
             return;
         var id = sessions[actIdx].id;
