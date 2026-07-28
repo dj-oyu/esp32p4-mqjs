@@ -2211,7 +2211,14 @@ static void kb_show(int mode)
    actually cost on this panel? (single draw buffer, 25-line chunks,
    PPA rotate per flush). Times the render+flush by forcing it. */
 /* Flip to 1 to re-measure after touching the keyboard or the display
-   pipeline. Measured on this panel (ms: one key | map swap | screen):
+   pipeline. It also logs where each repaint goes (draw / flush_cb /
+   DMA wait). PORTRAIT, -O2, shadows off: a keyboard map swap is 20 ms
+   of which draw is 18.4 (92%), flush_cb 0.7, DMA wait 1.1 — this
+   pipeline is CPU-rasterisation-bound, NOT transfer-bound, so buffer
+   tricks (double buffering, zero-copy) can only ever touch that last
+   ~9%. The 18.4 ms itself: fills 9.2, the theme's 13px corner radius
+   3.9, the 36 text labels 5.4.
+   Older numbers, same steps (ms: one key | map swap | screen):
      -Og portrait,  shadows      3 | 63 |  99
      -O2 landscape, shadows      3 | 81 | 125   (1.8x the pixels, + PPA
                                                  rotate, so per pixel
@@ -2229,16 +2236,56 @@ static void kb_show(int mode)
 #define UI_KB_BENCH 0
 #endif
 #if UI_KB_BENCH
+/* Where a repaint actually goes. LVGL brackets a refresh with
+   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
+   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
+   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
+   PPA rotation in landscape; wait is time blocked on the previous
+   chunk's DMA, which is exactly what a second draw buffer would hide. */
+static struct {
+    int64_t t_render, t_flush, t_wait;
+    int64_t render, flush, wait;
+    int flushes;
+} s_prof;
+
+static void prof_event(lv_event_t *e)
+{
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_RENDER_START:      s_prof.t_render = now; break;
+    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render; break;
+    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
+    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
+                                     s_prof.flushes++; break;
+    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
+    default: break;
+    }
+}
+
 static void kb_bench(void)
 {
     int64_t t0;
+    static const lv_event_code_t prof_codes[] = {
+        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
+        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
+        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
+    };
+    for (auto code : prof_codes)
+        lv_display_add_event_cb(s_disp, prof_event, code, nullptr);
+
 #define KB_BENCH_STEP(label, body)                                        \
     do {                                                                  \
+        memset(&s_prof, 0, sizeof s_prof);                                \
         t0 = esp_timer_get_time();                                        \
         body;                                                             \
         lv_refr_now(s_disp);                                              \
-        ESP_LOGW(TAG, "bench %-22s %5lld ms", label,                      \
-                 (esp_timer_get_time() - t0) / 1000);                     \
+        ESP_LOGW(TAG,                                                     \
+                 "bench %-22s %5lld ms | draw %5lld + flush %5lld + wait " \
+                 "%5lld us over %d chunks",                               \
+                 label, (esp_timer_get_time() - t0) / 1000,               \
+                 s_prof.render - s_prof.flush - s_prof.wait, s_prof.flush, \
+                 s_prof.wait, s_prof.flushes);                            \
     } while (0)
 
     /* the dock suppresses the on-screen keyboard, so lift that policy for
@@ -2267,6 +2314,25 @@ static void kb_bench(void)
         s_kb_map_shown = -1;
         lv_buttonmatrix_set_map(s_kb, KB_MAP_SYM);
     });
+    /* What the per-key styling costs. NB the steps after these include a
+       keyboard repaint, since restoring the styles invalidates it. */
+    KB_BENCH_STEP("map swap (radius 4)", {
+        lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+    });
+    KB_BENCH_STEP("map swap (radius 0)", {
+        lv_obj_set_style_radius(s_kb, 0, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
+    });
+    KB_BENCH_STEP("map swap (r0, no text)", {
+        lv_obj_set_style_text_opa(s_kb, LV_OPA_TRANSP, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+    });
+    lv_obj_set_style_text_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_kb, 13, LV_PART_ITEMS);
     KB_BENCH_STEP("strip label", kb_lock_refresh());
     KB_BENCH_STEP("clip label", kb_clip_refresh());
     KB_BENCH_STEP("whole screen", lv_obj_invalidate(lv_screen_active()));
