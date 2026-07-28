@@ -51,7 +51,7 @@ static esp_timer_handle_t s_watchdog;
 static microlink_t *s_ml;
 static char *s_session_key;          /* heap-owned, alive for the session */
 static ts_state_t s_state = TS_ST_NOT_CONFIGURED;
-static char s_detail[64];
+static char s_detail[128]; /* Japanese; sized with tailscale_status_t.detail */
 static int s_retries;
 static int s_ntp_waits;              /* ticks spent waiting for the clock */
 static bool s_connected_once;

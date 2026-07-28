@@ -26,7 +26,11 @@ extern "C" {
 
 typedef struct {
     char state[20];   /* not-configured|disabled|connecting|connected|error */
-    char detail[64];  /* human-readable, never contains secrets */
+    /* human-readable, never contains secrets. 128 because the details are
+       Japanese: the longest ("前回接続中にリセット。手動で再試行/電源入れ直し")
+       is 70 UTF-8 bytes, so 64 truncated it mid-sequence — the UI drew a
+       replacement glyph at the end. -O2 caught this; -Og did not. */
+    char detail[128];
     int retries;      /* connect attempts so far (live during connecting) */
     char ip[16];      /* Tailscale VPN IP "100.x.y.z", "" if none */
     int peers;        /* active peer count when connected */

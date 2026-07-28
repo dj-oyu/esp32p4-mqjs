@@ -2204,8 +2204,14 @@ static void kb_show(int mode)
    actually cost on this panel? (single draw buffer, 25-line chunks,
    PPA rotate per flush). Times the render+flush by forcing it. */
 /* Flip to 1 to re-measure after touching the keyboard or the display
-   pipeline. Numbers on this panel, portrait: single key 3 ms, map swap
-   63 ms, whole screen 99 ms, keyboard first draw 106 ms. */
+   pipeline. Measured on this panel:
+     -Og, portrait   key 3 ms | map swap 63 ms | screen  99 ms
+     -O2, landscape  key 3 ms | map swap 80 ms | screen 124 ms
+   Landscape draws 1.8x the keyboard pixels and PPA-rotates every flush,
+   so per pixel -O2 is ~40% faster on the button/text-heavy keyboard
+   (4.0 -> 5.6 Mpx/s) while a flat full-screen fill is memory-bound and
+   does not improve. The flush path — one draw buffer, 25-line chunks,
+   no overlap — is what sets the floor, not the compiler. */
 #ifndef UI_KB_BENCH
 #define UI_KB_BENCH 0
 #endif
@@ -2222,7 +2228,18 @@ static void kb_bench(void)
                  (esp_timer_get_time() - t0) / 1000);                     \
     } while (0)
 
+    /* the dock suppresses the on-screen keyboard, so lift that policy for
+       the measurement (and put it back at the end) */
+    bool had_dock = s_hw_kb;
+    s_hw_kb = false;
+    ESP_LOGW(TAG, "bench: %s, canvas %dx%d",
+             s_landscape ? "landscape" : "portrait", s_canvas_w, s_canvas_h);
     KB_BENCH_STEP("kb create+first draw", kb_show(2));
+    if (!s_kb) {
+        ESP_LOGW(TAG, "bench: no matrix (canvas_w=%d) — skipped", s_canvas_w);
+        s_hw_kb = had_dock;
+        return;
+    }
     KB_BENCH_STEP("one key invalidate",
                   lv_buttonmatrix_set_button_ctrl(
                       s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
@@ -2244,6 +2261,8 @@ static void kb_bench(void)
              (int)LV_DEF_REFR_PERIOD, (int)LV_DEF_REFR_PERIOD);
     s_kb_map_shown = -1;
     kb_show(0);
+    s_hw_kb = had_dock;
+    kb_show(s_app_kb_mode); /* back to whatever the app asked for */
 #undef KB_BENCH_STEP
 }
 #endif
