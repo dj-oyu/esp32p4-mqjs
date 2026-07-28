@@ -116,8 +116,10 @@ void kbd_mod_edge(kbd_mod_t *m, bool pressed, bool oneshot_arm);
    same tap / double-tap-lock behavior as the dock. */
 void kbd_mod_tap(kbd_mod_t *m, bool oneshot_arm);
 
-/* A non-modifier key was pressed: whatever is held right now was used
-   as a chord and its release must not count as a tap. */
+/* A non-modifier key was pressed. Whatever is held right now was used
+   as a chord, so its release must not count as a tap, and every pending
+   tap chain is broken: a double-tap lock requires two consecutive taps
+   of the same key with nothing typed in between. */
 void kbd_mods_mark_chord(kbd_mods_t *m);
 
 /* A key was emitted: one-shots are spent (locks and holds survive). */

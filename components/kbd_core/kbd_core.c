@@ -63,10 +63,13 @@ void kbd_mod_tap(kbd_mod_t *m, bool oneshot_arm)
 
 void kbd_mods_mark_chord(kbd_mods_t *m)
 {
-    m->sym.used |= m->sym.held;
-    m->shift.used |= m->shift.held;
-    m->ctrl.used |= m->ctrl.held;
-    m->alt.used |= m->alt.held;
+    kbd_mod_t *all[] = { &m->sym, &m->shift, &m->ctrl, &m->alt };
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+        all[i]->used |= all[i]->held; /* a chord, so its release isn't a tap */
+        all[i]->clicks = 0; /* and a tap chain must be consecutive taps of
+                               the same key: "Aa a Aa" is two single taps,
+                               not a double-tap that locks */
+    }
 }
 
 void kbd_mods_consume(kbd_mods_t *m)
