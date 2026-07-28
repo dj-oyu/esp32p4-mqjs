@@ -41,6 +41,7 @@
 #include "core/animation/animate_value/animate_value.hpp"
 #include "mooncake.h"
 
+#include "kbd_core.h"
 #include "ui_tab5.h"
 #include "ui_tab5_internal.h"
 
@@ -483,6 +484,9 @@ static inline int ui_cur_hres(void)
    pre-rotation 72KB — internal SRAM is the scarcest pool on this build
    (esp-hosted SDIO owns most of it). */
 #define UI_LVGL_BUF_LINES   25
+/* Touch sampling period. LVGL's default is LV_DEF_REFR_PERIOD (33 ms),
+   which is too coarse to catch a quick tap — see lvgl_port_add_touch. */
+#define UI_TOUCH_READ_MS    10
 /* UI_STATUSBAR_H lives in ui_tab5_internal.h (shared with ui_widgets.cpp) */
 
 /* Tab5 shipped with different panels over time; the variant is identified
@@ -692,11 +696,21 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
     touch_cfg.disp = disp;
     touch_cfg.handle = tp;
     s_touch_indev = lvgl_port_add_touch(&touch_cfg);
-    if (!s_touch_indev)
+    if (!s_touch_indev) {
         ESP_LOGE(TAG, "lvgl_port_add_touch failed");
-    else
-        ESP_LOGI(TAG, "touch up (%s)",
-                 variant == UI_PANEL_ILI9881C ? "GT911" : "ST7123");
+    } else {
+        /* LVGL samples the panel from the same timer loop it renders in,
+           every LV_DEF_REFR_PERIOD (33 ms) by default. That is coarser
+           than a quick tap: press and release can both fall between two
+           samples, which is why typing fast on the on-screen keyboard
+           dropped keys and a double-tap could not be landed at all. One
+           small I2C read every 10 ms buys three times the resolution. */
+        lv_timer_set_period(lv_indev_get_read_timer(s_touch_indev),
+                            UI_TOUCH_READ_MS);
+        ESP_LOGI(TAG, "touch up (%s, %d ms sampling)",
+                 variant == UI_PANEL_ILI9881C ? "GT911" : "ST7123",
+                 UI_TOUCH_READ_MS);
+    }
 }
 
 /* runs in the LVGL task (from the mooncake lv_timer): mirror the indev
@@ -1336,93 +1350,163 @@ private:
 };
 
 /* ------------------------------------------------------------------ */
-/* Phase 4: on-screen keyboard (JS terminal groundwork).               */
-/* lv_keyboard overlay on the bottom of the screen, hidden until JS    */
-/* calls ui.keyboard(1). Keys are forwarded to JS as small strings     */
-/* through mqjs_post_key: printable keys verbatim, Enter/OK = "\n",    */
-/* backspace = "\b", arrows = ANSI cursor sequences (terminal food).   */
+/* Phase 4: on-screen keyboard + T3a control bar.                      */
+/* Hidden until JS calls ui.keyboard(1|2). Every key goes through      */
+/* kbd_core — the same engine the A164 dock driver uses — so a touch   */
+/* Ctrl+C and a dock Ctrl+C put the identical byte on the wire, and    */
+/* Shift/Ctrl/Alt behave the same on both surfaces (tap = one shot,    */
+/* double-tap = lock). Printables and \b \t \n travel as themselves;   */
+/* Esc, arrows, F-keys, copy/paste travel as "\0name" tokens whose     */
+/* meaning is the app's (design §7 keytoken).                          */
 /* All of this runs in the LVGL task (queue drain / event callback).   */
 /* ------------------------------------------------------------------ */
 
-#define UI_KB_H 400 /* 4 rows x 100px: comfortable on the 5" panel */
-#define UI_CB_H 80  /* T3a control bar row above the keyboard */
+#define UI_KB_H      400 /* clipboard strip + 4 key rows on the 5" panel */
+#define UI_KB_TOP_H  48  /* the strip: clipboard preview + collapse */
+#define UI_KB_LOCK_W 150 /* the strip's latched-modifier readout */
+#define UI_CB_H      80  /* T3a control bar row above the keyboard */
 
-static lv_obj_t *s_kb;
-static lv_obj_t *s_cbar;    /* T3a terminal control bar (mode 2) */
-static bool s_cbar_fn;      /* current map: false = main, true = F1-F12 */
+static lv_obj_t *s_kb;       /* key matrix */
+static lv_obj_t *s_kb_top;   /* strip above it (clipboard + collapse) */
+static lv_obj_t *s_kb_clip;  /* paste button; its label is the preview */
+static lv_obj_t *s_kb_clip_lbl;
+static lv_obj_t *s_kb_lock_lbl; /* which modifiers are latched, in words */
+static lv_timer_t *s_kb_clip_tmr; /* another app may replace the value */
+static bool s_kb_sym;        /* symbol layer showing */
+static int s_kb_map_shown = -1; /* layer the matrix currently draws;
+                                   -1 = none yet (also after a rebuild) */
+static uint32_t s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE; /* Shift key */
+static lv_obj_t *s_cbar;     /* T3a terminal control bar (mode 2) */
+static bool s_cbar_fn;       /* current map: false = main, true = F1-F12 */
+static int s_cbar_map_fn = -1; /* map the bar actually draws; -1 = none */
 static lv_obj_t *s_root_scr; /* console screen: fixed parent for s_kb (a
                                 widget screen could be active when JS calls
                                 ui.keyboard(1); parenting there would leave
                                 s_kb dangling when that screen is freed) */
 
-/* T3a control bar (ssh-terminal-design §7): generic key-token source.
-   C only maps button -> "\0name" token (NUL-sentinel, design keytoken
-   convention); the terminal's meaning (one-shot Ctrl/Alt, xterm F-key
-   sequences, paste) lives in JS where it can be pushed OTA. Fn flips
-   the bar between the main map and F1-F12 (handled here: it changes
-   the bar itself, no token). Octal "\0" not hex: "\x00esc" would eat
-   'e' as a hex digit. */
+/* Modifier state of the TOUCH surface (keyboard + bar together, so a
+   bar Ctrl applies to the next on-screen letter). The dock keeps its
+   own instance: a held physical Ctrl and a tapped one-shot Ctrl are
+   deliberately different things. LVGL task only, hence no locking. */
+static kbd_mods_t s_ui_mods;
+
+static void kb_apply_map(void);        /* fwd: the bar spends Shift */
+static void kb_apply_shift_flag(void); /* fwd: ... and must show it */
+static void kb_lock_refresh(void);  /* fwd: which modifiers are latched */
+static void ui_kb_refresh(void);    /* fwd: deferred map/label work */
+
+/* T3a control bar (ssh-terminal-design §7). Ctrl/Alt drive the shared
+   engine (tap = one-shot, double-tap = lock) instead of posting a
+   token, so C resolves the chord exactly as it does for the dock. Fn
+   flips the bar between the main map and F1-F12 (bar-local, no key). */
+static const char *CB_LBL_CTRL = "Ctrl";
+static const char *CB_LBL_CTRL_LOCK = "CTRL"; /* locked: shouting = latched */
+static const char *CB_LBL_ALT = "Alt";
+static const char *CB_LBL_ALT_LOCK = "ALT";
+
+/* one row, so array index == button id */
 static const char *CB_MAP_MAIN[] = {
     "Esc", "Tab", "Ctrl", "Alt", "Fn",
     LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
     LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "",
 };
-static const char *CB_TOK_MAIN[] = {
-    "\0esc", "\0tab", "\0ctrl", "\0alt", NULL /* Fn */,
-    "\0left", "\0down", "\0up", "\0right",
-    "\0copy", "\0paste",
+#define CB_ID_CTRL 2
+#define CB_ID_ALT  3
+#define CB_ID_FN   4
+static const kbd_key_t CB_KEY_MAIN[] = {
+    KBD_K_ESC, KBD_K_TAB,
+    KBD_K_NONE /* Ctrl */, KBD_K_NONE /* Alt */, KBD_K_NONE /* Fn */,
+    KBD_K_LEFT, KBD_K_DOWN, KBD_K_UP, KBD_K_RIGHT,
+    KBD_K_COPY, KBD_K_PASTE,
 };
 static const char *CB_MAP_FN[] = {
     "Fn", "F1", "F2", "F3", "F4", "F5", "F6",
     "F7", "F8", "F9", "F10", "F11", "F12", "",
 };
-static const char *CB_TOK_FN[] = {
-    NULL /* Fn */, "\0f1", "\0f2", "\0f3", "\0f4", "\0f5", "\0f6",
-    "\0f7", "\0f8", "\0f9", "\0f10", "\0f11", "\0f12",
+static const kbd_key_t CB_KEY_FN[] = {
+    KBD_K_NONE /* Fn */, KBD_K_F1, KBD_K_F2, KBD_K_F3, KBD_K_F4,
+    KBD_K_F5, KBD_K_F6, KBD_K_F7, KBD_K_F8, KBD_K_F9, KBD_K_F10,
+    KBD_K_F11, KBD_K_F12,
 };
 
-/* One-shot modifier latch, mirrored on the buttons themselves (user
-   feedback: the tab-bar badge alone was too subtle). The SEMANTIC
-   one-shot state lives in the terminal JS; this visual copy stays in
-   sync by construction because both are driven by the same key
-   stream — armed on the Ctrl/Alt tap, cleared by the next key from
-   either the bar or the keyboard (exactly when JS consumes it). */
-#define CB_ID_CTRL 2 /* index in CB_MAP_MAIN */
-#define CB_ID_ALT  3
-static bool s_mod_ctrl, s_mod_alt;
-
-/* Push s_mod_ctrl/s_mod_alt onto the Ctrl/Alt buttons as a manual
-   CHECKED flag. Deliberately NOT CHECKABLE: LVGL toggles a checkable
-   button's CHECKED at RELEASED but fires VALUE_CHANGED at press time,
-   so reading the flag from the event handler races the toggle (seen
-   on device: the latch stuck yellow). Our bools are the only state;
-   the flag is write-only from here. Re-call after every set_map —
-   it wipes per-button ctrl flags (Fn flips back and forth). */
+/* Mirror the engine's Ctrl/Alt state on the buttons: CHECKED (amber)
+   while in effect. Only writes one ctrl bit per button and invalidates
+   those buttons, so unlike a set_map this is safe to call from inside
+   an event callback — modifier feedback has to feel immediate.
+   Deliberately NOT CHECKABLE: LVGL toggles a checkable button's
+   CHECKED at RELEASED but fires VALUE_CHANGED at press time, so
+   reading the flag from the event handler races the toggle (seen on
+   device: the latch stuck yellow). The engine is the only state; these
+   flags are write-only from here. Re-call after any set_map that
+   changed the button count — that reallocates and zeroes the flags. */
 static void cbar_apply_mods(void)
 {
     if (!s_cbar || s_cbar_fn)
         return;
-    if (s_mod_ctrl)
-        lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_CTRL,
-                                        LV_BUTTONMATRIX_CTRL_CHECKED);
-    else
-        lv_buttonmatrix_clear_button_ctrl(s_cbar, CB_ID_CTRL,
-                                          LV_BUTTONMATRIX_CTRL_CHECKED);
-    if (s_mod_alt)
-        lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_ALT,
-                                        LV_BUTTONMATRIX_CTRL_CHECKED);
-    else
-        lv_buttonmatrix_clear_button_ctrl(s_cbar, CB_ID_ALT,
-                                          LV_BUTTONMATRIX_CTRL_CHECKED);
+    struct {
+        uint32_t id;
+        bool on;
+    } mods[] = {
+        { CB_ID_CTRL, kbd_mod_armed(&s_ui_mods.ctrl) },
+        { CB_ID_ALT, kbd_mod_armed(&s_ui_mods.alt) },
+    };
+    for (auto &m : mods) {
+        if (m.on)
+            lv_buttonmatrix_set_button_ctrl(s_cbar, m.id,
+                                            LV_BUTTONMATRIX_CTRL_CHECKED);
+        else
+            lv_buttonmatrix_clear_button_ctrl(s_cbar, m.id,
+                                              LV_BUTTONMATRIX_CTRL_CHECKED);
+    }
 }
 
-/* the next key consumed the one-shot: drop the latch (no-op when idle) */
+/* Everything about the bar that needs a set_map: the Fn layer, and the
+   Ctrl/Alt faces shouting when LOCKED so a latch is never mistaken for
+   a one-shot. Deferred (see ui_kb_refresh) — the two maps differ in key
+   count, so installing one from inside the bar's own event would free
+   the arrays LVGL is still using for that press. */
+static void cbar_apply_labels(void)
+{
+    if (!s_cbar)
+        return;
+    const char *ctrl_lbl =
+        s_ui_mods.ctrl.lock ? CB_LBL_CTRL_LOCK : CB_LBL_CTRL;
+    const char *alt_lbl = s_ui_mods.alt.lock ? CB_LBL_ALT_LOCK : CB_LBL_ALT;
+    bool relabel = CB_MAP_MAIN[CB_ID_CTRL] != ctrl_lbl ||
+                   CB_MAP_MAIN[CB_ID_ALT] != alt_lbl;
+    CB_MAP_MAIN[CB_ID_CTRL] = ctrl_lbl;
+    CB_MAP_MAIN[CB_ID_ALT] = alt_lbl;
+    if (!relabel && s_cbar_map_fn == (int)s_cbar_fn)
+        return;
+    s_cbar_map_fn = s_cbar_fn;
+    lv_buttonmatrix_set_map(s_cbar, s_cbar_fn ? CB_MAP_FN : CB_MAP_MAIN);
+    cbar_apply_mods(); /* the key count changed: flags were zeroed */
+}
+
+/* Repainting a whole button matrix — every set_map — must NOT happen
+   inside that widget's own event callback. It reallocates the button
+   arrays LVGL is still using for the press in flight (the letter and
+   symbol layers differ in key count), and the full-keyboard repaint
+   delays the next touch sample enough to swallow a key: taps went
+   missing while typing fast, which is why a double-tap could not be
+   landed at all. Queued here and applied from the LVGL loop instead. */
+static void ui_kb_refresh(void)
+{
+    lv_async_call(
+        [](void *) {
+            kb_apply_map();
+            cbar_apply_labels();
+            kb_lock_refresh();
+        },
+        nullptr);
+}
+
+/* app switch / UI reset: no modifier may survive into another app */
 static void cbar_clear_mods(void)
 {
-    if (!s_mod_ctrl && !s_mod_alt)
-        return;
-    s_mod_ctrl = s_mod_alt = false;
+    kbd_mods_reset(&s_ui_mods);
     cbar_apply_mods();
+    ui_kb_refresh();
 }
 
 static void cbar_show(bool show)
@@ -1448,6 +1532,8 @@ static void cbar_show(bool show)
                                   LV_PART_ITEMS);
         lv_obj_set_style_text_color(s_cbar, lv_color_hex(UI_COL_TEXT),
                                     LV_PART_ITEMS);
+        lv_obj_set_style_shadow_width(s_cbar, 0, LV_PART_ITEMS); /* see s_kb */
+        lv_obj_set_style_radius(s_cbar, 4, LV_PART_ITEMS);
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_FLASH),
                                   (uint32_t)LV_PART_ITEMS |
                                       (uint32_t)LV_STATE_PRESSED);
@@ -1461,6 +1547,7 @@ static void cbar_show(bool show)
                                         (uint32_t)LV_STATE_CHECKED);
         lv_buttonmatrix_set_map(s_cbar, CB_MAP_MAIN);
         s_cbar_fn = false;
+        s_cbar_map_fn = 0;
         cbar_apply_mods();
         lv_obj_add_event_cb(
             s_cbar,
@@ -1469,37 +1556,39 @@ static void cbar_show(bool show)
                 uint32_t id = lv_buttonmatrix_get_selected_button(bm);
                 if (id == LV_BUTTONMATRIX_BUTTON_NONE)
                     return;
-                const char *tok;
-                size_t ntok;
-                if (s_cbar_fn) {
-                    if (id >= sizeof CB_TOK_FN / sizeof CB_TOK_FN[0])
-                        return;
-                    tok = CB_TOK_FN[id];
-                } else {
-                    if (id >= sizeof CB_TOK_MAIN / sizeof CB_TOK_MAIN[0])
-                        return;
-                    tok = CB_TOK_MAIN[id];
-                }
-                if (!tok) { /* Fn: flip the map locally */
+                if (s_cbar_fn ? id == 0 : id == CB_ID_FN) {
+                    /* Fn: flip the map, bar-local, nothing posted */
                     s_cbar_fn = !s_cbar_fn;
-                    lv_buttonmatrix_set_map(bm, s_cbar_fn ? CB_MAP_FN
-                                                          : CB_MAP_MAIN);
-                    cbar_apply_mods(); /* set_map wiped the latch */
+                    ui_kb_refresh(); /* the swap itself waits for the loop */
                     return;
                 }
-                ntok = 1 + strlen(tok + 1); /* NUL sentinel + name */
-                if (!s_cbar_fn && id == CB_ID_CTRL) {
-                    s_mod_ctrl = !s_mod_ctrl; /* same one-shot toggle as JS */
-                    cbar_apply_mods();
-                } else if (!s_cbar_fn && id == CB_ID_ALT) {
-                    s_mod_alt = !s_mod_alt;
-                    cbar_apply_mods();
+                if (!s_cbar_fn && (id == CB_ID_CTRL || id == CB_ID_ALT)) {
+                    /* touch can't hold a key while typing another, so a
+                       tap arms a one-shot and a double-tap locks */
+                    kbd_mod_tap(id == CB_ID_CTRL ? &s_ui_mods.ctrl
+                                                 : &s_ui_mods.alt,
+                                true);
+                    cbar_apply_mods();  /* highlight now... */
+                    kb_lock_refresh();
+                    ui_kb_refresh();    /* ...face swap off the event */
+                    return;
                 }
-                mqjs_post_key(tok, ntok);
-                /* any key but Ctrl/Alt themselves consumes the one-shot
-                   (in the FN map ids 2/3 are F2/F3, not modifiers) */
-                if (s_cbar_fn || (id != CB_ID_CTRL && id != CB_ID_ALT))
-                    cbar_clear_mods();
+                const kbd_key_t *keys = s_cbar_fn ? CB_KEY_FN : CB_KEY_MAIN;
+                size_t count = s_cbar_fn
+                                   ? sizeof CB_KEY_FN / sizeof CB_KEY_FN[0]
+                                   : sizeof CB_KEY_MAIN /
+                                         sizeof CB_KEY_MAIN[0];
+                if (id >= count || keys[id] == KBD_K_NONE)
+                    return;
+                char seq[KBD_SEQ_MAX];
+                size_t n = kbd_translate(&s_ui_mods, 0, keys[id], seq,
+                                         nullptr);
+                if (n)
+                    mqjs_post_key(seq, n);
+                kbd_mods_mark_chord(&s_ui_mods);
+                kbd_mods_consume(&s_ui_mods); /* one-shots are spent */
+                cbar_apply_mods();
+                kb_apply_shift_flag(); /* no map work: faces track locks */
             },
             LV_EVENT_VALUE_CHANGED, nullptr);
     }
@@ -1753,8 +1842,245 @@ static void kb_collapse(void)
 {
     if (s_kb)
         lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    if (s_kb_top)
+        lv_obj_add_flag(s_kb_top, LV_OBJ_FLAG_HIDDEN);
     cbar_show(false);
     spanel_show(true);
+}
+
+/* ---- key layers ------------------------------------------------------
+ * Touch-sized (10 keys a row), not a copy of the dock's 14-column
+ * matrix: mirroring the dock would mean 51px keys in portrait. What IS
+ * shared is the meaning — "Aa" is the dock's Shift with the same
+ * tap/double-tap semantics, "sym" reaches the symbols the dock puts on
+ * its sym layer, and both surfaces emit through kbd_translate.
+ * Row shape is identical across layers (Enter, Backspace and the wide
+ * space stay put) so muscle memory survives a layer flip.
+ * ` ^ { } and < are dock-only: three rows of ten cannot hold every
+ * symbol and these lost the vote to the shell's daily set. */
+#define KB_LBL_SHIFT "Aa"
+#define KB_LBL_SYM   "sym"
+#define KB_LBL_ABC   "abc"
+#define KB_SPACE     " " /* the widest key; an empty face is the hint */
+
+static const char *KB_MAP_LOWER[] = {
+    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
+    "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_NEW_LINE, "\n",
+    KB_LBL_SHIFT, "z", "x", "c", "v", "b", "n", "m", ".",
+    LV_SYMBOL_BACKSPACE, "\n",
+    KB_LBL_SYM, ",", KB_SPACE, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
+    LV_SYMBOL_COPY, "",
+};
+static const char *KB_MAP_UPPER[] = {
+    "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "\n",
+    "A", "S", "D", "F", "G", "H", "J", "K", "L", LV_SYMBOL_NEW_LINE, "\n",
+    KB_LBL_SHIFT, "Z", "X", "C", "V", "B", "N", "M", ".",
+    LV_SYMBOL_BACKSPACE, "\n",
+    KB_LBL_SYM, ",", KB_SPACE, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
+    LV_SYMBOL_COPY, "",
+};
+static const char *KB_MAP_SYM[] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
+    "-", "_", "=", "+", "/", "\\", "|", ":", ";", LV_SYMBOL_NEW_LINE, "\n",
+    "!", "?", "@", "#", "$", "%", "&", "*", "~",
+    LV_SYMBOL_BACKSPACE, "\n",
+    KB_LBL_ABC, "\"", "'", KB_SPACE, ">", "[", "]", "",
+};
+
+/* Shift shown on the Shift key alone: one ctrl bit and one button
+   invalidated, measured at 3 ms — against 63 ms to swap the whole map
+   (see kb_apply_map). Cheap enough to run inside an event callback,
+   which is what makes a one-shot feel instant. */
+static void kb_apply_shift_flag(void)
+{
+    if (!s_kb || s_kb_shift_id == LV_BUTTONMATRIX_BUTTON_NONE)
+        return;
+    if (kbd_mod_armed(&s_ui_mods.shift))
+        lv_buttonmatrix_set_button_ctrl(s_kb, s_kb_shift_id,
+                                        LV_BUTTONMATRIX_CTRL_CHECKED);
+    else
+        lv_buttonmatrix_clear_button_ctrl(s_kb, s_kb_shift_id,
+                                          LV_BUTTONMATRIX_CTRL_CHECKED);
+}
+
+/* Point the matrix at the layer the current state implies.
+   Uppercase FACES are shown for a Shift LOCK only, never for a one-shot.
+   Measured on this panel (single draw buffer, 25-line chunks, PPA
+   rotate per flush): a map swap costs 63 ms — two touch samples' worth
+   of blackout, since LVGL reads the panel from the same loop it renders
+   in. Paying that on every one-shot put it right inside the gesture the
+   user was still performing, which is what made a double-tap
+   impossible; a lock is a deliberate, rare toggle and lands after the
+   gesture is over. The one-shot still shows on the Shift key itself and
+   in the strip's LOCK line.
+   set_map wipes per-button widths and (when the key count changes) the
+   ctrl flags, so both are restored here. */
+static void kb_apply_map(void)
+{
+    if (!s_kb)
+        return;
+    bool upper = s_ui_mods.shift.lock;
+    int want = s_kb_sym ? 2 : upper ? 1 : 0;
+    if (want == s_kb_map_shown)
+        return;
+    s_kb_map_shown = want;
+    s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
+
+    lv_buttonmatrix_set_map(s_kb, s_kb_sym ? KB_MAP_SYM
+                                  : upper  ? KB_MAP_UPPER
+                                           : KB_MAP_LOWER);
+    /* by label, so a layer may place these keys wherever it likes */
+    for (uint32_t id = 0;; id++) {
+        const char *t = lv_buttonmatrix_get_button_text(s_kb, id);
+        if (!t)
+            break;
+        bool shift = !strcmp(t, KB_LBL_SHIFT);
+        if (!strcmp(t, KB_SPACE))
+            lv_buttonmatrix_set_button_width(s_kb, id, 4);
+        /* A held button repeats VALUE_CHANGED by default, which is what
+           makes typematic work for letters and Backspace — but on a
+           modifier or a layer key it would machine-gun taps and flip
+           the lock on and off. */
+        if (shift || !strcmp(t, KB_LBL_SYM) || !strcmp(t, KB_LBL_ABC) ||
+            !strcmp(t, LV_SYMBOL_NEW_LINE) || !strcmp(t, LV_SYMBOL_COPY))
+            lv_buttonmatrix_set_button_ctrl(s_kb, id,
+                                            LV_BUTTONMATRIX_CTRL_NO_REPEAT);
+        if (shift)
+            s_kb_shift_id = id; /* the layers move it around */
+    }
+    /* set AND clear: swapping between two maps of the same key count
+       keeps the old flags (LVGL only reallocates when the count
+       changes), which used to leave Shift stuck amber */
+    kb_apply_shift_flag();
+}
+
+/* Which modifiers are LATCHED, spelled out. A one-shot and a lock look
+   the same on the keys themselves (both highlight), and the user cannot
+   be expected to remember which tap did what — so name the locks. */
+static void kb_lock_refresh(void)
+{
+    if (!s_kb_lock_lbl)
+        return;
+    char buf[48] = "";
+    size_t n = 0;
+    struct {
+        bool on;
+        const char *name;
+    } locks[] = {
+        { s_ui_mods.shift.lock, KB_LBL_SHIFT },
+        { s_ui_mods.ctrl.lock, "Ctrl" },
+        { s_ui_mods.alt.lock, "Alt" },
+        { s_ui_mods.sym.lock, KB_LBL_SYM },
+    };
+    for (auto &l : locks) {
+        if (!l.on)
+            continue;
+        if (!n)
+            n += (size_t)snprintf(buf, sizeof buf, "LOCK");
+        n += (size_t)snprintf(buf + n, sizeof buf - n, " %s", l.name);
+    }
+    lv_label_set_text(s_kb_lock_lbl, buf);
+}
+
+/* Clipboard preview on the paste button: seeing what you are about to
+   paste is the point (the value can come from any app, even over MQTT).
+   mqjs_clipboard_peek is the one clipboard entry point callable off the
+   JS task, so this is safe from the LVGL task. */
+static void kb_clip_refresh(void)
+{
+    if (!s_kb_clip_lbl)
+        return;
+    char type[32], data[192], line[72];
+    if (mqjs_clipboard_peek(type, sizeof type, data, sizeof data) &&
+        kbd_clip_format(data, line, sizeof line) > 0) {
+        lv_label_set_text_fmt(s_kb_clip_lbl, LV_SYMBOL_PASTE "  %s", line);
+        lv_obj_remove_state(s_kb_clip, LV_STATE_DISABLED);
+    } else {
+        lv_label_set_text(s_kb_clip_lbl,
+                          LV_SYMBOL_PASTE "  クリップボードは空");
+        lv_obj_add_state(s_kb_clip, LV_STATE_DISABLED);
+    }
+}
+
+/* The strip above the keys: tap-to-paste (with preview) + collapse. */
+static void kb_top_create(void)
+{
+    int w = ui_cur_hres();
+    s_kb_top = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    lv_obj_remove_flag(s_kb_top, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_kb_top, w, UI_KB_TOP_H);
+    lv_obj_align(s_kb_top, LV_ALIGN_BOTTOM_MID, 0,
+                 -(UI_KB_H - UI_KB_TOP_H));
+    lv_obj_set_style_pad_all(s_kb_top, 2, 0);
+    lv_obj_set_style_radius(s_kb_top, 0, 0);
+    lv_obj_set_style_border_width(s_kb_top, 0, 0);
+    lv_obj_set_style_bg_color(s_kb_top, lv_color_hex(UI_COL_BG), 0);
+
+    s_kb_clip = lv_button_create(s_kb_top);
+    lv_obj_set_size(s_kb_clip, w - UI_KB_TOP_H * 2 - UI_KB_LOCK_W - 12,
+                    UI_KB_TOP_H - 4);
+    lv_obj_align(s_kb_clip, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_radius(s_kb_clip, 4, 0);
+    lv_obj_set_style_bg_color(s_kb_clip, lv_color_hex(UI_COL_BAR), 0);
+    lv_obj_set_style_bg_color(s_kb_clip, lv_color_hex(UI_COL_FLASH),
+                              LV_STATE_PRESSED);
+    s_kb_clip_lbl = lv_label_create(s_kb_clip);
+    lv_label_set_long_mode(s_kb_clip_lbl, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_width(s_kb_clip_lbl, lv_pct(100));
+    lv_obj_set_style_text_font(s_kb_clip_lbl, ui_font(), 0);
+    lv_obj_set_style_text_color(s_kb_clip_lbl, lv_color_hex(UI_COL_TEXT), 0);
+    lv_obj_center(s_kb_clip_lbl);
+    lv_obj_add_event_cb(
+        s_kb_clip,
+        [](lv_event_t *) {
+            /* paste stays a token: only the app knows whether to bracket
+               it (DECSET 2004) or to confirm a multi-line payload */
+            char seq[KBD_SEQ_MAX];
+            size_t n = kbd_translate(&s_ui_mods, 0, KBD_K_PASTE, seq,
+                                     nullptr);
+            if (n)
+                mqjs_post_key(seq, n);
+            kbd_mods_consume(&s_ui_mods);
+            cbar_apply_mods();
+            kb_apply_shift_flag();
+        },
+        LV_EVENT_CLICKED, nullptr);
+
+    /* latched modifiers, named in words (see kb_lock_refresh) */
+    s_kb_lock_lbl = lv_label_create(s_kb_top);
+    lv_obj_set_width(s_kb_lock_lbl, UI_KB_LOCK_W);
+    lv_obj_align(s_kb_lock_lbl, LV_ALIGN_RIGHT_MID,
+                 -(UI_KB_TOP_H * 2 + 8), 0);
+    lv_label_set_long_mode(s_kb_lock_lbl, LV_LABEL_LONG_MODE_CLIP);
+    lv_obj_set_style_text_align(s_kb_lock_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(s_kb_lock_lbl, ui_font(), 0);
+    lv_obj_set_style_text_color(s_kb_lock_lbl, lv_color_hex(0xFFD479), 0);
+    kb_lock_refresh();
+
+    lv_obj_t *close = lv_button_create(s_kb_top);
+    lv_obj_set_size(close, UI_KB_TOP_H * 2, UI_KB_TOP_H - 4);
+    lv_obj_align(close, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_radius(close, 4, 0);
+    lv_obj_set_style_bg_color(close, lv_color_hex(UI_COL_BAR), 0);
+    lv_obj_set_style_bg_color(close, lv_color_hex(UI_COL_FLASH),
+                              LV_STATE_PRESSED);
+    lv_obj_t *cl = lv_label_create(close);
+    lv_label_set_text(cl, LV_SYMBOL_KEYBOARD);
+    lv_obj_set_style_text_color(cl, lv_color_hex(UI_COL_TEXT), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(
+        close, [](lv_event_t *) { kb_collapse(); }, LV_EVENT_CLICKED,
+        nullptr);
+
+    kb_clip_refresh();
+    if (!s_kb_clip_tmr)
+        s_kb_clip_tmr = lv_timer_create(
+            [](lv_timer_t *) {
+                if (s_kb_top && !lv_obj_has_flag(s_kb_top,
+                                                 LV_OBJ_FLAG_HIDDEN))
+                    kb_clip_refresh();
+            },
+            1000, nullptr);
 }
 
 /* mode: 0 = hide (OFF: stats panel gone too), 1 = keyboard,
@@ -1774,6 +2100,8 @@ static void kb_show(int mode)
     if (mode <= 0 || s_hw_kb) {
         if (s_kb)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+        if (s_kb_top)
+            lv_obj_add_flag(s_kb_top, LV_OBJ_FLAG_HIDDEN);
         if (mode > 0)
             s_kb_mode = mode; /* dock removed later: ⌨ restores this */
         return;
@@ -1782,73 +2110,258 @@ static void kb_show(int mode)
     if (s_kb) {
         lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_kb);
+        if (s_kb_top) {
+            lv_obj_remove_flag(s_kb_top, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_kb_top);
+            kb_clip_refresh(); /* it may have changed while hidden */
+        }
         return;
     }
-    s_kb = lv_keyboard_create(s_root_scr ? s_root_scr : lv_screen_active());
-    /* the default VALUE_CHANGED handler is built for a textarea and
-       switches maps before our callback could read the key, so replace
-       it wholesale: mode switching is redone below via set_mode */
-    lv_obj_remove_event_cb(s_kb, lv_keyboard_def_event_cb);
-    lv_obj_set_size(s_kb, ui_cur_hres(), UI_KB_H);
+    s_kb_map_shown = -1; /* fresh matrix: kb_apply_map must really run */
+    kb_top_create();
+    s_kb = lv_buttonmatrix_create(s_root_scr ? s_root_scr
+                                             : lv_screen_active());
+    lv_obj_set_size(s_kb, ui_cur_hres(), UI_KB_H - UI_KB_TOP_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_pad_all(s_kb, 4, 0);
+    lv_obj_set_style_pad_gap(s_kb, 4, 0);
     lv_obj_set_style_text_font(s_kb, ui_font(), 0);
     /* dark system palette — the default light theme made every
        keyboard (re)appearance a bright blue-white flash */
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BG), 0);
+    lv_obj_set_style_border_width(s_kb, 0, 0);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BAR),
                               LV_PART_ITEMS);
     lv_obj_set_style_text_color(s_kb, lv_color_hex(UI_COL_TEXT),
                                 LV_PART_ITEMS);
+    /* The default theme gives every button a BLURRED DROP SHADOW, and
+       LV_DRAW_SW_SHADOW_CACHE_SIZE is 0 — so all 36 keys re-blurred
+       theirs on every repaint. lv_keyboard's own theme strips them
+       (lv_theme_default.c keyboard_button_bg); a raw button matrix
+       keeps them. Invisible on this dark palette, so pure cost. */
+    lv_obj_set_style_shadow_width(s_kb, 0, LV_PART_ITEMS);
+    /* The theme's ~13px radius sends every key fill through the masked
+       rounded-rect path; 4px keeps the keys visibly rounded and measured
+       15% off the repaint (draw 18.4 -> 15.7 ms). */
+    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_FLASH),
                               (uint32_t)LV_PART_ITEMS |
                                   (uint32_t)LV_STATE_PRESSED);
+    /* Shift in effect: same amber as the bar's latch and the terminal's
+       badge, so one visual language across every surface */
+    lv_obj_set_style_bg_color(s_kb, lv_color_hex(0xFFD479),
+                              (uint32_t)LV_PART_ITEMS |
+                                  (uint32_t)LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(s_kb, lv_color_black(),
+                                (uint32_t)LV_PART_ITEMS |
+                                    (uint32_t)LV_STATE_CHECKED);
+    lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
     lv_obj_add_event_cb(
         s_kb,
         [](lv_event_t *e) {
-            lv_obj_t *kb = (lv_obj_t *)lv_event_get_current_target(e);
-            uint32_t id = lv_buttonmatrix_get_selected_button(kb);
+            lv_obj_t *bm = (lv_obj_t *)lv_event_get_current_target(e);
+            uint32_t id = lv_buttonmatrix_get_selected_button(bm);
             if (id == LV_BUTTONMATRIX_BUTTON_NONE)
                 return;
-            const char *txt = lv_buttonmatrix_get_button_text(kb, id);
+            const char *txt = lv_buttonmatrix_get_button_text(bm, id);
             if (!txt)
                 return;
-            /* map/mode switches post nothing to JS: return before the
-               one-shot latch clear below */
-            if (!strcmp(txt, "abc")) {
-                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_LOWER);
+
+            /* keys that only change the keyboard: nothing is posted */
+            if (!strcmp(txt, KB_LBL_SYM) || !strcmp(txt, KB_LBL_ABC)) {
+                s_kb_sym = !strcmp(txt, KB_LBL_SYM);
+                ui_kb_refresh();
                 return;
             }
-            if (!strcmp(txt, "ABC")) {
-                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_TEXT_UPPER);
+            if (!strcmp(txt, KB_LBL_SHIFT)) {
+                kbd_mod_tap(&s_ui_mods.shift, true);
+                kb_apply_shift_flag(); /* 3 ms: the tap answers at once */
+                kb_lock_refresh();
+                ui_kb_refresh(); /* a lock also swaps the faces, later */
                 return;
             }
-            if (!strcmp(txt, "1#")) {
-                lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_SPECIAL);
-                return;
-            }
-            if (!strcmp(txt, LV_SYMBOL_CLOSE) ||
-                !strcmp(txt, LV_SYMBOL_KEYBOARD)) {
-                kb_collapse(); /* T3c: reveal the stats panel behind */
-                return;
-            }
+
+            kbd_key_t key = KBD_K_NONE;
+            char base = 0;
             if (!strcmp(txt, LV_SYMBOL_BACKSPACE))
-                mqjs_post_key("\b", 1);
-            else if (!strcmp(txt, LV_SYMBOL_NEW_LINE) ||
-                     !strcmp(txt, LV_SYMBOL_OK))
-                mqjs_post_key("\n", 1);
+                key = KBD_K_BS;
+            else if (!strcmp(txt, LV_SYMBOL_NEW_LINE))
+                key = KBD_K_ENTER;
             else if (!strcmp(txt, LV_SYMBOL_LEFT))
-                mqjs_post_key("\x1b[D", 3);
+                key = KBD_K_LEFT;
             else if (!strcmp(txt, LV_SYMBOL_RIGHT))
-                mqjs_post_key("\x1b[C", 3);
+                key = KBD_K_RIGHT;
+            else if (!strcmp(txt, LV_SYMBOL_COPY))
+                key = KBD_K_COPY;
+            else if (!(txt[0] & 0x80) && !txt[1])
+                base = txt[0]; /* a plain character face */
             else
-                mqjs_post_key(txt, strlen(txt));
-            /* every key the keyboard posts consumes a pending one-shot
-               modifier in the terminal JS — mirror it on the bar latch
-               (mode-switch taps returned above and don't get here) */
-            cbar_clear_mods();
+                return; /* an icon we have no key for: post nothing */
+
+            char seq[KBD_SEQ_MAX];
+            size_t n = kbd_translate(&s_ui_mods, base, key, seq, nullptr);
+            if (n)
+                mqjs_post_key(seq, n);
+            kbd_mods_mark_chord(&s_ui_mods); /* breaks pending tap chains */
+            kbd_mods_consume(&s_ui_mods);
+            /* both cheap, and the spent one-shots must stop showing now */
+            kb_apply_shift_flag();
+            cbar_apply_mods();
         },
         LV_EVENT_VALUE_CHANGED, nullptr);
+    kb_apply_map(); /* widths, and whatever state survived an app switch */
 }
+
+/* Temporary instrumentation: what does each kind of keyboard repaint
+   actually cost on this panel? (single draw buffer, 25-line chunks,
+   PPA rotate per flush). Times the render+flush by forcing it. */
+/* Flip to 1 to re-measure after touching the keyboard or the display
+   pipeline. It also logs where each repaint goes (draw / flush_cb /
+   DMA wait). PORTRAIT, -O2, shadows off: a keyboard map swap is 20 ms
+   of which draw is 18.4 (92%), flush_cb 0.7, DMA wait 1.1 — this
+   pipeline is CPU-rasterisation-bound, NOT transfer-bound, so buffer
+   tricks (double buffering, zero-copy) can only ever touch that last
+   ~9%. The 18.4 ms itself: fills 9.2, the theme's 13px corner radius
+   3.9, the 36 text labels 5.4.
+   Tried and dropped: LV_OBJ_STYLE_CACHE moved a keyboard repaint by
+   ~1% (15.75 -> 15.57 ms draw), i.e. nothing — per-chunk style
+   resolution is not where the time goes.
+   Where the rest goes: a 1-chunk repaint of ONE key costs ~1.0 ms
+   while a 1-chunk repaint of the strip label costs ~0.6 ms, and the
+   only difference is that LVGL walks the matrix's 36 buttons to build
+   draw tasks for every chunk. That puts the per-chunk walk near
+   0.4 ms — about 6 ms of a 15-chunk map swap. Halving the chunk count
+   (50-line draw buffer) would halve it, but sw_rotate mirrors the
+   buffer so that costs +72KB internal; splitting the keyboard into one
+   buttonmatrix per row would cut the walk ~4x for free. Neither is
+   done: the repaint is already off the typing path.
+   Older numbers, same steps (ms: one key | map swap | screen):
+     -Og portrait,  shadows      3 | 63 |  99
+     -O2 landscape, shadows      3 | 81 | 125   (1.8x the pixels, + PPA
+                                                 rotate, so per pixel
+                                                 -O2 is ~40% faster on
+                                                 button/text content;
+                                                 flat fills are memory
+                                                 bound and unchanged)
+     -O2 landscape, no shadows   1 | 47 |  85   <- shipped
+     ... + PSRAM draw buffers    3 | 85 | 160   (frees 72KB internal,
+                                                 costs ~2x render)
+     ... + double buffer (int)   1 | 40 |  73   (costs 36KB internal)
+   The flush path — draw buffer count and size — sets the floor; the
+   compiler and the styles set the slope. */
+#ifndef UI_KB_BENCH
+#define UI_KB_BENCH 0
+#endif
+#if UI_KB_BENCH
+/* Where a repaint actually goes. LVGL brackets a refresh with
+   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
+   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
+   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
+   PPA rotation in landscape; wait is time blocked on the previous
+   chunk's DMA, which is exactly what a second draw buffer would hide. */
+static struct {
+    int64_t t_render, t_flush, t_wait;
+    int64_t render, flush, wait;
+    int flushes;
+} s_prof;
+
+static void prof_event(lv_event_t *e)
+{
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_RENDER_START:      s_prof.t_render = now; break;
+    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render; break;
+    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
+    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
+                                     s_prof.flushes++; break;
+    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
+    default: break;
+    }
+}
+
+static void kb_bench(void)
+{
+    int64_t t0;
+    static const lv_event_code_t prof_codes[] = {
+        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
+        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
+        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
+    };
+    for (auto code : prof_codes)
+        lv_display_add_event_cb(s_disp, prof_event, code, nullptr);
+
+#define KB_BENCH_STEP(label, body)                                        \
+    do {                                                                  \
+        memset(&s_prof, 0, sizeof s_prof);                                \
+        t0 = esp_timer_get_time();                                        \
+        body;                                                             \
+        lv_refr_now(s_disp);                                              \
+        ESP_LOGW(TAG,                                                     \
+                 "bench %-22s %5lld ms | draw %5lld + flush %5lld + wait " \
+                 "%5lld us over %d chunks",                               \
+                 label, (esp_timer_get_time() - t0) / 1000,               \
+                 s_prof.render - s_prof.flush - s_prof.wait, s_prof.flush, \
+                 s_prof.wait, s_prof.flushes);                            \
+    } while (0)
+
+    /* the dock suppresses the on-screen keyboard, so lift that policy for
+       the measurement (and put it back at the end) */
+    bool had_dock = s_hw_kb;
+    s_hw_kb = false;
+    ESP_LOGW(TAG, "bench: %s, canvas %dx%d",
+             s_landscape ? "landscape" : "portrait", s_canvas_w, s_canvas_h);
+    KB_BENCH_STEP("kb create+first draw", kb_show(2));
+    if (!s_kb) {
+        ESP_LOGW(TAG, "bench: no matrix (canvas_w=%d) — skipped", s_canvas_w);
+        s_hw_kb = had_dock;
+        return;
+    }
+    KB_BENCH_STEP("one key invalidate",
+                  lv_buttonmatrix_set_button_ctrl(
+                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+    KB_BENCH_STEP("one key invalidate #2",
+                  lv_buttonmatrix_clear_button_ctrl(
+                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+    KB_BENCH_STEP("map swap (case)", {
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
+    });
+    KB_BENCH_STEP("map swap (sym, realloc)", {
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_SYM);
+    });
+    /* What the per-key styling costs. NB the steps after these include a
+       keyboard repaint, since restoring the styles invalidates it. */
+    KB_BENCH_STEP("map swap (radius 4)", {
+        lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+    });
+    KB_BENCH_STEP("map swap (radius 0)", {
+        lv_obj_set_style_radius(s_kb, 0, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
+    });
+    KB_BENCH_STEP("map swap (r0, no text)", {
+        lv_obj_set_style_text_opa(s_kb, LV_OPA_TRANSP, LV_PART_ITEMS);
+        s_kb_map_shown = -1;
+        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+    });
+    lv_obj_set_style_text_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS); /* back to shipped */
+    KB_BENCH_STEP("strip label", kb_lock_refresh());
+    KB_BENCH_STEP("clip label", kb_clip_refresh());
+    KB_BENCH_STEP("whole screen", lv_obj_invalidate(lv_screen_active()));
+    ESP_LOGW(TAG, "bench indev read period %d ms, refr %d ms",
+             (int)LV_DEF_REFR_PERIOD, (int)LV_DEF_REFR_PERIOD);
+    s_kb_map_shown = -1;
+    kb_show(0);
+    s_hw_kb = had_dock;
+    kb_show(s_app_kb_mode); /* back to whatever the app asked for */
+#undef KB_BENCH_STEP
+}
+#endif
 
 /* Phase 2: JS-drawable canvas over the console area. Hidden until the
    running script issues its first ui.* command; hides again (and
@@ -2371,13 +2884,24 @@ extern "C" void ui_tab5_set_landscape(bool on)
     if (s_kb) {
         lv_obj_delete(s_kb);
         s_kb = nullptr;
+        s_kb_map_shown = -1;
+    }
+    if (s_kb_clip_tmr) {
+        lv_timer_delete(s_kb_clip_tmr);
+        s_kb_clip_tmr = nullptr;
+    }
+    if (s_kb_top) {
+        lv_obj_delete(s_kb_top); /* takes the paste + collapse children */
+        s_kb_top = nullptr;
+        s_kb_clip = s_kb_clip_lbl = s_kb_lock_lbl = nullptr;
     }
     if (s_cbar) {
         lv_obj_delete(s_cbar);
         s_cbar = nullptr;
         s_cbar_fn = false;
-        s_mod_ctrl = s_mod_alt = false;
+        s_cbar_map_fn = -1;
     }
+    kbd_mods_reset(&s_ui_mods); /* nothing may be held across a rebuild */
     if (s_sp_timer) {
         lv_timer_delete(s_sp_timer);
         s_sp_timer = nullptr;
@@ -2452,12 +2976,24 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     disp_cfg.io_handle = io;
     disp_cfg.panel_handle = panel;
     disp_cfg.buffer_size = UI_LCD_H_RES * UI_LVGL_BUF_LINES;
+    /* MEASURED 2026-07-28: double_buffer=true overlaps render with the
+       DMA flush and is worth ~15% on big repaints (keyboard map swap
+       47 -> 40 ms, whole screen 85 -> 73 ms) for another 36KB of
+       internal DMA — largest contiguous internal block drops 80KB ->
+       46KB at network-up. Not taken: the camera and esp-hosted need
+       that headroom more than the keyboard needs 7 ms, now that the
+       repaint is off the typing path entirely. */
     disp_cfg.double_buffer = false;
     disp_cfg.hres = UI_LCD_H_RES;
     disp_cfg.vres = UI_LCD_V_RES;
     disp_cfg.monochrome = false;
     disp_cfg.color_format = LV_COLOR_FORMAT_RGB565;
     disp_cfg.flags.buff_dma = true;
+    /* MEASURED 2026-07-28: PSRAM draw buffers (flags.buff_spiram, legal
+       here since P4 PSRAM is DMA-capable) free the ~72KB of internal DMA
+       these two buffers hold — and cost roughly 2x the render time
+       (keyboard map swap 47 -> 85 ms, whole screen 85 -> 160 ms). The
+       buffers stay internal. */
     /* keyboard-dock landscape: PPA rotates each flush (needs
        CONFIG_LVGL_PORT_ENABLE_PPA; without it the port falls back to a
        CPU rotate through draw_buffs[2] — same memory, more CPU) */
@@ -2499,6 +3035,14 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
 
     backlight_set(100);
     ESP_LOGI(TAG, "UI up (%dx%d)", UI_LCD_H_RES, UI_LCD_V_RES);
+
+#if UI_KB_BENCH
+    {
+        lv_timer_t *t = lv_timer_create(
+            [](lv_timer_t *) { kb_bench(); }, 6000, nullptr);
+        lv_timer_set_repeat_count(t, 1);
+    }
+#endif
     if (ready_cb)
         ready_cb(arg);
 
