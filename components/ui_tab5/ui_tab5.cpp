@@ -1366,7 +1366,37 @@ private:
 #define UI_KB_LOCK_W 150 /* the strip's latched-modifier readout */
 #define UI_CB_H      80  /* T3a control bar row above the keyboard */
 
-static lv_obj_t *s_kb;       /* key matrix */
+#define KB_ROWS      4
+/* Geometry the four row matrices have to reproduce exactly, taken from
+   what one 4-row matrix laid out in the same box (lv_buttonmatrix.c
+   row_y1/row_y2): content height 352-2*4, minus three 4px row gaps,
+   split four ways = an 83px key, and rows pitched 87 apart starting
+   4px down. Each row matrix is one pitch tall and carries the gap as
+   its own bottom padding, so key rects land on the same scanlines the
+   monolithic matrix used. */
+#define KB_AREA_H    (UI_KB_H - UI_KB_TOP_H)                       /* 352 */
+#define KB_PAD       4
+#define KB_KEY_H     ((KB_AREA_H - 2 * KB_PAD - 3 * KB_PAD) / KB_ROWS) /* 83 */
+#define KB_ROW_PITCH (KB_KEY_H + KB_PAD)                            /* 87 */
+
+/* One button matrix PER ROW, not one for the whole keyboard. LVGL walks
+   every button of a matrix for every 25-line chunk it renders, with no
+   clip test in the loop (lv_buttonmatrix.c draw_main) — each walked
+   button costs two descriptor memcpys, a glyph-level text measure and
+   two malloc'd draw tasks whether or not it intersects the chunk. One
+   matrix meant 15 chunks x 36 keys = 540 walks for 144 useful ones.
+   Chunks span the full width, so a row either intersects or it does
+   not, and LVGL's own per-object intersect (lv_refr.c) now rejects the
+   2-3 rows a chunk misses before any of that runs — the same rejection
+   a clip test inside the loop would achieve, without forking LVGL.
+   MEASURED on branch perf/kb-row-split-bench (portrait, -O2): map swap
+   draw 16.06 -> 11.30 ms, and the clean walk test — one key's ctrl bit,
+   identical pixels, 10 buttons walked instead of 36 — 1.04 -> 0.62 ms.
+   s_kb stays the handle the rest of the file uses: it is now the
+   container the rows live in, and it paints the background (the rows
+   only cover from the first key down). */
+static lv_obj_t *s_kb;       /* key area container; parent of s_kb_row */
+static lv_obj_t *s_kb_row[KB_ROWS]; /* one button matrix per key row */
 static lv_obj_t *s_kb_top;   /* strip above it (clipboard + collapse) */
 static lv_obj_t *s_kb_clip;  /* paste button; its label is the preview */
 static lv_obj_t *s_kb_clip_lbl;
@@ -1375,7 +1405,10 @@ static lv_timer_t *s_kb_clip_tmr; /* another app may replace the value */
 static bool s_kb_sym;        /* symbol layer showing */
 static int s_kb_map_shown = -1; /* layer the matrix currently draws;
                                    -1 = none yet (also after a rebuild) */
-static uint32_t s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE; /* Shift key */
+/* Where the Shift key currently is. Row as well as id now: the layers
+   move it around, and the sym layer has none at all. */
+static int s_kb_shift_row = -1;
+static uint32_t s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
 static lv_obj_t *s_cbar;     /* T3a terminal control bar (mode 2) */
 static bool s_cbar_fn;       /* current map: false = main, true = F1-F12 */
 static int s_cbar_map_fn = -1; /* map the bar actually draws; -1 = none */
@@ -1864,28 +1897,54 @@ static void kb_collapse(void)
 #define KB_LBL_ABC   "abc"
 #define KB_SPACE     " " /* the widest key; an empty face is the hint */
 
-static const char *KB_MAP_LOWER[] = {
-    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
-    "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_NEW_LINE, "\n",
-    KB_LBL_SHIFT, "z", "x", "c", "v", "b", "n", "m", ".",
-    LV_SYMBOL_BACKSPACE, "\n",
-    KB_LBL_SYM, ",", KB_SPACE, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
-    LV_SYMBOL_COPY, "",
+/* One map per ROW per layer (see s_kb_row): a row matrix takes a map of
+   its own row only, terminated by "" instead of "\n". Row 3 is the same
+   object for lower and upper — no letters live there — which is what
+   lets a case flip repaint three rows instead of four.
+   Layers are indexed by the same 0/1/2 kb_apply_map computes. */
+static const char *KB_R0_LOWER[] = { "q", "w", "e", "r", "t",
+                                     "y", "u", "i", "o", "p", "" };
+static const char *KB_R1_LOWER[] = { "a", "s", "d", "f", "g", "h",
+                                     "j", "k", "l", LV_SYMBOL_NEW_LINE,
+                                     "" };
+static const char *KB_R2_LOWER[] = { KB_LBL_SHIFT, "z", "x", "c", "v",
+                                     "b", "n", "m", ".",
+                                     LV_SYMBOL_BACKSPACE, "" };
+static const char *KB_R0_UPPER[] = { "Q", "W", "E", "R", "T",
+                                     "Y", "U", "I", "O", "P", "" };
+static const char *KB_R1_UPPER[] = { "A", "S", "D", "F", "G", "H",
+                                     "J", "K", "L", LV_SYMBOL_NEW_LINE,
+                                     "" };
+static const char *KB_R2_UPPER[] = { KB_LBL_SHIFT, "Z", "X", "C", "V",
+                                     "B", "N", "M", ".",
+                                     LV_SYMBOL_BACKSPACE, "" };
+/* shared by lower and upper */
+static const char *KB_R3_ALPHA[] = { KB_LBL_SYM, ",", KB_SPACE,
+                                     LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
+                                     LV_SYMBOL_COPY, "" };
+static const char *KB_R0_SYM[] = { "1", "2", "3", "4", "5",
+                                   "6", "7", "8", "9", "0", "" };
+static const char *KB_R1_SYM[] = { "-", "_", "=", "+", "/", "\\",
+                                   "|", ":", ";", LV_SYMBOL_NEW_LINE,
+                                   "" };
+static const char *KB_R2_SYM[] = { "!", "?", "@", "#", "$", "%",
+                                   "&", "*", "~", LV_SYMBOL_BACKSPACE,
+                                   "" };
+static const char *KB_R3_SYM[] = { KB_LBL_ABC, "\"", "'", KB_SPACE,
+                                   ">", "[", "]", "" };
+
+static const char *const *KB_LAYER[3][KB_ROWS] = {
+    { KB_R0_LOWER, KB_R1_LOWER, KB_R2_LOWER, KB_R3_ALPHA }, /* 0 lower */
+    { KB_R0_UPPER, KB_R1_UPPER, KB_R2_UPPER, KB_R3_ALPHA }, /* 1 upper */
+    { KB_R0_SYM,   KB_R1_SYM,   KB_R2_SYM,   KB_R3_SYM   }, /* 2 sym   */
 };
-static const char *KB_MAP_UPPER[] = {
-    "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "\n",
-    "A", "S", "D", "F", "G", "H", "J", "K", "L", LV_SYMBOL_NEW_LINE, "\n",
-    KB_LBL_SHIFT, "Z", "X", "C", "V", "B", "N", "M", ".",
-    LV_SYMBOL_BACKSPACE, "\n",
-    KB_LBL_SYM, ",", KB_SPACE, LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
-    LV_SYMBOL_COPY, "",
-};
-static const char *KB_MAP_SYM[] = {
-    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
-    "-", "_", "=", "+", "/", "\\", "|", ":", ";", LV_SYMBOL_NEW_LINE, "\n",
-    "!", "?", "@", "#", "$", "%", "&", "*", "~",
-    LV_SYMBOL_BACKSPACE, "\n",
-    KB_LBL_ABC, "\"", "'", KB_SPACE, ">", "[", "]", "",
+/* what each row is actually pointed at, so a layer change only touches
+   the rows that differ (lower<->upper leaves row 3 alone), and where
+   Shift sits in each — both survive a row that was not re-mapped */
+static const char *const *s_kb_row_map[KB_ROWS];
+static uint32_t s_kb_row_shift[KB_ROWS] = {
+    LV_BUTTONMATRIX_BUTTON_NONE, LV_BUTTONMATRIX_BUTTON_NONE,
+    LV_BUTTONMATRIX_BUTTON_NONE, LV_BUTTONMATRIX_BUTTON_NONE,
 };
 
 /* Shift shown on the Shift key alone: one ctrl bit and one button
@@ -1894,13 +1953,15 @@ static const char *KB_MAP_SYM[] = {
    which is what makes a one-shot feel instant. */
 static void kb_apply_shift_flag(void)
 {
-    if (!s_kb || s_kb_shift_id == LV_BUTTONMATRIX_BUTTON_NONE)
+    if (s_kb_shift_row < 0 || !s_kb_row[s_kb_shift_row] ||
+        s_kb_shift_id == LV_BUTTONMATRIX_BUTTON_NONE)
         return;
+    lv_obj_t *m = s_kb_row[s_kb_shift_row];
     if (kbd_mod_armed(&s_ui_mods.shift))
-        lv_buttonmatrix_set_button_ctrl(s_kb, s_kb_shift_id,
+        lv_buttonmatrix_set_button_ctrl(m, s_kb_shift_id,
                                         LV_BUTTONMATRIX_CTRL_CHECKED);
     else
-        lv_buttonmatrix_clear_button_ctrl(s_kb, s_kb_shift_id,
+        lv_buttonmatrix_clear_button_ctrl(m, s_kb_shift_id,
                                           LV_BUTTONMATRIX_CTRL_CHECKED);
 }
 
@@ -1916,39 +1977,69 @@ static void kb_apply_shift_flag(void)
    in the strip's LOCK line.
    set_map wipes per-button widths and (when the key count changes) the
    ctrl flags, so both are restored here. */
-static void kb_apply_map(void)
-{
-    if (!s_kb)
-        return;
-    bool upper = s_ui_mods.shift.lock;
-    int want = s_kb_sym ? 2 : upper ? 1 : 0;
-    if (want == s_kb_map_shown)
-        return;
-    s_kb_map_shown = want;
-    s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
 
-    lv_buttonmatrix_set_map(s_kb, s_kb_sym ? KB_MAP_SYM
-                                  : upper  ? KB_MAP_UPPER
-                                           : KB_MAP_LOWER);
-    /* by label, so a layer may place these keys wherever it likes */
+/* Widths and no-repeat for one row, by label so a layer may place these
+   keys wherever it likes. Also records where Shift landed, since the
+   layers move it and the sym layer has none.
+   Only ever called on a row that was just re-mapped: both
+   lv_buttonmatrix_set_button_width (via update_map) and
+   set_button_ctrl invalidate unconditionally, with no check that the
+   value changed — calling this on an unchanged row would repaint it
+   and give back exactly what the split is here to save. */
+static void kb_row_apply_flags(int r)
+{
+    lv_obj_t *m = s_kb_row[r];
+    s_kb_row_shift[r] = LV_BUTTONMATRIX_BUTTON_NONE;
     for (uint32_t id = 0;; id++) {
-        const char *t = lv_buttonmatrix_get_button_text(s_kb, id);
+        const char *t = lv_buttonmatrix_get_button_text(m, id);
         if (!t)
             break;
         bool shift = !strcmp(t, KB_LBL_SHIFT);
         if (!strcmp(t, KB_SPACE))
-            lv_buttonmatrix_set_button_width(s_kb, id, 4);
+            lv_buttonmatrix_set_button_width(m, id, 4);
         /* A held button repeats VALUE_CHANGED by default, which is what
            makes typematic work for letters and Backspace — but on a
            modifier or a layer key it would machine-gun taps and flip
            the lock on and off. */
         if (shift || !strcmp(t, KB_LBL_SYM) || !strcmp(t, KB_LBL_ABC) ||
             !strcmp(t, LV_SYMBOL_NEW_LINE) || !strcmp(t, LV_SYMBOL_COPY))
-            lv_buttonmatrix_set_button_ctrl(s_kb, id,
+            lv_buttonmatrix_set_button_ctrl(m, id,
                                             LV_BUTTONMATRIX_CTRL_NO_REPEAT);
         if (shift)
-            s_kb_shift_id = id; /* the layers move it around */
+            s_kb_row_shift[r] = id;
     }
+}
+
+static void kb_apply_map(void)
+{
+    if (!s_kb_row[0])
+        return;
+    bool upper = s_ui_mods.shift.lock;
+    int want = s_kb_sym ? 2 : upper ? 1 : 0;
+    if (want == s_kb_map_shown)
+        return;
+    s_kb_map_shown = want;
+
+    /* Only the rows whose map actually changes are re-set, and only
+       those repaint: a case flip leaves row 3 alone (16.1 -> 8.8 ms
+       draw, measured on perf/kb-row-split-bench). An untouched row
+       keeps its widths, flags and Shift id, which is why those are
+       cached per row rather than recomputed for the whole keyboard. */
+    for (int r = 0; r < KB_ROWS; r++) {
+        const char *const *m = KB_LAYER[want][r];
+        if (m == s_kb_row_map[r])
+            continue;
+        s_kb_row_map[r] = m;
+        lv_buttonmatrix_set_map(s_kb_row[r], m);
+        kb_row_apply_flags(r);
+    }
+    s_kb_shift_row = -1;
+    s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
+    for (int r = 0; r < KB_ROWS; r++)
+        if (s_kb_row_shift[r] != LV_BUTTONMATRIX_BUTTON_NONE) {
+            s_kb_shift_row = r;
+            s_kb_shift_id = s_kb_row_shift[r];
+        }
     /* set AND clear: swapping between two maps of the same key count
        keeps the old flags (LVGL only reallocates when the count
        changes), which used to leave Shift stuck amber */
@@ -2120,52 +2211,75 @@ static void kb_show(int mode)
     }
     s_kb_map_shown = -1; /* fresh matrix: kb_apply_map must really run */
     kb_top_create();
-    s_kb = lv_buttonmatrix_create(s_root_scr ? s_root_scr
-                                             : lv_screen_active());
-    lv_obj_set_size(s_kb, ui_cur_hres(), UI_KB_H - UI_KB_TOP_H);
+    /* The container. It owns the background for the whole key area —
+       the row matrices only paint from the first key down, so the 4px
+       above row 0 would otherwise show the console through. */
+    s_kb = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(s_kb, ui_cur_hres(), KB_AREA_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_pad_all(s_kb, 4, 0);
-    lv_obj_set_style_pad_gap(s_kb, 4, 0);
-    lv_obj_set_style_text_font(s_kb, ui_font(), 0);
+    lv_obj_set_style_pad_all(s_kb, 0, 0);
     /* dark system palette — the default light theme made every
        keyboard (re)appearance a bright blue-white flash */
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BG), 0);
     lv_obj_set_style_border_width(s_kb, 0, 0);
-    /* MAIN, not ITEMS: the theme's card radius (10px at this DPI) was
-       still on the matrix's own background, and a rounded background is
-       not a COVER — so LVGL could not skip the console under any chunk
-       the keyboard's corners touch, and drew both. The corners sit on
-       UI_COL_BG either way, so squaring them changes no pixel unless a
-       JS canvas is showing, where ~86px of it were console before. */
-    lv_obj_set_style_radius(s_kb, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_BAR),
-                              LV_PART_ITEMS);
-    lv_obj_set_style_text_color(s_kb, lv_color_hex(UI_COL_TEXT),
-                                LV_PART_ITEMS);
-    /* The default theme gives every button a BLURRED DROP SHADOW, and
-       LV_DRAW_SW_SHADOW_CACHE_SIZE is 0 — so all 36 keys re-blurred
-       theirs on every repaint. lv_keyboard's own theme strips them
-       (lv_theme_default.c keyboard_button_bg); a raw button matrix
-       keeps them. Invisible on this dark palette, so pure cost. */
-    lv_obj_set_style_shadow_width(s_kb, 0, LV_PART_ITEMS);
-    /* The theme's ~13px radius sends every key fill through the masked
-       rounded-rect path; 4px keeps the keys visibly rounded and measured
-       15% off the repaint (draw 18.4 -> 15.7 ms). */
-    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
-    lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_FLASH),
-                              (uint32_t)LV_PART_ITEMS |
-                                  (uint32_t)LV_STATE_PRESSED);
-    /* Shift in effect: same amber as the bar's latch and the terminal's
-       badge, so one visual language across every surface */
-    lv_obj_set_style_bg_color(s_kb, lv_color_hex(0xFFD479),
-                              (uint32_t)LV_PART_ITEMS |
-                                  (uint32_t)LV_STATE_CHECKED);
-    lv_obj_set_style_text_color(s_kb, lv_color_black(),
-                                (uint32_t)LV_PART_ITEMS |
-                                    (uint32_t)LV_STATE_CHECKED);
-    lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
-    lv_obj_add_event_cb(
-        s_kb,
+    /* The theme's card radius (10px at this DPI) was never cleared
+       here, and a rounded background is not a COVER — so LVGL could not
+       skip the console under any chunk the keyboard's corners touch,
+       and drew both. The corners sit on UI_COL_BG either way. */
+    lv_obj_set_style_radius(s_kb, 0, 0);
+
+    for (int r = 0; r < KB_ROWS; r++) {
+        lv_obj_t *m = lv_buttonmatrix_create(s_kb);
+        s_kb_row[r] = m;
+        lv_obj_set_size(m, ui_cur_hres(), KB_ROW_PITCH);
+        /* one pitch tall, carrying the inter-row gap as its own bottom
+           padding, so the keys land where the 4-row matrix put them */
+        lv_obj_align(m, LV_ALIGN_BOTTOM_MID, 0,
+                     -(KB_AREA_H - KB_PAD - (r + 1) * KB_ROW_PITCH));
+        lv_obj_set_style_pad_hor(m, KB_PAD, 0);
+        lv_obj_set_style_pad_top(m, 0, 0);
+        lv_obj_set_style_pad_bottom(m, KB_PAD, 0);
+        lv_obj_set_style_pad_gap(m, KB_PAD, 0);
+        lv_obj_set_style_text_font(m, ui_font(), 0);
+        lv_obj_set_style_bg_color(m, lv_color_hex(UI_COL_BG), 0);
+        lv_obj_set_style_border_width(m, 0, 0);
+        lv_obj_set_style_radius(m, 0, 0); /* cover, as above */
+        lv_obj_set_style_bg_color(m, lv_color_hex(UI_COL_BAR),
+                                  LV_PART_ITEMS);
+        lv_obj_set_style_text_color(m, lv_color_hex(UI_COL_TEXT),
+                                    LV_PART_ITEMS);
+        /* The default theme gives every button a BLURRED DROP SHADOW,
+           and LV_DRAW_SW_SHADOW_CACHE_SIZE is 0 — so all 36 keys
+           re-blurred theirs on every repaint. lv_keyboard's own theme
+           strips them (lv_theme_default.c keyboard_button_bg); a raw
+           button matrix keeps them. Invisible on this dark palette, so
+           pure cost. */
+        lv_obj_set_style_shadow_width(m, 0, LV_PART_ITEMS);
+        /* The theme's ~13px radius sends every key fill through the
+           masked rounded-rect path; 4px keeps the keys visibly rounded
+           and measured 15% off the repaint (draw 18.4 -> 15.7 ms). */
+        lv_obj_set_style_radius(m, 4, LV_PART_ITEMS);
+        lv_obj_set_style_bg_color(m, lv_color_hex(UI_COL_FLASH),
+                                  (uint32_t)LV_PART_ITEMS |
+                                      (uint32_t)LV_STATE_PRESSED);
+        /* Shift in effect: same amber as the bar's latch and the
+           terminal's badge, so one visual language across every
+           surface */
+        lv_obj_set_style_bg_color(m, lv_color_hex(0xFFD479),
+                                  (uint32_t)LV_PART_ITEMS |
+                                      (uint32_t)LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(m, lv_color_black(),
+                                    (uint32_t)LV_PART_ITEMS |
+                                        (uint32_t)LV_STATE_CHECKED);
+        s_kb_row_map[r] = KB_LAYER[0][r];
+        lv_buttonmatrix_set_map(m, s_kb_row_map[r]);
+        kb_row_apply_flags(r);
+    }
+    /* One callback for all four rows: it already resolves everything
+       from the event's own target and the button's LABEL, never from a
+       matrix-wide id, so splitting the matrix costs it nothing. */
+    lv_event_cb_t key_cb =
         [](lv_event_t *e) {
             lv_obj_t *bm = (lv_obj_t *)lv_event_get_current_target(e);
             uint32_t id = lv_buttonmatrix_get_selected_button(bm);
@@ -2215,8 +2329,10 @@ static void kb_show(int mode)
             /* both cheap, and the spent one-shots must stop showing now */
             kb_apply_shift_flag();
             cbar_apply_mods();
-        },
-        LV_EVENT_VALUE_CHANGED, nullptr);
+        };
+    for (int r = 0; r < KB_ROWS; r++)
+        lv_obj_add_event_cb(s_kb_row[r], key_cb, LV_EVENT_VALUE_CHANGED,
+                            nullptr);
     kb_apply_map(); /* widths, and whatever state survived an app switch */
 }
 
@@ -2238,11 +2354,19 @@ static void kb_show(int mode)
    while a 1-chunk repaint of the strip label costs ~0.6 ms, and the
    only difference is that LVGL walks the matrix's 36 buttons to build
    draw tasks for every chunk. That puts the per-chunk walk near
-   0.4 ms — about 6 ms of a 15-chunk map swap. Halving the chunk count
-   (50-line draw buffer) would halve it, but sw_rotate mirrors the
-   buffer so that costs +72KB internal; splitting the keyboard into one
-   buttonmatrix per row would cut the walk ~4x for free. Neither is
-   done: the repaint is already off the typing path.
+   0.4 ms — about 6 ms of a 15-chunk map swap.
+   FIXED by the row split (see s_kb_row): one matrix per row lets
+   LVGL's own per-object intersect reject the rows a chunk misses.
+   Measured on the prototype: map swap draw 16.06 -> 11.30 ms, one key
+   1.04 -> 0.62 ms, and a real case flip (three rows re-mapped) 8.75.
+   The other half of that 6 ms — halving the chunk count with a 50-line
+   draw buffer — is still on the table but costs 36KB internal, since
+   sw_rotate has esp_lvgl_port allocate a PPA scratch of the same size
+   at init whether or not the display is ever rotated. In portrait that
+   scratch is dead weight (landscape means the dock, and the dock
+   suppresses this keyboard), but freeing it needs a fork of the port:
+   the handle is private and there is no runtime API. Worth ~1 ms now
+   that the walk is gone, so it waits for a measurement.
    Older numbers, same steps (ms: one key | map swap | screen):
      -Og portrait,  shadows      3 | 63 |  99
      -O2 landscape, shadows      3 | 81 | 125   (1.8x the pixels, + PPA
@@ -2320,44 +2444,61 @@ static void kb_bench(void)
     ESP_LOGW(TAG, "bench: %s, canvas %dx%d",
              s_landscape ? "landscape" : "portrait", s_canvas_w, s_canvas_h);
     KB_BENCH_STEP("kb create+first draw", kb_show(2));
-    if (!s_kb) {
+    if (!s_kb_row[0]) {
         ESP_LOGW(TAG, "bench: no matrix (canvas_w=%d) — skipped", s_canvas_w);
         s_hw_kb = had_dock;
         return;
     }
+    /* Re-map rows 0..rows_n-1 to a layer whether or not they changed —
+       kb_apply_map deliberately skips unchanged rows, which is the
+       thing being measured, so the bench has to force the work. */
+    auto set_layer = [](int layer, int rows_n) {
+        s_kb_map_shown = -1;
+        for (int r = 0; r < rows_n; r++) {
+            s_kb_row_map[r] = KB_LAYER[layer][r];
+            lv_buttonmatrix_set_map(s_kb_row[r], s_kb_row_map[r]);
+            kb_row_apply_flags(r);
+        }
+    };
+    auto all_rows_style = [](void (*f)(lv_obj_t *)) {
+        for (int r = 0; r < KB_ROWS; r++)
+            f(s_kb_row[r]);
+    };
     KB_BENCH_STEP("one key invalidate",
                   lv_buttonmatrix_set_button_ctrl(
-                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+                      s_kb_row[0], 0, LV_BUTTONMATRIX_CTRL_CHECKED));
     KB_BENCH_STEP("one key invalidate #2",
                   lv_buttonmatrix_clear_button_ctrl(
-                      s_kb, 0, LV_BUTTONMATRIX_CTRL_CHECKED));
-    KB_BENCH_STEP("map swap (case)", {
-        s_kb_map_shown = -1;
-        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
-    });
-    KB_BENCH_STEP("map swap (sym, realloc)", {
-        s_kb_map_shown = -1;
-        lv_buttonmatrix_set_map(s_kb, KB_MAP_SYM);
-    });
+                      s_kb_row[0], 0, LV_BUTTONMATRIX_CTRL_CHECKED));
+    /* the real case flip: row 3 has no letters, so it is not re-mapped
+       and does not repaint */
+    KB_BENCH_STEP("map swap (case, 3 rows)", set_layer(1, 3));
+    KB_BENCH_STEP("map swap (all 4 rows)", set_layer(0, KB_ROWS));
+    KB_BENCH_STEP("map swap (sym, realloc)", set_layer(2, KB_ROWS));
     /* What the per-key styling costs. NB the steps after these include a
        keyboard repaint, since restoring the styles invalidates it. */
     KB_BENCH_STEP("map swap (radius 4)", {
-        lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
-        s_kb_map_shown = -1;
-        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+        all_rows_style([](lv_obj_t *m) {
+            lv_obj_set_style_radius(m, 4, LV_PART_ITEMS);
+        });
+        set_layer(0, KB_ROWS);
     });
     KB_BENCH_STEP("map swap (radius 0)", {
-        lv_obj_set_style_radius(s_kb, 0, LV_PART_ITEMS);
-        s_kb_map_shown = -1;
-        lv_buttonmatrix_set_map(s_kb, KB_MAP_UPPER);
+        all_rows_style([](lv_obj_t *m) {
+            lv_obj_set_style_radius(m, 0, LV_PART_ITEMS);
+        });
+        set_layer(1, KB_ROWS);
     });
     KB_BENCH_STEP("map swap (r0, no text)", {
-        lv_obj_set_style_text_opa(s_kb, LV_OPA_TRANSP, LV_PART_ITEMS);
-        s_kb_map_shown = -1;
-        lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
+        all_rows_style([](lv_obj_t *m) {
+            lv_obj_set_style_text_opa(m, LV_OPA_TRANSP, LV_PART_ITEMS);
+        });
+        set_layer(0, KB_ROWS);
     });
-    lv_obj_set_style_text_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
-    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS); /* back to shipped */
+    all_rows_style([](lv_obj_t *m) {
+        lv_obj_set_style_text_opa(m, LV_OPA_COVER, LV_PART_ITEMS);
+        lv_obj_set_style_radius(m, 4, LV_PART_ITEMS); /* back to shipped */
+    });
     KB_BENCH_STEP("strip label", kb_lock_refresh());
     KB_BENCH_STEP("clip label", kb_clip_refresh());
     KB_BENCH_STEP("whole screen", lv_obj_invalidate(lv_screen_active()));
@@ -2890,8 +3031,15 @@ extern "C" void ui_tab5_set_landscape(bool on)
        the new width under the current dock policy */
     int app_kb = s_app_kb_mode;
     if (s_kb) {
-        lv_obj_delete(s_kb);
+        lv_obj_delete(s_kb); /* takes the four row matrices with it */
         s_kb = nullptr;
+        for (int r = 0; r < KB_ROWS; r++) {
+            s_kb_row[r] = nullptr;
+            s_kb_row_map[r] = nullptr; /* the rebuild must really set_map */
+            s_kb_row_shift[r] = LV_BUTTONMATRIX_BUTTON_NONE;
+        }
+        s_kb_shift_row = -1;
+        s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
         s_kb_map_shown = -1;
     }
     if (s_kb_clip_tmr) {
