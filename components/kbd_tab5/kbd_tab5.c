@@ -66,7 +66,7 @@ static const char *TAG = "kbd_tab5";
 #define KB_POLL_MS         100  /* present: fallback INT_STA poll */
 #define KB_REPEAT_DELAY_MS 400  /* typematic: first repeat */
 #define KB_REPEAT_TICK_MS  55   /* typematic: rate (~18 cps) */
-#define KB_AA_CLICK_MS     400  /* Aa tap/double-tap window (dock FW value) */
+#define KB_TAP_MS          400  /* tap / double-tap window (dock FW value) */
 #define KB_ERR_LIMIT       3    /* consecutive comm errors = detached */
 
 static i2c_master_bus_handle_t s_bus;
@@ -75,13 +75,26 @@ static SemaphoreHandle_t s_int_sem;
 static volatile bool s_present;
 static kbd_tab5_presence_cb_t s_presence_cb;
 
-/* ---- modifier / lock state (kbd task only) -------------------------- */
-static bool s_sym_held, s_ctrl_held, s_alt_held;
-static bool s_aa_held;        /* Aa physically down (shift-while-held) */
-static bool s_aa_lock;        /* double-tap caps lock */
-static bool s_aa_oneshot;     /* single tap: next letter uppercase */
-static int64_t s_aa_press_us, s_aa_release_us;
-static int s_aa_clicks;
+/* ---- modifier / lock state (kbd task only) --------------------------
+ * Every modifier supports hold AND double-tap lock (tap again to
+ * unlock) — continuous uppercase or sym symbols without holding the
+ * key. A press only counts as a "tap" when NO other key was typed
+ * while it was held (`used`), so rapid sym+X, sym+X typing can never
+ * latch the lock by accident. Aa additionally has the dock-FW one-shot
+ * (bare single tap = next letter uppercase). */
+typedef struct {
+    bool held, lock, oneshot;
+    bool used; /* another key was pressed while this one was held */
+    int64_t press_us, release_us;
+    int clicks;
+} kb_mod_t;
+
+static kb_mod_t s_sym, s_ctrl, s_alt, s_aa;
+
+static bool mod_active(const kb_mod_t *m)
+{
+    return m->held || m->lock;
+}
 
 /* typematic state */
 static bool s_held;
@@ -113,31 +126,43 @@ static bool wr_regs(uint8_t reg, const uint8_t *data, size_t len)
     return i2c_master_transmit(s_dev, buf, len + 1, 50) == ESP_OK;
 }
 
-/* ---- modifier LEDs --------------------------------------------------
- * The two WS2812s under the sym/Aa keys, driven through the dock's RGB
- * custom mode. One color for both, by held-modifier precedence. */
+static bool uppercase_active(void)
+{
+    return s_aa.held || s_aa.lock || s_aa.oneshot;
+}
 
-static uint32_t s_led_rgb = 1; /* impossible initial: force first write */
+/* ---- modifier LEDs --------------------------------------------------
+ * Two WS2812s via the dock's RGB custom mode, split by role so the
+ * colors never mask each other:
+ *   LED1 = momentary layer:  sym=blue > ctrl=cyan > alt=gray
+ *   LED2 = uppercase state:  red while Aa is held / one-shot / locked
+ * (held and locked show the same color on purpose — the lock IS "still
+ * held" to the typist). */
+
+static uint64_t s_led_state = 1; /* impossible initial: force 1st write */
 
 static void led_update(void)
 {
-    uint32_t rgb;
-    if (s_sym_held)
-        rgb = 0x0000FF; /* sym: blue */
-    else if (s_ctrl_held)
-        rgb = 0x00FFFF; /* ctrl: cyan */
-    else if (s_alt_held)
-        rgb = 0x808080; /* alt: gray */
-    else if (s_aa_held || s_aa_lock || s_aa_oneshot)
-        rgb = 0xFF0000; /* uppercase pending/locked: red */
+    uint32_t led1;
+    if (mod_active(&s_sym))
+        led1 = 0x0000FF; /* sym: blue */
+    else if (mod_active(&s_ctrl))
+        led1 = 0x00FFFF; /* ctrl: cyan */
+    else if (mod_active(&s_alt))
+        led1 = 0x808080; /* alt: gray */
     else
-        rgb = 0x000000; /* idle: off */
-    if (rgb == s_led_rgb)
+        led1 = 0x000000;
+    uint32_t led2 = uppercase_active() ? 0xFF0000 : 0x000000;
+
+    uint64_t state = ((uint64_t)led1 << 24) | led2;
+    if (state == s_led_state)
         return;
-    uint8_t r = rgb >> 16, g = rgb >> 8, b = rgb;
-    uint8_t bgr2[6] = { b, g, r, b, g, r }; /* regs are B,G,R per LED */
+    uint8_t bgr2[6] = { /* regs 0x60..: B,G,R per LED */
+        (uint8_t)led1, (uint8_t)(led1 >> 8), (uint8_t)(led1 >> 16),
+        (uint8_t)led2, (uint8_t)(led2 >> 8), (uint8_t)(led2 >> 16),
+    };
     if (wr_regs(KB_REG_RGB_BASE, bgr2, 6))
-        s_led_rgb = rgb;
+        s_led_state = state;
 }
 
 /* ---- host keymap (dock FW user_keyboard_handle.c, 5x14) -------------
@@ -191,17 +216,12 @@ static const char *token_name(uint8_t code)
     }
 }
 
-static bool uppercase_active(void)
-{
-    return s_aa_held || s_aa_lock || s_aa_oneshot;
-}
-
 /* Build the mqjs_post_key sequence for a non-modifier key press.
  * Returns length (0 = nothing to post), sets *repeats. */
 static size_t translate(uint8_t row, uint8_t col, char out[8], bool *repeats)
 {
     *repeats = false;
-    uint8_t code = (s_sym_held ? s_map_sym : s_map)[row][col];
+    uint8_t code = (mod_active(&s_sym) ? s_map_sym : s_map)[row][col];
 
     const char *tok = token_name(code);
     if (tok) {
@@ -225,8 +245,8 @@ static size_t translate(uint8_t row, uint8_t col, char out[8], bool *repeats)
         if (c >= 'a' && c <= 'z' && uppercase_active()) {
             c = (char)toupper((unsigned char)c);
             /* one-shot consumed by this letter (not while held/locked) */
-            if (s_aa_oneshot && !s_aa_held && !s_aa_lock) {
-                s_aa_oneshot = false;
+            if (s_aa.oneshot && !s_aa.held && !s_aa.lock) {
+                s_aa.oneshot = false;
                 led_update();
             }
         }
@@ -234,10 +254,10 @@ static size_t translate(uint8_t row, uint8_t col, char out[8], bool *repeats)
     }
 
     size_t n = 0;
-    if (s_alt_held)
+    if (mod_active(&s_alt))
         out[n++] = '\x1b'; /* Meta = ESC prefix (matches the terminal) */
 
-    if (s_ctrl_held) {
+    if (mod_active(&s_ctrl)) {
         /* Ctrl+letter/@[\]^_ -> control byte; Ctrl+anything-else falls
            through as the plain char. Ctrl+Space would be NUL — that
            collides with the "\x00name" token marker, so it is dropped. */
@@ -255,32 +275,38 @@ static size_t translate(uint8_t row, uint8_t col, char out[8], bool *repeats)
 
 /* ---- event handling -------------------------------------------------- */
 
-/* Aa mirrors the dock FW: hold = uppercase while held, tap = one-shot
-   for the next letter, double-tap = caps lock, tap while locked =
-   unlock. */
-static void aa_key(bool pressed, int64_t now)
+/* Shared hold / tap / double-tap-lock state machine. `oneshot_arm`:
+   only Aa arms a one-shot on a bare single tap (a one-shot Ctrl would
+   make a stray tap turn the next 'c' into SIGINT). Sequence:
+     hold + type      = modifier while held (as before)
+     bare double-tap  = lock (stays active hands-off)
+     bare tap, locked = unlock
+     bare tap, Aa     = one-shot for the next letter */
+static void mod_key(kb_mod_t *m, bool pressed, bool oneshot_arm, int64_t now)
 {
     if (pressed) {
-        s_aa_held = true;
-        s_aa_press_us = now;
-        s_aa_clicks =
-            (now - s_aa_release_us < KB_AA_CLICK_MS * 1000LL) ? s_aa_clicks + 1
-                                                              : 1;
+        m->held = true;
+        m->used = false;
+        m->press_us = now;
+        m->clicks = (now - m->release_us < KB_TAP_MS * 1000LL)
+                        ? m->clicks + 1
+                        : 1;
     } else {
-        s_aa_held = false;
-        s_aa_release_us = now;
-        if (now - s_aa_press_us < KB_AA_CLICK_MS * 1000LL) {
-            if (s_aa_clicks >= 2) {
-                s_aa_lock = true; /* double-tap: caps lock */
-                s_aa_oneshot = false;
-            } else if (s_aa_lock || s_aa_oneshot) {
-                s_aa_lock = false; /* tap while armed/locked: clear */
-                s_aa_oneshot = false;
-            } else {
-                s_aa_oneshot = true; /* tap: next letter uppercase */
-            }
-        } else {
-            /* long hold released: shift ends (lock survives) */
+        m->held = false;
+        m->release_us = now;
+        bool tap = !m->used && (now - m->press_us < KB_TAP_MS * 1000LL);
+        if (!tap) {
+            m->clicks = 0; /* it was a hold (or was used as a chord) */
+        } else if (m->clicks >= 2) {
+            m->lock = true; /* double-tap: latch */
+            m->oneshot = false;
+            m->clicks = 0;
+        } else if (m->lock || m->oneshot) {
+            m->lock = false; /* tap while latched/armed: clear */
+            m->oneshot = false;
+            m->clicks = 0;
+        } else if (oneshot_arm) {
+            m->oneshot = true; /* Aa: next letter uppercase */
         }
     }
     led_update();
@@ -296,19 +322,16 @@ static void handle_key_event(uint8_t ev)
 
     switch (s_map[row][col]) {
     case K_SYM:
-        s_sym_held = pressed;
-        led_update();
+        mod_key(&s_sym, pressed, false, now);
         return;
     case K_CTRL:
-        s_ctrl_held = pressed;
-        led_update();
+        mod_key(&s_ctrl, pressed, false, now);
         return;
     case K_ALT:
-        s_alt_held = pressed;
-        led_update();
+        mod_key(&s_alt, pressed, false, now);
         return;
     case K_AA:
-        aa_key(pressed, now);
+        mod_key(&s_aa, pressed, true, now);
         return;
     default:
         break;
@@ -320,6 +343,13 @@ static void handle_key_event(uint8_t ev)
             s_held = false;
         return;
     }
+
+    /* a real key while a modifier is held: that press was a chord, not
+       a tap — it must never count toward a double-tap lock */
+    s_sym.used |= s_sym.held;
+    s_ctrl.used |= s_ctrl.held;
+    s_alt.used |= s_alt.held;
+    s_aa.used |= s_aa.held;
 
     char seq[8];
     bool repeats = false;
@@ -391,10 +421,12 @@ static bool probe_and_init(void)
     (void)wr_reg(KB_REG_INT_STA, 0);
     (void)wr_reg(KB_REG_RGB_MODE, KB_RGB_CUSTOM); /* we own the LEDs */
     /* fresh attach: no modifier can be known-held; reset + LEDs off */
-    s_sym_held = s_ctrl_held = s_alt_held = false;
-    s_aa_held = s_aa_lock = s_aa_oneshot = false;
+    memset(&s_sym, 0, sizeof s_sym);
+    memset(&s_ctrl, 0, sizeof s_ctrl);
+    memset(&s_alt, 0, sizeof s_alt);
+    memset(&s_aa, 0, sizeof s_aa);
     s_held = false;
-    s_led_rgb = 1;
+    s_led_state = 1;
     led_update();
     ESP_LOGI(TAG, "dock attached (fw v%u)", ver);
     return true;
