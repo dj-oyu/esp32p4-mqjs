@@ -490,7 +490,18 @@ static inline int ui_cur_hres(void)
    internal footprint is 72KB either way — the same as before — and the
    draw buffer gets all of it. Fewer, taller chunks: a keyboard map swap
    goes from 16 chunks to 8, and every chunk is a fresh walk of the
-   widget tree (see s_kb_row). */
+   widget tree (see s_kb_row).
+   MEASURED on device, 25 vs 50 lines, everything else equal (draw us /
+   chunks). Chunks halve exactly and draw follows:
+     map swap, case flip   7940 / 12  ->  5881 / 6    -26%
+     map swap, all 4 rows  9955 / 16  ->  7368 / 8    -26%
+     whole screen         28418 / 52  -> 22787 / 26   -20%
+     one key                561 / 1   ->   554 / 1    (1 chunk either way)
+   Internal DMA is unchanged: free-at-net-up was 179707 B with the old
+   25-line pair and 179803 B with this one.
+   Do NOT raise this further without re-checking the heap: 50 lines is
+   72KB and the largest contiguous internal block is ~80KB, so 75 lines
+   (108KB) would not fit. */
 #define UI_LVGL_BUF_LINES   50
 
 /* The rotation scratch is written by the PPA and read by the LCD DMA —
