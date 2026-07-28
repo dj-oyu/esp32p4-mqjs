@@ -2,19 +2,28 @@
  * M5Stack Tab5 keyboard dock (A164): STM32F030 scanner at I2C 0x6D on
  * the pogo connector (SDA=GPIO0 SCL=GPIO1, INT=GPIO50 active-low).
  *
- * Mode choice: the dock firmware offers Normal (row/col), HID
- * (modifier+keycode, press AND release events) and Character (ready
- * strings, press only). We run HID: release events make host-side
- * typematic repeat possible (Character mode never says when a key is
- * let go), and the dock still resolves its own sym/Aa layer for us —
- * a shifted keycap arrives as LSHIFT|keycode, so one standard US
- * HID→ASCII table covers the whole 70-key layout.
+ * Mode choice: the dock offers Normal (raw row/col, press AND release
+ * for EVERY key), HID and Character modes. We run NORMAL and keep the
+ * whole keymap host-side (tables lifted from the dock firmware's
+ * user_keyboard_handle.c): it is the only mode that reports bare
+ * modifier presses (sym/Aa/ctrl/alt are swallowed by the dock's own
+ * state machine in HID/Character mode), which we need for
+ *   - immediate modifier LED feedback (sym=blue, ctrl=cyan, alt=gray,
+ *     Aa=red — WS2812 pair driven via the RGB custom-mode registers),
+ *   - typematic repeat that stops on the held key's own release,
+ *   - the Aa click/double-click/hold semantics (one-shot / caps lock /
+ *     shift-while-held), mirrored from the dock firmware.
+ *
+ * Key sequences posted to mqjs_post_key() use the exact on-screen
+ * keyboard / control-bar vocabulary, so apps need no awareness:
+ * printables, "\n" "\b" "\t", "\x00name" tokens, Ctrl+letter as
+ * control bytes, Alt as ESC prefix.
  *
  * Event flow (single task, no I2C from ISRs):
- *   GPIO50 negedge ISR -> semaphore -> drain INT_STA/EVENT_NUM/0x30
- *   queue -> translate -> mqjs_post_key(). A 100 ms fallback poll
- *   covers edges missed while the queue was already asserted, and a
- *   2 s probe loop covers hot-plug both ways.
+ *   GPIO50 negedge ISR -> semaphore -> drain INT_STA/EVENT_NUM/0x20
+ *   queue -> keymap -> mqjs_post_key(). A 100 ms fallback poll covers
+ *   edges missed while the line was already asserted, and a 2 s probe
+ *   loop covers hot-plug both ways.
  */
 #include "sdkconfig.h"
 
@@ -44,22 +53,21 @@ static const char *TAG = "kbd_tab5";
 #define KB_REG_INT_STA   0x01
 #define KB_REG_EVENT_NUM 0x02
 #define KB_REG_MODE      0x10
-#define KB_REG_HID_EVENT 0x30
+#define KB_REG_RGB_MODE  0x11
+#define KB_REG_KEY_EVENT 0x20
+#define KB_REG_RGB_BASE  0x60 /* RGB1_B,G,R, RGB2_B,G,R */
 #define KB_REG_VERSION   0xFE
 
-#define KB_MODE_HID      1
-#define KB_INT_HID_BIT   0x02
+#define KB_MODE_NORMAL    0
+#define KB_RGB_CUSTOM     1
+#define KB_INT_NORMAL_BIT 0x01
 
-/* HID modifier byte: L/R variants merged */
-#define KB_MOD_CTRL  0x11
-#define KB_MOD_SHIFT 0x22
-#define KB_MOD_ALT   0x44
-
-#define KB_PROBE_MS       2000 /* absent: how often to look for the dock */
-#define KB_POLL_MS        100  /* present: fallback INT_STA poll */
-#define KB_REPEAT_DELAY_MS 400 /* typematic: first repeat */
-#define KB_REPEAT_TICK_MS  55  /* typematic: rate (~18 cps) */
-#define KB_ERR_LIMIT      3    /* consecutive comm errors = detached */
+#define KB_PROBE_MS        2000 /* absent: how often to look for the dock */
+#define KB_POLL_MS         100  /* present: fallback INT_STA poll */
+#define KB_REPEAT_DELAY_MS 400  /* typematic: first repeat */
+#define KB_REPEAT_TICK_MS  55   /* typematic: rate (~18 cps) */
+#define KB_AA_CLICK_MS     400  /* Aa tap/double-tap window (dock FW value) */
+#define KB_ERR_LIMIT       3    /* consecutive comm errors = detached */
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -67,8 +75,17 @@ static SemaphoreHandle_t s_int_sem;
 static volatile bool s_present;
 static kbd_tab5_presence_cb_t s_presence_cb;
 
-/* typematic state (task-local use only) */
+/* ---- modifier / lock state (kbd task only) -------------------------- */
+static bool s_sym_held, s_ctrl_held, s_alt_held;
+static bool s_aa_held;        /* Aa physically down (shift-while-held) */
+static bool s_aa_lock;        /* double-tap caps lock */
+static bool s_aa_oneshot;     /* single tap: next letter uppercase */
+static int64_t s_aa_press_us, s_aa_release_us;
+static int s_aa_clicks;
+
+/* typematic state */
 static bool s_held;
+static uint8_t s_held_row, s_held_col;
 static char s_rep_seq[8];
 static size_t s_rep_len;
 static int64_t s_next_rep_us;
@@ -86,85 +103,141 @@ static bool wr_reg(uint8_t reg, uint8_t val)
     return i2c_master_transmit(s_dev, buf, 2, 50) == ESP_OK;
 }
 
-/* ---- HID usage id -> ui.onKey sequence ------------------------------ */
+static bool wr_regs(uint8_t reg, const uint8_t *data, size_t len)
+{
+    uint8_t buf[8];
+    if (len + 1 > sizeof buf)
+        return false;
+    buf[0] = reg;
+    memcpy(buf + 1, data, len);
+    return i2c_master_transmit(s_dev, buf, len + 1, 50) == ESP_OK;
+}
 
-/* keycodes 0x04 (A) .. 0x38 (SLASH): plain / shifted ASCII */
-static const char s_ascii_map[0x39 - 0x04][2] = {
-    { 'a', 'A' }, { 'b', 'B' }, { 'c', 'C' }, { 'd', 'D' }, { 'e', 'E' },
-    { 'f', 'F' }, { 'g', 'G' }, { 'h', 'H' }, { 'i', 'I' }, { 'j', 'J' },
-    { 'k', 'K' }, { 'l', 'L' }, { 'm', 'M' }, { 'n', 'N' }, { 'o', 'O' },
-    { 'p', 'P' }, { 'q', 'Q' }, { 'r', 'R' }, { 's', 'S' }, { 't', 'T' },
-    { 'u', 'U' }, { 'v', 'V' }, { 'w', 'W' }, { 'x', 'X' }, { 'y', 'Y' },
-    { 'z', 'Z' },
-    { '1', '!' }, { '2', '@' }, { '3', '#' }, { '4', '$' }, { '5', '%' },
-    { '6', '^' }, { '7', '&' }, { '8', '*' }, { '9', '(' }, { '0', ')' },
-    { '\n', '\n' },   /* ENTER */
-    { 0, 0 },         /* ESC   -> token below */
-    { '\b', '\b' },   /* BACKSPACE */
-    { '\t', '\t' },   /* TAB */
-    { ' ', ' ' },     /* SPACE */
-    { '-', '_' }, { '=', '+' }, { '[', '{' }, { ']', '}' }, { '\\', '|' },
-    { '#', '~' },     /* non-US # */
-    { ';', ':' }, { '\'', '"' }, { '`', '~' }, { ',', '<' }, { '.', '>' },
-    { '/', '?' },
+/* ---- modifier LEDs --------------------------------------------------
+ * The two WS2812s under the sym/Aa keys, driven through the dock's RGB
+ * custom mode. One color for both, by held-modifier precedence. */
+
+static uint32_t s_led_rgb = 1; /* impossible initial: force first write */
+
+static void led_update(void)
+{
+    uint32_t rgb;
+    if (s_sym_held)
+        rgb = 0x0000FF; /* sym: blue */
+    else if (s_ctrl_held)
+        rgb = 0x00FFFF; /* ctrl: cyan */
+    else if (s_alt_held)
+        rgb = 0x808080; /* alt: gray */
+    else if (s_aa_held || s_aa_lock || s_aa_oneshot)
+        rgb = 0xFF0000; /* uppercase pending/locked: red */
+    else
+        rgb = 0x000000; /* idle: off */
+    if (rgb == s_led_rgb)
+        return;
+    uint8_t r = rgb >> 16, g = rgb >> 8, b = rgb;
+    uint8_t bgr2[6] = { b, g, r, b, g, r }; /* regs are B,G,R per LED */
+    if (wr_regs(KB_REG_RGB_BASE, bgr2, 6))
+        s_led_rgb = rgb;
+}
+
+/* ---- host keymap (dock FW user_keyboard_handle.c, 5x14) -------------
+ * Cell codes: printable ASCII verbatim; >= 0x80 = named keys. The sym
+ * layer only differs where the FW's key_modifier_flag was set. */
+
+enum {
+    K_NONE = 0x80,
+    K_ESC, K_DEL, K_TAB, K_BS, K_ENTER,
+    K_UP, K_LEFT, K_DOWN, K_RIGHT,
+    K_SYM, K_AA, K_CTRL, K_ALT,
 };
 
-/* keys the JS side names by "\x00token" (control-bar vocabulary; the
-   terminal expands them via its own xterm table) */
-static const char *token_for(uint8_t code)
+static const uint8_t s_map[5][14] = {
+    { K_ESC, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '+',
+      K_DEL },
+    { '`', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '[', ']',
+      '\\' },
+    { K_TAB, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', ';', '\'',
+      K_BS },
+    { K_SYM, K_AA, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', K_UP, '_',
+      K_ENTER },
+    { K_CTRL, K_ALT, 'z', 'x', 'c', 'v', 'b', 'n', 'm', '.', K_LEFT,
+      K_DOWN, K_RIGHT, ' ' },
+};
+
+static const uint8_t s_map_sym[5][14] = {
+    { K_ESC, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '+',
+      K_DEL },
+    { '~', '?', '@', '#', '$', '%', '^', '&', '/', '<', '>', '{', '}',
+      '|' },
+    { K_TAB, 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', ':', '"',
+      K_BS },
+    { K_SYM, K_AA, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', K_UP, '=',
+      K_ENTER },
+    { K_CTRL, K_ALT, 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', K_LEFT,
+      K_DOWN, K_RIGHT, ' ' },
+};
+
+/* named keys -> the JS-side "\x00token" vocabulary (control-bar set) */
+static const char *token_name(uint8_t code)
 {
     switch (code) {
-    case 0x29: return "esc";
-    case 0x3a: return "f1";  case 0x3b: return "f2";
-    case 0x3c: return "f3";  case 0x3d: return "f4";
-    case 0x3e: return "f5";  case 0x3f: return "f6";
-    case 0x40: return "f7";  case 0x41: return "f8";
-    case 0x42: return "f9";  case 0x43: return "f10";
-    case 0x44: return "f11"; case 0x45: return "f12";
-    case 0x49: return "ins";  case 0x4a: return "home";
-    case 0x4b: return "pgup"; case 0x4c: return "del";
-    case 0x4d: return "end";  case 0x4e: return "pgdn";
-    case 0x4f: return "right"; case 0x50: return "left";
-    case 0x51: return "down";  case 0x52: return "up";
-    default:   return NULL;
+    case K_ESC:   return "esc";
+    case K_DEL:   return "del";
+    case K_UP:    return "up";
+    case K_LEFT:  return "left";
+    case K_DOWN:  return "down";
+    case K_RIGHT: return "right";
+    default:      return NULL;
     }
 }
 
-/* tokens that make sense to auto-repeat while held */
-static bool token_repeats(uint8_t code)
+static bool uppercase_active(void)
 {
-    return code == 0x4c /* del */ ||
-           (code >= 0x4f && code <= 0x52) /* arrows */ ||
-           code == 0x4b || code == 0x4e;  /* pgup/pgdn */
+    return s_aa_held || s_aa_lock || s_aa_oneshot;
 }
 
-/* Build the mqjs_post_key sequence for one HID event.
+/* Build the mqjs_post_key sequence for a non-modifier key press.
  * Returns length (0 = nothing to post), sets *repeats. */
-static size_t translate(uint8_t mod, uint8_t code, char out[8], bool *repeats)
+static size_t translate(uint8_t row, uint8_t col, char out[8], bool *repeats)
 {
     *repeats = false;
+    uint8_t code = (s_sym_held ? s_map_sym : s_map)[row][col];
 
-    const char *tok = token_for(code);
-    if (tok) { /* Ctrl/Alt on named keys: dropped for now */
+    const char *tok = token_name(code);
+    if (tok) {
         size_t n = strlen(tok);
         out[0] = '\0';
         memcpy(out + 1, tok, n);
-        *repeats = token_repeats(code);
+        /* arrows and del repeat; esc doesn't */
+        *repeats = (code != K_ESC);
         return n + 1;
     }
 
-    if (code < 0x04 || code >= 0x39)
-        return 0; /* rollover error, media keys, bare modifiers */
-
-    char c = s_ascii_map[code - 0x04][(mod & KB_MOD_SHIFT) ? 1 : 0];
-    if (!c)
-        return 0;
+    char c;
+    switch (code) {
+    case K_TAB:   c = '\t'; break;
+    case K_BS:    c = '\b'; break;
+    case K_ENTER: c = '\n'; break;
+    default:
+        if (code >= 0x80)
+            return 0;
+        c = (char)code;
+        if (c >= 'a' && c <= 'z' && uppercase_active()) {
+            c = (char)toupper((unsigned char)c);
+            /* one-shot consumed by this letter (not while held/locked) */
+            if (s_aa_oneshot && !s_aa_held && !s_aa_lock) {
+                s_aa_oneshot = false;
+                led_update();
+            }
+        }
+        break;
+    }
 
     size_t n = 0;
-    if (mod & KB_MOD_ALT)
+    if (s_alt_held)
         out[n++] = '\x1b'; /* Meta = ESC prefix (matches the terminal) */
 
-    if (mod & KB_MOD_CTRL) {
+    if (s_ctrl_held) {
         /* Ctrl+letter/@[\]^_ -> control byte; Ctrl+anything-else falls
            through as the plain char. Ctrl+Space would be NUL — that
            collides with the "\x00name" token marker, so it is dropped. */
@@ -176,44 +249,102 @@ static size_t translate(uint8_t mod, uint8_t code, char out[8], bool *repeats)
     }
     out[n++] = c;
 
-    /* repeat printables and edit keys, not Enter/Esc */
-    *repeats = (c != '\n');
+    *repeats = (c != '\n' && c != '\x1b');
     return n;
 }
 
-/* ---- event pump ----------------------------------------------------- */
+/* ---- event handling -------------------------------------------------- */
 
-static void handle_hid_event(uint8_t mod, uint8_t code)
+/* Aa mirrors the dock FW: hold = uppercase while held, tap = one-shot
+   for the next letter, double-tap = caps lock, tap while locked =
+   unlock. */
+static void aa_key(bool pressed, int64_t now)
 {
-    if (code == 0x00) { /* release (dock reports keycode 0) */
-        s_held = false;
+    if (pressed) {
+        s_aa_held = true;
+        s_aa_press_us = now;
+        s_aa_clicks =
+            (now - s_aa_release_us < KB_AA_CLICK_MS * 1000LL) ? s_aa_clicks + 1
+                                                              : 1;
+    } else {
+        s_aa_held = false;
+        s_aa_release_us = now;
+        if (now - s_aa_press_us < KB_AA_CLICK_MS * 1000LL) {
+            if (s_aa_clicks >= 2) {
+                s_aa_lock = true; /* double-tap: caps lock */
+                s_aa_oneshot = false;
+            } else if (s_aa_lock || s_aa_oneshot) {
+                s_aa_lock = false; /* tap while armed/locked: clear */
+                s_aa_oneshot = false;
+            } else {
+                s_aa_oneshot = true; /* tap: next letter uppercase */
+            }
+        } else {
+            /* long hold released: shift ends (lock survives) */
+        }
+    }
+    led_update();
+}
+
+static void handle_key_event(uint8_t ev)
+{
+    bool pressed = (ev & 0x80) != 0;
+    uint8_t row = (ev >> 4) & 0x07, col = ev & 0x0F;
+    if (row > 4 || col > 13)
+        return;
+    int64_t now = esp_timer_get_time();
+
+    switch (s_map[row][col]) {
+    case K_SYM:
+        s_sym_held = pressed;
+        led_update();
+        return;
+    case K_CTRL:
+        s_ctrl_held = pressed;
+        led_update();
+        return;
+    case K_ALT:
+        s_alt_held = pressed;
+        led_update();
+        return;
+    case K_AA:
+        aa_key(pressed, now);
+        return;
+    default:
+        break;
+    }
+
+    if (!pressed) {
+        /* only the held key's own release stops its repeat */
+        if (s_held && row == s_held_row && col == s_held_col)
+            s_held = false;
         return;
     }
-    if (code == 0x01) /* roll-over overflow marker */
-        return;
 
     char seq[8];
     bool repeats = false;
-    size_t n = translate(mod, code, seq, &repeats);
+    size_t n = translate(row, col, seq, &repeats);
     if (!n)
         return;
     mqjs_post_key(seq, n);
 
     s_held = repeats;
     if (repeats) {
+        s_held_row = row;
+        s_held_col = col;
         memcpy(s_rep_seq, seq, n);
         s_rep_len = n;
-        s_next_rep_us = esp_timer_get_time() + (int64_t)KB_REPEAT_DELAY_MS * 1000;
+        s_next_rep_us = now + (int64_t)KB_REPEAT_DELAY_MS * 1000;
     }
 }
 
-/* Drain the dock's HID queue. false = I2C died (dock likely detached). */
+/* Drain the dock's event queue. false = I2C died (dock detached). */
 static bool drain_events(void)
 {
     uint8_t sta = 0;
     if (!rd_reg(KB_REG_INT_STA, &sta, 1))
         return false;
-    if (!(sta & KB_INT_HID_BIT))
+    if (!(sta & KB_INT_NORMAL_BIT))
         return true;
 
     /* bounded re-check: events pushed between drain and clear keep the
@@ -225,12 +356,12 @@ static bool drain_events(void)
         if (count == 0 || count > 32)
             break;
         while (count--) {
-            uint8_t ev[2];
-            if (!rd_reg(KB_REG_HID_EVENT, ev, 2))
+            uint8_t ev;
+            if (!rd_reg(KB_REG_KEY_EVENT, &ev, 1))
                 return false;
-            if (ev[0] == 0xFF && ev[1] == 0xFF)
+            if (ev == 0xFF)
                 break; /* queue empty */
-            handle_hid_event(ev[0], ev[1]);
+            handle_key_event(ev);
         }
     }
     return wr_reg(KB_REG_INT_STA, 0); /* release the INT line */
@@ -245,7 +376,7 @@ static void IRAM_ATTR kb_isr(void *arg)
         portYIELD_FROM_ISR();
 }
 
-/* Dock answering? Then switch it to HID mode with a clean queue. */
+/* Dock answering? Switch to Normal mode + custom RGB, clean queue. */
 static bool probe_and_init(void)
 {
     if (i2c_master_probe(s_bus, KB_ADDR, 20) != ESP_OK)
@@ -253,11 +384,18 @@ static bool probe_and_init(void)
     uint8_t ver = 0;
     if (!rd_reg(KB_REG_VERSION, &ver, 1))
         return false;
-    if (!wr_reg(KB_REG_MODE, KB_MODE_HID))
+    if (!wr_reg(KB_REG_MODE, KB_MODE_NORMAL))
         return false;
-    (void)wr_reg(KB_REG_INT_CFG, KB_INT_HID_BIT); /* only HID irqs */
-    (void)wr_reg(KB_REG_EVENT_NUM, 0);            /* clear queue */
+    (void)wr_reg(KB_REG_INT_CFG, KB_INT_NORMAL_BIT);
+    (void)wr_reg(KB_REG_EVENT_NUM, 0); /* clear queue */
     (void)wr_reg(KB_REG_INT_STA, 0);
+    (void)wr_reg(KB_REG_RGB_MODE, KB_RGB_CUSTOM); /* we own the LEDs */
+    /* fresh attach: no modifier can be known-held; reset + LEDs off */
+    s_sym_held = s_ctrl_held = s_alt_held = false;
+    s_aa_held = s_aa_lock = s_aa_oneshot = false;
+    s_held = false;
+    s_led_rgb = 1;
+    led_update();
     ESP_LOGI(TAG, "dock attached (fw v%u)", ver);
     return true;
 }
