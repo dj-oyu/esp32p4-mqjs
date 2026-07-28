@@ -611,20 +611,51 @@ function makeTerm(reply) {
     }
 
     /* 画面の向きやキーボードの予約高さが変わると COLS/ROWS が変わる。
-       グリッドを新しい寸法で作り直す。中身は捨てる — ssh.resize が
-       リモートに SIGWINCH を送るので、TUI は自分で描き直す。
+       グリッドを新しい寸法に張り替える。
+       中身は必ず引き継ぐこと。捨てて ssh.resize の SIGWINCH に任せる
+       と、vi や top は描き直すが素のシェルのプロンプトは描き直さない
+       — 実機で回転したら画面が真っ白になり、見えないまま打った exit
+       だけが通る、という形で出た。
        rows は外から t.rows で掴まれているので、配列オブジェクトは
        同じものを使い回して length だけ張り替えること。 */
+    function fitRow(src) {
+        if (!src)
+            return newRow();
+        if (src.ch.length === COLS)
+            return src;
+        var out = newRow();
+        var n = src.ch.length < COLS ? src.ch.length : COLS;
+        for (var c = 0; c < n; c++) {
+            out.ch[c] = src.ch[c];
+            out.fg[c] = src.fg[c];
+            out.bg[c] = src.bg[c];
+        }
+        return out;
+    }
+
     function resizeTerm() {
+        var old = rows.slice(0);
+        /* 縮むとき、捨てるのは「カーソルを画面内に収めるのに必要な
+           ぶんだけ」上から。余りは末尾 (まだ何も無い行) を落とす。
+           無条件に上から捨てると、カーソルがまだ上のほうにある新しい
+           セッションで見えている行を丸ごと失う。 */
+        var excess = old.length > ROWS ? old.length - ROWS : 0;
+        var drop = cy - (ROWS - 1);
+        if (drop < 0) drop = 0;
+        if (drop > excess) drop = excess;
         rows.length = ROWS;
         dirty.length = ROWS;
         dirtySeq.length = ROWS;
         for (var r = 0; r < ROWS; r++)
-            rows[r] = newRow();
-        cx = 0; cy = 0;
-        savedCx = 0; savedCy = 0;
+            rows[r] = fitRow(old[r + drop]);
+        cy -= drop;
+        if (cy < 0) cy = 0;
+        if (cy > ROWS - 1) cy = ROWS - 1;
+        if (cx > COLS - 1) cx = COLS - 1;
+        if (cx < 0) cx = 0;
+        savedCx = cx; savedCy = cy;
         scrollTop = 0; scrollBot = ROWS - 1;
-        prevCurRow = 0;
+        prevCurRow = cy;
         markAll();
     }
 
