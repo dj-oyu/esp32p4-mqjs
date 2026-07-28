@@ -310,11 +310,29 @@ static void IRAM_ATTR kb_isr(void *arg)
         portYIELD_FROM_ISR();
 }
 
-/* Dock answering? Switch to Normal mode + custom RGB, clean queue. */
+/* Dock answering? Switch to Normal mode + custom RGB, clean queue.
+ *
+ * DO NOT reintroduce i2c_master_probe() here. It panics this board.
+ * IDF's i2c_master_probe() (6.0.1, still on master) differs from every
+ * other transaction entry point in two fatal ways:
+ *   - it publishes its own STACK-LOCAL 2-entry ops array into
+ *     bus->i2c_trans.ops (dangling as soon as it returns), and
+ *   - it does not reset read_buf_pos / read_len_static / contains_read,
+ *     which s_i2c_transaction_start() does for every real transaction.
+ * So a read that left contains_read=1 (a poll whose completion IRQ never
+ * ran the STOP-phase handler) makes the NEXT probe's completion IRQ take
+ * i2c_isr_receive_handler()'s non-READ branch and index ops[read_buf_pos]
+ * — read_buf_pos is 4 after any 1-byte transmit_receive — i.e. 64 bytes
+ * past a 2-entry array that lives in this task's stack. It then stores
+ * RX FIFO bytes through whatever pointer it finds there:
+ *   Store access fault, MTVAL 0x000030f0, i2c_master.c:766.
+ * Device-verified on Tab5 (I2C0 = the pogo/dock bus): 2-3 panics per
+ * 150 s once Wi-Fi/microlink is up. A plain register read is the
+ * presence test instead — it runs the ordinary synchronous path, which
+ * uses the driver-owned ops array and resets the ISR read state. A
+ * NACK from an absent dock is only ESP_LOGD, so this is not noisier. */
 static bool probe_and_init(void)
 {
-    if (i2c_master_probe(s_bus, KB_ADDR, 20) != ESP_OK)
-        return false;
     uint8_t ver = 0;
     if (!rd_reg(KB_REG_VERSION, &ver, 1))
         return false;

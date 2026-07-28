@@ -593,7 +593,17 @@ static ui_panel_variant_t panel_reset_and_detect(void)
        init the DSI with wrong timings -> black screen. Retry the probe a
        few times before giving up, and if nothing answers fall back to
        ST7123 (this repository's Tab5 lot) rather than ILI9881C — a wrong
-       ILI9881C guess on an ST7123 panel is exactly what blanks it. */
+       ILI9881C guess on an ST7123 panel is exactly what blanks it.
+
+       i2c_master_probe() is safe HERE and only here: this bus is freshly
+       created, every probe below runs BEFORE the single read on it
+       (st712x_flavour), and the bus is deleted right after. IDF's probe
+       leaves bus->i2c_trans.ops pointing at its own stack and never
+       resets the ISR read state, so a probe that FOLLOWS a read on the
+       same bus panics — that is the dock-bus crash written up in
+       components/kbd_tab5/kbd_tab5.c. Keep the probes ahead of the read:
+       st712x_flavour() never returns UI_PANEL_NONE, so the retry loop
+       cannot wrap back around to a probe after it. */
     vTaskDelay(pdMS_TO_TICKS(100));
     ui_panel_variant_t variant = UI_PANEL_NONE;
     for (int attempt = 0; attempt < 8 && variant == UI_PANEL_NONE; attempt++) {
