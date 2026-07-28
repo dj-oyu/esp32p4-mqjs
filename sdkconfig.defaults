@@ -50,3 +50,9 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=3072
 #     #warning that -Werror=cpp makes fatal (SSH runs on its own 8KB task)
 CONFIG_ESP_ENABLE_WOLFSSH=y
 CONFIG_ESP_WOLFSSL_NO_STACK_SIZE_BUILD_WARNING=y
+
+# Keyboard-dock landscape rotation: esp_lvgl_port rotates every flush on
+# the PPA (ui_tab5 sets disp flags.sw_rotate). Without this the port
+# falls back to a CPU rotate — same extra buffer, much more CPU. Only
+# exists on SOC_PPA_SUPPORTED targets (P4); ignored on Stamp.
+CONFIG_LVGL_PORT_ENABLE_PPA=y

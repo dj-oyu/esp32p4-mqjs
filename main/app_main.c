@@ -27,6 +27,7 @@
 #include "ui_tab5.h"
 #include "cam_tab5.h"
 #include "audio_tab5.h"
+#include "kbd_tab5.h"
 #include "opus_player.h"
 #include "wifi.h"
 #include "tailscale_adapter.h"
@@ -105,10 +106,26 @@ static void js_task(void *arg)
     mqjs_runtime_run(dev_next_source, NULL); /* never returns */
 }
 
+#if CONFIG_MQJS_TAB5_KEYBOARD
+/* Dock attach/detach -> screen orientation (kbd_tab5 task context) */
+static void kbd_dock_changed(bool present)
+{
+    ui_tab5_set_landscape(present);
+}
+#endif
+
 static void tab5_ui_ready(void *arg)
 {
     (void)arg;
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
+
+#if CONFIG_MQJS_TAB5_KEYBOARD
+    /* Keyboard dock: own I2C bus (port 0, pogo pins), hot-pluggable.
+       The dock holds the Tab5 sideways, so presence drives the screen
+       orientation (the callback runs on the kbd task, never an ISR). */
+    kbd_tab5_set_presence_cb(kbd_dock_changed);
+    kbd_tab5_start();
+#endif
     /* No boot-time probe: it brought the CSI/ISP pipeline up and left it
        STREAMING forever (~57MB/s MIPI->ISP->PSRAM DMA + per-frame ISP CCM
        errors), competing with esp_hosted's SDIO DMA. The pipeline is now

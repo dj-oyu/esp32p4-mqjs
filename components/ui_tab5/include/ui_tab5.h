@@ -175,6 +175,17 @@ void ui_tab5_w_commit(void);
  * metric lives inside the preallocated pool, invisible to heap_caps. */
 size_t ui_tab5_lv_mem_free(void);
 
+/* Landscape rotation (keyboard dock). Flips the whole UI between
+ * portrait (720x1280) and landscape (1280x720, panel content PPA-
+ * rotated per flush): status bar/console/canvas re-size, the lazily
+ * built overlays (on-screen keyboard, control bar, stats panel) are
+ * rebuilt at the new width on next use, and the foreground app gets a
+ * "\x00rotate" key token — its ui.size() has changed. Callable from
+ * any task (takes the LVGL lock); no-op before the UI is up or when
+ * already in the requested orientation. */
+void ui_tab5_set_landscape(bool on);
+bool ui_tab5_landscape(void);
+
 /* The touch controller's I2C master bus handle (port 1, SDA31/SCL32) —
  * the internal bus the camera's SCCB also lives on. void* so this
  * header stays IDF-type-free; cast to i2c_master_bus_handle_t. NULL

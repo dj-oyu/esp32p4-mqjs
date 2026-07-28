@@ -1,0 +1,13 @@
+menu "Tab5 Keyboard (A164 dock)"
+
+config MQJS_TAB5_KEYBOARD
+    bool "M5Stack Tab5 keyboard dock support"
+    depends on MQJS_TAB5_UI
+    default y
+    help
+        Driver for the 70-key Tab5 keyboard dock (I2C 0x6D on the pogo
+        connector, SDA=GPIO0 SCL=GPIO1 INT=GPIO50). Hot-pluggable: the
+        driver probes for the dock and feeds key events into the same
+        ui.onKey stream as the on-screen keyboard.
+
+endmenu
