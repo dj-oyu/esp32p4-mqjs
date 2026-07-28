@@ -64,6 +64,12 @@ var TAB_ROWS = 1;                   /* タブバーの行数 */
 var ROWS = GRID_ROWS - TAB_ROWS;    /* 端末の行数 (= pty rows) */
 if (COLS < 1) COLS = 1;
 if (ROWS < 1) ROWS = 1;
+/* 空白 1 行ぶん。drawTabs がタブ行を消すのに使う。
+   3070a4e が行バッファを共有 SP 文字列から行ごとの blankChars() 配列に
+   変えたとき、この定義だけが消えて drawTabs の参照が残り、以来
+   drawTabs() は 1 行目で ReferenceError を投げ続けていた (実機ログで
+   確認)。COLS は回転で変わるので relayout でも張り直すこと。 */
+var SP = " ".repeat(COLS);
 
 /* ---- 配色 (コンソールと同じ 16 色パレット、暗背景向け) ---- */
 var BG = 0x0B0E11;
@@ -910,6 +916,7 @@ if (SELFTEST) {
         ROWS = GRID_ROWS - TAB_ROWS;
         if (COLS < 1) COLS = 1;
         if (ROWS < 1) ROWS = 1;
+        SP = " ".repeat(COLS); /* タブ行のクリア幅も新しい桁数に */
         for (var i = 0; i < sessions.length; i++) {
             sessions[i].term.resize();
             /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
