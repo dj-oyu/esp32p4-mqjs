@@ -1533,6 +1533,7 @@ static void cbar_show(bool show)
         lv_obj_set_style_text_color(s_cbar, lv_color_hex(UI_COL_TEXT),
                                     LV_PART_ITEMS);
         lv_obj_set_style_shadow_width(s_cbar, 0, LV_PART_ITEMS); /* see s_kb */
+        lv_obj_set_style_radius(s_cbar, 4, LV_PART_ITEMS);
         lv_obj_set_style_bg_color(s_cbar, lv_color_hex(UI_COL_FLASH),
                                   (uint32_t)LV_PART_ITEMS |
                                       (uint32_t)LV_STATE_PRESSED);
@@ -2139,6 +2140,10 @@ static void kb_show(int mode)
        (lv_theme_default.c keyboard_button_bg); a raw button matrix
        keeps them. Invisible on this dark palette, so pure cost. */
     lv_obj_set_style_shadow_width(s_kb, 0, LV_PART_ITEMS);
+    /* The theme's ~13px radius sends every key fill through the masked
+       rounded-rect path; 4px keeps the keys visibly rounded and measured
+       15% off the repaint (draw 18.4 -> 15.7 ms). */
+    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS);
     lv_obj_set_style_bg_color(s_kb, lv_color_hex(UI_COL_FLASH),
                               (uint32_t)LV_PART_ITEMS |
                                   (uint32_t)LV_STATE_PRESSED);
@@ -2218,6 +2223,18 @@ static void kb_show(int mode)
    tricks (double buffering, zero-copy) can only ever touch that last
    ~9%. The 18.4 ms itself: fills 9.2, the theme's 13px corner radius
    3.9, the 36 text labels 5.4.
+   Tried and dropped: LV_OBJ_STYLE_CACHE moved a keyboard repaint by
+   ~1% (15.75 -> 15.57 ms draw), i.e. nothing — per-chunk style
+   resolution is not where the time goes.
+   Where the rest goes: a 1-chunk repaint of ONE key costs ~1.0 ms
+   while a 1-chunk repaint of the strip label costs ~0.6 ms, and the
+   only difference is that LVGL walks the matrix's 36 buttons to build
+   draw tasks for every chunk. That puts the per-chunk walk near
+   0.4 ms — about 6 ms of a 15-chunk map swap. Halving the chunk count
+   (50-line draw buffer) would halve it, but sw_rotate mirrors the
+   buffer so that costs +72KB internal; splitting the keyboard into one
+   buttonmatrix per row would cut the walk ~4x for free. Neither is
+   done: the repaint is already off the typing path.
    Older numbers, same steps (ms: one key | map swap | screen):
      -Og portrait,  shadows      3 | 63 |  99
      -O2 landscape, shadows      3 | 81 | 125   (1.8x the pixels, + PPA
@@ -2332,7 +2349,7 @@ static void kb_bench(void)
         lv_buttonmatrix_set_map(s_kb, KB_MAP_LOWER);
     });
     lv_obj_set_style_text_opa(s_kb, LV_OPA_COVER, LV_PART_ITEMS);
-    lv_obj_set_style_radius(s_kb, 13, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_kb, 4, LV_PART_ITEMS); /* back to shipped */
     KB_BENCH_STEP("strip label", kb_lock_refresh());
     KB_BENCH_STEP("clip label", kb_clip_refresh());
     KB_BENCH_STEP("whole screen", lv_obj_invalidate(lv_screen_active()));
