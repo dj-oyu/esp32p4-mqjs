@@ -1027,6 +1027,39 @@ JSValue js_i2c_setup(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_UNDEFINED;
 }
 
+#ifdef ESP_PLATFORM
+/* Address probe: does anything ACK at `addr`?
+ *
+ * Deliberately NOT i2c_master_probe(). That IDF entry point (6.0.1, and
+ * still on master) points bus->i2c_trans.ops at its own 2-entry STACK
+ * array and — unlike every real transaction — never resets read_buf_pos
+ * / read_len_static / contains_read. A read left half-finished by a
+ * timeout therefore makes the probe's completion IRQ index that dead
+ * stack array out of bounds and store RX FIFO bytes through the garbage
+ * it finds (Store access fault in i2c_master.c:766). We hit exactly that
+ * on the keyboard dock bus; see components/kbd_tab5/kbd_tab5.c.
+ *
+ * A 1-byte read is the safe equivalent: it runs the ordinary synchronous
+ * path (driver-owned ops array, ISR read state reset up front). Devices
+ * that ACK their address but NACK a bare read report as absent, which is
+ * the accepted cost of not panicking. */
+static bool i2c_addr_present(int port, int addr)
+{
+    i2c_device_config_t dc = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = (uint16_t)addr,
+        .scl_speed_hz = s_i2c_hz[port],
+    };
+    i2c_master_dev_handle_t dev;
+    if (i2c_master_bus_add_device(s_i2c_bus[port], &dc, &dev) != ESP_OK)
+        return false;
+    uint8_t b;
+    esp_err_t e = i2c_master_receive(dev, &b, 1, 20);
+    i2c_master_bus_rm_device(dev);
+    return e == ESP_OK;
+}
+#endif
+
 JSValue js_i2c_scan(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSValue arr = JS_NewArray(ctx, 0);
@@ -1037,7 +1070,7 @@ JSValue js_i2c_scan(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return err;
     int n = 0;
     for (int addr = 0x08; addr <= 0x77; addr++) {
-        if (i2c_master_probe(s_i2c_bus[port], addr, 20) == ESP_OK)
+        if (i2c_addr_present(port, addr))
             JS_SetPropertyUint32(ctx, arr, n++, JS_NewInt32(ctx, addr));
     }
 #else
