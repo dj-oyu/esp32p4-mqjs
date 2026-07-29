@@ -65,6 +65,13 @@ typedef enum {
     KBD_K_F12,
     KBD_K_COPY,
     KBD_K_PASTE,
+    /* Japanese IME on/off. A token and not a control byte on purpose:
+       every classic SKK toggle is already taken on this keyboard —
+       Ctrl+Space folds to NUL, which collides with the "\0name" marker
+       and is dropped below, and Ctrl+J / Ctrl+H / Ctrl+I are byte-equal
+       to Enter / Backspace / Tab. An app that does not do Japanese input
+       simply ignores the token. */
+    KBD_K_IME,
 } kbd_key_t;
 
 /* One modifier. Three ways to be in effect, all supported everywhere:

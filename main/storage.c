@@ -9,11 +9,14 @@
 #include <sys/stat.h>
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "mqjs_runtime.h"
 #include "storage.h"
 
 #define MOUNT     "/littlefs"
 #define TASK_PATH MOUNT "/task.js"
-#define MAX_TASK  (64 * 1024)
+/* same ceiling the MQTT rx path enforces — a file that arrives must be
+   loadable again after a reboot (mqjs_runtime.h) */
+#define MAX_TASK  MQJS_SCRIPT_MAX
 
 static const char *TAG = "storage";
 static bool s_mounted;
