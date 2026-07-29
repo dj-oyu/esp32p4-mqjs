@@ -46,6 +46,7 @@ print("hello");
 | 永続データを保存する | `settings_demo.js`, `reading.js`, `circuit.js` |
 | カメラで ISBN を読む | `cam_demo.js`, `reading.js` |
 | SSH クライアントを作る | `ssh_vt.js` |
+| 日本語入力 (SKK) をアプリに載せる | `ssh_vt.js`, `skk_test.js` |
 | CPU 負荷や長い処理の分割を学ぶ | `bench.js`, `mandelbrot.js` |
 
 ## サンプル一覧
@@ -72,7 +73,19 @@ print("hello");
 
 - `p4_bg_app.js`: foreground / background と通知
 - `clip_mirror.js`: クリップボードを MQTT へ日和見同期する常駐サービス
-- `ssh_vt.js`: 複数セッション対応の SSH ターミナル
+- `ssh_vt.js`: 複数セッション対応の SSH ターミナル。SKK 日本語入力つき —
+  制御バーの「あ」ボタン (`"\x00ime"` トークン) かタブバー右端のモードセルの
+  タップでトグルし、変換中の preedit と候補は `ui.overlay` のフロート窓が描く
+  (端末グリッドには書かない)。確定文字列だけが `ssh.write()` へ行く。
+  ⚠️ 端末フォントに かな/漢字 が無いので、確定した日本語はグリッド上では
+  まだ空白になる (設計の S3/S4 待ち)。
+  IME のキー経路は `tools/ssh_vt_imetest.sh` が見る — `@imetest-inject`
+  マーカーへ `tools/ssh_vt_imetest.js.inc` を注入したものを run_pc で走らせ、
+  `PASS` / `FAIL x<n>` を出す (**出荷アプリにテストのバイトは乗らない**)。
+  検出しているのは変換の正しさではなく **IME フックが TOKSEQ 展開より前に
+  あること** で、効いているのは `arrow-swallow` の項目。辞書は
+  `tools/skk_prep.py` が生成する gitignore 対象なので、無ければ `FAIL dict`
+  が出る (静かなスキップにはならない)
 - `reading.js`: NVS 永続化、一覧 UI、ISBN 入力
 - `circuit.js`: キャンバス UI、式評価、永続化
 

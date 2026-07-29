@@ -27,6 +27,20 @@ extern "C" {
  * PSRAM heap is not churned (design §3.6). */
 #define MQJS_APP_MEM_SIZE (256 * 1024)
 
+/* Largest script the device accepts, on the wire and on littlefs. ONE
+ * definition on purpose: the MQTT rx path (main/task_source.c), the
+ * littlefs load/save (main/storage.c) and start_from_file() all used to
+ * carry their own `64 * 1024`, so raising one silently left the other
+ * two rejecting the same file at a different layer.
+ *
+ * Raised 64K -> 128K when ssh_vt.js crossed 64K (the SKK IME frontend,
+ * docs/skk-ime-design.md S6): it had been sitting at 83% of the old
+ * ceiling. The MQTT rx buffer is sized from this and esp-mqtt takes it
+ * with a plain malloc(), which lands in PSRAM here (SPIRAM_USE_MALLOC=y,
+ * MALLOC_ALWAYSINTERNAL=4096) — internal SRAM, which lwIP and SDIO are
+ * already fighting over, is untouched. */
+#define MQJS_SCRIPT_MAX (128 * 1024)
+
 /*
  * Allocate the per-slot context arenas and the shared event queue.
  * Call once from the JS task before any mqjs_app_start.

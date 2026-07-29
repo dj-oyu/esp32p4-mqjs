@@ -51,6 +51,12 @@
 #include "mqjs_power.h"
 #include "system_vault.h"
 #include "tailscale_adapter.h"
+/* Pure logic, no ESP-IDF headers, so it is included unconditionally and
+   links into tools/run_pc exactly as it does into the firmware. */
+#include "skk_core.h"
+/* Same deal: header-only, no ESP-IDF headers, so ui.cellWidth and the
+   ui_tab5 cell renderer classify from one table on both targets. */
+#include "ui_cell_width.h"
 #include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
@@ -104,6 +110,21 @@ static int64_t time_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Monotonic microseconds. The 1 ms resolution of time_ms() cannot see
+   anything on the IME's per-keystroke path (microseconds against a
+   55 ms budget), so the skk bindings bracket skk_key() with this and
+   sys.micros() exposes it to JS benchmarks. */
+static int64_t time_us(void)
+{
+#ifdef ESP_PLATFORM
+    return esp_timer_get_time();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 #endif
 }
 
@@ -1176,8 +1197,11 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 typedef enum {
     UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
     UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL, UI_CMD_KEYBOARD,
-    UI_CMD_CELLS, UI_CMD_SCROLL, UI_CMD_RESET,
+    UI_CMD_CELLS, UI_CMD_SCROLL, UI_CMD_OVERLAY, UI_CMD_RESET,
 } ui_cmd_op_t;
+/* keep in step with ui_tab5.h — the order IS the wire format */
+#define UI_OVERLAY_MAX   4
+#define UI_OVERLAY_ITEMS 10
 /* PC stub of the deferred screen-load commit (§3.4) */
 #define ui_tab5_w_commit() ((void)0)
 #endif
@@ -1213,7 +1237,7 @@ static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
 #else
     static const char *names[] =
         { "clear", "fill", "rect", "line", "text", "pixel", "keyboard",
-          "cells", "scroll", "reset" };
+          "cells", "scroll", "overlay", "reset" }; /* order == ui_cmd_op_t */
     printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, fg=0x%06x, bg=0x%06x%s%s) (stub)\n",
            names[op], x, y, w, h, (unsigned)color, (unsigned)bg,
            text ? ", " : "", text ? text : "");
@@ -1289,43 +1313,27 @@ JSValue js_ui_cellSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     return arr;
 }
 
-/* ui.cellWidth(codePoint): compact wcwidth-like classification for grid UIs.
-   Private-use/Nerd Font glyphs intentionally remain width 1. */
+/* ui.cellWidth(codePoint): compact wcwidth-like classification for grid
+   UIs. The table is ui_cell_width() in ui_cell_width.h, shared verbatim
+   with the ui.cells glyph blitter — see that header for why. */
 JSValue js_ui_cellWidth(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int v; /* JS_ToInt32 takes int* — int32_t is long on riscv32 */
     if (JS_ToInt32(ctx, &v, argv[0]))
         return JS_EXCEPTION;
-    uint32_t cp = (uint32_t)v;
-    int width = 1;
-    if (cp == 0 || cp < 0x20 || (cp >= 0x7F && cp < 0xA0) ||
-        cp == 0x200D ||
-        (cp >= 0x0300 && cp <= 0x036F) ||
-        (cp >= 0x1AB0 && cp <= 0x1AFF) ||
-        (cp >= 0x1DC0 && cp <= 0x1DFF) ||
-        (cp >= 0x20D0 && cp <= 0x20FF) ||
-        (cp >= 0xFE00 && cp <= 0xFE0F) ||
-        (cp >= 0xFE20 && cp <= 0xFE2F) ||
-        (cp >= 0xE0100 && cp <= 0xE01EF)) {
-        width = 0;
-    } else if ((cp >= 0x1100 && cp <= 0x115F) ||
-               (cp >= 0x2329 && cp <= 0x232A) ||
-               (cp >= 0x2E80 && cp <= 0xA4CF) ||
-               (cp >= 0xAC00 && cp <= 0xD7A3) ||
-               (cp >= 0xF900 && cp <= 0xFAFF) ||
-               (cp >= 0xFE10 && cp <= 0xFE19) ||
-               (cp >= 0xFE30 && cp <= 0xFE6F) ||
-               (cp >= 0xFF01 && cp <= 0xFF60) ||
-               (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-               (cp >= 0x1F300 && cp <= 0x1FAFF) ||
-               (cp >= 0x20000 && cp <= 0x3FFFD)) {
-        width = 2;
-    }
-    return JS_NewInt32(ctx, width);
+    return JS_NewInt32(ctx, ui_cell_width((uint32_t)v));
 }
 
 /* ui.cells(col, row, str, fg, bg): draw a monospace run of cells with a
-   single fg/bg (the JS terminal splits each row into same-color runs). */
+   single fg/bg (the JS terminal splits each row into same-color runs).
+
+   CONTRACT: one codepoint per column. A width-2 codepoint (ui.cellWidth
+   == 2) must be followed by a filler codepoint — a space — for the
+   column it covers; ssh_vt.js calls that model cell CONT. The renderer
+   widens the glyph's clip box to two cells but still advances one
+   column per codepoint, so a caller that omits the filler gets the
+   wide glyph's right half painted over its neighbour instead of a
+   whole line shifted right. */
 JSValue js_ui_cells(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int col, row, fg = 0xFFFFFF, bg = 0;
@@ -1510,6 +1518,219 @@ static void dispatch_touch_event(MqjsWorker *app, const MqjsEvent *ev)
    bottom, so a terminal derives its grid without hardcoding it;
    ui.keyboard(-m) returns mode m's height without changing anything
    (the startup grid probe). */
+/* ui.overlay(id, spec | null) — a small window floated over the canvas at
+ * a point the app supplies (docs/ui-overlay-plan.md).
+ *
+ *   ui.overlay(0, { col, row } | { x, y, h },
+ *                 lines: [...], items: [...], sel: n,
+ *                 place: "auto"|"below"|"above", dir: "h"|"v" });
+ *   ui.overlay(0, null);   // hide
+ *
+ * The app supplies the ANCHOR and nothing else about placement: clamping,
+ * flipping above when the on-screen keyboard is in the way, and — the
+ * reason this is not a JS helper — repairing what the window covered.
+ * Drawing a float into the canvas means tracking the rows it dirtied,
+ * because the cells renderer's dirty check is content-based and an
+ * overdraw on unchanged content never goes away. LVGL composites, so
+ * that class of bug cannot happen and no app carries the bookkeeping.
+ *
+ * The content travels as ONE heap string in the existing ui_cmd_t (there
+ * is no richer payload and adding one would touch every command):
+ *   line ("\1" line)* ["\2" item ("\1" item)*]
+ */
+#define MQJS_OVL_TEXT_MAX 512
+
+static int uiw_copy_str(JSContext *ctx, JSValue v, char *dst, size_t cap);
+
+static int ovl_append(char *dst, size_t cap, size_t *len, const char *s)
+{
+    size_t n = strlen(s);
+    if (*len + n >= cap)
+        return -1;
+    memcpy(dst + *len, s, n);
+    *len += n;
+    dst[*len] = '\0';
+    return 0;
+}
+
+/* Collect arr[0..] into `dst`, separated by \1. Non-strings are skipped
+   rather than coerced: a stray object would otherwise be typed into the
+   window as "[object Object]". */
+/* How many entries an item array has, bounded. */
+static int ovl_count(JSContext *ctx, JSValue arr, int cap)
+{
+    int n = 0;
+    if (!JS_IsArray(ctx, arr))
+        return 0;
+    while (n < cap) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, (uint32_t)n);
+        if (JS_IsUndefined(v) || JS_IsNull(v))
+            break;
+        n++;
+    }
+    return n;
+}
+
+/* First item to show, per overlay handle. Only UI_OVERLAY_ITEMS labels
+   exist, so a long candidate list has to be windowed — and the window
+   has to be REMEMBERED, which is why this is state and not a pure
+   function of (count, sel).
+ *
+ * The window moves only when the selection would leave it. Recentring on
+ * every step was tried and is worse on the device: the highlight then
+ * never moves, the list slides underneath it, and you cannot tell that
+ * pressing Space did anything at all. Edge-triggered scrolling keeps the
+ * highlight visibly walking left and right, and the list only jumps when
+ * it has to.
+ *
+ * A fresh candidate set arrives with sel = 0, which is below any nonzero
+ * window and therefore resets it — no explicit "new list" signal needed. */
+static int s_ovl_first[UI_OVERLAY_MAX];
+
+static int ovl_window(int id, int count, int sel, int visible)
+{
+    int first = s_ovl_first[id];
+
+    if (count <= visible || sel < 0) {
+        s_ovl_first[id] = 0;
+        return 0;
+    }
+    if (first > count - visible)
+        first = count - visible;
+    if (first < 0)
+        first = 0;
+    if (sel < first)
+        first = sel;                        /* stepped off the left edge */
+    else if (sel >= first + visible)
+        first = sel - visible + 1;          /* stepped off the right edge */
+    s_ovl_first[id] = first;
+    return first;
+}
+
+static int ovl_join(JSContext *ctx, JSValue arr, char *dst, size_t cap,
+                    size_t *len, int from, int max)
+{
+    int wrote = 0;
+    if (!JS_IsArray(ctx, arr))
+        return 0;
+    for (int i = from; i < from + max; i++) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+        if (JS_IsUndefined(v) || JS_IsNull(v))
+            break;
+        if (!JS_IsString(ctx, v))
+            continue;
+        char item[128];
+        if (uiw_copy_str(ctx, v, item, sizeof item))
+            return -1;
+        if (wrote && ovl_append(dst, cap, len, "\1"))
+            break;
+        if (ovl_append(dst, cap, len, item))
+            break;
+        wrote++;
+    }
+    return wrote;
+}
+
+JSValue js_ui_overlay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    int id = 0;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (id < 0 || id >= UI_OVERLAY_MAX)
+        return JS_ThrowRangeError(ctx, "ui.overlay: id 0..%d",
+                                  UI_OVERLAY_MAX - 1);
+
+    JSValue spec = argc >= 2 ? argv[1] : JS_UNDEFINED;
+    if (JS_IsUndefined(spec) || JS_IsNull(spec)) {
+        ui_post(UI_CMD_OVERLAY, 0, 0, id, 0, 0, NULL); /* hide */
+        return JS_UNDEFINED;
+    }
+
+    /* Anchor: pixels win when both are given, because an app that can
+       give pixels (proportional text) cannot express its cursor in
+       cells without lying about the width. */
+    int cw = 9, ch = 24;
+#ifdef ESP_PLATFORM
+    ui_tab5_cell_size(&cw, &ch);
+#endif
+    if (cw <= 0) cw = 9;
+    if (ch <= 0) ch = 24;
+
+    int x = 0, y = 0, h = ch, tmp = 0;
+    JSValue v = JS_GetPropertyStr(ctx, spec, "col");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        x = tmp * cw;
+    v = JS_GetPropertyStr(ctx, spec, "row");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        y = tmp * ch;
+    v = JS_GetPropertyStr(ctx, spec, "x");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        x = tmp;
+    v = JS_GetPropertyStr(ctx, spec, "y");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        y = tmp;
+    v = JS_GetPropertyStr(ctx, spec, "h");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v) && tmp > 0)
+        h = tmp;
+
+    int sel = -1;
+    v = JS_GetPropertyStr(ctx, spec, "sel");
+    if (JS_IsNumber(ctx, v) && JS_ToInt32(ctx, &sel, v))
+        return JS_EXCEPTION;
+
+    char place[8], dir[4];
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, spec, "place"),
+                     place, sizeof place))
+        return JS_EXCEPTION;
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, spec, "dir"), dir, sizeof dir))
+        return JS_EXCEPTION;
+    uint32_t flags = 0;
+    if (strcmp(place, "below") == 0) flags |= 1;
+    else if (strcmp(place, "above") == 0) flags |= 2;
+    if (dir[0] == 'v') flags |= 4;
+
+    char body[MQJS_OVL_TEXT_MAX];
+    size_t len = 0;
+    body[0] = '\0';
+    if (ovl_join(ctx, JS_GetPropertyStr(ctx, spec, "lines"), body,
+                 sizeof body, &len, 0, 8) < 0)
+        return JS_EXCEPTION;
+    JSValue items = JS_GetPropertyStr(ctx, spec, "items");
+    if (JS_IsArray(ctx, items)) {
+        /* Slide the window so `sel` is inside it, and report sel relative
+           to what we actually send — the drawing side only ever sees the
+           window, so an absolute index would highlight the wrong chip. */
+        int total = ovl_count(ctx, items, 256);
+        int first = ovl_window(id, total, sel, UI_OVERLAY_ITEMS);
+        if (sel >= 0)
+            sel -= first;
+        if (ovl_append(body, sizeof body, &len, "\2") == 0) {
+            if (ovl_join(ctx, items, body, sizeof body, &len, first,
+                         UI_OVERLAY_ITEMS) < 0)
+                return JS_EXCEPTION;
+        }
+    }
+    if (!body[0]) {
+        ui_post(UI_CMD_OVERLAY, 0, 0, id, 0, 0, NULL); /* nothing to show */
+        return JS_UNDEFINED;
+    }
+
+    /* ui_post_bg TAKES OWNERSHIP and the UI task free()s it, so this has
+       to be a heap copy — handing it `body` (a stack array) made the UI
+       task free a stack address, which corrupted the heap and blew up
+       later in an unrelated allocation (tlsf block_next assert inside
+       LVGL's invalidate path). Same contract as js_ui_cells. */
+    size_t blen = strlen(body);
+    char *copy = malloc(blen + 1);
+    if (!copy)
+        return JS_ThrowOutOfMemory(ctx);
+    memcpy(copy, body, blen + 1);
+    ui_post_bg(UI_CMD_OVERLAY, x, y, id, h, (uint32_t)sel, flags, copy);
+    return JS_UNDEFINED;
+}
+
 JSValue js_ui_keyboard(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int mode = 1;
@@ -3211,6 +3432,25 @@ JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return arr;
 }
 
+/* sys.micros() -> monotonic microseconds since boot.
+   performance.now() divides the same hardware counter by 1000, which is
+   useless for anything that costs microseconds (the IME key path, one
+   ui.cells run): a single call reads as 0 ms. This keeps the µs.
+
+   Two notes for benchmark authors:
+     - short int tops out at 2^30-1, so past 17.9 minutes of uptime the
+       return value becomes a float64 and costs one arena allocation per
+       call. Read it OUTSIDE the loop you are timing, never inside.
+     - it is NOT the wall clock; Date.now() jumps on SNTP sync, this
+       does not. */
+JSValue js_sys_micros(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    return JS_NewInt64(ctx, time_us());
+}
+
 /* sys.onForeground(fn): called after this app becomes foreground — the
    app rebuilds its screens/canvas here (destroy-on-switch model, §3.3).
    Registering any lifecycle/signal handler keeps the app alive. */
@@ -3801,7 +4041,7 @@ static int start_from_file(int slot, const char *arg, const char *name)
     fseek(f, 0, SEEK_END);
     long flen = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (flen <= 0 || flen > 64 * 1024) {
+    if (flen <= 0 || flen > MQJS_SCRIPT_MAX) {
         fclose(f);
         return -1;
     }
@@ -4875,6 +5115,603 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
+/* skk: local Japanese IME (docs/skk-ime-design.md §8)                  */
+/*                                                                      */
+/* Handle-style like ssh, and for the same two reasons. The API in §8   */
+/* is flat (skk.key(h, k), not h.key(k)), so a JS class object would    */
+/* buy nothing but a malloc and a JS_GetOpaque on the hot path; and the */
+/* dictionary is ~290 KB of PSRAM whose release must happen when the    */
+/* app stops, not whenever the GC next runs a finalizer.                */
+/*                                                                      */
+/* skk.key() returns an int and nothing else — no object, no string, no */
+/* array — which is the whole point of the status bitmask (§4.2): a     */
+/* keystroke the IME passes through costs one C call and zero           */
+/* allocations, and the moving-GC nesting hazard never arises because   */
+/* nothing is built. Strings and the candidate array materialise only   */
+/* when the app asks, i.e. when the status bits say something moved.    */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_MAX_SKK       4   /* IME handles. Low 2 bits of the id are the
+                                  slot, so this must stay <= 4. */
+#define MQJS_MAX_SKK_DICT  2   /* distinct dictionary images resident */
+#define MQJS_SKK_PATH_MAX  96
+#define MQJS_SKK_IMAGE_MAX (9u * 1024 * 1024) /* pine (L) is 8.3 MB */
+
+#ifdef ESP_PLATFORM
+#define MQJS_SKK_DEFAULT_DICT "/littlefs/skk/skk_dict_M.bin"
+#else
+#define MQJS_SKK_DEFAULT_DICT "skk/skk_dict_M.bin"
+#endif
+
+/* One loaded image, shared by every handle that named the same path:
+   skk_dict_t is explicitly read-only and shareable, and two apps each
+   holding their own 290 KB copy of SKK-JISYO.M would be a waste that
+   grows to 8 MB at the pine stage. Refcounted, freed at zero. */
+typedef struct {
+    bool       used;
+    bool       owned;     /* false = built-in rodata, never free it */
+    uint16_t   refs;
+    char       path[MQJS_SKK_PATH_MAX]; /* "" = the built-in image */
+    const uint8_t *base;  /* 8-byte aligned image */
+    size_t     len;
+    skk_dict_t dict;
+    uint32_t   load_us;   /* read + open, for skk.stats() */
+} SkkImage;
+static SkkImage s_skk_img[MQJS_MAX_SKK_DICT];
+
+typedef struct {
+    bool     used;
+    uint16_t gen;      /* bumped per open; part of the public id */
+    int      id;       /* public id while used */
+    uint8_t  worker;   /* owning app slot (== s_cur_wk->idx) */
+    int8_t   img;      /* index into s_skk_img */
+    skk_t   *core;     /* ~1.2 KB of engine state, PSRAM */
+    /* µs accounting, split by what the key actually did. A key that
+       only stepped the romaji state machine and a key that ran a
+       dictionary search have budgets three orders of magnitude apart
+       (design §4.1: 55 ms per keystroke, tens of ms per conversion);
+       averaging them together hides both. */
+    uint32_t last_lookups; /* engine lookup counter at the last key */
+    uint32_t key_calls, key_us, key_max_us;
+    uint32_t conv_calls, conv_us, conv_max_us;
+} SkkSlot;
+static SkkSlot s_skk[MQJS_MAX_SKK];
+
+/* Same shape as sshc.c's sess_id/sess_lookup: slot in the low bits,
+   generation above, id 0 always invalid. A stale handle from a closed
+   IME resolves to NULL instead of hitting whoever reused the slot. */
+static int skkslot_id(int slot)
+{
+    return (int)(((unsigned)s_skk[slot].gen << 2) | (unsigned)slot) + 1;
+}
+
+static SkkSlot *skkslot_lookup(int id)
+{
+    if (id <= 0)
+        return NULL;
+    int slot = (id - 1) & 3;
+    if (slot >= MQJS_MAX_SKK)
+        return NULL;
+    SkkSlot *s = &s_skk[slot];
+    if (!s->used || s->id != id)
+        return NULL;                      /* closed, or an older generation */
+    if (s_cur_wk && s->worker != s_cur_wk->idx)
+        return NULL;                      /* another app's handle */
+    return s;
+}
+
+/* The image must be 8-byte aligned: skk_dict_open() reads the packed-key
+   arrays as uint64 directly and returns SKK_ERR_ALIGN rather than risk
+   an unaligned trap. */
+static uint8_t *skk_image_alloc(size_t len)
+{
+    len = (len + 7u) & ~(size_t)7; /* aligned_alloc() wants a multiple of the
+                                      alignment; the extra bytes are unread —
+                                      the header's image_len is authoritative */
+#ifdef ESP_PLATFORM
+    /* PSRAM only, deliberately: internal SRAM's largest contiguous block
+       is 34-43 KB and lwIP/SDIO want it (design §4.3). Failing here is
+       better than starving WiFi or SSH. */
+    return heap_caps_aligned_alloc(8, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    return malloc(len);
+#endif
+}
+
+static void skk_image_free(uint8_t *p)
+{
+#ifdef ESP_PLATFORM
+    heap_caps_free(p);
+#else
+    free(p);
+#endif
+}
+
+/* Load `path` (or take another reference to it) and return its index in
+   s_skk_img, or -1 with *out_err set to an skk_err_t / -100 for I/O. */
+static int skkimg_acquire(const char *path, int *out_err)
+{
+    int free_slot = -1;
+
+    *out_err = SKK_ERR_ARG;
+    for (int i = 0; i < MQJS_MAX_SKK_DICT; i++) {
+        if (s_skk_img[i].used) {
+            if (strcmp(s_skk_img[i].path, path) == 0) {
+                s_skk_img[i].refs++;
+                return i;
+            }
+        } else if (free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) {
+        *out_err = SKK_ERR_NOSPACE;
+        return -1;
+    }
+
+    int64_t t0 = time_us();
+
+    /* "" = the image linked into the firmware (docs/skk-ime-design.md
+       §6.6). Read in place out of flash rodata: no file, no allocation,
+       no copy, and no CRC pass — the bootloader already validates the
+       whole app image with SHA-256 on every boot, so verifying here
+       would redo that with a weaker checksum for 20-30 ms (§6.10). */
+    if (!path[0]) {
+        skk_blob_t blob = skk_builtin_image();
+        if (!blob.base) {
+            *out_err = -102; /* built without a dictionary image */
+            return -1;
+        }
+        SkkImage *bi = &s_skk_img[free_slot];
+        int rc = skk_dict_open(&bi->dict, blob, 0);
+        if (rc != SKK_OK) {
+            *out_err = rc;
+            return -1;
+        }
+        bi->used = true;
+        bi->owned = false;
+        bi->refs = 1;
+        bi->base = blob.base;
+        bi->len = blob.len;
+        bi->load_us = (uint32_t)(time_us() - t0);
+        bi->path[0] = '\0';
+        *out_err = SKK_OK;
+        return free_slot;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        *out_err = -100;
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        *out_err = -100;
+        return -1;
+    }
+    long sz = ftell(f);
+    rewind(f);
+    if (sz < (long)sizeof(skk_image_hdr_t) || (unsigned long)sz > MQJS_SKK_IMAGE_MAX) {
+        fclose(f);
+        *out_err = SKK_ERR_TRUNCATED;
+        return -1;
+    }
+    uint8_t *base = skk_image_alloc((size_t)sz);
+    if (!base) {
+        fclose(f);
+        *out_err = -101;
+        return -1;
+    }
+    size_t got = fread(base, 1, (size_t)sz, f);
+    fclose(f);
+    if (got != (size_t)sz) {
+        skk_image_free(base);
+        *out_err = SKK_ERR_TRUNCATED;
+        return -1;
+    }
+
+    SkkImage *im = &s_skk_img[free_slot];
+    skk_blob_t blob = { base, (size_t)sz };
+    /* VERIFY here but NOT for the built-in image: a file on littlefs or
+       a partition is written by us and nobody checks it afterwards, so a
+       partial write is a real and silent failure mode (a corrupt index
+       does not crash, it answers wrong). The CRC pass costs 20-30 ms,
+       paid once per open. */
+    int rc = skk_dict_open(&im->dict, blob, SKK_OPEN_VERIFY);
+    if (rc != SKK_OK) {
+        skk_image_free(base);
+        *out_err = rc;
+        return -1;
+    }
+    im->used = true;
+    im->owned = true;
+    im->refs = 1;
+    im->base = base;
+    im->len = (size_t)sz;
+    im->load_us = (uint32_t)(time_us() - t0);
+    snprintf(im->path, sizeof im->path, "%s", path);
+    *out_err = SKK_OK;
+    return free_slot;
+}
+
+static void skkimg_release(int idx)
+{
+    if (idx < 0 || idx >= MQJS_MAX_SKK_DICT || !s_skk_img[idx].used)
+        return;
+    if (--s_skk_img[idx].refs)
+        return;
+    if (s_skk_img[idx].owned) /* the built-in image lives in rodata */
+        skk_image_free((uint8_t *)s_skk_img[idx].base);
+    memset(&s_skk_img[idx], 0, sizeof s_skk_img[idx]);
+}
+
+static void skkslot_free(SkkSlot *s)
+{
+    if (!s->used)
+        return;
+    skkimg_release(s->img);
+#ifdef ESP_PLATFORM
+    heap_caps_free(s->core);
+#else
+    free(s->core);
+#endif
+    s->core = NULL;
+    s->used = false;
+    s->id = 0;
+    s->img = -1;
+}
+
+/* skk.open([dictPath]) -> handle.
+   No argument = the image linked into the firmware: read in place out of
+   flash rodata, so this costs no allocation and no load (§6.6). A path
+   loads a file instead — that is how the bamboo/pine stages and a
+   dev-loop dictionary swap work, and it pays a copy plus a CRC pass.
+   Either way it happens here and not at boot, so an app whose user never
+   types Japanese never touches a dictionary. */
+JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    char path[MQJS_SKK_PATH_MAX];
+
+    if (uiw_copy_str(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+    /* No path and no built-in image: fall back to the conventional file
+       location so a dictionary can still be dropped on the device. */
+    if (!path[0] && !skk_builtin_image().base)
+        snprintf(path, sizeof path, "%s", MQJS_SKK_DEFAULT_DICT);
+
+    int slot = -1;
+    for (int i = 0; i < MQJS_MAX_SKK; i++) {
+        if (!s_skk[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
+                                     MQJS_MAX_SKK);
+
+    int err = 0;
+    int img = skkimg_acquire(path, &err);
+    if (img < 0) {
+        if (err == -102)
+            return JS_ThrowInternalError(
+                ctx, "skk: no built-in dictionary — build one with "
+                     "tools/skk_prep.py into components/skk_core/skk_dict.bin, "
+                     "or pass a path to skk.open()");
+        return JS_ThrowInternalError(ctx, "skk: cannot load %s (err %d)",
+                                     path[0] ? path : "(built-in)", err);
+    }
+
+    skk_t *core;
+#ifdef ESP_PLATFORM
+    core = heap_caps_malloc(sizeof *core, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    core = malloc(sizeof *core);
+#endif
+    if (!core) {
+        skkimg_release(img);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    skk_init(core);
+    skk_attach(core, &s_skk_img[img].dict);
+    skk_enable(core, true);
+
+    SkkSlot *s = &s_skk[slot];
+    uint16_t gen = (uint16_t)(s->gen + 1);
+    if (!gen)
+        gen = 1; /* gen 0 would let a fresh id collide with an old one */
+    memset(s, 0, sizeof *s);
+    s->used = true;
+    s->gen = gen;
+    s->id = skkslot_id(slot);
+    s->worker = s_cur_wk ? s_cur_wk->idx : 0;
+    s->img = (int8_t)img;
+    s->core = core;
+    return JS_NewInt32(ctx, s->id);
+}
+
+JSValue js_skk_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    SkkSlot *s = skkslot_lookup(id);
+    if (s)
+        skkslot_free(s); /* closing twice is not an error, as ssh.close */
+    return JS_UNDEFINED;
+}
+
+/* Every accessor below resolves the handle the same way. Returns NULL
+   with an exception already thrown, so callers just return JS_EXCEPTION.
+   A handle from a closed IME, from an older generation, or from another
+   app lands here — it never reaches whoever reused the slot. */
+static SkkSlot *skk_arg_slot(JSContext *ctx, JSValue *argv)
+{
+    int id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return NULL;
+    SkkSlot *s = skkslot_lookup(id);
+    if (!s)
+        JS_ThrowTypeError(ctx, "invalid skk handle");
+    return s;
+}
+
+JSValue js_skk_enable(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    skk_enable(s->core, uiw_truthy(ctx, argv[1]) > 0);
+    return JS_UNDEFINED;
+}
+
+/* skk.key(h, k) -> status bitmask. THE hot path: one integer out, no
+   allocation, no string built. 0 means the IME did not take the key and
+   the app must run its own handling.
+
+   `k` is passed straight through from ui.onKey, bytes and length as
+   delivered — a "\0name" token is recognised by its leading NUL, so the
+   length is load-bearing and strlen() would be wrong. */
+JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+
+    /* Require a string rather than letting JS_ToCStringLen coerce. A
+       mixed-up argument order (skk.key(k, h)) or a stray number would
+       otherwise be stringified and typed into the IME as text, which
+       reads as a rendering bug rather than as the caller error it is. */
+    if (!JS_IsString(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "skk.key(handle, string)");
+
+    JSCStringBuf kbuf;
+    size_t klen;
+    const char *k = JS_ToCStringLen(ctx, &klen, argv[1], &kbuf);
+    if (!k)
+        return JS_EXCEPTION;
+    char key[16]; /* mqjs key events are char[8]; the spare absorbs abuse */
+    if (klen > sizeof key)
+        klen = sizeof key;
+    memcpy(key, k, klen);
+
+    int64_t t0 = time_us();
+    uint32_t st = skk_key(s->core, key, klen);
+
+    /* Passthrough leaves before the instrumentation. §4.2 promises that
+       a key the IME does not take costs one C call and nothing else, and
+       a second clock read plus a 32-byte struct copy on every ASCII
+       keystroke is precisely the per-key overhead the bitmask design
+       exists to avoid. A key that was not consumed cannot have searched
+       the dictionary either, so there is nothing to attribute. What
+       remains on that path is the single t0 read, which has to happen
+       before the call. */
+    if (st == SKK_ST_PASSTHROUGH)
+        return JS_NewInt32(ctx, 0);
+
+    uint32_t us = (uint32_t)(time_us() - t0);
+    /* Attribute the µs to the right bucket. "Did this key search the
+       dictionary?" is the engine's lookup counter, not SKK_ST_CANDS: a
+       search that matched nothing sets no bit at all and would
+       otherwise be charged to the keystroke budget it blows through. */
+    skk_stats_t es;
+    skk_stats(s->core, &es);
+    if (es.lookups != s->last_lookups) {
+        s->last_lookups = es.lookups;
+        s->conv_calls++;
+        s->conv_us += us;
+        if (us > s->conv_max_us)
+            s->conv_max_us = us;
+    } else {
+        s->key_calls++;
+        s->key_us += us;
+        if (us > s->key_max_us)
+            s->key_max_us = us;
+    }
+    return JS_NewInt32(ctx, (int)st);
+}
+
+JSValue js_skk_preedit(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    size_t len = 0;
+    const char *p = skk_preedit(s->core, &len);
+    return JS_NewStringLen(ctx, p ? p : "", p ? len : 0);
+}
+
+JSValue js_skk_commit(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    size_t len = 0;
+    const char *p = skk_commit(s->core, &len);
+    return JS_NewStringLen(ctx, p ? p : "", p ? len : 0);
+}
+
+/* skk.candidates(h) -> [string]. Called once per entry into v mode, on
+   SKK_ST_CANDS — never per keystroke (moving through the list only sets
+   SKK_ST_SEL, which is an int read).
+
+   The candidate bytes live in the dictionary image, not the GC heap, so
+   JS_NewStringLen cannot invalidate them. The array itself is rooted and
+   each string is built in its own statement: a nested
+   JS_SetPropertyUint32(..., JS_NewStringLen(...)) may read arr_ref.val
+   before the allocation that moves it. */
+JSValue js_skk_candidates(JSContext *ctx, JSValue *this_val, int argc,
+                          JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+
+    JSGCRef arr_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+    JS_PUSH_VALUE(ctx, arr);
+    int n = skk_cand_count(s->core);
+    for (int i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *p = skk_cand(s->core, i, &len);
+        if (!p)
+            break;
+        JSValue v = JS_NewStringLen(ctx, p, len);
+        JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)i, v);
+    }
+    JS_POP_VALUE(ctx, arr);
+    return arr;
+}
+
+JSValue js_skk_sel(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, skk_sel(s->core));
+}
+
+JSValue js_skk_mode(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, (int)skk_mode(s->core));
+}
+
+/* skk.setMode(h, mode) -> 1 / 0. Only ASCII/KANA/KATA are settable.
+   This exists because real SKK leaves ASCII mode with C-j and kbd_core
+   already spends 0x0A on Enter, so the engine cannot honour it: an app
+   wires this to the same surface as its IME toggle. Discards any
+   preedit, like skk.reset(). */
+JSValue js_skk_setMode(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    int m;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &m, argv[1]))
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, skk_set_mode(s->core, (skk_mode_t)m) == SKK_OK);
+}
+
+/* skk.reset(h): drop the preedit and candidates WITHOUT committing.
+   For losing focus, or the ssh session being typed into going away. */
+JSValue js_skk_reset(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    skk_reset(s->core);
+    return JS_UNDEFINED;
+}
+
+/* skk.stats(h) -> JSON string, the audio.stats()/camera.status() shape.
+   The µs live here rather than in JS because performance.now() is
+   milliseconds and because bracketing the call from JS would measure
+   the mquickjs dispatch too. keyUs/convUs are the engine alone. */
+JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    skk_stats_t st;
+    skk_stats(s->core, &st);
+    const SkkImage *im = &s_skk_img[s->img];
+    char buf[512];
+    snprintf(buf, sizeof buf,
+             "{\"keys\":%lu,\"consumed\":%lu,\"lookups\":%lu,\"probes\":%lu,"
+             "\"fullcmp\":%lu,\"cands\":%lu,\"dropped\":%lu,\"commits\":%lu,"
+             "\"keyCalls\":%lu,\"keyUs\":%lu,\"keyMaxUs\":%lu,"
+             "\"convCalls\":%lu,\"convUs\":%lu,\"convMaxUs\":%lu,"
+             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu}",
+             (unsigned long)st.keys, (unsigned long)st.consumed,
+             (unsigned long)st.lookups, (unsigned long)st.probes,
+             (unsigned long)st.fullcmp, (unsigned long)st.cands,
+             (unsigned long)st.dropped, (unsigned long)st.commits,
+             (unsigned long)s->key_calls, (unsigned long)s->key_us,
+             (unsigned long)s->key_max_us,
+             (unsigned long)s->conv_calls, (unsigned long)s->conv_us,
+             (unsigned long)s->conv_max_us,
+             (unsigned long)im->len, (unsigned long)im->load_us,
+             (unsigned long)im->dict.blk[SKK_BLK_NASI].count,
+             (unsigned long)im->dict.blk[SKK_BLK_ARI].count);
+    return JS_NewString(ctx, buf);
+}
+
+JSValue js_skk_statsReset(JSContext *ctx, JSValue *this_val, int argc,
+                          JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    SkkSlot *s = skk_arg_slot(ctx, argv);
+    if (!s)
+        return JS_EXCEPTION;
+    skk_stats_reset(s->core);
+    s->last_lookups = 0; /* must track the counter it is compared against */
+    s->key_calls = s->key_us = s->key_max_us = 0;
+    s->conv_calls = s->conv_us = s->conv_max_us = 0;
+    return JS_UNDEFINED;
+}
+
+/* Release the IMEs one app opened. Called from app_reset_bindings, so
+   the dictionary's PSRAM comes back when the app stops rather than
+   whenever a finalizer happens to run — the reason these are int
+   handles and not JS class objects. */
+static void skk_release_app(int worker)
+{
+    for (int i = 0; i < MQJS_MAX_SKK; i++)
+        if (s_skk[i].used && s_skk[i].worker == (uint8_t)worker)
+            skkslot_free(&s_skk[i]);
+}
+
+/* ------------------------------------------------------------------ */
 /* scheduler (design §3.7)                                             */
 /* ------------------------------------------------------------------ */
 
@@ -4955,6 +5792,9 @@ static void app_reset_bindings(MqjsWorker *app)
         }
     }
 #endif
+    /* not inside the ESP_PLATFORM block: skk_core is pure logic and its
+       dictionary is a real allocation on the host too */
+    skk_release_app(app->idx);
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
         if (app->mqtt_subs[i].used) {
             JS_DeleteGCRef(ctx, &app->mqtt_subs[i].fn);

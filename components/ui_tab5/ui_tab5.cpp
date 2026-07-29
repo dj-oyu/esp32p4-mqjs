@@ -68,24 +68,38 @@ extern "C" void mqjs_request_open(const char *name);
  * The hiz8 min TTF it was generated from has no glyph for U+0020 space
  * (or U+0022) — they render as tofu. ui_font() returns a mutable copy
  * with a fallback chain:
- *   Noto JP 20 -> Montserrat 20 (ASCII gaps + LV_SYMBOL FontAwesome)
- *              -> HackGen NF icons 20px (Nerd Font BMP ranges)
+ *   Noto JP 20 -> HackGen term mono 17 (ASCII gaps, box drawing, and
+ *                 the whole Nerd Font BMP set incl. LV_SYMBOL's
+ *                 FontAwesome points)
+ *              -> Montserrat 14 (the handful of points nothing else has)
  * The NF link makes icon glyphs available to EVERY text surface
  * (status bar, widgets, console lines, ui.text) — apps just put
- * "\uE7xx"-style characters in strings (system decoration / @icon). */
+ * "\uE7xx"-style characters in strings (system decoration / @icon).
+ *
+ * The middle link used to be Montserrat 20 plus a SECOND 20px Nerd Font
+ * (fonts/font_nf_ui_20.c). font_term_mono's codepoint coverage is a
+ * strict superset of that font's — same ~3,490 icons, verified point by
+ * point (design doc §7.6) — so the pair cost 533 KB of flash to draw the
+ * same icons 3px larger; both are gone. Montserrat 14 stays on as the
+ * tail because LV_SYMBOL_BACKSPACE (U+F55A) and LV_SYMBOL_NEW_LINE
+ * (U+F8A2) — the on-screen keyboard's BS and Enter caps — exist in NO
+ * other font we link, and CONFIG_LV_USE_FONT_PLACEHOLDER would draw
+ * them as tofu boxes rather than drop them silently. It costs nothing:
+ * LV_FONT_DEFAULT_MONTSERRAT_14 already pulls it into the image. It is
+ * LAST so every point the two share resolves at 17px, not 14px. */
 extern "C" {
 LV_FONT_DECLARE(font_noto_jp_20_4);
-LV_FONT_DECLARE(font_nf_ui_20);
+LV_FONT_DECLARE(font_term_mono);
 }
 
 static const lv_font_t *ui_font(void)
 {
-    static lv_font_t jp, mont;
+    static lv_font_t jp, term;
     if (!jp.line_height) {
-        mont = lv_font_montserrat_20;
-        mont.fallback = &font_nf_ui_20;
+        term = font_term_mono; /* mutable copy: .fallback is ours to set */
+        term.fallback = &lv_font_montserrat_14;
         jp = font_noto_jp_20_4;
-        jp.fallback = &mont;
+        jp.fallback = &term;
     }
     return &jp;
 }
@@ -99,14 +113,27 @@ const lv_font_t *ui_tab5_jp_font(void)
 /* Monospace terminal font (HackGen Console NF, fonts/font_term_mono.c;
  * includes the Nerd Font BMP icon ranges, cell-fitted by upstream).
  * Fixed cell grid for ui.cells/UI_CMD_CELLS: 9px advance (720/9 = 80 cols),
- * 24px line height. Glyphs are blitted directly (no lv_draw_label) and
- * clipped to the cell, so the box-drawing overhang (box_w up to 11) tiles
- * cleanly across cell edges. */
+ * 24px line height. Glyphs are blitted directly (no lv_draw_label).
+ *
+ * Clipping is driven by ui_cell_width() — the SAME table ui.cellWidth
+ * exposes to JS — and NOT by the glyph's own box_w:
+ *   - width 1 (and 0) clips to one cell. This is load-bearing, not
+ *     conservatism: the box-drawing glyphs are 11px wide with ofs_x=-1,
+ *     i.e. they deliberately overhang the 9px cell on both sides, and
+ *     cutting them at the cell edge is what makes U+2500-259F tile
+ *     seamlessly. Widening the clip to box_w would bleed U+2588 into
+ *     the neighbouring cell and fight the next run's bg fill.
+ *   - width 2 (CJK) clips to two cells, because the glyph really does
+ *     span them.
+ * CALLER CONTRACT (ui.cells): one codepoint per column. After a width-2
+ * codepoint the caller appends a filler codepoint (a space — ssh_vt.js
+ * calls the model cell CONT) so that codepoint count == column count.
+ * The C side therefore measures width to size the CLIP, never to
+ * advance the column: doing both would double-count and shear every
+ * line of CJK to the right. */
 #include "driver/ppa.h"
+#include "ui_cell_width.h"
 
-extern "C" {
-LV_FONT_DECLARE(font_term_mono);
-}
 #define UI_CELL_W 9
 #define UI_CELL_H 24
 
@@ -131,6 +158,16 @@ static ppa_client_handle_t s_ppa_blend;
    e.g. 142-cell landscape rows); 64B-aligned (and 64B-multiple) for PPA
    cache ops. Deliberately NOT grown for landscape: internal SRAM. */
 static uint8_t s_cells_a8[720 * UI_CELL_H] __attribute__((aligned(64)));
+
+/* Columns one glyph is allowed to paint, per the shared ui_cell_width()
+   table. Width 0 (combining marks) is clamped UP to 1 rather than
+   skipped: ui.cells is a column-indexed API, so whatever the caller put
+   in a column gets that column — dropping it would leave the cell blank
+   with no way for the caller to notice. */
+static inline int cells_glyph_cols(uint32_t cp)
+{
+    return ui_cell_width(cp) == 2 ? 2 : 1;
+}
 
 /* minimal UTF-8 decode, shared by both cells paths */
 static inline uint32_t cells_utf8_next(const uint8_t *&s)
@@ -162,6 +199,22 @@ static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
 }
 
 static const char *TAG = "ui_tab5";
+
+/* A width-2 glyph that had to be cut short because it ran past the end of
+   its run. Both cells paths clamp (the CPU blit to the run's right edge,
+   the PPA compose to the A8 buffer) so nothing is ever written out of
+   bounds — but the clamp is silent, and a sheared kanji on screen looks
+   exactly like a font that is missing the glyph's right half. Count it and
+   say so, rate-limited, so "the caller forgot the CONT filler" can be told
+   apart from "the font is wrong" on the device instead of by guesswork. */
+static uint32_t s_cells_clip_hits;
+static void cells_note_clip(void)
+{
+    uint32_t n = ++s_cells_clip_hits;
+    if (n == 1 || (n & 0xFF) == 0)
+        ESP_LOGW(TAG, "cells: wide glyph clipped at run end x%u "
+                      "(caller dropped the CONT filler?)", (unsigned)n);
+}
 
 /* ------------------------------------------------------------------ */
 /* Data plane: console line ring + status snapshot                     */
@@ -1497,10 +1550,14 @@ static const char *CB_LBL_ALT = "Alt";
 static const char *CB_LBL_ALT_LOCK = "ALT";
 
 /* one row, so array index == button id */
+/* "あ" is the IME toggle: it sends "\0ime", which an app with Japanese
+   input turns into skk.enable() and every other app ignores. It is here
+   rather than on a control byte because the classic SKK toggles are all
+   unreachable on this keyboard — see the comment on KBD_K_IME. */
 static const char *CB_MAP_MAIN[] = {
     "Esc", "Tab", "Ctrl", "Alt", "Fn",
     LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
-    LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "",
+    LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "\xe3\x81\x82" /* あ */, "",
 };
 #define CB_ID_CTRL 2
 #define CB_ID_ALT  3
@@ -1509,7 +1566,7 @@ static const kbd_key_t CB_KEY_MAIN[] = {
     KBD_K_ESC, KBD_K_TAB,
     KBD_K_NONE /* Ctrl */, KBD_K_NONE /* Alt */, KBD_K_NONE /* Fn */,
     KBD_K_LEFT, KBD_K_DOWN, KBD_K_UP, KBD_K_RIGHT,
-    KBD_K_COPY, KBD_K_PASTE,
+    KBD_K_COPY, KBD_K_PASTE, KBD_K_IME,
 };
 static const char *CB_MAP_FN[] = {
     "Fn", "F1", "F2", "F3", "F4", "F5", "F6",
@@ -1520,6 +1577,225 @@ static const kbd_key_t CB_KEY_FN[] = {
     KBD_K_F5, KBD_K_F6, KBD_K_F7, KBD_K_F8, KBD_K_F9, KBD_K_F10,
     KBD_K_F11, KBD_K_F12,
 };
+
+/* ------------------------------------------------------------------ */
+/* Overlay: a small window floated over the canvas, anchored to a point
+ * the app supplies (docs/ui-overlay-plan.md).
+ *
+ * WHY THIS IS NOT DRAWN INTO THE CANVAS. The cells renderer's dirty
+ * check is content-based, so anything drawn *over* an unchanged row
+ * survives every later repaint. An app that floats its own window must
+ * therefore remember the rows it covered and force them to repaint —
+ * and forgetting is not a crash, it is a smear that accumulates
+ * (skk_test.js shipped exactly that bug for its cursor). LVGL composites
+ * over the canvas instead, so the problem cannot occur and no app needs
+ * the bookkeeping.
+ *
+ * Second reason, specific to Japanese: these labels use ui_font()
+ * (Noto JP, 3,517 kanji), NOT the terminal grid font, which has zero
+ * CJK glyphs. An IME window is therefore readable today, before the
+ * cells renderer learns double-width and the terminal font is
+ * regenerated.
+ *
+ * Objects per handle are created on first use and then reused: text
+ * changes every keystroke, so per-keystroke object churn is exactly what
+ * we do not want. */
+struct ui_overlay_t {
+    lv_obj_t *box;                       /* container, positioned/clamped */
+    lv_obj_t *lines;                     /* the preedit line(s) */
+    lv_obj_t *row;                       /* item container (flex) */
+    lv_obj_t *item[UI_OVERLAY_ITEMS];    /* candidate chips */
+};
+static ui_overlay_t s_ovl[UI_OVERLAY_MAX];
+
+#define UI_OVL_PAD 6
+
+static void ovl_build(ui_overlay_t *o)
+{
+    lv_obj_t *parent = s_root_scr ? s_root_scr : lv_screen_active();
+
+    o->box = lv_obj_create(parent);
+    lv_obj_remove_style_all(o->box);
+    lv_obj_add_flag(o->box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_CLICKABLE); /* never steal touch */
+    lv_obj_set_style_bg_opa(o->box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(o->box, lv_color_hex(UI_COL_BAR), 0);
+    lv_obj_set_style_radius(o->box, 4, 0);
+    lv_obj_set_style_pad_all(o->box, UI_OVL_PAD, 0);
+    lv_obj_set_style_pad_row(o->box, 2, 0);
+    lv_obj_set_style_border_width(o->box, 1, 0);
+    lv_obj_set_style_border_color(o->box, lv_color_hex(UI_COL_DOWN), 0);
+    lv_obj_set_style_text_font(o->box, ui_font(), 0);
+    lv_obj_set_size(o->box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(o->box, LV_FLEX_FLOW_COLUMN);
+
+    o->lines = lv_label_create(o->box);
+    lv_obj_set_style_text_color(o->lines, lv_color_hex(UI_COL_EVENT), 0);
+    lv_label_set_text(o->lines, "");
+
+    o->row = lv_obj_create(o->box);
+    lv_obj_remove_style_all(o->row);
+    lv_obj_remove_flag(o->row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(o->row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_column(o->row, 10, 0);
+    lv_obj_set_style_pad_row(o->row, 2, 0);
+    for (int i = 0; i < UI_OVERLAY_ITEMS; i++) {
+        o->item[i] = lv_label_create(o->row);
+        lv_obj_set_style_text_color(o->item[i], lv_color_hex(UI_COL_TEXT), 0);
+        lv_obj_set_style_pad_hor(o->item[i], 4, 0);
+        lv_obj_set_style_radius(o->item[i], 3, 0);
+        lv_obj_add_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(o->item[i], "");
+    }
+}
+
+static void ovl_hide(int id)
+{
+    if (id < 0 || id >= UI_OVERLAY_MAX || !s_ovl[id].box)
+        return;
+    lv_obj_add_flag(s_ovl[id].box, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* UI task only. The public ui_tab5_overlay_hide_all() posts commands. */
+static void ovl_hide_all(void)
+{
+    for (int i = 0; i < UI_OVERLAY_MAX; i++)
+        ovl_hide(i);
+}
+
+/* Split `p` on `sep` into up to `max` NUL-terminated pieces, in place. */
+static int ovl_split(char *p, char sep, char **out, int max)
+{
+    int n = 0;
+    if (!p || !*p)
+        return 0;
+    out[n++] = p;
+    for (; *p; p++) {
+        if (*p != sep)
+            continue;
+        *p = '\0';
+        if (n < max)
+            out[n++] = p + 1;
+    }
+    return n;
+}
+
+extern "C" int ui_tab5_kb_reserved(int mode); /* defined below */
+
+/* Position the box against the anchor.
+ *
+ * The anchor is in CANVAS coordinates (what the app draws in); the box is
+ * a child of the screen, which starts UI_STATUSBAR_H higher.
+ *
+ * Rules, in the order they matter:
+ *   - below the anchor by default, above it when below would run past the
+ *     usable bottom — and "usable" subtracts the on-screen keyboard,
+ *     otherwise the window a user is typing into hides under the keys;
+ *   - keep the anchor's x if at all possible, because the entire point is
+ *     that the eye does not move. Only clamp when the box would leave the
+ *     screen;
+ *   - never cover the status bar. */
+static void ovl_place(ui_overlay_t *o, const ui_cmd_t &cmd)
+{
+    lv_obj_update_layout(o->box);
+    int bw = lv_obj_get_width(o->box);
+    int bh = lv_obj_get_height(o->box);
+
+    int scr_w = s_canvas_w > 0 ? s_canvas_w : UI_LCD_H_RES;
+    int top = UI_STATUSBAR_H;
+    int bottom = top + s_canvas_h - ui_tab5_kb_reserved(s_app_kb_mode);
+
+    int ax = cmd.x;
+    int ay = cmd.y + top;
+    int place = cmd.bg & 0x3;
+
+    int y;
+    if (place == 2) {
+        y = ay - bh;
+    } else {
+        y = ay + cmd.h;                       /* below */
+        if (place == 0 && y + bh > bottom)
+            y = ay - bh;                      /* auto: flip above */
+    }
+    if (y + bh > bottom)
+        y = bottom - bh;
+    if (y < top)
+        y = top;
+
+    int x = ax;
+    if (x + bw > scr_w)
+        x = scr_w - bw;
+    if (x < 0)
+        x = 0;
+
+    lv_obj_set_pos(o->box, x, y);
+}
+
+static void ovl_apply(const ui_cmd_t &cmd)
+{
+    int id = cmd.w;
+    if (id < 0 || id >= UI_OVERLAY_MAX)
+        return;
+    if (!cmd.text) {
+        ovl_hide(id);
+        return;
+    }
+    ui_overlay_t *o = &s_ovl[id];
+    if (!o->box)
+        ovl_build(o);
+
+    /* content: "line\1line\2item\1item" */
+    char *body = cmd.text;
+    char *items = strchr(body, '\2');
+    if (items)
+        *items++ = '\0';
+
+    /* LVGL renders '\n' as a line break, so the line separator only has
+       to become one. */
+    for (char *q = body; *q; q++)
+        if (*q == '\1')
+            *q = '\n';
+    lv_label_set_text(o->lines, body);
+    if (*body)
+        lv_obj_remove_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
+
+    char *iv[UI_OVERLAY_ITEMS];
+    int n = items ? ovl_split(items, '\1', iv, UI_OVERLAY_ITEMS) : 0;
+    int sel = (int)cmd.color;
+    bool vertical = (cmd.bg & 0x4) != 0;
+    lv_obj_set_flex_flow(o->row, vertical ? LV_FLEX_FLOW_COLUMN
+                                          : LV_FLEX_FLOW_ROW);
+    for (int i = 0; i < UI_OVERLAY_ITEMS; i++) {
+        if (i < n) {
+            lv_label_set_text(o->item[i], iv[i]);
+            bool on = (i == sel);
+            lv_obj_set_style_bg_opa(o->item[i],
+                                    on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_style_bg_color(o->item[i],
+                                      lv_color_hex(UI_COL_FLASH), 0);
+            lv_obj_set_style_text_color(
+                o->item[i], lv_color_hex(on ? 0xFFFFFF : UI_COL_TEXT), 0);
+            lv_obj_remove_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (n)
+        lv_obj_remove_flag(o->row, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(o->row, LV_OBJ_FLAG_HIDDEN);
+
+    /* Unhide BEFORE measuring: lv_obj_update_layout() does not lay out a
+       hidden subtree, so measuring first returns 0 and the box lands at
+       the wrong place (and, with LV_SIZE_CONTENT, can be shown at a size
+       that was never computed). */
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(o->box);
+    ovl_place(o, cmd);
+}
 
 /* Mirror the engine's Ctrl/Alt state on the buttons: CHECKED (amber)
    while in effect. Only writes one ctrl bit per button and invalidates
@@ -2638,6 +2914,13 @@ public:
                 kb_show(cmd.x);
                 continue;
             }
+            if (cmd.op == UI_CMD_OVERLAY) {
+                /* not a canvas op: composited above, so it must not
+                   unhide the canvas or count as "drew" */
+                ovl_apply(cmd);
+                free(cmd.text);
+                continue;
+            }
             if (cmd.op == UI_CMD_RESET) {
                 /* foreground-app switch (P4a): same hygiene as a task
                    switch — stale pixels gone, console visible again,
@@ -2646,6 +2929,7 @@ public:
                 lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
                 kb_show(0);
                 cbar_clear_mods(); /* one-shot state died with the app */
+                ovl_hide_all();    /* a dead app's float must not survive */
                 continue;
             }
             apply(cmd);
@@ -2771,8 +3055,17 @@ private:
     }
 
     /* Blit one monospace glyph, fg blended over whatever bg is already in
-       the cell, clipped to the cell box (no lv_draw_label, no layer). */
-    void blit_glyph(int cx0, int cy0, uint32_t cp, uint16_t fg)
+       the cell, clipped to its cell box — one cell wide, two for a
+       width-2 codepoint (no lv_draw_label, no layer).
+       `run_right` is the run's right edge in pixels: the CPU path has to
+       honour it for the same reason the PPA path clamps to the A8 buffer
+       (see compose_glyph_a8). Without it the two paths disagree for a
+       width-2 codepoint that ends a run — PPA shears the glyph, the CPU
+       paints its right half into the next column, which fill_rect never
+       cleared, so half a kanji survives until that row is redrawn. Same
+       ui.cells call, two different pictures depending only on the run's
+       length (UI_PPA_CELLS_MIN_CELLS). */
+    void blit_glyph(int cx0, int cy0, uint32_t cp, uint16_t fg, int run_right)
     {
         const lv_font_t *font = &font_term_mono;
         lv_font_glyph_dsc_t g;
@@ -2800,7 +3093,12 @@ private:
         int baseline = cy0 + (UI_CELL_H - font->base_line);
         int gx0 = cx0 + g.ofs_x;
         int gy0 = baseline - g.ofs_y - g.box_h;
-        int clipR = cx0 + UI_CELL_W, clipB = cy0 + UI_CELL_H;
+        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
+        if (clipR > run_right) {
+            clipR = run_right;
+            cells_note_clip();
+        }
+        int clipB = cy0 + UI_CELL_H;
         for (int py = 0; py < g.box_h; py++) {
             int y = gy0 + py;
             if (y < cy0 || y >= clipB || y < 0 || y >= s_canvas_h)
@@ -2844,9 +3142,20 @@ private:
         int gx0 = cx0 + g.ofs_x;
         int gy0 = baseline - g.ofs_y - g.box_h;
         int clipL = cx0 < 0 ? 0 : cx0;
-        int clipR = cx0 + UI_CELL_W;
-        if (clipR > dst_w)
+        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
+        /* Clamp to the A8 buffer, i.e. to the run's right edge. This is
+           NOT just a last line of defence: cells()'s straddle guard only
+           runs inside the `while (n > seg_max)` splitting loop, so every
+           run of <= seg_max cells (which is nearly every run ssh_vt's
+           drawRow emits) and the final segment of a long one can still
+           END on a width-2 codepoint — a selection dragged to the left
+           half of a full-width character does exactly that. The CPU path
+           clamps to the same edge (blit_glyph's run_right) so the two
+           paths agree; without that they diverge on run length alone. */
+        if (clipR > dst_w) {
             clipR = dst_w;
+            cells_note_clip();
+        }
         for (int py = 0; py < g.box_h; py++) {
             int y = gy0 + py;
             if (y < 0 || y >= UI_CELL_H)
@@ -2883,7 +3192,12 @@ private:
         const uint8_t *s = (const uint8_t *)cmd.text;
         /* the run has a single bg: clear it in one rect (instead of one
            9x24 fill per cell) — row-contiguous, and long runs clear the
-           PPA threshold */
+           PPA threshold. Columns == codepoints (the CONT contract at the
+           top of this file), so counting UTF-8 lead bytes gives the run's
+           width. Deliberately NOT sum(ui_cell_width): the caller already
+           spent a column on the filler cell, and counting the wide
+           glyph's second column here as well would overshoot the fill by
+           one cell per CJK character and eat the head of the next run. */
         int n = 0;
         for (const uint8_t *p = s; *p; p++)
             if ((*p & 0xC0) != 0x80)
@@ -2894,13 +3208,30 @@ private:
         const int seg_max = (int)(sizeof(s_cells_a8) /
                                   ((size_t)UI_CELL_W * UI_CELL_H));
         while (n > seg_max) {
+            /* Fill a segment, but never let one END on a width-2 glyph:
+               its right half belongs to the next segment's first cell,
+               which is outside the A8 buffer, so compose_glyph_a8 would
+               shear it — and only on the PPA path, since the CPU blit
+               writes straight to the canvas and would not. Hand the
+               straddling glyph to the next segment instead. */
             const uint8_t *p = s;
-            for (int c = 0; c < seg_max; c++)
-                cells_utf8_next(p); /* advance past this segment */
-            cells_run(col, row, s, p, seg_max, fg);
+            int take = 0;
+            while (take < seg_max) {
+                const uint8_t *q = p;
+                if (take + cells_glyph_cols(cells_utf8_next(p)) > seg_max) {
+                    p = q; /* rewind over the straddling glyph */
+                    break;
+                }
+                take++; /* one column per codepoint, wide or not */
+            }
+            if (take == 0) { /* unreachable at seg_max=80; no stuck loop */
+                cells_utf8_next(p);
+                take = 1;
+            }
+            cells_run(col, row, s, p, take, fg);
             s = p;
-            col += seg_max;
-            n -= seg_max;
+            col += take;
+            n -= take;
         }
         cells_run(col, row, s, nullptr, n, fg);
     }
@@ -2957,9 +3288,10 @@ private:
         }
 
         int c = col;
+        int run_right = (col + n) * UI_CELL_W;
         while (*s && (!e || s < e)) {
             uint32_t cp = cells_utf8_next(s);
-            blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg);
+            blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg, run_right);
             c++;
         }
     }
