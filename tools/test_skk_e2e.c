@@ -189,15 +189,28 @@ int main(int argc, char **argv)
     if (st.probes == 0)  { printf("FAIL probes stayed 0 (skk_lookup_stats "
                                   "not wired into convert())\n"); inst++; }
     if (st.cands == 0)   { printf("FAIL cands stayed 0\n"); inst++; }
+    /* A probe is one 64-byte line the index search touches. With the
+       sampled tree (skk_core.h) that is one per level plus one — 5 or 6
+       for a real dictionary, where bisection was 12-17. Bound it by what
+       THIS image says rather than by a constant, so the check still means
+       something when the dictionary changes size or is built without a
+       tree. */
+    uint32_t lo_p = 8, hi_p = 24;               /* bisecting: ~log2(N) */
+    if (D.blk[SKK_BLK_NASI].levels && D.blk[SKK_BLK_ARI].levels) {
+        lo_p = D.blk[SKK_BLK_ARI].levels + 1u;  /* the smaller block */
+        hi_p = D.blk[SKK_BLK_NASI].levels + 1u;
+    }
     if (st.probes && st.lookups &&
-        (st.probes / st.lookups < 8 || st.probes / st.lookups > 24)) {
-        printf("FAIL probes/lookup = %u, expected ~log2(N) (11-18)\n",
-               st.probes / st.lookups);
+        (st.probes / st.lookups < lo_p || st.probes / st.lookups > hi_p)) {
+        printf("FAIL probes/lookup = %u, expected %u-%u\n",
+               st.probes / st.lookups, lo_p, hi_p);
         inst++;
     }
     if (!inst)
-        printf("ok   instrumentation: %u probes over %u lookups (%u/lookup)\n",
-               st.probes, st.lookups, st.probes / st.lookups);
+        printf("ok   instrumentation: %u probes over %u lookups (%u lines/"
+               "lookup, tree levels %u nasi / %u ari)\n",
+               st.probes, st.lookups, st.probes / st.lookups,
+               D.blk[SKK_BLK_NASI].levels, D.blk[SKK_BLK_ARI].levels);
     bad += inst;
 
     size_t n = sizeof T / sizeof T[0];

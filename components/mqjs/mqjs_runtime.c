@@ -69,6 +69,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include <dirent.h>
 #include "mqtt_client.h"
 #include "esp_http_client.h"
@@ -5143,19 +5144,42 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 #define MQJS_SKK_DEFAULT_DICT "skk/skk_dict_M.bin"
 #endif
 
+/* Where a dictionary can come from. The string is both the selector an
+ * app may pass to skk.open() and the cache key, so each source names
+ * exactly one set of bytes:
+ *
+ *   ""              the image linked into the firmware (plum, §6.6)
+ *   "part:<name>"   a flash partition, mmap'd and read in place —
+ *                   bamboo and pine (§6.7)
+ *   anything else   a file, read into PSRAM
+ *
+ * skk.open() with no argument tries them in that order, best first, so
+ * flashing a bigger dictionary into `jisyo` upgrades every app without
+ * an app change and removing it falls back instead of failing. */
+#define MQJS_SKK_PART_PREFIX "part:"
+#define MQJS_SKK_PARTITION   "jisyo"
+/* The custom data subtype partitions.csv gives `jisyo`. No built-in
+   subtype means "a blob we mmap", and 0x40 is the first of the range
+   reserved for applications. */
+#define MQJS_SKK_PART_SUBTYPE 0x40
+
 /* One loaded image, shared by every handle that named the same path:
    skk_dict_t is explicitly read-only and shareable, and two apps each
    holding their own 290 KB copy of SKK-JISYO.M would be a waste that
    grows to 8 MB at the pine stage. Refcounted, freed at zero. */
 typedef struct {
     bool       used;
-    bool       owned;     /* false = built-in rodata, never free it */
+    bool       owned;     /* malloc'd; rodata and mmap are not */
     uint16_t   refs;
     char       path[MQJS_SKK_PATH_MAX]; /* "" = the built-in image */
     const uint8_t *base;  /* 8-byte aligned image */
     size_t     len;
     skk_dict_t dict;
     uint32_t   load_us;   /* read + open, for skk.stats() */
+#ifdef ESP_PLATFORM
+    esp_partition_mmap_handle_t mmap_h;
+    bool       mapped;    /* base is an mmap window, munmap it at zero */
+#endif
 } SkkImage;
 static SkkImage s_skk_img[MQJS_MAX_SKK_DICT];
 
@@ -5227,6 +5251,80 @@ static void skk_image_free(uint8_t *p)
 #endif
 }
 
+#ifdef ESP_PLATFORM
+/* Attach a dictionary partition without reading it.
+ *
+ * This chip maps flash through the MMU, so bamboo and pine cost exactly
+ * what plum costs: no allocation, no load, no copy. skk_dict_t just
+ * points at the window (design §6.6/§6.7) and the search reads the
+ * mmap'd bytes in place, the same way font_term_mono's 772 KB of glyphs
+ * are read on the draw path.
+ *
+ * Mapped in TWO steps, and the second one matters: `jisyo` is sized for
+ * pine (8.5 MB) but bamboo only fills 1.86 MB of it. The header says how
+ * long the image really is, so map a page, read image_len, and map only
+ * that — otherwise 6.6 MB of erased flash would sit in the MMU window,
+ * which this SoC shares between PSRAM, the instruction cache and every
+ * other mapping.
+ *
+ * The image base lands on a partition boundary, so the 8-byte alignment
+ * skk_dict_open() requires comes for free — but it is still checked
+ * there rather than assumed here. */
+static int skkpart_open(const char *name, SkkImage *im)
+{
+    const esp_partition_t *p;
+    esp_partition_mmap_handle_t h;
+    const void *win = NULL;
+    uint32_t magic, image_len;
+    size_t probe;
+    int rc;
+
+    p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 (esp_partition_subtype_t)MQJS_SKK_PART_SUBTYPE,
+                                 name);
+    if (!p)
+        return -103;                      /* no such partition in the table */
+
+    probe = p->size < 4096 ? p->size : 4096;
+    if (probe < sizeof(skk_image_hdr_t) ||
+        esp_partition_mmap(p, 0, probe, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
+        return -100;
+    magic     = ((const uint32_t *)win)[0];
+    image_len = ((const uint32_t *)win)[2];   /* skk_image_hdr_t.image_len */
+    esp_partition_munmap(h);
+
+    /* An erased partition reads as 0xFF everywhere, which is the normal
+       state of a device that has never been given a dictionary. Say so
+       distinctly instead of reporting a corrupt image. */
+    if (magic == 0xFFFFFFFFu)
+        return -104;
+    if (magic != SKK_IMAGE_MAGIC)
+        return SKK_ERR_MAGIC;
+    if (image_len < sizeof(skk_image_hdr_t) || image_len > p->size)
+        return SKK_ERR_TRUNCATED;
+
+    if (esp_partition_mmap(p, 0, image_len, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
+        return -100;
+
+    /* VERIFY, unlike the built-in image: this one lives OUTSIDE the app
+       image, so the bootloader's per-boot SHA-256 never saw it and a
+       half-written flash would show up as wrong conversions rather than
+       as a failure (design §6.10). ~190 ms for bamboo, paid once. */
+    skk_blob_t blob = { (const uint8_t *)win, image_len };
+    rc = skk_dict_open(&im->dict, blob, SKK_OPEN_VERIFY);
+    if (rc != SKK_OK) {
+        esp_partition_munmap(h);
+        return rc;
+    }
+    im->base   = (const uint8_t *)win;
+    im->len    = image_len;
+    im->mmap_h = h;
+    im->mapped = true;
+    im->owned  = false;
+    return SKK_OK;
+}
+#endif /* ESP_PLATFORM */
+
 /* Load `path` (or take another reference to it) and return its index in
    s_skk_img, or -1 with *out_err set to an skk_err_t / -100 for I/O. */
 static int skkimg_acquire(const char *path, int *out_err)
@@ -5277,6 +5375,29 @@ static int skkimg_acquire(const char *path, int *out_err)
         bi->path[0] = '\0';
         *out_err = SKK_OK;
         return free_slot;
+    }
+
+    /* "part:<name>" — mmap'd flash, the bamboo/pine stages. Also
+       allocation-free and load-free; see skkpart_open(). */
+    if (strncmp(path, MQJS_SKK_PART_PREFIX, sizeof(MQJS_SKK_PART_PREFIX) - 1) == 0) {
+#ifdef ESP_PLATFORM
+        SkkImage *pi = &s_skk_img[free_slot];
+        int rc = skkpart_open(path + sizeof(MQJS_SKK_PART_PREFIX) - 1, pi);
+        if (rc != SKK_OK) {
+            memset(pi, 0, sizeof *pi);   /* skkpart_open may have half-filled it */
+            *out_err = rc;
+            return -1;
+        }
+        pi->used = true;
+        pi->refs = 1;
+        pi->load_us = (uint32_t)(time_us() - t0);
+        snprintf(pi->path, sizeof pi->path, "%s", path);
+        *out_err = SKK_OK;
+        return free_slot;
+#else
+        *out_err = -103;                 /* no partitions off-device */
+        return -1;
+#endif
     }
 
     FILE *f = fopen(path, "rb");
@@ -5340,7 +5461,11 @@ static void skkimg_release(int idx)
         return;
     if (--s_skk_img[idx].refs)
         return;
-    if (s_skk_img[idx].owned) /* the built-in image lives in rodata */
+#ifdef ESP_PLATFORM
+    if (s_skk_img[idx].mapped)   /* give the MMU window back */
+        esp_partition_munmap(s_skk_img[idx].mmap_h);
+#endif
+    if (s_skk_img[idx].owned) /* rodata and mmap windows are not owned */
         skk_image_free((uint8_t *)s_skk_img[idx].base);
     memset(&s_skk_img[idx], 0, sizeof s_skk_img[idx]);
 }
@@ -5361,25 +5486,39 @@ static void skkslot_free(SkkSlot *s)
     s->img = -1;
 }
 
-/* skk.open([dictPath]) -> handle.
-   No argument = the image linked into the firmware: read in place out of
-   flash rodata, so this costs no allocation and no load (§6.6). A path
-   loads a file instead — that is how the bamboo/pine stages and a
-   dev-loop dictionary swap work, and it pays a copy plus a CRC pass.
-   Either way it happens here and not at boot, so an app whose user never
-   types Japanese never touches a dictionary. */
+/* skk.open([dictSource]) -> handle.
+ *
+ * No argument means "the best dictionary this device has", tried in
+ * order: the `jisyo` partition (bamboo/pine — mmap'd, no allocation, no
+ * load), then the image linked into the firmware (plum — flash rodata,
+ * likewise free), then the conventional file. That order is why S8 needs
+ * no app change: flashing SKK-JISYO.ML into `jisyo` upgrades every app's
+ * vocabulary, and erasing it falls back instead of failing.
+ *
+ * An explicit argument pins one source: "part:<name>" for a partition,
+ * anything else for a file (which does pay a copy into PSRAM plus a CRC
+ * pass — that is the dev-loop path). Either way it happens here and not
+ * at boot, so an app whose user never types Japanese never touches a
+ * dictionary. */
 JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     (void)this_val;
     (void)argc;
     char path[MQJS_SKK_PATH_MAX];
+    const char *tried[3];
+    int ntried = 0;
 
     if (uiw_copy_str(ctx, argv[0], path, sizeof path))
         return JS_EXCEPTION;
-    /* No path and no built-in image: fall back to the conventional file
-       location so a dictionary can still be dropped on the device. */
-    if (!path[0] && !skk_builtin_image().base)
-        snprintf(path, sizeof path, "%s", MQJS_SKK_DEFAULT_DICT);
+    if (path[0]) {
+        tried[ntried++] = path;
+    } else {
+        tried[ntried++] = MQJS_SKK_PART_PREFIX MQJS_SKK_PARTITION;
+        if (skk_builtin_image().base)
+            tried[ntried++] = "";                    /* plum, in rodata */
+        else
+            tried[ntried++] = MQJS_SKK_DEFAULT_DICT; /* nothing built in */
+    }
 
     int slot = -1;
     for (int i = 0; i < MQJS_MAX_SKK; i++) {
@@ -5392,16 +5531,32 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
                                      MQJS_MAX_SKK);
 
-    int err = 0;
-    int img = skkimg_acquire(path, &err);
+    int err = 0, img = -1;
+    for (int i = 0; i < ntried && img < 0; i++)
+        img = skkimg_acquire(tried[i], &err);
     if (img < 0) {
         if (err == -102)
             return JS_ThrowInternalError(
                 ctx, "skk: no built-in dictionary — build one with "
                      "tools/skk_prep.py into components/skk_core/skk_dict.bin, "
-                     "or pass a path to skk.open()");
-        return JS_ThrowInternalError(ctx, "skk: cannot load %s (err %d)",
-                                     path[0] ? path : "(built-in)", err);
+                     "flash one into the `jisyo` partition, or pass a path to "
+                     "skk.open()");
+        /* -100 I/O, -101 out of memory, -103 no such partition,
+           -104 the partition is erased; anything else is an skk_err_t. */
+        return JS_ThrowInternalError(
+            ctx, "skk: cannot load %s (%s)",
+            tried[ntried - 1][0] ? tried[ntried - 1] : "(built-in)",
+            err == -103 ? "no such partition — check partitions.csv"
+          : err == -104 ? "partition is erased — flash a dictionary into it "
+                          "(README 3.5)"
+          : err == SKK_ERR_VERSION ? "image built by a different format "
+                                     "version — rebuild it with "
+                                     "tools/skk_prep.py"
+          : err == SKK_ERR_CRC ? "CRC mismatch — the image is damaged"
+          : err == SKK_ERR_ALPHABET ? "collation table mismatch — rebuild "
+                                      "the image with this tree's "
+                                      "tools/skk_prep.py"
+          : "I/O or format error");
     }
 
     skk_t *core;
@@ -5664,13 +5819,17 @@ JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     skk_stats_t st;
     skk_stats(s->core, &st);
     const SkkImage *im = &s_skk_img[s->img];
-    char buf[512];
+    /* 512 no longer fits: the source string is up to MQJS_SKK_PATH_MAX
+       and snprintf would truncate the JSON into something JS cannot
+       parse rather than fail visibly. */
+    char buf[512 + MQJS_SKK_PATH_MAX + 32];
     snprintf(buf, sizeof buf,
              "{\"keys\":%lu,\"consumed\":%lu,\"lookups\":%lu,\"probes\":%lu,"
              "\"fullcmp\":%lu,\"cands\":%lu,\"dropped\":%lu,\"commits\":%lu,"
              "\"keyCalls\":%lu,\"keyUs\":%lu,\"keyMaxUs\":%lu,"
              "\"convCalls\":%lu,\"convUs\":%lu,\"convMaxUs\":%lu,"
-             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu}",
+             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu,"
+             "\"dict\":\"%s\",\"levels\":%u}",
              (unsigned long)st.keys, (unsigned long)st.consumed,
              (unsigned long)st.lookups, (unsigned long)st.probes,
              (unsigned long)st.fullcmp, (unsigned long)st.cands,
@@ -5681,7 +5840,12 @@ JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
              (unsigned long)s->conv_max_us,
              (unsigned long)im->len, (unsigned long)im->load_us,
              (unsigned long)im->dict.blk[SKK_BLK_NASI].count,
-             (unsigned long)im->dict.blk[SKK_BLK_ARI].count);
+             (unsigned long)im->dict.blk[SKK_BLK_ARI].count,
+             /* which source skk.open() settled on, and how many tree
+                levels it is searching through — the two things you need
+                to tell plum from bamboo without guessing from the size */
+             im->path[0] ? im->path : "builtin",
+             (unsigned)im->dict.blk[SKK_BLK_NASI].levels);
     return JS_NewString(ctx, buf);
 }
 

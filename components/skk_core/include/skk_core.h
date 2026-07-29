@@ -214,8 +214,10 @@ uint32_t skk_utf8_decode(const char *s, size_t len, size_t i, size_t *adv);
  *
  *   0x00  skk_image_hdr_t          (64 B, see below)
  *   ...   uint64 keys[nasi_count]  8-byte aligned, ascending
+ *   ...   uint64 fan[fan_total]    8-byte aligned, the sampled tree below
  *   ...   uint32 offs[nasi_count]  4-byte aligned, line starts
  *   ...   uint64 keys[ari_count]
+ *   ...   uint64 fan[fan_total]
  *   ...   uint32 offs[ari_count]
  *   ...   entry text               "<reading> /c1/c2/.../\n" lines
  *
@@ -240,7 +242,7 @@ uint32_t skk_utf8_decode(const char *s, size_t len, size_t i, size_t *adv);
  * offs[] defines what the index means.) */
 
 #define SKK_IMAGE_MAGIC   0x314b4b53u /* "SKK1" */
-#define SKK_IMAGE_VERSION 1u
+#define SKK_IMAGE_VERSION 2u          /* 2 added the sampled tree (below) */
 #define SKK_IMAGE_ALIGN   8u
 
 typedef struct {
@@ -258,7 +260,13 @@ typedef struct {
     uint32_t ari_count;
     uint32_t ari_keys_off;
     uint32_t ari_offs_off;
-    uint32_t reserved[3];
+    /* uint64[skk_fan_total(count)], 0 when the block has no tree. Only
+       the START is stored: every level's size is a pure function of
+       `count` (skk_fan_levels), so the writer and the reader cannot
+       disagree about the shape of the thing. */
+    uint32_t nasi_fan_off;
+    uint32_t ari_fan_off;
+    uint32_t reserved[1];
 } skk_image_hdr_t;          /* exactly 64 bytes; the CRC covers what follows */
 
 /* Enforced, because the header size is part of the on-disk format: a
@@ -275,10 +283,88 @@ typedef enum {
     SKK_BLK_COUNT
 } skk_blk_t;
 
+/* ------------------------------------------------------------------ */
+/* The sampled search tree — one cache line per level, not one per
+ * bisection step (design §6.5).
+ *
+ * A plain binary search over keys[] lands on a different 64-byte line at
+ * every step. Measured over every heading of every shipped dictionary,
+ * that is 12.8 lines for plum's okuri-nasi block and 15.5-17.4 for
+ * bamboo's and pine's, on arrays of 67 KB / 390 KB / 1.41 MB. Once the
+ * dictionary is mmap'd flash rather than something L2 can hold, those
+ * lines ARE the search: the comparisons are free and the misses are not.
+ *
+ * So the image carries sampled levels above the keys. Level 1 is every
+ * 8th key, level 2 every 8th of those, up until a level holds fewer than
+ * eight:
+ *
+ *     L[0] = keys,   L[k+1][j] = L[k][8j + 7]
+ *
+ * Each separator IS one of the keys below it, so a lower_bound at level
+ * k+1 pins the lower_bound at level k to eight consecutive, 8-ALIGNED
+ * elements — one 64-byte line, whichever way the comparison goes. The
+ * search is therefore a scan of at most 8 uint64 per level and touches
+ * log8(n) lines instead of log2(n):
+ *
+ *   block              n     bisecting   tree   the tree costs
+ *   M   okuri-nasi   6,934    12.8 ln    5 ln    7,904 B  (+9.5%)
+ *   ML  okuri-nasi  44,401    15.5 ln    6 ln   50,720 B  (+9.5%)
+ *   L   okuri-nasi 159,795    17.4 ln    6 ln  182,600 B  (+9.5%)
+ *
+ * (measured by tools/test_skk_dict.c over every heading of every shipped
+ * dictionary, both blocks, plus a guaranteed-absent variant of each so
+ * the bounds that fall BETWEEN entries are covered too; the percentage
+ * is against that block's keys[] + offs[]). The top levels are small
+ * enough to stay in L2 between lookups — bamboo's levels 3-5 are 97 keys
+ * = 776 B — so the lines actually fetched from flash are fewer still.
+ *
+ * THIS IS ALSO §4.5's FIRST-CHARACTER BUCKET INDEX, generalised. A
+ * bucket table is a one-level sampled index that assumes the first
+ * character splits the space evenly; this is the same idea at every
+ * level and assumes nothing. Adding both would be redundant.
+ *
+ * WHY NOT THE EYTZINGER / B-TREE PERMUTATION §6.5 first proposed: it
+ * reorders keys[], and two things downstream walk to the NEXT entry in
+ * sorted order after a hit — the packed-key collision group in
+ * find_entry(), and TAB completion in skk_complete(). Sampling leaves
+ * the sorted array exactly as it was and costs n/7 extra keys (+10% of
+ * the index, +8% of a bamboo image), so nothing downstream changes and
+ * a block without a tree still searches correctly.
+ *
+ * THE TREE IS DERIVED DATA, and a tree that disagrees with its keys does
+ * not crash — it answers wrong, the same failure mode as a mis-sorted
+ * dictionary (§6.1). Two things keep that from shipping: every level
+ * size is computed from `count` alone (so writer and reader cannot
+ * disagree about the shape), and the prep tool re-searches every single
+ * heading THROUGH THE TREE before it writes an image out. */
+#define SKK_FANOUT          8u  /* uint64 per 64-byte line */
+#define SKK_FAN_LEVELS_MAX 12u  /* 8^11 > 2^32; index 0 is keys itself */
+
+/* Sizes of the sampled levels above `count` sorted keys. Sets
+   lvl_n[0] = count and lvl_n[1..T], and returns T — 0 when count is
+   below SKK_FANOUT and the block is simply scanned. `lvl_n` must hold
+   SKK_FAN_LEVELS_MAX entries. A pure function of `count`: the image
+   stores where the tree starts and nothing else. */
+uint32_t skk_fan_levels(uint32_t count, uint32_t *lvl_n);
+
+/* Total uint64 in the tree, i.e. the sum of lvl_n[1..T]. */
+uint32_t skk_fan_total(uint32_t count);
+
+/* Fill `fan` (skk_fan_total(count) elements) from a sorted key array.
+   For the prep tool and the host tests; the firmware only reads. */
+void skk_fan_build(const uint64_t *keys, uint32_t count, uint64_t *fan);
+
 typedef struct {
     const uint64_t *keys;
     const uint32_t *offs;
     uint32_t        count;
+    /* lvl[0] is keys itself, lvl[1..levels] the sampled levels as laid
+       out in the image. levels == 0 means there is no tree — either the
+       block is shorter than SKK_FANOUT or the image was built without
+       one — and the search falls back to bisection. */
+    uint8_t         levels;
+    const uint64_t *lvl[SKK_FAN_LEVELS_MAX];
+    uint32_t        lvl_n[SKK_FAN_LEVELS_MAX];
 } skk_index_t;
 
 /* Opened dictionary. Caller-owned, no allocation, safe to share
@@ -371,7 +457,9 @@ typedef struct {
     uint32_t keys;       /* skk_key() calls */
     uint32_t consumed;   /* ... of which returned non-zero */
     uint32_t lookups;    /* dictionary searches */
-    uint32_t probes;     /* binary-search probes, summed over lookups */
+    uint32_t probes;     /* index probes: one per 64-byte line the search
+                            touches — one tree level, or one bisection
+                            step in a block with no tree */
     uint32_t fullcmp;    /* packed-key hits that needed a byte compare */
     uint32_t cands;      /* candidates produced */
     uint32_t dropped;    /* candidates skipped or past SKK_CAND_MAX */
@@ -640,11 +728,13 @@ const char *skk_cand_text(const skk_dict_t *d, const skk_cand_t *c, size_t *len)
 int skk_index_build(skk_blob_t text, uint64_t *keys, uint32_t *offs,
                     size_t cap, size_t *out_count);
 
-/* Verify that an opened block really is sorted by skk_entry_cmp() —
- * the check that catches the EUC-JP/UTF-8 reordering described above.
+/* Verify that an opened block really is sorted by skk_entry_cmp(), and
+ * that its sampled tree samples the keys it claims to — the two ways an
+ * index can be wrong without crashing (§6.1 and the tree note above).
  * O(n) and worth running once in the host test for every dictionary.
  * Returns SKK_OK, or SKK_ERR_FORMAT with *out_at set to the index of
- * the first entry that is not >= its predecessor. */
+ * the first entry that is not >= its predecessor, or to
+ * count + <tree index> for a separator that is not the key it samples. */
 int skk_index_verify(const skk_dict_t *d, skk_blk_t blk, uint32_t *out_at);
 
 #ifdef __cplusplus

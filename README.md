@@ -306,6 +306,48 @@ Tab5 は USB の DTR/RTS リセットが効かない場合があるため、書�
 古いパーティション構成を書き込んだことがある端末では、最初に一度だけ
 `idf.py ... erase-flash` が必要です。LittleFS と NVS の保存内容は消えます。
 
+### 3.5. 日本語入力の辞書を入れる (任意)
+
+SKK IME は辞書なしでも動きます (`SKK-JISYO.M` 約 8,300 見出しがファームに
+埋め込まれるため)。語彙を増やすには `jisyo` パーティションへ大きい辞書を
+焼きます。**アプリ側の変更は要りません** — `skk.open()` は
+`jisyo` → 埋め込み → ファイルの順に試し、いちばん良いものを使います。
+
+```powershell
+# 1. 辞書を落として、UTF-8 へ再ソート＋索引化する (skk_prep.py が検証まで行う)
+curl.exe -o SKK-JISYO.ML https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.ML
+python tools/skk_prep.py build SKK-JISYO.ML --max-size 0x880000 -o jisyo.bin
+
+# 2. パーティションへ書く (オフセットはテーブルから読まれる)
+parttool.py --port COM8 --partition-table-file build_tab5/partition_table/partition-table.bin `
+            write_partition --partition-name jisyo --input jisyo.bin
+```
+
+実測 (Tab5、2026-07-29):
+
+| 辞書 | 見出し | image | `skk.open()` | 変換 1 回 | 索引の探索 |
+|---|---:|---:|---:|---:|---:|
+| M (埋め込み、既定) | 8,346 | 303 KB | **0.2 ms** | 75 µs | 5 ライン |
+| **ML** | **48,750** | **1.86 MB** | **197 ms** | 76 µs | 6 ライン |
+| L | 175,790 | 8.07 MB | **826 ms** | 77 µs | 6 ライン |
+
+**辞書を 21 倍にしても変換は速くなりません — 遅くもなりません。** 索引が
+サンプリング木で、触るキャッシュラインが log₈ で増えるためです
+(docs/skk-ime-design.md §6.5)。
+
+`skk.open()` の時間はイメージ全体の CRC32 検証です (パーティションは
+ブートローダの検証範囲外なので、ここでしか壊れを検出できません)。1 回だけ
+かかり、日本語を打たないアプリは辞書に触りません。L の 826 ms が気になる
+なら ML を選んでください。
+
+⚠️ `--max-size` を必ず付けてください。パーティションより大きいイメージは
+**静かに切り詰められ**、切れたイメージは開けるし引けるのに切れ目から先だけ
+誤答します。
+
+`--strip-annotations` で候補の注釈を落とすと L が 538 KB 縮みます。
+`python tools/skk_prep.py inspect jisyo.bin --lookup かんじ` で中身を確認できます。
+仕組みは [`docs/skk-ime-design.md`](docs/skk-ime-design.md) を参照してください。
+
 ### 4. JavaScript を送る
 
 別のターミナルから、署名済みスクリプトを開発トピックへ送ります。
@@ -490,7 +532,7 @@ http.get("https://example.com/data.json", function (body, status) {
 - 重い処理は `setTimeout()` で分割し、イベントループへ制御を返してください
 - `delay()` は全アプリのイベント処理を止めるため、原則として使わないでください
 - タイマー粒度は約 10 ms です。高精度な信号生成は C 側の高水準 API として実装してください
-- MQTT で配信できるスクリプトは最大 64 KiB です
+- MQTT で配信できるスクリプトは最大 128 KiB です (`MQJS_SCRIPT_MAX`)
 - 署名はコードの出所を検証しますが、アプリごとの権限制御はまだ実装されていません
 
 より詳しい JavaScript サブセットと上限値は [examples/README.md](examples/README.md) を参照してください。

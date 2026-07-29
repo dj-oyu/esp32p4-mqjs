@@ -1,11 +1,31 @@
 # ESP32-P4 / 16MB flash. Custom table to add a LittleFS "storage" data
 # partition for persisting the most recently verified JS task.
+#
+# EVERY OFFSET IS WRITTEN OUT, deliberately. A blank offset means "right
+# after the previous one", so growing `factory` used to slide `storage`
+# and `coredump` down the flash — installed apps and settings would
+# vanish on the next flash with no warning at all, because littlefs
+# simply finds an unformatted partition and formats it. Spelled out, the
+# same edit overlaps instead and gen_esp32part.py fails the build.
+#
 # Name,     Type, SubType,  Offset,   Size
 nvs,        data, nvs,      0x9000,   0x6000
 phy_init,   data, phy,      0xf000,   0x1000
 factory,    app,  factory,  0x10000,  0x600000
-storage,    data, littlefs, ,         0x100000
+storage,    data, littlefs, 0x610000, 0x100000
 # coredump: panic backtrace saved to flash (read via esptool + esp-coredump),
 # for crashes the live console misses. Appended after storage so existing
 # offsets (nvs/littlefs) are unchanged.
-coredump,   data, coredump, ,         0x10000
+coredump,   data, coredump, 0x710000, 0x10000
+# jisyo: the SKK dictionary image, mmap'd and read in place — never
+# copied, never loaded (docs/skk-ime-design.md §6.6/§6.7). Added at the
+# tail of the previously unallocated 8.875 MB, so nothing above it moved
+# and no installed app was lost by introducing it.
+#
+# Sized for PINE (SKK-JISYO.L: 8.07 MB with the search tree) even though
+# bamboo (ML, 1.86 MB) is what gets flashed today. This is the last
+# partition and everything below it is empty, so the space costs nothing
+# until it is written; growing it later would mean re-flashing the table
+# on every device instead. Subtype 0x40 is the first of the custom data
+# range — no built-in subtype describes "a blob we mmap".
+jisyo,      data, 0x40,     0x720000, 0x880000

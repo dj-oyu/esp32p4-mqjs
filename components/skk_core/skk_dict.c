@@ -416,6 +416,91 @@ static int cand_next(cand_iter_t *it, const char **txt, size_t *len,
 }
 
 /* ================================================================== */
+/* The sampled search tree (skk_core.h, design §6.5).
+ *
+ * Every level's size comes from `count` and nothing else, so the writer
+ * and the reader compute the identical shape or they both compute the
+ * wrong one — there is no third outcome where they merely disagree.
+ * That is why the image stores one offset per block and no level table. */
+
+uint32_t skk_fan_levels(uint32_t count, uint32_t *lvl_n)
+{
+    uint32_t t = 0;
+    uint32_t n = count;
+
+    if (!lvl_n) {
+        return 0;
+    }
+    lvl_n[0] = count;
+    /* A level of n contributes n / SKK_FANOUT separators: the last key
+       of each COMPLETE group. The tail group gets none, and needs none —
+       a search that runs off the end of a level lands in it by default,
+       and it is shorter than SKK_FANOUT so it is still one line. */
+    while (n >= SKK_FANOUT && t + 1u < SKK_FAN_LEVELS_MAX) {
+        n /= SKK_FANOUT;
+        t++;
+        lvl_n[t] = n;
+    }
+    return t;
+}
+
+uint32_t skk_fan_total(uint32_t count)
+{
+    uint32_t lvl_n[SKK_FAN_LEVELS_MAX];
+    uint32_t t = skk_fan_levels(count, lvl_n);
+    uint32_t total = 0;
+
+    for (uint32_t k = 1; k <= t; k++) {
+        total += lvl_n[k];
+    }
+    return total;
+}
+
+void skk_fan_build(const uint64_t *keys, uint32_t count, uint64_t *fan)
+{
+    uint32_t lvl_n[SKK_FAN_LEVELS_MAX];
+    uint32_t t;
+    const uint64_t *src;
+    uint64_t *dst;
+
+    if (!keys || !fan) {
+        return;
+    }
+    t = skk_fan_levels(count, lvl_n);
+    src = keys;
+    dst = fan;
+    for (uint32_t k = 1; k <= t; k++) {
+        for (uint32_t j = 0; j < lvl_n[k]; j++) {
+            dst[j] = src[(j + 1u) * SKK_FANOUT - 1u];
+        }
+        src = dst;                       /* level k+1 samples level k */
+        dst += lvl_n[k];
+    }
+}
+
+/* Fill ix->lvl / ix->lvl_n from a validated header. `fan` may be NULL
+   (no tree in the image), which leaves the index searchable by
+   bisection. */
+static void fan_attach(skk_index_t *ix, const uint64_t *fan)
+{
+    uint32_t lvl_n[SKK_FAN_LEVELS_MAX];
+    uint32_t t = skk_fan_levels(ix->count, lvl_n);
+
+    ix->levels = 0;
+    ix->lvl[0] = ix->keys;
+    ix->lvl_n[0] = ix->count;
+    if (!fan || t == 0) {
+        return;
+    }
+    for (uint32_t k = 1; k <= t; k++) {
+        ix->lvl[k] = fan;
+        ix->lvl_n[k] = lvl_n[k];
+        fan += lvl_n[k];
+    }
+    ix->levels = (uint8_t)t;
+}
+
+/* ================================================================== */
 /* Opening an image */
 
 static uint32_t rd_u32(const uint8_t *p)
@@ -482,6 +567,8 @@ int skk_dict_open(skk_dict_t *d, skk_blob_t image, uint32_t flags)
     h.ari_count      = rd_u32(b + 40);
     h.ari_keys_off   = rd_u32(b + 44);
     h.ari_offs_off   = rd_u32(b + 48);
+    h.nasi_fan_off   = rd_u32(b + 52);
+    h.ari_fan_off    = rd_u32(b + 56);
 
     if (h.magic != SKK_IMAGE_MAGIC) {
         return SKK_ERR_MAGIC;
@@ -506,6 +593,15 @@ int skk_dict_open(skk_dict_t *d, skk_blob_t image, uint32_t flags)
         return SKK_ERR_TRUNCATED;
     }
     if (h.text_len == 0 && (h.nasi_count || h.ari_count)) {
+        return SKK_ERR_TRUNCATED;
+    }
+    /* The tree is optional — 0 means "built without one", and a block
+       under SKK_FANOUT never has one — but a non-zero offset must
+       describe a section that is really there. */
+    if ((h.nasi_fan_off != 0 &&
+         !sect_ok(h.nasi_fan_off, skk_fan_total(h.nasi_count), 8, 8, h.image_len)) ||
+        (h.ari_fan_off != 0 &&
+         !sect_ok(h.ari_fan_off, skk_fan_total(h.ari_count), 8, 8, h.image_len))) {
         return SKK_ERR_TRUNCATED;
     }
     if ((flags & SKK_OPEN_VERIFY) != 0) {
@@ -536,6 +632,13 @@ int skk_dict_open(skk_dict_t *d, skk_blob_t image, uint32_t flags)
         d->blk[SKK_BLK_ARI].keys = NULL;
         d->blk[SKK_BLK_ARI].offs = NULL;
     }
+
+    fan_attach(&d->blk[SKK_BLK_NASI],
+               h.nasi_fan_off ? (const uint64_t *)(const void *)(b + h.nasi_fan_off)
+                              : NULL);
+    fan_attach(&d->blk[SKK_BLK_ARI],
+               h.ari_fan_off ? (const uint64_t *)(const void *)(b + h.ari_fan_off)
+                             : NULL);
     return SKK_OK;
 }
 
@@ -554,18 +657,52 @@ int skk_dict_open(skk_dict_t *d, skk_blob_t image, uint32_t flags)
 static uint32_t key_lower_bound(const skk_index_t *ix, uint64_t key,
                                 uint32_t *probes)
 {
-    uint32_t lo = 0, hi = ix->count;
+    uint32_t lo, hi, i;
+    int k;
 
-    while (lo < hi) {
-        uint32_t mid = lo + ((hi - lo) >> 1);
-        if (probes) { (*probes)++; }
-        if (ix->keys[mid] < key) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    if (ix->levels == 0) {
+        /* No tree: a block under SKK_FANOUT, or an image built without
+           one. Bisection, exactly as before. */
+        lo = 0;
+        hi = ix->count;
+        while (lo < hi) {
+            uint32_t mid = lo + ((hi - lo) >> 1);
+            if (probes) { (*probes)++; }
+            if (ix->keys[mid] < key) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
+        return lo;
     }
-    return lo;
+
+    /* Descend the sampled tree. At every level the candidate window is
+       eight consecutive, 8-ALIGNED elements — one 64-byte line — because
+       every separator is itself one of the keys one level down:
+       lvl[k+1][j] == lvl[k][8j+7], so lvl[k+1][i-1] < key <= lvl[k+1][i]
+       bounds the answer at level k to [8i, 8i+8). The topmost level is
+       shorter than SKK_FANOUT (that is where skk_fan_levels stops), and
+       so is the tail group any level ends with, so the window is one line
+       in every case. `probes` counts lines touched, which is what the
+       search actually costs once the index is mmap'd flash. */
+    i = 0;
+    for (k = (int)ix->levels; k >= 0; k--) {
+        const uint64_t *a = ix->lvl[k];
+        uint32_t n = ix->lvl_n[k];
+
+        lo = (k == (int)ix->levels) ? 0u : i * SKK_FANOUT;
+        hi = (k == (int)ix->levels) ? n : lo + SKK_FANOUT;
+        if (hi > n) {
+            hi = n;
+        }
+        if (probes) { (*probes)++; }
+        while (lo < hi && a[lo] < key) {
+            lo++;
+        }
+        i = lo;
+    }
+    return i;
 }
 
 static int find_entry(const skk_dict_t *d, skk_blk_t blk,
@@ -859,6 +996,8 @@ int skk_index_verify(const skk_dict_t *d, skk_blk_t blk, uint32_t *out_at)
 {
     const skk_index_t *ix;
     size_t lo;
+    uint32_t k, seen;
+    int rc;
 
     if (out_at) {
         *out_at = 0;
@@ -874,8 +1013,31 @@ int skk_index_verify(const skk_dict_t *d, skk_blk_t blk, uint32_t *out_at)
         return SKK_ERR_ARG;
     }
     lo = (size_t)((const uint8_t *)d->text - d->image.base);
-    return index_check(d->image.base, lo, lo + d->text_len,
-                       ix->keys, ix->offs, ix->count, out_at);
+    rc = index_check(d->image.base, lo, lo + d->text_len,
+                     ix->keys, ix->offs, ix->count, out_at);
+    if (rc != SKK_OK) {
+        return rc;
+    }
+
+    /* The tree. Its whole contract is lvl[k+1][j] == lvl[k][8j+7]; break
+       that and the search still returns an index, just the wrong one. So
+       check it element by element rather than trusting the offsets that
+       skk_dict_open() bounds-checked. Reported as count + <flat index>
+       so a failure is distinguishable from a sort violation. */
+    seen = 0;
+    for (k = 1; k <= (uint32_t)ix->levels; k++) {
+        const uint64_t *up = ix->lvl[k];
+        const uint64_t *dn = ix->lvl[k - 1];
+
+        for (uint32_t j = 0; j < ix->lvl_n[k]; j++) {
+            if (up[j] != dn[(j + 1u) * SKK_FANOUT - 1u]) {
+                if (out_at) { *out_at = ix->count + seen + j; }
+                return SKK_ERR_FORMAT;
+            }
+        }
+        seen += ix->lvl_n[k];
+    }
+    return SKK_OK;
 }
 
 /* Same check before an image exists, i.e. straight on the arrays that
