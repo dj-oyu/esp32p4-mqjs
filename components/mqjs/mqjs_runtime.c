@@ -180,7 +180,7 @@ typedef struct {
         struct { uint8_t pin; uint8_t level; } gpio;
         struct { char *topic; char *payload; uint32_t len; } mqtt;
         struct { int16_t x, y; uint8_t kind; } touch;
-        struct { char text[8]; uint8_t len; } key; /* one key as UTF-8 */
+        struct { char text[64]; uint8_t len; } key; /* one key as UTF-8 */
         struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
@@ -194,6 +194,14 @@ typedef struct {
                        frees it), status<=0 = request failed */
     } u;
 } MqjsEvent;
+
+/* key.text は IME の確定文字列も運ぶので 8 バイトでは足りない。union は
+   ssh_closed の reason[84] が支配しているので、そこに収まる限り広げても
+   MqjsEvent は 1 バイトも太らない (riscv32 で 92B のまま)。キューは
+   MQJS_QUEUE_LEN 個をまるごと確保するので、超えたら静かに RAM を食う。 */
+_Static_assert(sizeof(((MqjsEvent *)0)->u.key)
+                   <= sizeof(((MqjsEvent *)0)->u.ssh_closed),
+               "widening key.text would grow every queued event");
 
 typedef struct {
     bool used;
@@ -1786,15 +1794,29 @@ void mqjs_post_key(const char *utf8, size_t len)
        blanked screen is swallowed here, exactly like the wake tap. */
     if (mqjs_power_note_input(2))
         return;
-    MqjsEvent ev = { .type = EV_KEY };
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
-    if (!s_event_queue || !fg->used || !fg->key_used || !utf8)
+    if (!s_event_queue || !fg->used || !fg->key_used || !utf8 || len == 0)
         return;
-    if (len == 0 || len > sizeof(ev.u.key.text))
-        return;
-    memcpy(ev.u.key.text, utf8, len);
-    ev.u.key.len = (uint8_t)len;
-    xQueueSend(s_event_queue, &ev, 0); /* full queue: drop, never block */
+    /* 1 イベントに入り切らない入力は捨てずに続きとして送る。IME の確定
+       文字列は 1 打鍵で 8 バイトを軽く超え、落とすと入力が黙って消える
+       (端末も textarea も順序さえ保てればよい)。切り口は必ず UTF-8 の
+       文字境界 — コードポイントの途中で切ると JS には壊れた文字が届く。 */
+    while (len) {
+        MqjsEvent ev = { .type = EV_KEY };
+        size_t n = len;
+        if (n > sizeof ev.u.key.text) {
+            n = sizeof ev.u.key.text;
+            while (n && ((unsigned char)utf8[n] & 0xC0) == 0x80)
+                n--;                   /* 継続バイトの手前まで戻す */
+            if (n == 0)
+                return;                /* 1 文字が入らない = 不正な UTF-8 */
+        }
+        memcpy(ev.u.key.text, utf8, n);
+        ev.u.key.len = (uint8_t)n;
+        xQueueSend(s_event_queue, &ev, 0); /* full queue: drop, never block */
+        utf8 += n;
+        len -= n;
+    }
 #else
     (void)utf8;
     (void)len;
@@ -5787,7 +5809,7 @@ JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     const char *k = JS_ToCStringLen(ctx, &klen, argv[1], &kbuf);
     if (!k)
         return JS_EXCEPTION;
-    char key[16]; /* mqjs key events are char[8]; the spare absorbs abuse */
+    char key[16]; /* 打鍵 1 つはこれで足りる; 余りは異常入力の吸収代 */
     if (klen > sizeof key)
         klen = sizeof key;
     memcpy(key, k, klen);
