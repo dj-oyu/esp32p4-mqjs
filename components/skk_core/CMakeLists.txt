@@ -41,6 +41,86 @@ set(SKK_SRCS "skk_kana.c" "skk_dict.c" "skk_builtin.c")
 # the top of skk_dict_image.S — this is a real failure that appears and
 # disappears with unrelated commits.
 set(SKK_IMAGE "${CMAKE_CURRENT_LIST_DIR}/skk_dict.bin")
+set(SKK_JISYO_IMAGE "${CMAKE_CURRENT_LIST_DIR}/skk_jisyo.bin")
+
+# Whether an image EXISTS decides what gets compiled and flashed, and
+# that is decided at configure time — so CMake has to re-run when one
+# appears or disappears.
+#
+# The files themselves cover the DELETE direction: without them, removing
+# skk_dict.bin from a tree configured with it leaves ninja chasing a
+# missing dependency ("needed by skk_dict_image.S.obj, missing and no
+# known rule to make it") instead of taking the no-dictionary path.
+#
+# The DIRECTORY covers the create direction, which the files cannot:
+# CMake drops paths that do not exist at configure time, so an image that
+# was absent and then appears would otherwise be ignored until the next
+# reconfigure — and the symptom is a firmware quietly built without a
+# dictionary. A directory's mtime changes when a file is created or
+# removed in it and NOT when one is edited, so this does not re-run on
+# every source edit.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${SKK_IMAGE}" "${SKK_JISYO_IMAGE}" "${CMAKE_CURRENT_LIST_DIR}")
+
+# Build <out> from SKK-JISYO.<want>, or leave it alone when no source
+# directory is configured. Sets <done_var> to TRUE when it really ran, so
+# the caller can tell "this is the dictionary you asked for" from "this
+# is whatever was there".
+#
+# At CONFIGURE time, not as a build rule: the embedded image is an input
+# to the .S below, and skk_prep.py verifies the whole thing (seconds for
+# M, ~30 s for L) — it must not re-run on every incremental build.
+# menuconfig reconfigures, which is when a changed choice should act.
+function(skk_make_image want out max_size done_var)
+    set(${done_var} FALSE PARENT_SCOPE)
+    if(NOT want OR NOT CONFIG_MQJS_SKK_DICT_SOURCE_DIR OR
+       CONFIG_MQJS_SKK_DICT_SOURCE_DIR STREQUAL "")
+        return()
+    endif()
+    get_filename_component(src_dir "${CONFIG_MQJS_SKK_DICT_SOURCE_DIR}"
+                           ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    set(src "${src_dir}/SKK-JISYO.${want}")
+    if(NOT EXISTS "${src}")
+        message(FATAL_ERROR
+            "skk_core: CONFIG_MQJS_SKK_DICT_SOURCE_DIR is set but ${src} is "
+            "not there. Get it from https://github.com/skk-dev/dict , or "
+            "clear the option to use the prepared .bin files as they are.")
+    endif()
+    set(prep_args "")
+    if(CONFIG_MQJS_SKK_DICT_STRIP_ANNOTATIONS)
+        list(APPEND prep_args "--strip-annotations")
+    endif()
+    if(max_size)
+        list(APPEND prep_args "--max-size" "${max_size}")
+    endif()
+    message(STATUS "skk_core: building the ${want} image from ${src}")
+    idf_build_get_property(py PYTHON)
+    execute_process(
+        COMMAND ${py} "${CMAKE_SOURCE_DIR}/tools/skk_prep.py" build
+                "${src}" -o "${out}" -q ${prep_args}
+        RESULT_VARIABLE rc OUTPUT_VARIABLE out_txt ERROR_VARIABLE err_txt)
+    if(NOT rc EQUAL 0)
+        # Loud on purpose: a half-written or unverified dictionary does
+        # not crash, it answers wrong for some words (§6.1).
+        message(FATAL_ERROR "skk_core: tools/skk_prep.py failed (${rc})\n"
+                            "${out_txt}${err_txt}")
+    endif()
+    set(${done_var} TRUE PARENT_SCOPE)
+endfunction()
+
+# Read nasi_count out of an image header (offset 28, little endian —
+# skk_image_hdr_t). Reporting what the file ACTUALLY holds rather than
+# what menuconfig asked for: without regeneration the two differ, and
+# printing the choice next to a stale file is how you end up debugging
+# the wrong dictionary.
+function(skk_image_headings path out_var)
+    file(READ "${path}" hdr HEX OFFSET 28 LIMIT 4)
+    string(REGEX MATCHALL ".." bytes "${hdr}")
+    list(REVERSE bytes)
+    string(JOIN "" hex ${bytes})
+    math(EXPR n "0x${hex}")
+    set(${out_var} "${n}" PARENT_SCOPE)
+endfunction()
 
 if(CONFIG_MQJS_SKK_DICT_NONE)
     set(SKK_WANT "")
@@ -59,42 +139,8 @@ if(CONFIG_MQJS_SKK_DICT_NONE)
     # or the choice would be silently ignored on a tree that once built
     # one.
     set(SKK_IMAGE "")
-elseif(SKK_WANT AND CONFIG_MQJS_SKK_DICT_SOURCE_DIR AND
-       NOT CONFIG_MQJS_SKK_DICT_SOURCE_DIR STREQUAL "")
-    # Regenerate. Done at CONFIGURE time, not as a build rule: the image
-    # is an input to the .S below, skk_prep.py verifies the whole thing
-    # (a few seconds for M, ~30 s for L) and it must not re-run on every
-    # incremental build. Reconfigure to pick up a changed choice — which
-    # menuconfig does anyway.
-    get_filename_component(SKK_SRC_DIR "${CONFIG_MQJS_SKK_DICT_SOURCE_DIR}"
-                           ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
-    set(SKK_SRC_FILE "${SKK_SRC_DIR}/SKK-JISYO.${SKK_WANT}")
-    if(NOT EXISTS "${SKK_SRC_FILE}")
-        message(FATAL_ERROR
-            "skk_core: CONFIG_MQJS_SKK_DICT_SOURCE_DIR is set but "
-            "${SKK_SRC_FILE} is not there. Get it from "
-            "https://github.com/skk-dev/dict , or clear the option to use "
-            "components/skk_core/skk_dict.bin as it is.")
-    endif()
-    set(SKK_PREP_ARGS "")
-    if(CONFIG_MQJS_SKK_DICT_STRIP_ANNOTATIONS)
-        list(APPEND SKK_PREP_ARGS "--strip-annotations")
-    endif()
-    message(STATUS "skk_core: building the ${SKK_WANT} image from ${SKK_SRC_FILE}")
-    idf_build_get_property(skk_python PYTHON)
-    execute_process(
-        COMMAND ${skk_python} "${CMAKE_SOURCE_DIR}/tools/skk_prep.py" build
-                "${SKK_SRC_FILE}" -o "${SKK_IMAGE}" -q ${SKK_PREP_ARGS}
-        RESULT_VARIABLE skk_prep_rc
-        OUTPUT_VARIABLE skk_prep_out
-        ERROR_VARIABLE  skk_prep_err)
-    if(NOT skk_prep_rc EQUAL 0)
-        # Loud on purpose: a half-written or unverified dictionary does
-        # not crash, it answers wrong for some words (§6.1).
-        message(FATAL_ERROR "skk_core: tools/skk_prep.py failed (${skk_prep_rc})\n"
-                            "${skk_prep_out}${skk_prep_err}")
-    endif()
-    set(SKK_REGENERATED TRUE)
+else()
+    skk_make_image("${SKK_WANT}" "${SKK_IMAGE}" "" SKK_REGENERATED)
 endif()
 
 if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
@@ -113,18 +159,7 @@ if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
                  APPEND PROPERTY OBJECT_DEPENDS "${SKK_IMAGE}")
     file(SIZE "${SKK_IMAGE}" SKK_IMAGE_BYTES)
 
-    # Report what is ACTUALLY in the image, not what menuconfig asked
-    # for. Without regeneration the two can differ — skk_dict.bin is
-    # whatever was built last — and printing the choice next to a stale
-    # file is how you end up debugging the wrong dictionary. The heading
-    # count is nasi_count at offset 28 of skk_image_hdr_t (little endian,
-    # skk_core.h).
-    file(READ "${SKK_IMAGE}" SKK_HDR HEX OFFSET 28 LIMIT 4)
-    string(REGEX MATCHALL ".." SKK_HDR_BYTES "${SKK_HDR}")
-    list(REVERSE SKK_HDR_BYTES)
-    string(JOIN "" SKK_HDR_HEX ${SKK_HDR_BYTES})
-    math(EXPR SKK_IMAGE_NASI "0x${SKK_HDR_HEX}")
-
+    skk_image_headings("${SKK_IMAGE}" SKK_IMAGE_NASI)
     if(SKK_REGENERATED)
         message(STATUS "skk_core: embedding the ${SKK_WANT} dictionary — "
                        "${SKK_IMAGE_BYTES} B, ${SKK_IMAGE_NASI} okuri-nasi headings")
@@ -145,4 +180,62 @@ else()
                     "CONFIG_MQJS_SKK_DICT_SOURCE_DIR to a directory holding "
                     "SKK-JISYO.${SKK_WANT}, run tools/skk_prep.py yourself, or "
                     "flash the `jisyo` partition (README 3.5).")
+endif()
+
+# ------------------------------------------------------------------
+# The `jisyo` partition — where a big dictionary actually belongs.
+#
+# Same bytes, same mmap, same search speed as the embedded copy, but it
+# does not compete with the code for the 6 MB app partition, it can hold
+# pine (8.07 MB) which the app partition never could, and replacing it
+# does not mean rebuilding and re-flashing the firmware.
+#
+# Registered with esptool_py_flash_to_partition so plain `idf.py flash`
+# delivers it — the offset comes from the partition table rather than
+# from a number written down twice. `idf.py app-flash` does not touch it
+# and the contents survive, so the day-to-day loop is unaffected.
+
+if(CONFIG_MQJS_SKK_JISYO_M)
+    set(SKK_JISYO_WANT "M")
+elseif(CONFIG_MQJS_SKK_JISYO_L)
+    set(SKK_JISYO_WANT "L")
+elseif(CONFIG_MQJS_SKK_JISYO_NONE)
+    set(SKK_JISYO_WANT "")
+else()
+    set(SKK_JISYO_WANT "ML")
+endif()
+
+if(SKK_JISYO_WANT)
+    # --max-size is the partition's, so an oversized dictionary is refused
+    # here rather than truncated at the boundary at flash time — and a
+    # truncated image is not obviously broken, it opens and searches and
+    # answers wrong past the cut.
+    partition_table_get_partition_info(SKK_JISYO_SIZE
+                                       "--partition-name jisyo" "size")
+    skk_make_image("${SKK_JISYO_WANT}" "${SKK_JISYO_IMAGE}"
+                   "${SKK_JISYO_SIZE}" SKK_JISYO_REGENERATED)
+endif()
+
+if(SKK_JISYO_WANT AND EXISTS "${SKK_JISYO_IMAGE}")
+    file(SIZE "${SKK_JISYO_IMAGE}" SKK_JISYO_BYTES)
+    skk_image_headings("${SKK_JISYO_IMAGE}" SKK_JISYO_NASI)
+    esptool_py_flash_to_partition(flash "jisyo" "${SKK_JISYO_IMAGE}")
+    if(SKK_JISYO_REGENERATED)
+        message(STATUS "skk_core: `idf.py flash` will write the "
+                       "${SKK_JISYO_WANT} dictionary to `jisyo` — "
+                       "${SKK_JISYO_BYTES} B, ${SKK_JISYO_NASI} okuri-nasi headings")
+    else()
+        message(STATUS "skk_core: `idf.py flash` will write skk_jisyo.bin to "
+                       "`jisyo` as it stands — ${SKK_JISYO_BYTES} B, "
+                       "${SKK_JISYO_NASI} okuri-nasi headings. The menuconfig "
+                       "choice (${SKK_JISYO_WANT}) only takes effect once "
+                       "CONFIG_MQJS_SKK_DICT_SOURCE_DIR is set")
+    endif()
+elseif(SKK_JISYO_WANT)
+    # Not fatal: a fresh clone has neither the source dictionaries nor a
+    # prepared image, and must still build and flash.
+    message(STATUS "skk_core: no skk_jisyo.bin, so `jisyo` is left alone. "
+                   "Set CONFIG_MQJS_SKK_DICT_SOURCE_DIR to a directory holding "
+                   "SKK-JISYO.${SKK_JISYO_WANT} and the build will prepare and "
+                   "flash it (README 3.5)")
 endif()

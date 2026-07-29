@@ -306,29 +306,59 @@ Tab5 は USB の DTR/RTS リセットが効かない場合があるため、書�
 古いパーティション構成を書き込んだことがある端末では、最初に一度だけ
 `idf.py ... erase-flash` が必要です。LittleFS と NVS の保存内容は消えます。
 
-### 3.5. 日本語入力の辞書を入れる (任意)
+### 3.5. 日本語入力の辞書 (任意)
 
-SKK IME は辞書なしでも動きます (`SKK-JISYO.M` 約 8,300 見出しがファームに
-埋め込まれるため)。語彙を増やすには `jisyo` パーティションへ大きい辞書を
-焼きます。**アプリ側の変更は要りません** — `skk.open()` は
-`jisyo` → 埋め込み → ファイルの順に試し、いちばん良いものを使います。
+**辞書の置き場所は 2 か所**あります。どちらもフラッシュを mmap してその場で
+読むので、**探索速度は同じ**です。違うのは場所の性質だけ:
 
-> **ファームに埋め込む辞書は menuconfig で選べます** (`mqjs SKK Japanese
-> input`)。ただし埋め込みは `jisyo` が無いときの受け皿で、**語彙を増やす
-> 手段としてはパーティションのほうが正解**です — mmap するので速度は同じ、
-> app image を太らせず、再ビルドなしで差し替えられます。ML を埋め込むと
-> `factory` の残りが 2% になります。埋め込みを消して 303 KB 取り戻すなら
-> `CONFIG_MQJS_SKK_DICT_NONE=y`。詳細は `sdkconfig.tab5.defaults.example`。
+| | ファーム埋め込み | **`jisyo` パーティション** |
+|---|---|---|
+| 場所 | `factory` の中 (6 MB、コードと共有) | 専用 8.5 MB |
+| 上限 | ML で残り 2%、L は入らない | L (8.07 MB) も入る |
+| 差し替え | ファーム再ビルド + 4.5 MB 再書き込み | 辞書だけ書けば済む |
+| `skk.open()` | 175 µs | 197 ms (竹) — CRC32 の分 |
+
+**`skk.open()` の 197 ms はパーティションだからではなく、誰も検証していない
+から**です。埋め込みはブートローダが毎起動 app image 全体を SHA-256 検証
+しているので、そのぶんを省けます。
+
+既定はこうなっています:
+
+- **埋め込み = M** (8,346 見出し、303 KB) — パーティションが空のときの受け皿
+- **パーティション = ML** (48,750 見出し、1.86 MB) — `idf.py flash` が一緒に焼く
+
+**辞書のソースを置く場所だけ教えてください。** あとはビルドが
+`tools/skk_prep.py` で image を作り、`idf.py flash` がパーティションまで
+書きます (オフセットはパーティションテーブルから読まれます)。
 
 ```powershell
-# 1. 辞書を落として、UTF-8 へ再ソート＋索引化する (skk_prep.py が検証まで行う)
-curl.exe -o SKK-JISYO.ML https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.ML
-python tools/skk_prep.py build SKK-JISYO.ML --max-size 0x880000 -o jisyo.bin
+mkdir ..\skk-dict; cd ..\skk-dict
+curl.exe -O https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.M
+curl.exe -O https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.ML
+cd ..\esp32p4-mqjs
+```
 
-# 2. パーティションへ書く (オフセットはテーブルから読まれる)
+`sdkconfig.tab5.defaults` に置き場所を書きます。
+
+```ini
+CONFIG_MQJS_SKK_DICT_SOURCE_DIR="../skk-dict"
+```
+
+あとは通常どおり `idf.py ... flash` するだけです。ML は `idf.py flash` を
+約 9 秒伸ばしますが、**`idf.py app-flash` は触らず中身も残る**ので、日々の
+開発ループには影響しません。
+
+辞書だけ後から差し替えるなら:
+
+```powershell
+python tools/skk_prep.py build ..\skk-dict\SKK-JISYO.L --max-size 0x880000 -o jisyo.bin
 parttool.py --port COM8 --partition-table-file build_tab5/partition_table/partition-table.bin `
             write_partition --partition-name jisyo --input jisyo.bin
 ```
+
+どちらの辞書も menuconfig (`mqjs SKK Japanese input`) で none/S/M/ML/L から
+選べます。埋め込みを `none` にすると 303 KB 戻ります (パーティションが必ず
+ある端末向け)。ソースが無いときはどちらも黙って飛ばされ、ビルドは通ります。
 
 実測 (Tab5、2026-07-29):
 

@@ -75,22 +75,29 @@ CONFIG_MQJS_TAB5_AUDIO=y
 # CONFIG_OPUS_PLAYER_BOOT_OPUS=y
 # CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY=y
 
-# --- SKK Japanese input: which dictionary goes INTO the firmware -------
-# The default (M, ~8,300 headings, 303 KB) needs nothing set here. It is
-# only the fallback: skk.open() prefers the `jisyo` partition, so the way
-# to get a big dictionary is to flash one there (README 3.5), not to grow
-# the app image.
-#
-# CONFIG_MQJS_SKK_DICT_NONE=y      # no dictionary in the image (-303 KB);
-#                                  # the device must have `jisyo` flashed
-# CONFIG_MQJS_SKK_DICT_S=y         # 3,379 headings, 117 KB
-# CONFIG_MQJS_SKK_DICT_ML=y        # 48,750 headings, 1.86 MB — links with
-#                                  # only 2% of `factory` left; prefer the
-#                                  # partition
-#
-# The choice above is only ACTED ON when this points at a directory
-# holding SKK-JISYO.{S,M,ML,L} from https://github.com/skk-dev/dict ;
-# the build then regenerates the image with tools/skk_prep.py. Left
-# empty, components/skk_core/skk_dict.bin is used exactly as it is and
-# the build prints how many headings it actually contains.
+# --- SKK Japanese input: where the dictionaries come from -------------
+# Point this at a directory holding SKK-JISYO.{S,M,ML,L} from
+# https://github.com/skk-dev/dict and the build prepares BOTH images with
+# tools/skk_prep.py (UTF-8 re-sort + full verification), and `idf.py
+# flash` writes the partition one for you. Leave it empty and the
+# prepared .bin files are used as they are; with neither, the build says
+# so and still succeeds.
 # CONFIG_MQJS_SKK_DICT_SOURCE_DIR="../skk-dict"
+#
+# Two places, same mmap and the same search speed. The partition does not
+# compete with the code for the 6 MB app partition, holds up to 8.5 MB,
+# and can be replaced without rebuilding. Defaults: M built in (the
+# fallback when the partition is empty), ML in the partition.
+#
+# CONFIG_MQJS_SKK_DICT_NONE=y    # nothing built in (-303 KB). Fine when
+#                                # the partition is always flashed.
+# CONFIG_MQJS_SKK_DICT_S=y       # 3,379 headings, 117 KB
+# CONFIG_MQJS_SKK_DICT_ML=y      # 48,750 headings, 1.86 MB — links, but
+#                                # leaves `factory` 2% free. Prefer the
+#                                # partition.
+#
+# CONFIG_MQJS_SKK_JISYO_NONE=y   # `idf.py flash` leaves `jisyo` alone
+# CONFIG_MQJS_SKK_JISYO_L=y      # 175,790 headings, 8.07 MB. Adds ~34 s
+#                                # to `idf.py flash` and makes skk.open()
+#                                # 826 ms instead of 197 ms (the CRC).
+#                                # Conversion speed is identical.

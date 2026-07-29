@@ -71,10 +71,59 @@ config MQJS_SKK_DICT_L
 
 endchoice
 
+choice MQJS_SKK_JISYO_DICT
+    prompt "Dictionary written to the `jisyo` partition by `idf.py flash`"
+    default MQJS_SKK_JISYO_ML
+    help
+        THIS is where a big dictionary belongs. The partition is mmap'd
+        and read in place, exactly like the built-in image, so the search
+        is the same speed — but it costs the app image nothing, it can
+        hold pine (8.07 MB) which the app partition never could, and it
+        can be replaced without rebuilding the firmware.
+
+        Needs MQJS_SKK_DICT_SOURCE_DIR set (the image is generated from
+        the SKK-JISYO source) or a prepared components/skk_core/
+        skk_jisyo.bin. With neither, the build says so and skips the
+        step: `idf.py flash` still works and the device falls back to
+        whatever is built in.
+
+        `idf.py flash` then writes ~1.9 MB more, about 9 seconds.
+        `idf.py app-flash` does not, and the partition survives it — so
+        the day-to-day loop is unaffected.
+
+config MQJS_SKK_JISYO_NONE
+    bool "none — leave the partition alone"
+    help
+        `idf.py flash` does not touch `jisyo`. Whatever was flashed there
+        before stays. Use tools: parttool.py write_partition (README 3.5).
+
+config MQJS_SKK_JISYO_M
+    bool "M — 8,346 headings (303 KB)"
+    help
+        The same dictionary the firmware already carries. Pointless
+        unless the built-in one is set to `none`.
+
+config MQJS_SKK_JISYO_ML
+    bool "ML — 48,750 headings (1.86 MB)"
+    help
+        The default. 4,349 okuri-ari entries against M's 1,412, which is
+        the number that decides whether conjugated verbs and adjectives
+        convert — i.e. whether continuous Japanese writing works at all.
+
+config MQJS_SKK_JISYO_L
+    bool "L — 175,790 headings (8.07 MB)"
+    help
+        Everything. Fits the 8.5 MB partition. Two costs: `idf.py flash`
+        writes 8 MB (~34 s), and skk.open() spends 826 ms verifying the
+        CRC once per app rather than 197 ms. Conversion speed is
+        identical — the index is a sampled tree, so it is 6 cache lines
+        either way.
+
+endchoice
+
 config MQJS_SKK_DICT_SOURCE_DIR
     string "Directory holding SKK-JISYO.{S,M,ML,L}"
     default ""
-    depends on !MQJS_SKK_DICT_NONE
     help
         Absolute path, or relative to the project root. Empty means "do
         not regenerate": the build uses components/skk_core/skk_dict.bin
