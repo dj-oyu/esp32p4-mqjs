@@ -143,6 +143,11 @@ const char *ime_preedit(const ime_t *im, size_t *len)
     return skk_preedit(&im->skk, len);
 }
 
+int ime_preedit_spans(const ime_t *im, const skk_span_t **out)
+{
+    return skk_preedit_spans(&im->skk, out);
+}
+
 int ime_mode(const ime_t *im) { return im->mode; }
 int ime_cand_count(const ime_t *im) { return im->ncand; }
 

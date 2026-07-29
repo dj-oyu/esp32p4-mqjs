@@ -131,6 +131,11 @@ static void fk_add(const char *reading, int blk, const char *const *cands)
 
 static void fk_init(void)
 {
+    /* Long enough that ▼ + this overruns SKK_PREEDIT_MAX (192): a
+       candidate is bounded by SKK_COMMIT_MAX (256), not by the preedit,
+       so pre_add really does clip in v mode. 66 x 3 B = 198 B. */
+    static char        longc[199];
+    static const char *longcand[] = { longc, NULL };
     static const char *const kanji[] = { "漢字", "感じ", "幹事", NULL };
     static const char *const okuru[] = { "送", "贈", NULL };
     static const char *const motsu[] = { "持", NULL };
@@ -144,8 +149,13 @@ static void fk_init(void)
 
     g_blob_len = 0;
     g_fk_n     = 0;
+    for (int i = 0; i < 66; i++)
+        memcpy(longc + i * 3, "あ", 3);
+    longc[198] = '\0';
+
     fk_add("かんじ", SKK_BLK_NASI, kanji);
     fk_add("おくr", SKK_BLK_ARI, okuru);
+    fk_add("ためs", SKK_BLK_ARI, longcand);
     fk_add("もt", SKK_BLK_ARI, motsu);
     fk_add("かん", SKK_BLK_NASI, kan);
     fk_add("かんじゃ", SKK_BLK_NASI, kanja);
@@ -1341,6 +1351,169 @@ static bool invariants(uint32_t st, const char **why)
     return true;
 }
 
+/* The spans must PARTITION the preedit — no gaps, no overlaps, no empty
+   entries, ending exactly at the last byte. A renderer walks them
+   instead of the string, so a hole is a hole in what gets painted. */
+static void spans_partition(const char *what)
+{
+    const skk_span_t *sp = NULL;
+    int n = skk_preedit_spans(&g_s, &sp);
+    size_t plen = 0;
+    const char *pre = skk_preedit(&g_s, &plen);
+    size_t at = 0;
+    int i;
+
+    (void)pre;
+    for (i = 0; i < n; i++) {
+        CHECK(sp[i].off == at, "%s: span %d starts at %u, want %u",
+              what, i, (unsigned)sp[i].off, (unsigned)at);
+        CHECK(sp[i].len > 0, "%s: span %d is empty", what, i);
+        at += sp[i].len;
+    }
+    CHECK(at == plen, "%s: spans cover %u of %u bytes",
+          what, (unsigned)at, (unsigned)plen);
+}
+
+/* kinds[] in order, -1 terminated */
+static void spans_are(const char *what, const int *kinds)
+{
+    const skk_span_t *sp = NULL;
+    int n = skk_preedit_spans(&g_s, &sp);
+    int i = 0;
+
+    while (kinds[i] >= 0)
+        i++;
+    CHECK(n == i, "%s: %d spans, want %d", what, n, i);
+    if (n != i)
+        return;
+    for (i = 0; kinds[i] >= 0; i++)
+        CHECK(sp[i].kind == (uint16_t)kinds[i],
+              "%s: span %d kind=%u, want %d", what, i,
+              (unsigned)sp[i].kind, kinds[i]);
+    spans_partition(what);
+}
+
+/* Byte-compare one span against a literal. */
+static void span_is(const char *what, int i, const char *want)
+{
+    const skk_span_t *sp = NULL;
+    int n = skk_preedit_spans(&g_s, &sp);
+    const char *pre = skk_preedit(&g_s, NULL);
+
+    if (i >= n) {
+        CHECK(0, "%s: no span %d (have %d)", what, i, n);
+        return;
+    }
+    CHECK(sp[i].len == strlen(want) &&
+          memcmp(pre + sp[i].off, want, sp[i].len) == 0,
+          "%s: span %d = \"%.*s\", want \"%s\"", what, i,
+          (int)sp[i].len, pre + sp[i].off, want);
+}
+
+static void t_spans(void)
+{
+    static const int K_NONE[]    = { -1 };
+    static const int K_ROMA[]    = { SKK_SPAN_ROMA, -1 };
+    static const int K_READ[]    = { SKK_SPAN_MARK, SKK_SPAN_READING, -1 };
+    static const int K_READ_R[]  = { SKK_SPAN_MARK, SKK_SPAN_READING,
+                                     SKK_SPAN_ROMA, -1 };
+    static const int K_OKURI[]   = { SKK_SPAN_MARK, SKK_SPAN_READING,
+                                     SKK_SPAN_SEP, SKK_SPAN_OKURI, -1 };
+    static const int K_SELECT[]  = { SKK_SPAN_MARK, SKK_SPAN_CAND,
+                                     SKK_SPAN_OKURI, -1 };
+    size_t plen;
+
+    /* Nothing composing: nothing to paint. */
+    begin("spans/idle");
+    spans_are("idle", K_NONE);
+
+    /* Plain kana leaves only the romaji that has not resolved yet. */
+    begin("spans/roma");
+    feed("ky");
+    EQ_PRE("ky");
+    spans_are("roma", K_ROMA);
+    span_is("roma", 0, "ky");
+
+    begin("spans/midashi");
+    feed("Kanji");
+    EQ_PRE("▽かんじ");
+    spans_are("midashi", K_READ);
+    span_is("midashi", 0, "▽");     /* the real U+25BD, not an ASCII stand-in */
+    span_is("midashi", 1, "かんじ");
+
+    /* An unresolved tail is its own span, so the renderer can leave it
+       undecorated while the settled reading is underlined. */
+    begin("spans/midashi-tail");
+    feed("Kany");
+    EQ_PRE("▽かny");
+    spans_are("midashi-tail", K_READ_R);
+    span_is("midashi-tail", 1, "か");
+    span_is("midashi-tail", 2, "ny");
+
+    /* An empty part records NOTHING rather than a zero-length span:
+       "K" opens the span but its reading is still empty, and only the
+       unresolved "k" follows the marker. */
+    begin("spans/empty-reading");
+    feed("K");
+    EQ_PRE("▽k");
+    spans_are("empty-reading", (const int[]){ SKK_SPAN_MARK,
+                                              SKK_SPAN_ROMA, -1 });
+    span_is("empty-reading", 1, "k");
+
+    /* The okurigana consonant is romaji until its kana lands, so the
+       '*' is already its own span while "r" still trails. */
+    begin("spans/okuri-sep");
+    feed("OkuR");
+    EQ_PRE("▽おく*r");
+    spans_are("okuri-sep", (const int[]){ SKK_SPAN_MARK, SKK_SPAN_READING,
+                                          SKK_SPAN_SEP, SKK_SPAN_ROMA, -1 });
+    span_is("okuri-sep", 1, "おく");
+    span_is("okuri-sep", 2, "*");
+    span_is("okuri-sep", 3, "r");
+    (void)K_OKURI; /* the ~ form with kana in the okurigana converts on
+                      the spot, so it never reaches a repaint */
+
+    /* ---- THE CASE A PARSER CANNOT DO ----
+       In v the candidate and the okurigana are concatenated with no
+       separator, so "▼送る" gives a downstream reader no way to know
+       whether る belongs to the candidate or is the okurigana. The
+       spans say. */
+    begin("spans/select");
+    feed("OkuRu");
+    CHECK(skk_mode(&g_s) == SKK_MODE_SELECT, "mode=%d", skk_mode(&g_s));
+    EQ_PRE("▼送る");
+    spans_are("select", K_SELECT);
+    span_is("select", 0, "▼");
+    span_is("select", 1, "送");   /* candidate: NOT "送る" */
+    span_is("select", 2, "る");   /* okurigana */
+
+    /* Walking the candidates re-spans against the new one. */
+    feed(" ");
+    EQ_PRE("▼贈る");
+    spans_are("select-next", K_SELECT);
+    span_is("select-next", 1, "贈");
+    span_is("select-next", 2, "る");
+
+    /* Committing leaves nothing composed. */
+    feed("\n");
+    spans_are("after-commit", K_NONE);
+
+    /* A DROPPED APPEND. A candidate is bounded by SKK_COMMIT_MAX (256),
+       not by SKK_PREEDIT_MAX (192), so v mode is where pre_add refuses
+       one — and it drops the whole append rather than truncating it. A
+       span that claimed those bytes anyway would send the renderer far
+       past the end of the string, so the partition check is the net.
+       First prove the drop really happened, or it proves nothing. */
+    begin("spans/dropped");
+    feed("TameSu");
+    CHECK(skk_mode(&g_s) == SKK_MODE_SELECT, "mode=%d", skk_mode(&g_s));
+    plen = strlen(skk_preedit(&g_s, NULL));
+    CHECK(plen < 198, "the 198 B candidate was not dropped (preedit %u B) "
+          "— the checks below would prove nothing", (unsigned)plen);
+    spans_are("dropped", (const int[]){ SKK_SPAN_MARK, SKK_SPAN_OKURI, -1 });
+    span_is("dropped", 1, "す");
+}
+
 static void t_soak(void)
 {
     /* Random bytes almost never spell a reading the dictionary has, so
@@ -1432,6 +1605,7 @@ int main(void)
     t_limits();
     t_badutf8();
     t_misc();
+    t_spans();
     t_soak();
 
 #ifdef SKK_WRAP_ALLOC

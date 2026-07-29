@@ -133,6 +133,12 @@ void     ime_view_clear(ime_t *im);
 
 const char *ime_text(const ime_t *im, size_t *len);    /* after IME_TEXT */
 const char *ime_preedit(const ime_t *im, size_t *len);
+
+/* The parts of the preedit, for a renderer that paints the reading, the
+   chosen candidate and the okurigana differently. A straight forward of
+   skk_preedit_spans() — the composition rule stays in the one place
+   that composes. */
+int ime_preedit_spans(const ime_t *im, const skk_span_t **out);
 int         ime_mode(const ime_t *im);                 /* skk_mode_t */
 int         ime_cand_count(const ime_t *im);
 int         ime_sel(const ime_t *im);                  /* -1 outside SELECT */

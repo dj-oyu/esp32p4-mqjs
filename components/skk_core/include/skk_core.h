@@ -543,6 +543,43 @@ int  skk_mru_save(const skk_mru_t *m, char *buf, size_t cap, size_t *out_len);
 int  skk_mru_load(skk_mru_t *m, const char *buf, size_t len);
 
 /* ------------------------------------------------------------------ */
+/* How the preedit is composed.
+ *
+ * The renderer wants to paint the parts differently — the reading is
+ * provisional input, a chosen candidate is not, and the okurigana is a
+ * third thing again — and it CANNOT work the boundaries out from the
+ * string. In SELECT the candidate and the okurigana are concatenated
+ * with no separator at all (skk_kana.c build_preedit), so "ﾃｷｽﾄ + り"
+ * and a candidate that happens to end in り are the same bytes. Only
+ * this engine knows the lengths.
+ *
+ * So build_preedit records the spans AS IT BUILDS rather than anything
+ * downstream re-deriving the rule. There is exactly one description of
+ * how a preedit is put together, and it is the code that puts it
+ * together.
+ *
+ * The spans PARTITION the preedit: concatenating them in order gives
+ * skk_preedit() back, byte for byte. A renderer that wants to drop the
+ * ▽/▼ marker just skips that span instead of slicing the string. */
+typedef enum {
+    SKK_SPAN_MARK = 0,  /* ▽ (U+25BD) or ▼ (U+25BC) */
+    SKK_SPAN_READING,   /* the reading being typed, in ▽ */
+    SKK_SPAN_CAND,      /* the selected candidate, in ▼ */
+    SKK_SPAN_SEP,       /* the '*' between reading and okurigana */
+    SKK_SPAN_OKURI,     /* the okurigana */
+    SKK_SPAN_ROMA,      /* romaji that has not become kana yet */
+} skk_span_kind_t;
+
+/* mark + reading/cand + sep + okuri + roma */
+#define SKK_SPAN_MAX 5
+
+typedef struct {
+    uint16_t off;  /* byte offset into skk_preedit() */
+    uint16_t len;
+    uint16_t kind; /* skk_span_kind_t */
+} skk_span_t;
+
+/* ------------------------------------------------------------------ */
 /* The IME instance.
  *
  * Laid out in the header on purpose: the caller decides where it lives
@@ -587,6 +624,11 @@ typedef struct {
 
     char     preedit[SKK_PREEDIT_MAX];
     uint16_t preedit_len;
+    /* How that preedit is composed, recorded BY build_preedit as it
+       builds (see skk_preedit_spans). 30 bytes, written once per key
+       and read once per repaint. */
+    skk_span_t span[SKK_SPAN_MAX];
+    uint8_t    span_n;
     char     commit[SKK_COMMIT_MAX];
     uint16_t commit_len;
     char     scratch[SKK_SCRATCH_MAX];
@@ -696,7 +738,13 @@ uint32_t skk_key(skk_t *s, const char *key, size_t len);
 
 skk_mode_t skk_mode(const skk_t *s);
 
-/* Display preedit, e.g. "~かんじ" / "~おく*り" / "vかんじ". NUL
+/* The parts of that preedit, in order, partitioning it exactly (see
+   skk_span_t). Returns how many and points *out at them; the array is
+   valid for as long as skk_preedit()'s bytes are. Zero spans means
+   there is nothing being composed. */
+int skk_preedit_spans(const skk_t *s, const skk_span_t **out);
+
+/* Display preedit, e.g. "▽かんじ" / "▽おく*り" / "▼漢字る". NUL
    terminated as a convenience; *len (optional) gets the byte length. */
 const char *skk_preedit(const skk_t *s, size_t *len);
 

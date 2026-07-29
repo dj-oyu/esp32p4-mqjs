@@ -469,30 +469,55 @@ static void pre_add(skk_t *s, const char *p, size_t n)
     s->preedit_len = (uint16_t)(s->preedit_len + n);
 }
 
+/* pre_add, plus a note of what was just appended. Records what ACTUALLY
+   landed rather than what was asked for: pre_add drops an append whole
+   when it would not fit (a dictionary candidate is bounded by
+   SKK_COMMIT_MAX, not by SKK_PREEDIT_MAX, so this really happens in v),
+   and a span claiming bytes that never arrived would send the renderer
+   past the end of the string. A dropped or empty append records
+   nothing, so a renderer never has to skip zero-length spans. */
+static void pre_span(skk_t *s, skk_span_kind_t kind, const char *p, size_t n)
+{
+    uint16_t off = s->preedit_len;
+    uint16_t got;
+
+    pre_add(s, p, n);
+    got = (uint16_t)(s->preedit_len - off);
+    if (got == 0 || s->span_n >= SKK_SPAN_MAX)
+        return;
+    s->span[s->span_n].off  = off;
+    s->span[s->span_n].len  = got;
+    s->span[s->span_n].kind = (uint16_t)kind;
+    s->span_n++;
+}
+
 static void build_preedit(skk_t *s)
 {
     s->preedit_len = 0;
+    s->span_n = 0;
 
     switch (s->mode) {
     case SKK_MODE_MIDASHI:
-        pre_add(s, MARK_MIDASHI, sizeof MARK_MIDASHI - 1);
-        pre_add(s, s->reading, s->reading_len);
+        pre_span(s, SKK_SPAN_MARK, MARK_MIDASHI, sizeof MARK_MIDASHI - 1);
+        pre_span(s, SKK_SPAN_READING, s->reading, s->reading_len);
         break;
 
     case SKK_MODE_OKURI:
-        pre_add(s, MARK_MIDASHI, sizeof MARK_MIDASHI - 1);
-        pre_add(s, s->reading, s->reading_len);
-        pre_add(s, "*", 1);
-        pre_add(s, s->okuri, s->okuri_len);
+        pre_span(s, SKK_SPAN_MARK, MARK_MIDASHI, sizeof MARK_MIDASHI - 1);
+        pre_span(s, SKK_SPAN_READING, s->reading, s->reading_len);
+        pre_span(s, SKK_SPAN_SEP, "*", 1);
+        pre_span(s, SKK_SPAN_OKURI, s->okuri, s->okuri_len);
         break;
 
     case SKK_MODE_SELECT: {
         size_t n = 0;
         const char *c = skk_cand(s, s->sel, &n);
-        pre_add(s, MARK_SELECT, sizeof MARK_SELECT - 1);
-        if (c) pre_add(s, c, n);
-        else   pre_add(s, s->reading, s->reading_len); /* dictionary gone */
-        pre_add(s, s->okuri, s->okuri_len);
+        pre_span(s, SKK_SPAN_MARK, MARK_SELECT, sizeof MARK_SELECT - 1);
+        /* the fallback is the reading, so it is READING and not CAND —
+           the renderer must not paint it as a chosen candidate */
+        if (c) pre_span(s, SKK_SPAN_CAND, c, n);
+        else   pre_span(s, SKK_SPAN_READING, s->reading, s->reading_len);
+        pre_span(s, SKK_SPAN_OKURI, s->okuri, s->okuri_len);
         break;
     }
 
@@ -501,8 +526,15 @@ static void build_preedit(skk_t *s)
     }
     /* The romaji tail always trails the span it is being typed into;
        SELECT has no tail because conversion needs an empty buffer. */
-    pre_add(s, s->roma, s->roma_len);
+    pre_span(s, SKK_SPAN_ROMA, s->roma, s->roma_len);
     s->preedit[s->preedit_len] = '\0';
+}
+
+int skk_preedit_spans(const skk_t *s, const skk_span_t **out)
+{
+    if (out)
+        *out = s->span;
+    return s->span_n;
 }
 
 /* ------------------------------------------------------------------ */
