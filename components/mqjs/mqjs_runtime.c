@@ -1789,35 +1789,17 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 
 #ifdef ESP_PLATFORM
 /* IME は打鍵の分配より手前で噛ませる。実体は辞書解決を skk.open() と
-   共有するため下の skk セクションにある。IME_TEXT のときは key と len が
-   確定文字列に差し替わる。 */
-static ime_disp_t mqjs_ime_feed(const char **key, size_t *len);
-#endif
+   共有するため下の skk セクションにある。true = IME の所有タスクが
+   引き取った (確定文字列の配達もそちらがやる)。 */
+static bool ime_route_key(const char *utf8, size_t len);
 
-void mqjs_post_key(const char *utf8, size_t len)
+/* 打鍵を fg アプリの ui.onKey へ流す、唯一の出口。IME を通した後の配達も
+   ここなので IME 所有タスクからも呼ばれる — どのタスクから来ても触るのは
+   s_event_queue だけなので、それで足りる。 */
+static void key_to_app(const char *utf8, size_t len)
 {
-#ifdef ESP_PLATFORM
-    /* keys feed the device idle clock like touch does (matters for the
-       keyboard dock: typing must keep the screen awake). kind 2 = a
-       discrete event with no gesture to eat through; a key that wakes a
-       blanked screen is swallowed here, exactly like the wake tap. */
-    if (mqjs_power_note_input(2))
-        return;
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
-    if (!s_event_queue || !fg->used || !utf8 || len == 0)
-        return;
-
-    /* IME はここ (docs/keyboard-ime-unification.md §7)。両側とも理由がある。
-       復帰キーの握り潰しの「後」: 画面を起こしただけのキーで変換を始めない。
-       fg->key_used チェックの「前」: あの行は ui.onKey を登録していない
-       アプリの打鍵をここで殺しており (launcher や reading のような widget
-       専用アプリがそれ)、後ろに置くと「ドックの物理キーが field に入らない」
-       という §2 の根っこをそのまま踏む。 */
-    if (mqjs_ime_feed(&utf8, &len) == IME_TAKEN)
-        return;   /* 変換中: preedit は外へ 1 バイトも出さない */
-    /* IME_TEXT なら utf8/len は確定文字列に差し替わっている。IME_PASS は素通し。 */
-
-    if (!fg->key_used)
+    if (!s_event_queue || !fg->used || !fg->key_used)
         return;
     /* 1 イベントに入り切らない入力は捨てずに続きとして送る。IME の確定
        文字列は 1 打鍵で 8 バイトを軽く超え、落とすと入力が黙って消える
@@ -1839,6 +1821,32 @@ void mqjs_post_key(const char *utf8, size_t len)
         utf8 += n;
         len -= n;
     }
+}
+#endif
+
+void mqjs_post_key(const char *utf8, size_t len)
+{
+#ifdef ESP_PLATFORM
+    /* keys feed the device idle clock like touch does (matters for the
+       keyboard dock: typing must keep the screen awake). kind 2 = a
+       discrete event with no gesture to eat through; a key that wakes a
+       blanked screen is swallowed here, exactly like the wake tap. */
+    if (mqjs_power_note_input(2))
+        return;
+    MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
+    if (!s_event_queue || !fg->used || !utf8 || len == 0)
+        return;
+
+    /* IME はここ (docs/keyboard-ime-unification.md §7)。両側とも理由がある。
+       復帰キーの握り潰しの「後」: 画面を起こしただけのキーで変換を始めない。
+       fg->key_used チェックの「前」: あの行は ui.onKey を登録していない
+       アプリの打鍵をここで殺しており (launcher や reading のような widget
+       専用アプリがそれ)、後ろに置くと「ドックの物理キーが field に入らない」
+       という §2 の根っこをそのまま踏む。 */
+    if (ime_route_key(utf8, len))
+        return;   /* この打鍵の行き先は所有タスクが決める */
+
+    key_to_app(utf8, len);
 #else
     (void)utf8;
     (void)len;
@@ -6106,21 +6114,32 @@ static void skk_release_app(int worker)
  * 上の skk.* ハンドルは残してある: skk_test.js はエンジンの試験台で、
  * 直叩きがその仕事。
  *
- * 所有タスクの注意: ime_t は単一タスク所有が前提 (ime_core.h) だが、
- * mqjs_post_key() は LVGL タスクとドックの kbd タスクの両方から呼ばれ、
- * ui.ime() は mqjs タスクで走る。opt-in するアプリがまだ 1 本も無い間は
- * ime_used が立たず ime_feed() まで到達しないので現状は無害。**最初の
- * opt-in を入れる前に排他を入れること** — 例えば自動回転の
- * "\0rotate" (ui_tab5) とドックの打鍵は本当に同時に来る。 */
+ * 所有タスク: s_ime に触ってよいのは「所有タスク」1 つだけ、例外なし。
+ * ime_t は単一タスク所有が前提 (ime_core.h) なのに、打鍵の入口
+ * mqjs_post_key() は LVGL タスク (オンスクリーン kbd と自動回転の
+ * "\0rotate") とドックの kbd タスクの両方から呼ばれ、ui.ime() は mqjs
+ * タスクで走る — ドックで打ちながら回転するのは普通に起きる。排他を足す
+ * のではなく、tailscale_adapter の lifecycle キューと同じ形 (単一所有者 +
+ * どの文脈からも post するだけのコマンドキュー) に寄せた。あちらが状態を
+ * 再帰ミューテックスでも守っているのは公開 API から直接読まれるからで、
+ * s_ime は所有タスクの外から一切見えないので鍵は要らない。 */
 static ime_t s_ime;
 static bool  s_ime_init;
 static int   s_ime_img = -1;
+
+/* --- ここから 3 つは所有タスクの上でしか呼ばない (ESP では IME タスク、
+   ホストには入力タスクが無いので mqjs タスクがそのまま所有者)。
+   単一所有になるのは s_ime だけ、という点は正確に読むこと: 学習 (skk_mru_t)
+   は js_skk_open が配る skk.* ハンドルと同じ 1 つを共有しており、skk_test.js
+   が mqjs タスクから skk.key を叩けば所有タスクの ime_feed と同時に同じ構造体
+   を書く。この変更は MRU の 2 人目の所有者を「消した」のではなく「改名した」
+   だけで、直すなら skk.* に MRU を共有させるのをやめる方 (別件・要判断)。 --- */
 
 /* セッションを使える状態にする。辞書は初回だけ開く。
    失敗を恒久ラッチしないのが肝で (§4-4)、skk_dict.bin は gitignore 対象
    = クリーンビルドのファームには本当に辞書が無く、後から焼かれる。
    ラッチすると焼いた後もアプリ再起動まで直らない。 */
-static bool ime_arm(void)
+static bool ime_arm_now(void)
 {
     if (!s_ime_init) {
         ime_init(&s_ime);
@@ -6142,38 +6161,166 @@ static bool ime_arm(void)
 
 /* IME を降りるときの後始末。読みかけは捨てる (確定させない — 誤操作で
    リモートのシェルへ文字列を押し込むより、数文字打ち直す方がまし)。
-   学習の書き戻しは ime_core が I/O をしないのでここの仕事 (§4-7)。 */
-static void ime_disarm(void)
+   学習の書き戻しはここには無い: I/O は所有タスクの仕事ではなく、畳んだ後に
+   呼び手 (mqjs タスク) が同期で書く — 下の ime_disarm()。 */
+static void ime_fold_now(void)
 {
     if (!s_ime_init)
         return;
     ime_set_on(&s_ime, false);
     ime_reset(&s_ime);
     ime_view_clear(&s_ime);
-    (void)skk_mru_flush();
 }
 
 #ifdef ESP_PLATFORM
-/* mqjs_post_key() のフック本体。opt-in していないアプリでは 1 回の
-   分岐で IME_PASS へ抜ける。 */
-static ime_disp_t mqjs_ime_feed(const char **key, size_t *len)
+/* 打鍵 1 つを IME に通し、残ったもの (素通し or 確定文字列) をアプリへ
+   配達する。判定と配達が同じタスクの同じ関数に居るのが肝: 打鍵を渡した側は
+   「食われたか」を聞かずに済み、キューが 1 本なので順序も勝手に保たれる。 */
+static void ime_owner_key(const char *key, size_t len)
+{
+    ime_disp_t d = IME_PASS;
+
+    if (s_ime_img >= 0) {
+        d = ime_feed(&s_ime, key, len);
+        if (d == IME_TEXT) {
+            s_skk_mru_dirty = true; /* js_skk_key と同じ: 印だけ、書き戻しは後 */
+            key = ime_text(&s_ime, &len);
+            if (!key || len == 0)
+                d = IME_TAKEN;      /* 空の確定は流さない */
+        }
+        /* 打鍵の経路に同期の littlefs I/O は置かない。所有タスクへ移しても
+           次の打鍵が fwrite/fsync の後ろで待たされ、キューが埋まれば静かに
+           消えるだけ (「あ」で切った縁もここでは書かない)。印
+           (s_skk_mru_dirty) は確定のたびに立っているので、次の境界
+           — ime_disarm / skk.save / アプリ停止 — がまとめて書く。 */
+        ime_view_clear(&s_ime);     /* 描く側は W3。今は溜めない */
+    }
+    if (d == IME_TAKEN)
+        return;                     /* 変換中: preedit は外へ 1 バイトも出さない */
+    key_to_app(key, len);
+}
+
+/* コマンドキュー。打鍵は投げっぱなし、ARM/FOLD だけ ack を待つ。
+   ImeCmd.key は KBD_SEQ_MAX(16) を包む — 入力面が作る打鍵はここに必ず収まる。 */
+#define MQJS_IME_KEY_MAX  24
+#define MQJS_IME_QUEUE_LEN 16   /* 26B×16 + キュー本体 ≒ 500B。連打 0.5 秒分:
+                                   辞書引き 1 回の裏で溢れる深さではない。 */
+enum { IME_CMD_KEY, IME_CMD_ARM, IME_CMD_FOLD };
+
+typedef struct {
+    uint8_t kind;
+    uint8_t len;
+    char    key[MQJS_IME_KEY_MAX];
+} ImeCmd;
+
+static QueueHandle_t     s_ime_q;
+static SemaphoreHandle_t s_ime_ack;   /* 待つのは mqjs タスクだけ (JS 束縛) */
+static volatile bool     s_ime_cmd_ok;
+
+static void ime_owner_task(void *arg)
+{
+    (void)arg;
+    ImeCmd c;
+    for (;;) {
+        if (xQueueReceive(s_ime_q, &c, portMAX_DELAY) != pdTRUE)
+            continue;
+        switch (c.kind) {
+        case IME_CMD_KEY:    ime_owner_key(c.key, c.len);   break;
+        case IME_CMD_ARM:    s_ime_cmd_ok = ime_arm_now();
+                             xSemaphoreGive(s_ime_ack);     break;
+        case IME_CMD_FOLD:   ime_fold_now();
+                             s_ime_cmd_ok = false;
+                             xSemaphoreGive(s_ime_ack);     break;
+        }
+    }
+}
+
+/* 最初の opt-in で 1 度だけ立てる。誰も ui.ime() を呼ばないファームでは
+   タスクもキューも作られない = RAM を 1 バイトも払わない。落とす手段は
+   用意しない: 走らせたまま眠っているタスクより、生きているタスクを消す
+   方がよほど危ない (microlink の UAF の教訓)。 */
+static bool ime_owner_start(void)
+{
+    if (s_ime_q)
+        return true;
+    if (!s_ime_ack)
+        s_ime_ack = xSemaphoreCreateBinary();
+    if (!s_ime_ack)
+        return false;
+    s_ime_q = xQueueCreate(MQJS_IME_QUEUE_LEN, sizeof(ImeCmd));
+    if (!s_ime_q)
+        return false;
+    /* 優先度は打鍵を渡してくる側 (mqjs/kbd_tab5 = 5) と同じ。上げると入力面を
+       押しのけ、下げると打鍵がここで待たされる。 */
+    if (xTaskCreate(ime_owner_task, "mqjs_ime", 4096, NULL, 5, NULL) != pdPASS) {
+        vQueueDelete(s_ime_q);
+        s_ime_q = NULL;
+        return false;
+    }
+    return true;
+}
+
+/* mqjs タスクから 1 コマンド投げて、完了を待つ。待つのは ack であって
+   時間ではない (盲目の vTaskDelay で join しない — 単一所有者を入れた
+   tailscale_adapter で払った授業料)。上限を付けてあるのは、所有タスクが
+   何かで詰まったときにアプリの起動/停止まで道連れにしないため。
+   FIFO が 1 本なので、FOLD の ack は「手前に並んでいた打鍵を配り終えた」
+   印も兼ねる — 畳んだ拍子に打ち終わりが消えることはない。 */
+static bool ime_cmd_sync(uint8_t kind)
+{
+    if (!s_ime_q)
+        return false;
+    /* 前回タイムアウトした ack が残っていると次のコマンドが即座に「完了」に
+       見えてしまう。投げる前に捨てる。 */
+    xSemaphoreTake(s_ime_ack, 0);
+    ImeCmd c = { .kind = kind };
+    if (xQueueSend(s_ime_q, &c, pdMS_TO_TICKS(200)) != pdTRUE)
+        return false;
+    if (xSemaphoreTake(s_ime_ack, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "ime cmd %u: no ack", (unsigned)kind);
+        return false;
+    }
+    return s_ime_cmd_ok;
+}
+
+/* 打鍵の入口 (LVGL タスク / ドックの kbd タスク) から呼ばれる。opt-in して
+   いないアプリでは 1 回の分岐で false = 従来どおりの直行便。 */
+static bool ime_route_key(const char *utf8, size_t len)
 {
     MqjsWorker *fg = &s_workers[s_fg_worker];
-    if (!fg->used || !fg->ime_used || s_ime_img < 0)
-        return IME_PASS;
-
-    ime_disp_t d = ime_feed(&s_ime, *key, *len);
-    if (d == IME_TEXT) {
-        s_skk_mru_dirty = true;  /* js_skk_key と同じ: 印だけ、書き戻しは後 */
-        *key = ime_text(&s_ime, len);
-        if (!*key || *len == 0)
-            d = IME_TAKEN;       /* 空の確定は流さない */
-    }
-    if ((ime_view(&s_ime) & IME_V_ENABLE) && !ime_on(&s_ime))
-        (void)skk_mru_flush();   /* 「あ」で切った瞬間 = 打鍵が止まる区切り */
-    ime_view_clear(&s_ime);      /* 描く側は W3。今は溜めない */
-    return d;
+    /* len 超過は入力面には作れない (KBD_SEQ_MAX=16) が、通ってきたら IME を
+       迂回させる — 千切って渡すと変換の途中に嘘の打鍵を混ぜることになる。 */
+    if (!fg->ime_used || !s_ime_q || len > MQJS_IME_KEY_MAX)
+        return false;
+    ImeCmd c = { .kind = IME_CMD_KEY, .len = (uint8_t)len };
+    memcpy(c.key, utf8, len);
+    /* キューが溢れたら握り潰す。素通しにすると、変換中に飲まれるはずの打鍵が
+       アプリへ抜けるうえ順序も崩れる — 落とす方がまし (s_event_queue が満杯の
+       ときと同じ方針)。 */
+    xQueueSend(s_ime_q, &c, 0);
+    return true;
 }
+
+/* --- ここから下は mqjs タスク側 (JS 束縛から呼ばれる) --- */
+
+static bool ime_arm(void)
+{
+    return ime_owner_start() && ime_cmd_sync(IME_CMD_ARM);
+}
+
+/* 畳むのは所有タスク、書き戻すのはこのタスク。分けてあるのは、境界での
+   書き戻しが「同期であること」に意味があるから (アプリ停止でこの後 JS の
+   文脈が消える。誰かに投げると投げた先が書く前に落ちる)。ack を待った後
+   なので打鍵はもう来ておらず、学習を触っているのはこのタスクだけ。 */
+static void ime_disarm(void)
+{
+    (void)ime_cmd_sync(IME_CMD_FOLD);
+    (void)skk_mru_flush();
+}
+#else
+/* ホストには打鍵を投げてくるタスクが無く、mqjs タスクが唯一の所有者。 */
+static bool ime_arm(void)    { return ime_arm_now(); }
+static void ime_disarm(void) { ime_fold_now(); (void)skk_mru_flush(); }
 #endif
 
 /* ui.ime(mode) — canvas アプリの opt-in (§7/§8.2)。1 = このアプリの打鍵を
