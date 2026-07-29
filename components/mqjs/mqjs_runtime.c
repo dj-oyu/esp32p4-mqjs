@@ -5416,9 +5416,9 @@ static int skkpart_open(const char *name, SkkImage *im)
  * to change, the change is here: key the file by app name and hand each
  * worker its own skk_mru_t.
  *
- * Sharing a MUTABLE structure between handles is safe only because
- * every mqjs worker runs on the single `mqjs` task (app_main.c), so
- * nothing here locks. skk_core says the same about skk_t.
+ * Sharing a MUTABLE structure between handles used to be safe because
+ * every mqjs worker runs on the single `mqjs` task (app_main.c). The
+ * platform IME broke that: see s_skk_mru_lock below.
  *
  * PERSISTENCE POLICY: written on close (which includes an app being
  * stopped or evicted) and on an explicit skk.save(). NOT on every
@@ -5430,18 +5430,86 @@ static int skkpart_open(const char *name, SkkImage *im)
 static skk_mru_t *s_skk_mru;
 static bool       s_skk_mru_dirty;
 
+/* 学習を守る唯一の鍵。読み手も書き手も、例外なくこれを取る。
+ *
+ * js_skk_open() が配る skk.* ハンドルは全部この 1 つを指し、プラットフォーム
+ * IME も同じものを attach する。skk_test.js が mqjs タスクで skk.key を叩く
+ * 裏で IME 所有タスクが ime_feed を回す = 書き手 2 人と構造体まるごとの読み手
+ * が、別タスクで同時に走る。
+ *
+ * 危ないのは昇格がバイトを物理的に動かすことで、mru_to_front()
+ * (skk_dict.c:1200) は最大 47 record × ~100B ≒ 4.7KB の memmove。その最中に
+ * 読むと record が重複したり半分だけ動いた姿で見える。しかも読み手 2 つは
+ * どちらも派手に落ちず静かに壊れる:
+ *   - skk_mru_apply() (skk_kana.c:686) 変換ごと 1 回。候補列に混ざる =
+ *     利用者には誤変換として出る。
+ *   - skk_mru_save()  壊れた個人辞書をそのままファイルへ焼く。skk_mru_load()
+ *     は解釈できない行を黙って捨てるので、次の起動では「なぜか覚えていない」
+ *     としか見えない。
+ *
+ * 計数セマフォで reader-writer にするのは検討して捨てた: 読み手はどう多くても
+ * 2 人、1 回の仕事は辞書引き ~77µs の隣に置く数µs でしかなく、並列度を上げても
+ * 測れる差にならない。逆に書き手は N 個のトークンを非アトミックに集めることに
+ * なり、結局そのための writer mutex が要るうえ、優先度継承と再帰検出を失う。
+ * 「改善」しないこと。
+ *
+ * 鍵を skk_core の中には置かない: skk_core.h:36 が "A skk_t is owned by ONE
+ * task, so nothing here locks" と宣言していて、あの component は I/O も
+ * allocation も lock も持たないからこそホストの素の gcc で単体試験がビルド
+ * できる。FreeRTOS のハンドルを 1 個入れた時点でそれが壊れる。だから mqjs 側の
+ * 境界 — 学習に届くエンジン呼び出し — で包む。MRU そのものを守るより粗いが、
+ * 正しくて安い。 */
+#ifdef ESP_PLATFORM
+static SemaphoreHandle_t s_skk_mru_lock;
+
+/* 生成が起きるのは mqjs タスクの上だけ。2 人目の触り手である IME 所有タスクを
+   作るのは ime_owner_start() で、そこが xTaskCreate の前にこれを呼ぶ。だから
+   所有タスクが初めて mru_lock() へ来たときには必ず出来上がっており、遅延生成
+   そのものが競合することはない。 */
+static void mru_lock_init(void)
+{
+    if (!s_skk_mru_lock)
+        s_skk_mru_lock = xSemaphoreCreateRecursiveMutex();
+}
+static void mru_lock(void)
+{
+    mru_lock_init();
+    if (s_skk_mru_lock)
+        xSemaphoreTakeRecursive(s_skk_mru_lock, portMAX_DELAY);
+}
+static void mru_unlock(void)
+{
+    if (s_skk_mru_lock)
+        xSemaphoreGiveRecursive(s_skk_mru_lock);
+}
+#else
+/* ホストには打鍵を投げてくるタスクが無く、mqjs タスクが唯一の触り手。 */
+#define mru_lock_init() ((void)0)
+#define mru_lock()      ((void)0)
+#define mru_unlock()    ((void)0)
+#endif
+
 static skk_mru_t *skk_mru_get(void)
 {
-    if (s_skk_mru)
+    /* 生成と初回ロードは鍵の内側。下の flush と違ってファイル I/O を抱えた
+       まま持つ唯一の場所だが、これは 1 起動 1 回・skk.open() / IME の arm の
+       縁でしか走らず打鍵の経路には無い。外へ出すと「まだ load 途中の store」を
+       もう一方のタスクが引くか、両方が 4.7KB を malloc して片方を捨てる。 */
+    mru_lock();
+    if (s_skk_mru) {
+        mru_unlock();
         return s_skk_mru;
+    }
 #ifdef ESP_PLATFORM
     s_skk_mru = heap_caps_malloc(sizeof *s_skk_mru,
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
     s_skk_mru = malloc(sizeof *s_skk_mru);
 #endif
-    if (!s_skk_mru)
+    if (!s_skk_mru) {
+        mru_unlock();
         return NULL;                 /* no learning is better than no IME */
+    }
     skk_mru_init(s_skk_mru);
 
     FILE *f = fopen(MQJS_SKK_MRU_PATH, "rb");
@@ -5458,6 +5526,7 @@ static skk_mru_t *skk_mru_get(void)
         fclose(f);
     }
     s_skk_mru_dirty = false;
+    mru_unlock();
     return s_skk_mru;
 }
 
@@ -5472,7 +5541,14 @@ static bool skk_mru_flush(void)
     size_t len = 0;
     if (!buf)
         return false;
-    if (skk_mru_save(s_skk_mru, buf, SKK_MRU_SAVE_MAX, &len) != SKK_OK) {
+    /* 鍵はメモリ上のレンダだけ。ここから先の mkdir/fopen/fwrite/fsync まで
+       抱えると、IME 所有タスクが littlefs の裏で止まり、81031dc が入力経路から
+       追い出したはずの同期 I/O が鍵という別の顔で戻ってくる。skk_core は I/O を
+       しないので、この境目はちょうど skk_mru_save() の出口に引ける。 */
+    mru_lock();
+    int save_rc = skk_mru_save(s_skk_mru, buf, SKK_MRU_SAVE_MAX, &len);
+    mru_unlock();
+    if (save_rc != SKK_OK) {
         free(buf);
         return false;
     }
@@ -5860,8 +5936,14 @@ JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         klen = sizeof key;
     memcpy(key, k, klen);
 
+    /* 学習は IME 所有タスクと共有 (s_skk_mru_lock)。素通しの打鍵でも取るのは、
+       食われたかどうかが分かるのが skk_key() から帰ってきた後だから。鍵を t0 の
+       外に置いてあるのは、計測したいのがエンジンの仕事であって待ち時間では
+       ないため。 */
+    mru_lock();
     int64_t t0 = time_us();
     uint32_t st = skk_key(s->core, key, klen);
+    mru_unlock();
 
     /* Passthrough leaves before the instrumentation. §4.2 promises that
        a key the IME does not take costs one C call and nothing else, and
@@ -5951,6 +6033,12 @@ JSValue js_skk_candidates(JSContext *ctx, JSValue *this_val, int argc,
     if (JS_IsException(arr))
         return arr;
     JS_PUSH_VALUE(ctx, arr);
+    /* SKK_SRC_USER の候補 — 辞書がもう持っていない、学習だけが覚えているもの —
+       は skk_mru_text() が返す MRU の中身をそのまま指す (skk_kana.c:1240)。
+       所有タスクの昇格 memmove と重なると、候補が半分ずれた文字列で JS へ出る。
+       ここでの hold は候補数ぶん (最大 SKK_CAND_MAX) だが、待つ相手は所有タスク
+       だけで、所有タスクがこちらを待つ経路は無い = 逆向きは起きない。 */
+    mru_lock();
     int n = skk_cand_count(s->core);
     for (int i = 0; i < n; i++) {
         size_t len = 0;
@@ -5960,6 +6048,7 @@ JSValue js_skk_candidates(JSContext *ctx, JSValue *this_val, int argc,
         JSValue v = JS_NewStringLen(ctx, p, len);
         JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)i, v);
     }
+    mru_unlock();
     JS_POP_VALUE(ctx, arr);
     return arr;
 }
@@ -6181,7 +6270,12 @@ static void ime_owner_key(const char *key, size_t len)
     ime_disp_t d = IME_PASS;
 
     if (s_ime_img >= 0) {
+        /* 学習は skk.* ハンドルと 1 つを共有しているので、エンジンを回す間だけ
+           鍵を取る (s_skk_mru_lock)。ime_text() が指すのは skk_t の commit
+           バッファであって MRU ではないから、外に出してよい。 */
+        mru_lock();
         d = ime_feed(&s_ime, key, len);
+        mru_unlock();
         if (d == IME_TEXT) {
             s_skk_mru_dirty = true; /* js_skk_key と同じ: 印だけ、書き戻しは後 */
             key = ime_text(&s_ime, &len);
@@ -6250,6 +6344,9 @@ static bool ime_owner_start(void)
     s_ime_q = xQueueCreate(MQJS_IME_QUEUE_LEN, sizeof(ImeCmd));
     if (!s_ime_q)
         return false;
+    /* 所有タスクを起こす前に。ここが MRU の鍵の唯一の生成点であることの
+       裏付けで、以降 mru_lock() の遅延生成は競合しない。 */
+    mru_lock_init();
     /* 優先度は打鍵を渡してくる側 (mqjs/kbd_tab5 = 5) と同じ。上げると入力面を
        押しのけ、下げると打鍵がここで待たされる。 */
     if (xTaskCreate(ime_owner_task, "mqjs_ime", 4096, NULL, 5, NULL) != pdPASS) {
@@ -6311,7 +6408,12 @@ static bool ime_arm(void)
 /* 畳むのは所有タスク、書き戻すのはこのタスク。分けてあるのは、境界での
    書き戻しが「同期であること」に意味があるから (アプリ停止でこの後 JS の
    文脈が消える。誰かに投げると投げた先が書く前に落ちる)。ack を待った後
-   なので打鍵はもう来ておらず、学習を触っているのはこのタスクだけ。 */
+   なので打鍵はもう来ておらず、学習を触っているのはこのタスクだけ。
+
+   ⚠ 順序は入れ替えられないし、この 2 行を鍵で囲ってもいけない。
+   ime_cmd_sync() は所有タスクの返事を待ち、所有タスクは仕事をするのに
+   s_skk_mru_lock を取る — 鍵を持ったまま ack を待てばそのまま睨み合いになる。
+   鍵が現れるのは skk_mru_flush() の内側だけ、という形を守ること。 */
 static void ime_disarm(void)
 {
     (void)ime_cmd_sync(IME_CMD_FOLD);
