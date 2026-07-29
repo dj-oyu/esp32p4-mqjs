@@ -536,8 +536,13 @@ static int define_props(BuildContext *s, const JSPropDef *props_def,
         case JS_DEF_PROP_DOUBLE:
             if (ident_tab[i] >= 0)
                 goto value_ptr;
-            /* short int */
-            printf("%d << 1,", (int32_t)d->u.f64);
+            /* short int. '* 2' and not '<< 1': a negative constant would emit
+               '-3 << 1', which is undefined behaviour in C and a hard error
+               under -Werror=shift-negative-value (the device build uses
+               -Wall -Werror). '* 2' has the identical value for every
+               representable short int (the payload is 31 bits, so doubling
+               cannot overflow int32) and no compiler complains. */
+            printf("%d * 2,", (int32_t)d->u.f64);
             break;
         case JS_DEF_CGETSET:
             if (is_global_object) {
