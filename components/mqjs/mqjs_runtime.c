@@ -265,6 +265,10 @@ typedef struct {
     volatile bool key_used;   /* read by the UI task (poster) */
     JSGCRef   key_cb;
     volatile bool ime_used;   /* ui.ime(1): 打鍵を IME に通す (poster が読む) */
+    /* ui.caret(): 変換中の文字列を出す位置 (canvas 座標)。C が知り得ない
+       唯一の値なので JS から貰う。IME の所有タスクが fg アプリの分だけを
+       読む — 3 つの int16 で、ずれても 1 打鍵ぶんフロートの位置が古いだけ。 */
+    volatile int16_t caret_x, caret_y, caret_h;
     bool fg_used;  JSGCRef fg_cb;   /* sys.onForeground */
     bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
@@ -1218,6 +1222,8 @@ typedef enum {
 /* keep in step with ui_tab5.h — the order IS the wire format */
 #define UI_OVERLAY_MAX   4
 #define UI_OVERLAY_ITEMS 10
+#define UI_OVERLAY_IME   UI_OVERLAY_MAX
+#define UI_OVERLAY_SLOTS (UI_OVERLAY_MAX + 1)
 /* PC stub of the deferred screen-load commit (§3.4) */
 #define ui_tab5_w_commit() ((void)0)
 #endif
@@ -1229,16 +1235,17 @@ static bool ui_is_fg(void)
     return !s_cur_wk || s_cur_wk->idx == s_fg_worker;
 }
 
-/* Post one drawing command. Takes ownership of `text` (heap copy) in
-   every outcome; drops are counted on-screen by the UI itself. `bg` is
-   only used by UI_CMD_CELLS (cell background). Background apps: no-op. */
-static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
-                       uint32_t color, uint32_t bg, char *text)
+/* Put one command on the UI queue, unconditionally. Takes ownership of
+   `text` in every outcome.
+
+   プラットフォーム発の描画 (IME のフロート) 専用の入口でもある: あれは
+   IME の所有タスクから出るので、そこから見た s_cur_wk は「mqjs タスクが
+   いまどのアプリの JS を回しているか」という別タスクの作業変数でしかなく、
+   fg 判定に使うと裏で走ったバックグラウンドアプリのタイマー次第で
+   preedit が消える。 */
+static void ui_send(uint8_t op, int x, int y, int w, int h,
+                    uint32_t color, uint32_t bg, char *text)
 {
-    if (!ui_is_fg()) {
-        free(text);
-        return;
-    }
 #ifdef ESP_PLATFORM
     ui_cmd_t c = {
         .op = op,
@@ -1259,6 +1266,20 @@ static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
            text ? ", " : "", text ? text : "");
     free(text);
 #endif
+}
+
+/* Post one drawing command from an app. Takes ownership of `text` (heap
+   copy) in every outcome; drops are counted on-screen by the UI itself.
+   `bg` is only used by UI_CMD_CELLS (cell background) and the overlay
+   flags. Background apps: no-op. */
+static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
+                       uint32_t color, uint32_t bg, char *text)
+{
+    if (!ui_is_fg()) {
+        free(text);
+        return;
+    }
+    ui_send(op, x, y, w, h, color, bg, text);
 }
 
 static void ui_post(uint8_t op, int x, int y, int w, int h,
@@ -1600,8 +1621,11 @@ static int ovl_count(JSContext *ctx, JSValue arr, int cap)
  * it has to.
  *
  * A fresh candidate set arrives with sel = 0, which is below any nonzero
- * window and therefore resets it — no explicit "new list" signal needed. */
-static int s_ovl_first[UI_OVERLAY_MAX];
+ * window and therefore resets it — no explicit "new list" signal needed.
+ *
+ * The IME's own slot is windowed by the IME's owner task and the app
+ * slots by the mqjs task; two tasks, but never the same element. */
+static int s_ovl_first[UI_OVERLAY_SLOTS];
 
 static int ovl_window(int id, int count, int sel, int visible)
 {
@@ -1744,6 +1768,31 @@ JSValue js_ui_overlay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
         return JS_ThrowOutOfMemory(ctx);
     memcpy(copy, body, blen + 1);
     ui_post_bg(UI_CMD_OVERLAY, x, y, id, h, (uint32_t)sel, flags, copy);
+    return JS_UNDEFINED;
+}
+
+/* ui.caret(x, y, h) — where this app's cursor is, in canvas pixels
+ * (design §7). The one fact the platform cannot work out for itself:
+ * the IME float exists so the eye does not have to move, so a fixed
+ * position would defeat it.
+ *
+ * Call it when the cursor MOVES, not per keystroke — the value is only
+ * read when the composition changes. h is the caret's height, so the
+ * float can sit below the line instead of on top of it.
+ *
+ * Nothing is posted here: the float is issued by the IME's owner task,
+ * which reads these three numbers at the moment it draws. */
+JSValue js_ui_caret(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    int x, y, h = 0;
+    if (JS_ToInt32(ctx, &x, argv[0]) || JS_ToInt32(ctx, &y, argv[1]))
+        return JS_EXCEPTION;
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &h, argv[2]))
+        return JS_EXCEPTION;
+    s_cur_wk->caret_x = (int16_t)x;
+    s_cur_wk->caret_y = (int16_t)y;
+    s_cur_wk->caret_h = (int16_t)h;
     return JS_UNDEFINED;
 }
 
@@ -6262,6 +6311,160 @@ static void ime_fold_now(void)
 }
 
 #ifdef ESP_PLATFORM
+/* ---- 変換中を見せる (docs/keyboard-ime-unification.md §6) ------------
+ *
+ * フロートを出すのは C 側。アプリは preedit も候補も見ないので、
+ * ui.overlay を呼ぶ材料をそもそも持っていない。新しい配管は無く、
+ * js_ui_overlay と同じ文字列を組んで同じキューへ載せるだけ。 */
+
+/* preedit の塗り分け (skk_span_kind_t で引く)。
+ *
+ * ⚠ 暫定値。色は実機で見て決める約束のもの (§6.4) なので、1 か所に
+ * 集めてある — 実機で気に入らなければこの表の 1 行を書き換えるだけで済む。
+ * 下線や淡い背景が使えないのは LVGL の制約で (CONFIG_LV_USE_SPAN が無く、
+ * recolor は前景色しか変えられない §6.3)、§6.1 の表はそのままでは実装
+ * できない。色だけで「どこが仮でどこが決まったか」を出すのが出発点。 */
+static const uint32_t IME_SPAN_COL[] = {
+    [SKK_SPAN_MARK]    = 0x7F8C99, /* ▽/▼ 自体は記号なので一段落とす     */
+    [SKK_SPAN_READING] = 0xFFFFFF, /* 打ったばかりの読み = 素の文字色     */
+    [SKK_SPAN_CAND]    = 0xFFD479, /* 選択中の候補 = 制御バーの latch と同じ琥珀 */
+    [SKK_SPAN_SEP]     = 0x7F8C99, /* '*' は区切りで、読みの一部ではない  */
+    [SKK_SPAN_OKURI]   = 0x8FD3FF, /* 送り仮名 = 候補と別物だと分かる色   */
+    [SKK_SPAN_ROMA]    = 0x9AA5AD, /* かなになる前のローマ字 = 一番仮     */
+};
+
+/* span 1 つを "#RRGGBB …#" で包んで足す。'#' は recolor の記号なので、
+   本文に出てきたら 2 つに増やして逃がす (コンソールのログ整形と同じ作法)。
+   入り切らないときは足さずに諦める — 途中で切ると markup が閉じず、
+   そこから先の色が全部化ける。 */
+static size_t ime_ovl_span(char *dst, size_t cap, size_t len, uint32_t col,
+                           const char *s, size_t n)
+{
+    char head[10];
+    if (n == 0)
+        return len;      /* 空の span に色だけ置いても何も見えない */
+    int hn = snprintf(head, sizeof head, "#%06X ", (unsigned)(col & 0xFFFFFF));
+    if (hn < 0 || len + (size_t)hn + n * 2 + 1 >= cap)
+        return len;
+    memcpy(dst + len, head, (size_t)hn);
+    len += (size_t)hn;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '#')
+            dst[len++] = '#';
+        dst[len++] = s[i];
+    }
+    dst[len++] = '#';
+    dst[len] = '\0';
+    return len;
+}
+
+static bool s_ime_ovl_on;   /* いま出ているか。所有タスクしか触らない */
+
+/* preedit と候補を 1 枚のフロートにして出す (無ければ引っ込める)。
+   呼ぶのは view ビットが「変わった」と言ったときだけ。 */
+static void ime_float_update(void)
+{
+    size_t plen = 0;
+    const char *pre = ime_on(&s_ime) ? ime_preedit(&s_ime, &plen) : NULL;
+
+    if (!pre || plen == 0) {
+        if (s_ime_ovl_on) {
+            ui_send(UI_CMD_OVERLAY, 0, 0, UI_OVERLAY_IME, 0, 0, 0, NULL);
+            s_ime_ovl_on = false;
+        }
+        return;
+    }
+
+    /* 所有タスク以外は触らないので static でよい。IME タスクのスタックは
+       4KB しかなく、512B の作業配列を積むと辞書引きと同居できない。 */
+    static char body[MQJS_OVL_TEXT_MAX];
+    size_t len = 0;
+    body[0] = '\0';
+
+    /* 候補文字列は学習ストア (skk_mru_text) を指すことがあり、それは
+       skk.* ハンドルと共有している。組み終わるまで鍵を持つ。 */
+    mru_lock();
+
+    /* 境界はエンジンから貰う。▼ では候補と送り仮名が区切り記号なしで
+       連結されるので、文字列をいくら眺めても切れ目は出てこない (§6.1)。 */
+    const skk_span_t *sp = NULL;
+    int nsp = ime_preedit_spans(&s_ime, &sp);
+    for (int i = 0; i < nsp; i++) {
+        uint32_t col = (size_t)sp[i].kind <
+                               (sizeof IME_SPAN_COL / sizeof *IME_SPAN_COL)
+                           ? IME_SPAN_COL[sp[i].kind]
+                           : IME_SPAN_COL[SKK_SPAN_READING];
+        len = ime_ovl_span(body, sizeof body, len, col, pre + sp[i].off,
+                           sp[i].len);
+    }
+    if (nsp <= 0)   /* 境界を貰えない preedit: 丸ごと素の色で出す */
+        len = ime_ovl_span(body, sizeof body, len,
+                           IME_SPAN_COL[SKK_SPAN_READING], pre, plen);
+
+    int sel = ime_sel(&s_ime);
+    int ncand = ime_cand_count(&s_ime);
+    if (ncand > 0 && sel >= 0) {
+        /* 窓の送りは ovl_window の担当 (端でだけ動く。中央固定はハイライトが
+           止まって手応えが消えると実機で却下済み)。送った分だけを描く側は
+           見るので、sel も窓の中の番号に直す。 */
+        int first = ovl_window(UI_OVERLAY_IME, ncand, sel, UI_OVERLAY_ITEMS);
+        sel -= first;
+        if (ovl_append(body, sizeof body, &len, "\2") == 0) {
+            for (int i = first; i < first + UI_OVERLAY_ITEMS && i < ncand; i++) {
+                size_t cl = 0;
+                const char *c = ime_cand(&s_ime, i, &cl);
+                if (!c || len + cl + 1 >= sizeof body)
+                    break;
+                if (i > first)
+                    body[len++] = '\1';
+                memcpy(body + len, c, cl);  /* skk_cand は NUL 終端しない */
+                len += cl;
+                body[len] = '\0';
+            }
+        }
+    } else {
+        sel = -1;
+    }
+    mru_unlock();
+
+    /* アンカーはアプリのカーソル (ui.caret)。高さを貰っていなければ端末の
+       1 行ぶんで代用する — 0 だと preedit が行に重なる。 */
+    const MqjsWorker *fg = &s_workers[s_fg_worker];
+    int h = fg->caret_h;
+    if (h <= 0) {
+        int cw = 0, ch = 0;
+        ui_tab5_cell_size(&cw, &ch);
+        h = ch > 0 ? ch : 24;
+    }
+
+    /* ⚠ ui_send は所有権を取り、UI タスクが free() する。だからここは必ず
+       ヒープ複製: body (静的でも配列) をそのまま渡せば UI タスクが自分の
+       ものでない番地を free することになる。スタック配列を渡した前例は、
+       無関係な確保の中で tlsf のアサートを踏んで初めて見つかった。 */
+    char *copy = malloc(len + 1);
+    if (!copy)
+        return;
+    memcpy(copy, body, len + 1);
+    /* flags: bit0-1 = 0 (auto 配置)、bit2 = 0 (候補は横並び)、bit3 = recolor */
+    ui_send(UI_CMD_OVERLAY, fg->caret_x, fg->caret_y, UI_OVERLAY_IME, h,
+            (uint32_t)sel, 0x8, copy);
+    s_ime_ovl_on = true;
+}
+
+/* 「あ」キーの面 = モード表示 (§6.2)。押すものと状態を見るものが同じに
+   なるので、アプリの画面からモード表示が消える。
+   変換中 (▽/▼) は基底が かな か カナ か分からず「あ」に倒れるが、その間
+   状態を語っているのは preedit の方で (§6.1)、キーの面が要るのは preedit が
+   無いときだけ。 */
+static void ime_face_update(void)
+{
+    int face = UI_IME_FACE_ASCII;
+    if (ime_on(&s_ime))
+        face = ime_mode(&s_ime) == SKK_MODE_KATA ? UI_IME_FACE_KATA
+                                                 : UI_IME_FACE_KANA;
+    ui_tab5_ime_face(face);
+}
+
 /* 打鍵 1 つを IME に通し、残ったもの (素通し or 確定文字列) をアプリへ
    配達する。判定と配達が同じタスクの同じ関数に居るのが肝: 打鍵を渡した側は
    「食われたか」を聞かずに済み、キューが 1 本なので順序も勝手に保たれる。 */
@@ -6287,7 +6490,16 @@ static void ime_owner_key(const char *key, size_t len)
            消えるだけ (「あ」で切った縁もここでは書かない)。印
            (s_skk_mru_dirty) は確定のたびに立っているので、次の境界
            — ime_disarm / skk.save / アプリ停止 — がまとめて書く。 */
-        ime_view_clear(&s_ime);     /* 描く側は W3。今は溜めない */
+
+        /* 何を描き直すかは view ビットだけで決める (再導出しない)。素通しの
+           打鍵では 1 本も立たないので post も起きないし、▼ の中の SPACE 連打は
+           SEL しか立てないので候補配列を組み直すのもそこだけで済む。 */
+        uint32_t view = ime_view(&s_ime);
+        if (view & (IME_V_PREEDIT | IME_V_CANDS | IME_V_SEL | IME_V_ENABLE))
+            ime_float_update();
+        if (view & (IME_V_MODE | IME_V_ENABLE))
+            ime_face_update();
+        ime_view_clear(&s_ime);
     }
     if (d == IME_TAKEN)
         return;                     /* 変換中: preedit は外へ 1 バイトも出さない */
@@ -6323,6 +6535,10 @@ static void ime_owner_task(void *arg)
         case IME_CMD_ARM:    s_ime_cmd_ok = ime_arm_now();
                              xSemaphoreGive(s_ime_ack);     break;
         case IME_CMD_FOLD:   ime_fold_now();
+                             /* 畳んだのに読みかけが画面に残ると、次のアプリの
+                                上に他人の preedit が浮いたままになる。 */
+                             ime_float_update();
+                             ime_face_update();
                              s_ime_cmd_ok = false;
                              xSemaphoreGive(s_ime_ack);     break;
         }

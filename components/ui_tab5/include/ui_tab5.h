@@ -61,10 +61,13 @@ typedef enum {
 
                          x, y  anchor top-left (canvas pixels)
                          h     anchor height, so "below" clears the line
-                         w     handle id, 0 .. UI_OVERLAY_MAX-1
+                         w     handle id, 0 .. UI_OVERLAY_SLOTS-1
                          color selected item index, -1 for none
                          bg    bit0-1 place: 0 auto, 1 below, 2 above
                                bit2   items direction: 0 horizontal, 1 vertical
+                               bit3   lines carry LVGL recolor markup
+                                      (#RRGGBB ...#; the IME paints the
+                                      preedit's spans with it)
                          text  content, or NULL to hide this handle:
                                  line ("\1" line)* ["\2" item ("\1" item)*]
                                i.e. \1 separates, \2 starts the item list. */
@@ -89,6 +92,24 @@ typedef struct {
    allocated up-front per handle on first use. */
 #define UI_OVERLAY_MAX   4
 #define UI_OVERLAY_ITEMS 10
+
+/* One more slot, above every app handle: the platform's own IME float
+   (preedit + candidates), issued by C now that apps do not see a preedit
+   at all. It is separate rather than "id 0 by convention" because an app
+   that opts into the IME goes on using its own overlays — ssh_vt held id
+   0 for the IME and gets it back. */
+#define UI_OVERLAY_IME   UI_OVERLAY_MAX
+#define UI_OVERLAY_SLOTS (UI_OVERLAY_MAX + 1)
+
+/* What the control bar's 「あ」 key shows (design §6.2): the thing you
+   press to change the mode is the thing that shows it, so no app needs a
+   mode indicator of its own. Values, not skk_mode_t — the UI layer must
+   not learn the engine's enum. */
+typedef enum {
+    UI_IME_FACE_ASCII = 0, /* IME off / ASCII: "A"  */
+    UI_IME_FACE_KANA  = 1, /* hiragana:        "あ" */
+    UI_IME_FACE_KATA  = 2, /* katakana:        "ア" */
+} ui_ime_face_t;
 
 /* Overlays are taken down by UI_CMD_RESET, which mqjs already posts both
    when the foreground app switches and when a foreground app stops — the
@@ -153,6 +174,12 @@ void ui_tab5_cell_size(int *w, int *h);
  * Depends on the keyboard dock: docked, mode 1 reserves nothing (the
  * dock types directly) and mode 2 only the control bar's height. */
 int ui_tab5_kb_reserved(int mode);
+
+/* Show the IME's mode on the control bar's 「あ」 key (see
+ * ui_ime_face_t). Callable from any task (takes the LVGL lock; the
+ * relabel itself is deferred to the LVGL loop like every other
+ * control-bar map change). */
+void ui_tab5_ime_face(int face);
 
 /* Keyboard dock presence (kbd_tab5): while set, ui.keyboard() requests
  * raise no on-screen keyboard — mode 2 keeps only the control bar
@@ -297,6 +324,7 @@ static inline int ui_tab5_kb_reserved(int mode)
     (void)mode;
     return 0;
 }
+static inline void ui_tab5_ime_face(int face) { (void)face; }
 static inline uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
 {
     (void)title;

@@ -1548,12 +1548,21 @@ static const char *CB_LBL_CTRL = "Ctrl";
 static const char *CB_LBL_CTRL_LOCK = "CTRL"; /* locked: shouting = latched */
 static const char *CB_LBL_ALT = "Alt";
 static const char *CB_LBL_ALT_LOCK = "ALT";
+/* The IME key's face IS the mode display (design §6.2), indexed by
+   ui_ime_face_t. Written by the IME's owner task, read by the LVGL task:
+   a plain int is enough — a torn read is not possible and the worst
+   outcome of a lost update is one stale face until the next mode change. */
+static const char *CB_LBL_IME[] = {
+    "A", "\xe3\x81\x82" /* あ */, "\xe3\x82\xa2" /* ア */,
+};
+static int s_cbar_ime_face = UI_IME_FACE_ASCII;
 
 /* one row, so array index == button id */
-/* "あ" is the IME toggle: it sends "\0ime", which an app with Japanese
-   input turns into skk.enable() and every other app ignores. It is here
-   rather than on a control byte because the classic SKK toggles are all
-   unreachable on this keyboard — see the comment on KBD_K_IME. */
+/* "あ" is the IME toggle: it sends "\0ime", which the platform IME
+   session answers (ime_feed owns that token outright). It is here rather
+   than on a control byte because the classic SKK toggles are all
+   unreachable on this keyboard — see the comment on KBD_K_IME. Its face
+   is rewritten by cbar_apply_labels to show the current mode. */
 static const char *CB_MAP_MAIN[] = {
     "Esc", "Tab", "Ctrl", "Alt", "Fn",
     LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
@@ -1562,6 +1571,7 @@ static const char *CB_MAP_MAIN[] = {
 #define CB_ID_CTRL 2
 #define CB_ID_ALT  3
 #define CB_ID_FN   4
+#define CB_ID_IME  11
 static const kbd_key_t CB_KEY_MAIN[] = {
     KBD_K_ESC, KBD_K_TAB,
     KBD_K_NONE /* Ctrl */, KBD_K_NONE /* Alt */, KBD_K_NONE /* Fn */,
@@ -1606,7 +1616,7 @@ struct ui_overlay_t {
     lv_obj_t *row;                       /* item container (flex) */
     lv_obj_t *item[UI_OVERLAY_ITEMS];    /* candidate chips */
 };
-static ui_overlay_t s_ovl[UI_OVERLAY_MAX];
+static ui_overlay_t s_ovl[UI_OVERLAY_SLOTS]; /* + the platform IME float */
 
 #define UI_OVL_PAD 6
 
@@ -1652,7 +1662,7 @@ static void ovl_build(ui_overlay_t *o)
 
 static void ovl_hide(int id)
 {
-    if (id < 0 || id >= UI_OVERLAY_MAX || !s_ovl[id].box)
+    if (id < 0 || id >= UI_OVERLAY_SLOTS || !s_ovl[id].box)
         return;
     lv_obj_add_flag(s_ovl[id].box, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1660,7 +1670,7 @@ static void ovl_hide(int id)
 /* UI task only. The public ui_tab5_overlay_hide_all() posts commands. */
 static void ovl_hide_all(void)
 {
-    for (int i = 0; i < UI_OVERLAY_MAX; i++)
+    for (int i = 0; i < UI_OVERLAY_SLOTS; i++)
         ovl_hide(i);
 }
 
@@ -1735,7 +1745,7 @@ static void ovl_place(ui_overlay_t *o, const ui_cmd_t &cmd)
 static void ovl_apply(const ui_cmd_t &cmd)
 {
     int id = cmd.w;
-    if (id < 0 || id >= UI_OVERLAY_MAX)
+    if (id < 0 || id >= UI_OVERLAY_SLOTS)
         return;
     if (!cmd.text) {
         ovl_hide(id);
@@ -1756,6 +1766,12 @@ static void ovl_apply(const ui_cmd_t &cmd)
     for (char *q = body; *q; q++)
         if (*q == '\1')
             *q = '\n';
+    /* Per-span colour is all this firmware can do: CONFIG_LV_USE_SPAN is
+       off, so lv_spangroup does not exist and only recolor markup gets
+       more than one colour into a label (design §6.3). Per handle, not
+       once at build: an app's lines are plain text, and turning recolor
+       on for them would eat their '#'. */
+    lv_label_set_recolor(o->lines, (cmd.bg & 0x8) != 0);
     lv_label_set_text(o->lines, body);
     if (*body)
         lv_obj_remove_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
@@ -1835,15 +1851,22 @@ static void cbar_apply_mods(void)
    the arrays LVGL is still using for that press. */
 static void cbar_apply_labels(void)
 {
-    if (!s_cbar)
-        return;
     const char *ctrl_lbl =
         s_ui_mods.ctrl.lock ? CB_LBL_CTRL_LOCK : CB_LBL_CTRL;
     const char *alt_lbl = s_ui_mods.alt.lock ? CB_LBL_ALT_LOCK : CB_LBL_ALT;
+    const char *ime_lbl = CB_LBL_IME[s_cbar_ime_face];
     bool relabel = CB_MAP_MAIN[CB_ID_CTRL] != ctrl_lbl ||
-                   CB_MAP_MAIN[CB_ID_ALT] != alt_lbl;
+                   CB_MAP_MAIN[CB_ID_ALT] != alt_lbl ||
+                   CB_MAP_MAIN[CB_ID_IME] != ime_lbl;
+    /* The map is kept current even with no bar on screen: mode changes
+       happen while the bar is down (the dock types without one), and
+       cbar_show() installs whatever the array holds — a face written only
+       when a bar exists would come up stale. */
     CB_MAP_MAIN[CB_ID_CTRL] = ctrl_lbl;
     CB_MAP_MAIN[CB_ID_ALT] = alt_lbl;
+    CB_MAP_MAIN[CB_ID_IME] = ime_lbl;
+    if (!s_cbar)
+        return;
     if (!relabel && s_cbar_map_fn == (int)s_cbar_fn)
         return;
     s_cbar_map_fn = s_cbar_fn;
@@ -3377,6 +3400,26 @@ private:
 extern "C" bool ui_tab5_landscape(void)
 {
     return s_landscape;
+}
+
+/* The IME's mode, on the key that changes it (design §6.2). Called from
+   the IME's owner task, i.e. never from inside the bar's own event
+   callback — but the relabel still goes through ui_kb_refresh(), because
+   a set_map is only safe from the LVGL loop (see cbar_apply_labels).
+   No deadlock: this waits for the LVGL task, and the LVGL task only ever
+   posts to the IME queue without waiting. */
+extern "C" void ui_tab5_ime_face(int face)
+{
+    if (face < UI_IME_FACE_ASCII || face > UI_IME_FACE_KATA)
+        face = UI_IME_FACE_ASCII;
+    if (s_cbar_ime_face == face)
+        return;
+    s_cbar_ime_face = face;
+    if (!s_disp)
+        return;
+    lvgl_port_lock(0);
+    ui_kb_refresh();
+    lvgl_port_unlock();
 }
 
 /* Keyboard dock present: stop raising the on-screen keyboard (mode 1
