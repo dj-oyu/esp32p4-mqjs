@@ -77,11 +77,19 @@ function finish() {
 
 function qrPhase() {
     setPhase("qr");
-    var ok = camera.scanQr(function (code) {
-        pub({ ph: "qr", result: code ? "decoded" : "none" });
-        finish();
-    });
-    if (!ok) { pub({ ph: "qr", err: "scanQr refused" }); finish(); }
+    /* scanQr is system-app-only (provisioning payloads can carry WiFi
+       secrets); from the dev slot it THROWS. Catch it — an uncaught
+       throw here killed this state machine on 2026-07-29 and looked
+       exactly like a firmware hang. */
+    var ok = false, err = null;
+    try {
+        ok = camera.scanQr(function (code) {
+            pub({ ph: "qr", result: code ? "decoded" : "none" });
+            finish();
+        });
+    } catch (e) { err = String(e); }
+    if (err) { pub({ ph: "qr", skipped: err }); finish(); }
+    else if (!ok) { pub({ ph: "qr", err: "scanQr refused" }); finish(); }
 }
 
 function scanPhase() {

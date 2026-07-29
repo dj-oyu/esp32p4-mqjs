@@ -903,20 +903,46 @@ static bool qr_once(void)
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_qr_go = xSemaphoreCreateBinary();
     s_qr_result = xSemaphoreCreateBinary();
+    /* Failure must be ATOMIC. A half-initialized state here is what
+       wedged the owner task for good (2026-07-29): s_qr_rgb left set
+       with no worker made the scan loop hand frames to nobody, and
+       teardown blocked forever draining a result that could never come
+       — no callback, s_busy stuck, every later scan refused. */
     if (!s_qr_rgb || !s_qr_go || !s_qr_result) {
-        quirc_destroy(q);
-        return false;
+        ESP_LOGE(TAG, "qr init: alloc failed (rgb=%p go=%p res=%p)",
+                 (void *)s_qr_rgb, (void *)s_qr_go, (void *)s_qr_result);
+        goto fail;
     }
     /* core 0 (with the cam_owner task at prio 4), one below it: the owner
      * preempts to keep the viewfinder at frame rate, the worker takes the
-     * slack. Off core 1 so it never steals LVGL render time. */
+     * slack. Off core 1 so it never steals LVGL render time. NOTE the
+     * 12 KB stack is a DYNAMIC task stack = internal RAM only, no PSRAM
+     * fallback — under fragmentation this is the first thing to fail. */
     if (xTaskCreatePinnedToCore(qr_worker, "qr_worker", 12288, NULL, 3,
                                 &s_qr_task, 0) != pdPASS) {
-        quirc_destroy(q);
-        return false;
+        ESP_LOGE(TAG, "qr init: worker create failed (internal largest=%u)",
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL));
+        goto fail;
     }
     s_quirc = q; /* publish last: worker checks s_quirc before touching it */
     return true;
+
+fail:
+    quirc_destroy(q);
+    if (s_qr_rgb) {
+        heap_caps_free(s_qr_rgb);
+        s_qr_rgb = NULL;
+    }
+    if (s_qr_go) {
+        vSemaphoreDelete(s_qr_go);
+        s_qr_go = NULL;
+    }
+    if (s_qr_result) {
+        vSemaphoreDelete(s_qr_result);
+        s_qr_result = NULL;
+    }
+    return false;
 }
 
 /* Viewfinder = the rotated analysis image (sensor sits 90° to the
@@ -1180,21 +1206,30 @@ static void cam_run_scan(void)
                 ? "QRコードを枠の中に入れてください"
                 : "スキャン中 (緑=読取 黄=惜しい)");
 
-        if (s_req.mode == SCAN_QR && qr_once()) {
-            xSemaphoreTake(s_qr_result, 0); /* drop any stale completion */
-            s_qr_hit = false;
-            s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
-            s_qr_runs = 0;
-            s_qr_candidates = 0;
-            s_qr_last_err = 0; /* QUIRC_SUCCESS */
-            s_qr_last_size = 0;
+        bool qr_ok = true;
+        if (s_req.mode == SCAN_QR) {
+            qr_ok = qr_once();
+            if (!qr_ok) {
+                /* fail loudly NOW — scanning with no decoder used to look
+                   exactly like a hang (viewfinder up, callback never) */
+                fail = "QR init failed (no memory)";
+            } else {
+                xSemaphoreTake(s_qr_result, 0); /* drop stale completion */
+                s_qr_hit = false;
+                s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
+                s_qr_runs = 0;
+                s_qr_candidates = 0;
+                s_qr_last_err = 0; /* QUIRC_SUCCESS */
+                s_qr_last_size = 0;
+            }
         }
 
         int dq_fail = 0;
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         scan_started = esp_timer_get_time();
-        while (!s_cancel && esp_timer_get_time() < deadline && !found) {
+        while (qr_ok && !s_cancel && esp_timer_get_time() < deadline &&
+               !found) {
             struct v4l2_buffer buf = { 0 };
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
@@ -1319,8 +1354,15 @@ static void cam_run_scan(void)
        (decode drain -> UI dismiss -> network resume -> busy release -> result
        callback; §12). Persistent resources are kept; the pipeline stays
        streaming (see pipeline_once / §9). */
-    if (qr_outstanding)
-        xSemaphoreTake(s_qr_result, portMAX_DELAY); /* worker stops touching bufs */
+    /* Bounded drain, never portMAX_DELAY: a wedged/absent worker must not
+       hold s_busy (and the user's callback) hostage. On timeout the
+       persistent s_qr_rgb/quirc stay valid for a late worker write, and
+       the next scan's take(s_qr_result, 0) drops the stale completion. */
+    if (qr_outstanding &&
+        xSemaphoreTake(s_qr_result, pdMS_TO_TICKS(15000)) != pdTRUE)
+        ESP_LOGE(TAG, "qr drain timeout: worker never completed "
+                 "(task=%p quirc=%p runs=%d)",
+                 (void *)s_qr_task, (void *)s_quirc, s_qr_runs);
     if (led.canvas)
         ui_tab5_cam_canvas_hide();
     if (led.dismiss_cb)
