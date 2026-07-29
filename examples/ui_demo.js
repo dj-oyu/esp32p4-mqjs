@@ -22,22 +22,38 @@ if (!W)
 var BG = 0x102030, FG = 0xE0E6EA, DIM = 0x47566A;
 var ACC = 0x4FC3F7, RED = 0xE05A4E;
 
-ui.clear(BG);
-ui.text(20, 14, "mqjs ui デモ", FG);
-ui.rect(W - 72, 8, 56, 56, 0x2E6BD6); /* 設定を開くボタン */
+/* ---- レイアウト: 縦横で高さが倍近く変わるので寸法は全部 W/H から引く ---- */
+var CX, CY, R;        /* 時計: 中心と半径 */
+var CAP, GC, GA;      /* グラフ: キャプション y / 中心線 / 振幅 */
+function measure() {
+    CX = W >> 1;
+    var gband = Math.round(H * 0.28);   /* 下端はグラフ帯、残りが時計 */
+    var cband = H - gband - 44;         /* 44 = ヘッダの下 */
+    CY = 44 + (cband >> 1);
+    R = Math.round(Math.min(W, cband) * 0.42);
+    GA = Math.round(gband * 0.34);
+    GC = H - Math.round(gband * 0.40);
+    CAP = GC - GA - 30;
+}
 
-/* ---- アナログ時計: 文字盤 ---- */
-var CX = Math.round(W / 2), CY = 360, R = 210;
-var i;
-for (i = 0; i < 60; i++) {
-    var a = i * Math.PI / 30;
-    var major = (i % 5 === 0);
-    var r0 = major ? R - 16 : R - 7;
-    ui.line(CX + Math.round(r0 * Math.sin(a)), CY - Math.round(r0 * Math.cos(a)),
-            CX + Math.round(R * Math.sin(a)), CY - Math.round(R * Math.cos(a)),
-            major ? FG : DIM);
-    if (i % 15 === 0)
-        delay(5); /* let the UI drain the queue */
+/* 静的シーン (ヘッダ / 文字盤 60 本 / グラフの軸)。回転後もこれごと引き直す */
+function drawScene() {
+    ui.clear(BG);
+    ui.text(20, 14, "mqjs ui デモ", FG);
+    ui.rect(W - 72, 8, 56, 56, 0x2E6BD6); /* 設定を開くボタン */
+    var i;
+    for (i = 0; i < 60; i++) {
+        var a = i * Math.PI / 30;
+        var major = (i % 5 === 0);
+        var r0 = major ? R - 16 : R - 7;
+        ui.line(CX + Math.round(r0 * Math.sin(a)), CY - Math.round(r0 * Math.cos(a)),
+                CX + Math.round(R * Math.sin(a)), CY - Math.round(R * Math.cos(a)),
+                major ? FG : DIM);
+        if (i % 15 === 0)
+            delay(5); /* let the UI drain the queue */
+    }
+    ui.text(20, CAP, "サイン波 (50ms 周期) — 右上 □ で設定", DIM);
+    ui.line(0, GC, W - 1, GC, DIM);
 }
 
 /* ---- 針 (SNTP 未同期なら 1970 起点で動くだけ) ---- */
@@ -66,15 +82,51 @@ function drawClock() {
     ui.rect(CX - 80, CY + R + 24, 160, 26, BG);
     ui.text(CX - 52, CY + R + 24, two(hr) + ":" + two(min) + ":" + two(sec), FG);
 }
-setInterval(drawClock, 1000);
+
+/* 回転すると C 側はキャンバスを別寸法で張り直し、アプリが描くまで隠したままに
+   する。hands の端点は旧中心で測った座標なので、消し線を新中心から引くと筋が
+   残る — 捨てて引き直す。掃引位置も新しい幅の外側かもしれない。 */
+function relayout() {
+    var s = ui.size();
+    W = s[0] || W;   /* [0,0] = 画面なし: 前の値を保つ */
+    H = s[1] || H;
+    measure();
+    hands = [null, null, null];
+    gx = 0;
+    drawScene();
+    drawClock();
+}
+
+/* このアプリは他にキーを使わないので、回転トークンだけの handler */
+ui.onKey(function (k) {
+    if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate")
+        relayout();
+});
+
+/* 追従を "\x00rotate" だけに頼らない。トークンはフォアグラウンドのアプリにしか
+   届かず、取りこぼした一回がそのままズレっぱなしになる。ui.size() は副作用の
+   無いクエリなので、毎秒の針更新のついでに突き合わせる。 */
+setInterval(function () {
+    var s = ui.size();
+    if (s[0] && (s[0] !== W || s[1] !== H)) {
+        relayout();
+        return;
+    }
+    drawClock();
+}, 1000);
+
+/* 背面では描画コマンドが捨てられる — 上のポーリングだけだと、裏で回転を拾って
+   W/H だけ新しくなり、前面に戻っても寸法が一致するので文字盤が戻らない */
+sys.onForeground(relayout);
+
+measure();
+drawScene();
 drawClock();
 
 /* ---- ライブグラフ: サイン波の掃引 (ホットパス) ---- */
-ui.text(20, 860, "サイン波 (50ms 周期) — 右上 □ で設定", DIM);
-var GC = 1020, GA = 100, gx = 0, ph = 0;
+var gx = 0, ph = 0;
 var waveStep = 2;      /* 掃引の速さ (px/tick): 設定スライダーで変更 */
 var waveRun = true;    /* 一時停止トグル */
-ui.line(0, GC, W - 1, GC, DIM);
 setInterval(function () {
     if (!waveRun)
         return;
