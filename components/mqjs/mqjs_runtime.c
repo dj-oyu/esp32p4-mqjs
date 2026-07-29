@@ -5636,21 +5636,28 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
                                      MQJS_MAX_SKK);
 
-    int err = 0, img = -1;
-    for (int i = 0; i < ntried && img < 0; i++)
+    /* Report the FIRST candidate's failure, not the last. The chain is
+       best-first, so the first is the one the build meant to provide —
+       naming the last would blame /littlefs/skk/skk_dict_M.bin for an
+       erased `jisyo` partition, which is the wrong place to go looking. */
+    int err = 0, first_err = 0, img = -1;
+    for (int i = 0; i < ntried && img < 0; i++) {
         img = skkimg_acquire(tried[i], &err);
+        if (i == 0)
+            first_err = err;
+    }
     if (img < 0) {
+        err = first_err;
         if (err == -102)
             return JS_ThrowInternalError(
-                ctx, "skk: no built-in dictionary — build one with "
-                     "tools/skk_prep.py into components/skk_core/skk_dict.bin, "
-                     "flash one into the `jisyo` partition, or pass a path to "
-                     "skk.open()");
+                ctx, "skk: this firmware was built without a dictionary — "
+                     "flash one into the `jisyo` partition (README 3.5), "
+                     "select one in menuconfig, or pass a path to skk.open()");
         /* -100 I/O, -101 out of memory, -103 no such partition,
            -104 the partition is erased; anything else is an skk_err_t. */
         return JS_ThrowInternalError(
             ctx, "skk: cannot load %s (%s)",
-            tried[ntried - 1][0] ? tried[ntried - 1] : "(built-in)",
+            tried[0][0] ? tried[0] : "(built-in)",
             err == -103 ? "no such partition — check partitions.csv"
           : err == -104 ? "partition is erased — flash a dictionary into it "
                           "(README 3.5)"
