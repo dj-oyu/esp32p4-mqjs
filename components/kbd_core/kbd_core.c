@@ -112,6 +112,7 @@ static const char *key_token(kbd_key_t k)
     case KBD_K_F12:   return "f12";
     case KBD_K_COPY:  return "copy";
     case KBD_K_PASTE: return "paste";
+    case KBD_K_IME:   return "ime";
     default:          return NULL;
     }
 }
@@ -124,6 +125,7 @@ static bool key_repeats(kbd_key_t k)
     case KBD_K_ESC:
     case KBD_K_COPY:
     case KBD_K_PASTE:
+    case KBD_K_IME:   /* a held toggle would flap the IME on and off */
     case KBD_K_ENTER:
         return false;
     default:

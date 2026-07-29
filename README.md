@@ -506,9 +506,10 @@ gcc -O2 -I mquickjs -o /tmp/stdlib_tool device_stdlib.c mquickjs/mquickjs_build.
 mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h
 /tmp/stdlib_tool -m64 > gen_pc/device_stdlib.h
-gcc -O2 -I. -Igen_pc -Imquickjs -o /tmp/run_pc tools/run_pc.c \
-  mqjs_runtime.c system_vault.c app/mqjs_app_manager.c mquickjs/mquickjs.c \
-  mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c -lm
+gcc -O2 -I. -Igen_pc -Imquickjs -I../skk_core/include -o /tmp/run_pc tools/run_pc.c \
+  mqjs_runtime.c system_vault.c tailscale_adapter.c app/mqjs_app_manager.c \
+  ../skk_core/skk_kana.c ../skk_core/skk_dict.c ../skk_core/skk_builtin.c \
+  mquickjs/mquickjs.c mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c -lm
 
 /tmp/run_pc ../../examples/bench.js
 timeout 3 /tmp/run_pc ../../examples/life.js

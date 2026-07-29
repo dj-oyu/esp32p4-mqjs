@@ -1497,10 +1497,14 @@ static const char *CB_LBL_ALT = "Alt";
 static const char *CB_LBL_ALT_LOCK = "ALT";
 
 /* one row, so array index == button id */
+/* "あ" is the IME toggle: it sends "\0ime", which an app with Japanese
+   input turns into skk.enable() and every other app ignores. It is here
+   rather than on a control byte because the classic SKK toggles are all
+   unreachable on this keyboard — see the comment on KBD_K_IME. */
 static const char *CB_MAP_MAIN[] = {
     "Esc", "Tab", "Ctrl", "Alt", "Fn",
     LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
-    LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "",
+    LV_SYMBOL_COPY, LV_SYMBOL_PASTE, "\xe3\x81\x82" /* あ */, "",
 };
 #define CB_ID_CTRL 2
 #define CB_ID_ALT  3
@@ -1509,7 +1513,7 @@ static const kbd_key_t CB_KEY_MAIN[] = {
     KBD_K_ESC, KBD_K_TAB,
     KBD_K_NONE /* Ctrl */, KBD_K_NONE /* Alt */, KBD_K_NONE /* Fn */,
     KBD_K_LEFT, KBD_K_DOWN, KBD_K_UP, KBD_K_RIGHT,
-    KBD_K_COPY, KBD_K_PASTE,
+    KBD_K_COPY, KBD_K_PASTE, KBD_K_IME,
 };
 static const char *CB_MAP_FN[] = {
     "Fn", "F1", "F2", "F3", "F4", "F5", "F6",
