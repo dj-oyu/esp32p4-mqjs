@@ -54,6 +54,7 @@
 /* Pure logic, no ESP-IDF headers, so it is included unconditionally and
    links into tools/run_pc exactly as it does into the firmware. */
 #include "skk_core.h"
+#include "ime_core.h"
 /* Same deal: header-only, no ESP-IDF headers, so ui.cellWidth and the
    ui_tab5 cell renderer classify from one table on both targets. */
 #include "ui_cell_width.h"
@@ -263,6 +264,7 @@ typedef struct {
     JSGCRef   touch_cb;
     volatile bool key_used;   /* read by the UI task (poster) */
     JSGCRef   key_cb;
+    volatile bool ime_used;   /* ui.ime(1): 打鍵を IME に通す (poster が読む) */
     bool fg_used;  JSGCRef fg_cb;   /* sys.onForeground */
     bool bg_used;  JSGCRef bg_cb;   /* sys.onBackground */
     bool sig_used; JSGCRef sig_cb;  /* sys.onSignal */
@@ -1785,6 +1787,13 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return JS_UNDEFINED;
 }
 
+#ifdef ESP_PLATFORM
+/* IME は打鍵の分配より手前で噛ませる。実体は辞書解決を skk.open() と
+   共有するため下の skk セクションにある。IME_TEXT のときは key と len が
+   確定文字列に差し替わる。 */
+static ime_disp_t mqjs_ime_feed(const char **key, size_t *len);
+#endif
+
 void mqjs_post_key(const char *utf8, size_t len)
 {
 #ifdef ESP_PLATFORM
@@ -1795,7 +1804,20 @@ void mqjs_post_key(const char *utf8, size_t len)
     if (mqjs_power_note_input(2))
         return;
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
-    if (!s_event_queue || !fg->used || !fg->key_used || !utf8 || len == 0)
+    if (!s_event_queue || !fg->used || !utf8 || len == 0)
+        return;
+
+    /* IME はここ (docs/keyboard-ime-unification.md §7)。両側とも理由がある。
+       復帰キーの握り潰しの「後」: 画面を起こしただけのキーで変換を始めない。
+       fg->key_used チェックの「前」: あの行は ui.onKey を登録していない
+       アプリの打鍵をここで殺しており (launcher や reading のような widget
+       専用アプリがそれ)、後ろに置くと「ドックの物理キーが field に入らない」
+       という §2 の根っこをそのまま踏む。 */
+    if (mqjs_ime_feed(&utf8, &len) == IME_TAKEN)
+        return;   /* 変換中: preedit は外へ 1 バイトも出さない */
+    /* IME_TEXT なら utf8/len は確定文字列に差し替わっている。IME_PASS は素通し。 */
+
+    if (!fg->key_used)
         return;
     /* 1 イベントに入り切らない入力は捨てずに続きとして送る。IME の確定
        文字列は 1 打鍵で 8 バイトを軽く超え、落とすと入力が黙って消える
@@ -5612,6 +5634,41 @@ static void skkimg_release(int idx)
     memset(&s_skk_img[idx], 0, sizeof s_skk_img[idx]);
 }
 
+/* 辞書ソースの探索順を 1 か所に閉じ込める。`path` が空なら
+   partition → 内蔵 (無ければファイル) の best-first。開けた s_skk_img の
+   index、失敗なら -1。
+   `*out_err` は最初の候補の失敗理由、`*out_first` はその名前 — 最後の
+   候補で答えると、消えた `jisyo` パーティションの話なのに
+   skk_dict_M.bin を指してしまい、探す場所を間違えさせる。
+   skk.open() とプラットフォーム IME が同じ順で開くのは必須で、ずれると
+   「大きい辞書を焼けば全アプリが賢くなる」(設計 §6.6) が崩れる。 */
+static int skkimg_acquire_best(const char *path, int *out_err,
+                               const char **out_first)
+{
+    const char *tried[3];
+    int ntried = 0;
+
+    if (path && path[0]) {
+        tried[ntried++] = path;
+    } else {
+        tried[ntried++] = MQJS_SKK_PART_PREFIX MQJS_SKK_PARTITION;
+        if (skk_builtin_image().base)
+            tried[ntried++] = "";                    /* plum, in rodata */
+        else
+            tried[ntried++] = MQJS_SKK_DEFAULT_DICT; /* nothing built in */
+    }
+    *out_first = tried[0];
+
+    int err = 0, first_err = 0, img = -1;
+    for (int i = 0; i < ntried && img < 0; i++) {
+        img = skkimg_acquire(tried[i], &err);
+        if (i == 0)
+            first_err = err;
+    }
+    *out_err = first_err;
+    return img;
+}
+
 static void skkslot_free(SkkSlot *s)
 {
     if (!s->used)
@@ -5651,20 +5708,9 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     (void)this_val;
     (void)argc;
     char path[MQJS_SKK_PATH_MAX];
-    const char *tried[3];
-    int ntried = 0;
 
     if (uiw_copy_str(ctx, argv[0], path, sizeof path))
         return JS_EXCEPTION;
-    if (path[0]) {
-        tried[ntried++] = path;
-    } else {
-        tried[ntried++] = MQJS_SKK_PART_PREFIX MQJS_SKK_PARTITION;
-        if (skk_builtin_image().base)
-            tried[ntried++] = "";                    /* plum, in rodata */
-        else
-            tried[ntried++] = MQJS_SKK_DEFAULT_DICT; /* nothing built in */
-    }
 
     int slot = -1;
     for (int i = 0; i < MQJS_MAX_SKK; i++) {
@@ -5677,18 +5723,10 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
                                      MQJS_MAX_SKK);
 
-    /* Report the FIRST candidate's failure, not the last. The chain is
-       best-first, so the first is the one the build meant to provide —
-       naming the last would blame /littlefs/skk/skk_dict_M.bin for an
-       erased `jisyo` partition, which is the wrong place to go looking. */
-    int err = 0, first_err = 0, img = -1;
-    for (int i = 0; i < ntried && img < 0; i++) {
-        img = skkimg_acquire(tried[i], &err);
-        if (i == 0)
-            first_err = err;
-    }
+    int err = 0;
+    const char *first = "";
+    int img = skkimg_acquire_best(path, &err, &first);
     if (img < 0) {
-        err = first_err;
         if (err == -102)
             return JS_ThrowInternalError(
                 ctx, "skk: this firmware was built without a dictionary — "
@@ -5698,7 +5736,7 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
            -104 the partition is erased; anything else is an skk_err_t. */
         return JS_ThrowInternalError(
             ctx, "skk: cannot load %s (%s)",
-            tried[0][0] ? tried[0] : "(built-in)",
+            first[0] ? first : "(built-in)",
             err == -103 ? "no such partition — check partitions.csv"
           : err == -104 ? "partition is erased — flash a dictionary into it "
                           "(README 3.5)"
@@ -6057,6 +6095,112 @@ static void skk_release_app(int worker)
             skkslot_free(&s_skk[i]);
 }
 
+/* ---- platform IME session (docs/keyboard-ime-unification.md §7) ------
+ *
+ * ONE ime_t for the device, not one per app. 辞書も学習も既に device
+ * 単位で共有されていて (skkimg_acquire / skk_mru_get)、セッションだけ
+ * 増やしても「どこにも描かれない 2 つ目の preedit」ができるだけ。誰の
+ * 打鍵を通すかは MqjsWorker.ime_used (ui.ime(1) の opt-in) が決めるので、
+ * ゲームのキーが黙って食われることはない。
+ *
+ * 上の skk.* ハンドルは残してある: skk_test.js はエンジンの試験台で、
+ * 直叩きがその仕事。
+ *
+ * 所有タスクの注意: ime_t は単一タスク所有が前提 (ime_core.h) だが、
+ * mqjs_post_key() は LVGL タスクとドックの kbd タスクの両方から呼ばれ、
+ * ui.ime() は mqjs タスクで走る。opt-in するアプリがまだ 1 本も無い間は
+ * ime_used が立たず ime_feed() まで到達しないので現状は無害。**最初の
+ * opt-in を入れる前に排他を入れること** — 例えば自動回転の
+ * "\0rotate" (ui_tab5) とドックの打鍵は本当に同時に来る。 */
+static ime_t s_ime;
+static bool  s_ime_init;
+static int   s_ime_img = -1;
+
+/* セッションを使える状態にする。辞書は初回だけ開く。
+   失敗を恒久ラッチしないのが肝で (§4-4)、skk_dict.bin は gitignore 対象
+   = クリーンビルドのファームには本当に辞書が無く、後から焼かれる。
+   ラッチすると焼いた後もアプリ再起動まで直らない。 */
+static bool ime_arm(void)
+{
+    if (!s_ime_init) {
+        ime_init(&s_ime);
+        s_ime_init = true;
+    }
+    if (s_ime_img < 0) {
+        int err = 0;
+        const char *first = "";
+        int img = skkimg_acquire_best("", &err, &first);
+        if (img < 0)
+            return false;
+        s_ime_img = img;
+        ime_attach(&s_ime, &s_skk_img[img].dict);
+        /* NULL でも IME は動く (学習しなくなるだけ) */
+        ime_attach_mru(&s_ime, skk_mru_get());
+    }
+    return true;
+}
+
+/* IME を降りるときの後始末。読みかけは捨てる (確定させない — 誤操作で
+   リモートのシェルへ文字列を押し込むより、数文字打ち直す方がまし)。
+   学習の書き戻しは ime_core が I/O をしないのでここの仕事 (§4-7)。 */
+static void ime_disarm(void)
+{
+    if (!s_ime_init)
+        return;
+    ime_set_on(&s_ime, false);
+    ime_reset(&s_ime);
+    ime_view_clear(&s_ime);
+    (void)skk_mru_flush();
+}
+
+#ifdef ESP_PLATFORM
+/* mqjs_post_key() のフック本体。opt-in していないアプリでは 1 回の
+   分岐で IME_PASS へ抜ける。 */
+static ime_disp_t mqjs_ime_feed(const char **key, size_t *len)
+{
+    MqjsWorker *fg = &s_workers[s_fg_worker];
+    if (!fg->used || !fg->ime_used || s_ime_img < 0)
+        return IME_PASS;
+
+    ime_disp_t d = ime_feed(&s_ime, *key, *len);
+    if (d == IME_TEXT) {
+        s_skk_mru_dirty = true;  /* js_skk_key と同じ: 印だけ、書き戻しは後 */
+        *key = ime_text(&s_ime, len);
+        if (!*key || *len == 0)
+            d = IME_TAKEN;       /* 空の確定は流さない */
+    }
+    if ((ime_view(&s_ime) & IME_V_ENABLE) && !ime_on(&s_ime))
+        (void)skk_mru_flush();   /* 「あ」で切った瞬間 = 打鍵が止まる区切り */
+    ime_view_clear(&s_ime);      /* 描く側は W3。今は溜めない */
+    return d;
+}
+#endif
+
+/* ui.ime(mode) — canvas アプリの opt-in (§7/§8.2)。1 = このアプリの打鍵を
+   IME に通す、0 = 通さない。既存アプリの挙動を変えないための明示 opt-in で、
+   widget の field は I3 で自動になる。
+   返すのは「実際に有効になったか」— 辞書の無いファームでは false で、
+   アプリは見えない変換を始めずに済む。 */
+JSValue js_ui_ime(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    int mode;
+    if (JS_ToInt32(ctx, &mode, argv[0]))
+        return JS_EXCEPTION;
+    if (mode) {
+        if (!ime_arm())
+            return JS_NewBool(false);
+        s_cur_wk->ime_used = true;
+        return JS_NewBool(true);
+    }
+    if (s_cur_wk->ime_used) {
+        s_cur_wk->ime_used = false;  /* 先に落とす: poster を止めてから畳む */
+        ime_disarm();
+    }
+    return JS_NewBool(false);
+}
+
 /* ------------------------------------------------------------------ */
 /* scheduler (design §3.7)                                             */
 /* ------------------------------------------------------------------ */
@@ -6158,6 +6302,10 @@ static void app_reset_bindings(MqjsWorker *app)
     if (app->key_used) {
         app->key_used = false;   /* ditto */
         JS_DeleteGCRef(ctx, &app->key_cb);
+    }
+    if (app->ime_used) {
+        app->ime_used = false;   /* ditto */
+        ime_disarm();            /* 読みかけを次のアプリへ持ち越さない (§4-7) */
     }
     if (app->fg_used) {
         JS_DeleteGCRef(ctx, &app->fg_cb);
@@ -6302,6 +6450,7 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     app->mqtt_onconn_used = false;
     app->touch_used = false;
     app->key_used = false;
+    app->ime_used = false;
     app->fg_used = app->bg_used = app->sig_used = false;
     app->stop_used = false;
     app->stopping = false;

@@ -434,6 +434,7 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("overlay", 2, js_ui_overlay),
     JS_CFUNC_DEF("onTouch", 1, js_ui_onTouch),
     JS_CFUNC_DEF("onKey", 1, js_ui_onKey),
+    JS_CFUNC_DEF("ime", 1, js_ui_ime),   /* canvas アプリの IME opt-in */
     /* widget layer (W1) */
     JS_CFUNC_DEF("screen", 1, js_ui_screen),
     JS_CFUNC_DEF("back", 0, js_ui_back),
