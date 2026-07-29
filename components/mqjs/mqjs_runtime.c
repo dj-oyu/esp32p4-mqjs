@@ -54,6 +54,9 @@
 /* Pure logic, no ESP-IDF headers, so it is included unconditionally and
    links into tools/run_pc exactly as it does into the firmware. */
 #include "skk_core.h"
+/* Same deal: header-only, no ESP-IDF headers, so ui.cellWidth and the
+   ui_tab5 cell renderer classify from one table on both targets. */
+#include "ui_cell_width.h"
 #include "app/mqjs_app_manager_internal.h"
 
 #ifdef ESP_PLATFORM
@@ -1310,43 +1313,27 @@ JSValue js_ui_cellSize(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     return arr;
 }
 
-/* ui.cellWidth(codePoint): compact wcwidth-like classification for grid UIs.
-   Private-use/Nerd Font glyphs intentionally remain width 1. */
+/* ui.cellWidth(codePoint): compact wcwidth-like classification for grid
+   UIs. The table is ui_cell_width() in ui_cell_width.h, shared verbatim
+   with the ui.cells glyph blitter — see that header for why. */
 JSValue js_ui_cellWidth(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int v; /* JS_ToInt32 takes int* — int32_t is long on riscv32 */
     if (JS_ToInt32(ctx, &v, argv[0]))
         return JS_EXCEPTION;
-    uint32_t cp = (uint32_t)v;
-    int width = 1;
-    if (cp == 0 || cp < 0x20 || (cp >= 0x7F && cp < 0xA0) ||
-        cp == 0x200D ||
-        (cp >= 0x0300 && cp <= 0x036F) ||
-        (cp >= 0x1AB0 && cp <= 0x1AFF) ||
-        (cp >= 0x1DC0 && cp <= 0x1DFF) ||
-        (cp >= 0x20D0 && cp <= 0x20FF) ||
-        (cp >= 0xFE00 && cp <= 0xFE0F) ||
-        (cp >= 0xFE20 && cp <= 0xFE2F) ||
-        (cp >= 0xE0100 && cp <= 0xE01EF)) {
-        width = 0;
-    } else if ((cp >= 0x1100 && cp <= 0x115F) ||
-               (cp >= 0x2329 && cp <= 0x232A) ||
-               (cp >= 0x2E80 && cp <= 0xA4CF) ||
-               (cp >= 0xAC00 && cp <= 0xD7A3) ||
-               (cp >= 0xF900 && cp <= 0xFAFF) ||
-               (cp >= 0xFE10 && cp <= 0xFE19) ||
-               (cp >= 0xFE30 && cp <= 0xFE6F) ||
-               (cp >= 0xFF01 && cp <= 0xFF60) ||
-               (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-               (cp >= 0x1F300 && cp <= 0x1FAFF) ||
-               (cp >= 0x20000 && cp <= 0x3FFFD)) {
-        width = 2;
-    }
-    return JS_NewInt32(ctx, width);
+    return JS_NewInt32(ctx, ui_cell_width((uint32_t)v));
 }
 
 /* ui.cells(col, row, str, fg, bg): draw a monospace run of cells with a
-   single fg/bg (the JS terminal splits each row into same-color runs). */
+   single fg/bg (the JS terminal splits each row into same-color runs).
+
+   CONTRACT: one codepoint per column. A width-2 codepoint (ui.cellWidth
+   == 2) must be followed by a filler codepoint — a space — for the
+   column it covers; ssh_vt.js calls that model cell CONT. The renderer
+   widens the glyph's clip box to two cells but still advances one
+   column per codepoint, so a caller that omits the filler gets the
+   wide glyph's right half painted over its neighbour instead of a
+   whole line shifted right. */
 JSValue js_ui_cells(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int col, row, fg = 0xFFFFFF, bg = 0;
@@ -4054,7 +4041,7 @@ static int start_from_file(int slot, const char *arg, const char *name)
     fseek(f, 0, SEEK_END);
     long flen = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (flen <= 0 || flen > 64 * 1024) {
+    if (flen <= 0 || flen > MQJS_SCRIPT_MAX) {
         fclose(f);
         return -1;
     }

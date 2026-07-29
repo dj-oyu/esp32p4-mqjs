@@ -25,11 +25,13 @@
 #include "ui_status.h"
 
 #define SIG_LEN        64
-#define MAX_SCRIPT_LEN (64 * 1024)
+#define MAX_SCRIPT_LEN MQJS_SCRIPT_MAX
 /* sig+script must fit in one esp-mqtt packet: honor MAX_SCRIPT_LEN with
    topic/header headroom. 32KB silently capped pushes below the
    documented limit (ssh_vt grew past it at T3b: "rejected: too large"
-   while the sender said published). */
+   while the sender said published; it did it again at S6 when the SKK
+   frontend took the file past 64KB, which is why MQJS_SCRIPT_MAX now
+   lives in mqjs_runtime.h instead of being repeated here). */
 #define RX_BUF_SIZE    (MAX_SCRIPT_LEN + 2048)
 #define TX_BUF_SIZE    2048          /* out = short status lines only */
 

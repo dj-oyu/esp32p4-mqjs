@@ -6,11 +6,15 @@ if(CONFIG_MQJS_TAB5_UI)
     set(UI_SRCS "ui_tab5.cpp" "ui_widgets.cpp" "fonts/font_noto_jp_20_4.c"
         # monospace terminal font (HackGen Console NF size17 bpp4 via
         # lv_font_conv; ASCII + box-drawing + Nerd Font BMP icons so an
-        # SSH'd neovim/powerline/eza renders) — used by ui.cells
+        # SSH'd neovim/powerline/eza renders) — used by ui.cells, and
+        # since S0 also the icon link of the ui_font fallback chain (it
+        # is a strict superset of the deleted 20px font_nf_ui_20.c).
+        # S4 added JIS X 0208 ku 1-7 + 16-47 (kana, punctuation, Greek,
+        # Cyrillic, level-1 kanji): 3,747 -> 7,204 codepoints, glyph_bitmap
+        # 366,124 -> 772,460 B. Regenerate with tools/font_term_mono.py
+        # (it re-inserts the _Static_assert lv_font_conv does not emit and
+        # refuses to install a font over the LVGL 1 MB bitmap_index cap).
         "fonts/font_term_mono.c"
-        # Nerd Font icons at UI size (20px): 3rd link of the ui_font
-        # fallback chain — labels/buttons/console lines can use NF glyphs
-        "fonts/font_nf_ui_20.c"
         # ST712x panel drivers vendored from M5Tab5-UserDemo (Apache-2.0)
         "vendor/esp_lcd_st7123.c" "vendor/esp_lcd_st7121.c")
 else()

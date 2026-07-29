@@ -22,7 +22,17 @@ CONFIG_MQJS_TASK_BROKER="mqtt://192.168.1.2"
 # Tab5 display, touch, SSH client, and camera.
 CONFIG_MQJS_TAB5_UI=y
 CONFIG_MQJS_SSH=y
-CONFIG_LV_FONT_MONTSERRAT_20=y
+# Montserrat 20 was the ui_font() fallback that filled Noto's missing
+# U+0020/U+0022 and drew the LV_SYMBOL icons. font_term_mono covers both
+# since S0, so this is 21.8 KB of dead weight; Montserrat 14 is the chain
+# tail now.
+# CONFIG_LV_FONT_MONTSERRAT_20 is not set
+# Required, not decorative: ui_font() references &lv_font_montserrat_14
+# directly (it is the last link of the fallback chain, for U+F55A/U+F8A2).
+# It happens to be on via LV_FONT_DEFAULT_MONTSERRAT_14 today, so state it
+# explicitly — changing the default font size would otherwise turn this
+# into a link error. A loud failure, but an avoidable one.
+CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_MQJS_CAMERA=y
 
 # Camera pipeline (SC2356 over MIPI-CSI).
