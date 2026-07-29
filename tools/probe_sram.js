@@ -25,7 +25,10 @@
 sys.setAppName("probe_sram");
 
 var BASE = "esp32p4-mqjs/task/u7q3x9f2";
-var WG_URL = "http://100.83.214.77:8799/"; // this PC over the tailnet
+/* level-infinity's open SSH port: HTTP fails but connect+banner+close
+   all cross the WG tunnel (the PC's 8799 was firewalled, st=-1 with no
+   return traffic) */
+var WG_URL = "http://100.124.214.100:22/";
 
 function pub(o) { mqtt.publish(BASE + "/proberep", JSON.stringify(o), 0, 0); }
 
