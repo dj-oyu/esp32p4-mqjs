@@ -14,6 +14,7 @@
 #include "cam_tab5.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #if CONFIG_MQJS_CAMERA
 
@@ -107,9 +108,22 @@ const char *cam_tab5_status(void)
     return s_status;
 }
 
+static bool cam_owner_once(void); /* fwd: pre-created at boot, see below */
+
 void cam_tab5_set_i2c(void *i2c_master_bus_handle)
 {
     s_bus = (i2c_master_bus_handle_t)i2c_master_bus_handle;
+    /* Pre-create the resident owner task NOW, on the boot-fresh heap.
+       Created lazily on the first scan, its 16 KB stack landed in the
+       middle of the heap's tail free block and split the largest
+       contiguous region (heap-walk audit 2026-07-29: 98.6K -> 7.7+56.8K
+       was mostly this stack plus driver allocs). At boot the same 16 KB
+       packs into the low free space and the tail stays whole. The scan
+       lifecycle is unchanged — the task just blocks on its queue.
+       (A static .bss stack was tried first and measured WORSE: .bss and
+       the heap share L2 one-for-one, so the reservation shrank the tail
+       by the same bytes it saved — placement is the only real lever.) */
+    cam_owner_once();
 }
 
 static bool xclk_once(void)
@@ -717,8 +731,13 @@ static bool ppa_once(void)
 
 static uint16_t *s_mid;
 static struct quirc *s_quirc;
-static struct quirc_code s_qr_code;
-static struct quirc_data s_qr_data;
+/* decode temporaries (~12.6 KB): heap-allocated per decode run instead
+ * of permanent .bss — resident cost is zero while no QR scan runs, and
+ * one malloc per ~220 ms decode is noise */
+struct qr_tmp {
+    struct quirc_code code;
+    struct quirc_data data;
+};
 /* QR decode crop: a NATIVE-RES reticle window (camera-lifecycle-plan §6), NOT a
  * downscale. The old 400x300 failed because it DOWNSCALED the 800x600 crop 0.5x,
  * dropping module density below quirc's finder threshold. We instead CROP a
@@ -841,24 +860,33 @@ static void qr_decode_once(void)
     s_qr_candidates = n;
 
     t = esp_timer_get_time();
-    for (int i = 0; i < n; i++) {
-        quirc_extract(s_quirc, i, &s_qr_code);
-        quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+    struct qr_tmp *qt = NULL;
+    if (n > 0) {
+        qt = heap_caps_malloc(sizeof *qt,
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!qt) /* internal tight (scan-time transient): PSRAM works too */
+            qt = heap_caps_malloc(sizeof *qt,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    for (int i = 0; qt && i < n; i++) {
+        quirc_extract(s_quirc, i, &qt->code);
+        quirc_decode_error_t err = quirc_decode(&qt->code, &qt->data);
         if (err == QUIRC_ERROR_DATA_ECC) {
-            quirc_flip(&s_qr_code);
-            err = quirc_decode(&s_qr_code, &s_qr_data);
+            quirc_flip(&qt->code);
+            err = quirc_decode(&qt->code, &qt->data);
         }
         s_qr_last_err = err;             /* diag (last candidate wins) */
-        s_qr_last_size = s_qr_code.size; /* diag: QR cells/side */
-        if (err != QUIRC_SUCCESS || s_qr_data.payload_len <= 0 ||
-            (size_t)s_qr_data.payload_len >= sizeof s_qr_payload ||
-            memchr(s_qr_data.payload, '\0', s_qr_data.payload_len))
+        s_qr_last_size = qt->code.size;  /* diag: QR cells/side */
+        if (err != QUIRC_SUCCESS || qt->data.payload_len <= 0 ||
+            (size_t)qt->data.payload_len >= sizeof s_qr_payload ||
+            memchr(qt->data.payload, '\0', qt->data.payload_len))
             continue;
-        memcpy(s_qr_payload, s_qr_data.payload, s_qr_data.payload_len);
-        s_qr_payload[s_qr_data.payload_len] = '\0';
+        memcpy(s_qr_payload, qt->data.payload, qt->data.payload_len);
+        s_qr_payload[qt->data.payload_len] = '\0';
         s_qr_hit = true;
         break;
     }
+    free(qt);
     s_qr_dec_us += esp_timer_get_time() - t;
     s_qr_runs++;
 }
@@ -888,20 +916,46 @@ static bool qr_once(void)
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_qr_go = xSemaphoreCreateBinary();
     s_qr_result = xSemaphoreCreateBinary();
+    /* Failure must be ATOMIC. A half-initialized state here is what
+       wedged the owner task for good (2026-07-29): s_qr_rgb left set
+       with no worker made the scan loop hand frames to nobody, and
+       teardown blocked forever draining a result that could never come
+       — no callback, s_busy stuck, every later scan refused. */
     if (!s_qr_rgb || !s_qr_go || !s_qr_result) {
-        quirc_destroy(q);
-        return false;
+        ESP_LOGE(TAG, "qr init: alloc failed (rgb=%p go=%p res=%p)",
+                 (void *)s_qr_rgb, (void *)s_qr_go, (void *)s_qr_result);
+        goto fail;
     }
     /* core 0 (with the cam_owner task at prio 4), one below it: the owner
      * preempts to keep the viewfinder at frame rate, the worker takes the
-     * slack. Off core 1 so it never steals LVGL render time. */
+     * slack. Off core 1 so it never steals LVGL render time. NOTE the
+     * 12 KB stack is a DYNAMIC task stack = internal RAM only, no PSRAM
+     * fallback — under fragmentation this is the first thing to fail. */
     if (xTaskCreatePinnedToCore(qr_worker, "qr_worker", 12288, NULL, 3,
                                 &s_qr_task, 0) != pdPASS) {
-        quirc_destroy(q);
-        return false;
+        ESP_LOGE(TAG, "qr init: worker create failed (internal largest=%u)",
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL));
+        goto fail;
     }
     s_quirc = q; /* publish last: worker checks s_quirc before touching it */
     return true;
+
+fail:
+    quirc_destroy(q);
+    if (s_qr_rgb) {
+        heap_caps_free(s_qr_rgb);
+        s_qr_rgb = NULL;
+    }
+    if (s_qr_go) {
+        vSemaphoreDelete(s_qr_go);
+        s_qr_go = NULL;
+    }
+    if (s_qr_result) {
+        vSemaphoreDelete(s_qr_result);
+        s_qr_result = NULL;
+    }
+    return false;
 }
 
 /* Viewfinder = the rotated analysis image (sensor sits 90° to the
@@ -1087,7 +1141,9 @@ typedef struct {
  * delete the task) — the owner loops for the next command. */
 static void cam_run_scan(void)
 {
-    static uint8_t line[CAM_W]; /* one scan at a time (s_busy) */
+    /* scan-lifetime scratch (freed in teardown): one scanline at a time
+       (s_busy). Was permanent .bss; now costs nothing between scans. */
+    uint8_t *line = malloc(CAM_W);
     char code[CAM_TAB5_QR_PAYLOAD_MAX + 1];
     char lbl[112], lbl_cache[112];
     FrameHit disp, last_hit;
@@ -1122,7 +1178,9 @@ static void cam_run_scan(void)
         led.net = CAM_NET_MICROLINK;
     }
 
-    bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+    bool pipe_ok = line && pipeline_once(); /* on failure it set s_status */
+    if (!line)
+        fail = "no memory (scanline)";
 
     if (pipe_ok) {
         /* bound DQBUF so the loop's deadline/cancel check actually runs */
@@ -1161,21 +1219,30 @@ static void cam_run_scan(void)
                 ? "QRコードを枠の中に入れてください"
                 : "スキャン中 (緑=読取 黄=惜しい)");
 
-        if (s_req.mode == SCAN_QR && qr_once()) {
-            xSemaphoreTake(s_qr_result, 0); /* drop any stale completion */
-            s_qr_hit = false;
-            s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
-            s_qr_runs = 0;
-            s_qr_candidates = 0;
-            s_qr_last_err = 0; /* QUIRC_SUCCESS */
-            s_qr_last_size = 0;
+        bool qr_ok = true;
+        if (s_req.mode == SCAN_QR) {
+            qr_ok = qr_once();
+            if (!qr_ok) {
+                /* fail loudly NOW — scanning with no decoder used to look
+                   exactly like a hang (viewfinder up, callback never) */
+                fail = "QR init failed (no memory)";
+            } else {
+                xSemaphoreTake(s_qr_result, 0); /* drop stale completion */
+                s_qr_hit = false;
+                s_qr_gray_us = s_qr_id_us = s_qr_dec_us = 0;
+                s_qr_runs = 0;
+                s_qr_candidates = 0;
+                s_qr_last_err = 0; /* QUIRC_SUCCESS */
+                s_qr_last_size = 0;
+            }
         }
 
         int dq_fail = 0;
         int64_t deadline =
             esp_timer_get_time() + (int64_t)s_req.timeout_ms * 1000;
         scan_started = esp_timer_get_time();
-        while (!s_cancel && esp_timer_get_time() < deadline && !found) {
+        while (qr_ok && !s_cancel && esp_timer_get_time() < deadline &&
+               !found) {
             struct v4l2_buffer buf = { 0 };
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
@@ -1300,14 +1367,24 @@ static void cam_run_scan(void)
        (decode drain -> UI dismiss -> network resume -> busy release -> result
        callback; §12). Persistent resources are kept; the pipeline stays
        streaming (see pipeline_once / §9). */
-    if (qr_outstanding)
-        xSemaphoreTake(s_qr_result, portMAX_DELAY); /* worker stops touching bufs */
+    /* Bounded drain, never portMAX_DELAY: a wedged/absent worker must not
+       hold s_busy (and the user's callback) hostage. On timeout the
+       persistent s_qr_rgb/quirc stay valid for a late worker write, and
+       the next scan's take(s_qr_result, 0) drops the stale completion. */
+    if (qr_outstanding &&
+        xSemaphoreTake(s_qr_result, pdMS_TO_TICKS(15000)) != pdTRUE)
+        ESP_LOGE(TAG, "qr drain timeout: worker never completed "
+                 "(task=%p quirc=%p runs=%d)",
+                 (void *)s_qr_task, (void *)s_quirc, s_qr_runs);
     if (led.canvas)
         ui_tab5_cam_canvas_hide();
     if (led.dismiss_cb)
         ui_tab5_cam_set_dismiss_cb(NULL);
     if (led.net != CAM_NET_NONE && s_net_resume)
         s_net_resume();   /* re-arm the network now the camera released the bus */
+    free(line);
+    ean13_scratch_release(); /* barcode scratch (~24 KB + ~10 KB): freed */
+    bc_locate_release();     /* between scans, reallocated on the next one */
 
     char done[256];
     char perf[192] = "";

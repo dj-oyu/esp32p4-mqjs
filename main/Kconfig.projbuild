@@ -45,6 +45,30 @@ menu "mqjs platform"
             No signature verification yet: on a public broker the topic
             name is the only secret, pick a non-guessable one.
 
+    config MQJS_DEV_ARENA_KB
+        int "Dev-slot JS arena size override in KB (0 = default 256, PSRAM)"
+        default 0
+        range 0 256
+        help
+            A/B probe for the PSRAM-arena tax on the JS interpreter
+            (pointer-chasing is latency-bound; nobody has measured what
+            PSRAM costs this workload). Overrides the dev worker's arena
+            size only — every other slot keeps the 256 KB PSRAM arena and
+            the app model is untouched. Compare 96 KB PSRAM against 96 KB
+            internal (below) with the same bench, NOT against the 256 KB
+            default: a different arena size changes GC cadence, which
+            would confound the comparison.
+
+    config MQJS_DEV_ARENA_INTERNAL
+        bool "Place the dev-slot arena in internal L2 SRAM"
+        default n
+        help
+            The other half of the A/B. Only sensible with
+            MQJS_DEV_ARENA_KB small enough to leave L2MEM room for the
+            camera scan scratch and network bursts (96 KB is the tested
+            point). Falls back to PSRAM with a warning if the internal
+            allocation fails at boot. Dev probe only — never ship.
+
     config MQJS_OPUS_BENCHMARK
         bool "Run real-fixture Opus decoder benchmark at boot"
         default n

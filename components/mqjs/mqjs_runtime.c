@@ -3419,22 +3419,41 @@ static void dispatch_http(MqjsWorker *app, MqjsEvent *ev)
 /* sys: heap telemetry (W1-4) + P4a lifecycle / signals                */
 /* ------------------------------------------------------------------ */
 
-/* sys.heap() -> [internal_free, psram_free, lvgl_pool_free] bytes.
+/* sys.heap() -> [internal_free, psram_free, lvgl_pool_free,
+                  l2_free, l2_largest, l2_min_ever, lp_free, psram_largest].
+   [0..2] are the legacy trio (existing callers index them).
+   [3..5] view the 576 KB L2MEM through MALLOC_CAP_DMA — the only caps
+   unique to L2 — because [0] (MALLOC_CAP_INTERNAL) also counts the
+   LP SRAM overflow region (ALLOW_RTC_FAST_MEM_AS_HEAP) whose 32 KB
+   block would mask real L2 numbers and fragmentation. [5] is the
+   low-water mark since boot: transient dips (SDIO bursts, camera scan
+   scratch) register here even when sampling misses them.
    The third element matters most for widget churn: the LVGL tlsf pool
    is preallocated from PSRAM (W1-1), so leaks inside it are invisible
    to the OS heap counters. */
 JSValue js_sys_heap(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     uint32_t internal = 0, psram = 0, lvgl = 0;
+    uint32_t l2f = 0, l2max = 0, l2min = 0, lpf = 0, psmax = 0;
 #ifdef ESP_PLATFORM
     internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     lvgl = ui_tab5_lv_mem_free();
+    l2f = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    l2max = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    l2min = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
+    lpf = heap_caps_get_free_size(MALLOC_CAP_RTCRAM);
+    psmax = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 #endif
     JSValue arr = JS_NewArray(ctx, 0);
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewUint32(ctx, internal));
     JS_SetPropertyUint32(ctx, arr, 1, JS_NewUint32(ctx, psram));
     JS_SetPropertyUint32(ctx, arr, 2, JS_NewUint32(ctx, lvgl));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewUint32(ctx, l2f));
+    JS_SetPropertyUint32(ctx, arr, 4, JS_NewUint32(ctx, l2max));
+    JS_SetPropertyUint32(ctx, arr, 5, JS_NewUint32(ctx, l2min));
+    JS_SetPropertyUint32(ctx, arr, 6, JS_NewUint32(ctx, lpf));
+    JS_SetPropertyUint32(ctx, arr, 7, JS_NewUint32(ctx, psmax));
     return arr;
 }
 
@@ -5636,21 +5655,28 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
                                      MQJS_MAX_SKK);
 
-    int err = 0, img = -1;
-    for (int i = 0; i < ntried && img < 0; i++)
+    /* Report the FIRST candidate's failure, not the last. The chain is
+       best-first, so the first is the one the build meant to provide —
+       naming the last would blame /littlefs/skk/skk_dict_M.bin for an
+       erased `jisyo` partition, which is the wrong place to go looking. */
+    int err = 0, first_err = 0, img = -1;
+    for (int i = 0; i < ntried && img < 0; i++) {
         img = skkimg_acquire(tried[i], &err);
+        if (i == 0)
+            first_err = err;
+    }
     if (img < 0) {
+        err = first_err;
         if (err == -102)
             return JS_ThrowInternalError(
-                ctx, "skk: no built-in dictionary — build one with "
-                     "tools/skk_prep.py into components/skk_core/skk_dict.bin, "
-                     "flash one into the `jisyo` partition, or pass a path to "
-                     "skk.open()");
+                ctx, "skk: this firmware was built without a dictionary — "
+                     "flash one into the `jisyo` partition (README 3.5), "
+                     "select one in menuconfig, or pass a path to skk.open()");
         /* -100 I/O, -101 out of memory, -103 no such partition,
            -104 the partition is erased; anything else is an skk_err_t. */
         return JS_ThrowInternalError(
             ctx, "skk: cannot load %s (%s)",
-            tried[ntried - 1][0] ? tried[ntried - 1] : "(built-in)",
+            tried[0][0] ? tried[0] : "(built-in)",
             err == -103 ? "no such partition — check partitions.csv"
           : err == -104 ? "partition is erased — flash a dictionary into it "
                           "(README 3.5)"
@@ -6588,18 +6614,35 @@ void mqjs_rt_init(void)
     for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
         if (s_workers[i].mem)
             continue;
-        uint8_t *m = heap_caps_malloc(MQJS_APP_MEM_SIZE, MALLOC_CAP_SPIRAM);
+        size_t asz = MQJS_APP_MEM_SIZE;
+        uint8_t *m = NULL;
+#if CONFIG_MQJS_DEV_ARENA_KB > 0
+        /* A/B probe (MQJS_DEV_ARENA_KB / _INTERNAL): dev slot only */
+        if (i == MQJS_WORKER_DEV) {
+            asz = (size_t)CONFIG_MQJS_DEV_ARENA_KB * 1024;
+#ifdef CONFIG_MQJS_DEV_ARENA_INTERNAL
+            m = heap_caps_malloc(asz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!m)
+                ESP_LOGW(TAG, "dev arena: internal %u KB failed, PSRAM "
+                         "fallback", (unsigned)(asz / 1024));
+#endif
+            ESP_LOGW(TAG, "dev arena probe: %u KB, %s", (unsigned)(asz / 1024),
+                     m ? "internal L2" : "PSRAM");
+        }
+#endif
+        if (!m)
+            m = heap_caps_malloc(asz, MALLOC_CAP_SPIRAM);
         if (!m) {
             ESP_LOGW(TAG, "PSRAM arena alloc failed for slot %d, trying "
                      "internal RAM", i);
-            m = malloc(MQJS_APP_MEM_SIZE);
+            m = malloc(asz);
         }
         if (!m) {
             ESP_LOGE(TAG, "no arena for app slot %d", i);
             continue;
         }
         s_workers[i].mem = m;
-        s_workers[i].mem_size = MQJS_APP_MEM_SIZE;
+        s_workers[i].mem_size = asz;
     }
 #endif
 }
