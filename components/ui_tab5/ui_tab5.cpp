@@ -458,6 +458,59 @@ extern "C" bool ui_tab5_cmd(const ui_cmd_t *cmd)
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* UI-task work seam (docs/term-design.md §5/§7.2). A generic job queue */
+/* plus a per-frame hook: the native terminal parses and serialises on  */
+/* this task so its grid stays single-writer, and ui_tab5 never learns  */
+/* what term_core is.                                                   */
+/* ------------------------------------------------------------------ */
+#define UI_JOB_QUEUE_DEPTH 16
+
+typedef struct {
+    ui_tab5_job_fn fn;
+    void *arg;
+} ui_job_t;
+
+static QueueHandle_t s_job_queue;
+static TaskHandle_t s_ui_task;      /* stamped by the frame timer */
+static ui_tab5_job_fn s_frame_fn;
+static void *s_frame_arg;
+
+extern "C" bool ui_tab5_post_job(ui_tab5_job_fn fn, void *arg,
+                                 uint32_t timeout_ms)
+{
+    if (!s_job_queue || !fn)
+        return false;
+    ui_job_t job = { fn, arg };
+    TickType_t ticks = timeout_ms ? pdMS_TO_TICKS(timeout_ms) : 0;
+    return xQueueSend(s_job_queue, &job, ticks) == pdTRUE;
+}
+
+extern "C" bool ui_tab5_is_ui_task(void)
+{
+    return s_ui_task && xTaskGetCurrentTaskHandle() == s_ui_task;
+}
+
+extern "C" void ui_tab5_set_frame_cb(ui_tab5_job_fn fn, void *arg)
+{
+    s_frame_arg = arg;
+    s_frame_fn = fn;
+}
+
+/* Called from the mooncake frame timer, i.e. on the UI task under the
+   LVGL port lock, after the canvas has drained its command queue. */
+static void ui_run_frame_work(void)
+{
+    s_ui_task = xTaskGetCurrentTaskHandle();
+    if (s_job_queue) {
+        ui_job_t job;
+        while (xQueueReceive(s_job_queue, &job, 0) == pdTRUE)
+            job.fn(job.arg);
+    }
+    if (s_frame_fn)
+        s_frame_fn(s_frame_arg);
+}
+
 extern "C" void ui_tab5_canvas_size(int *w, int *h)
 {
     *w = s_canvas_w;
@@ -3500,6 +3553,7 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     s_log_mtx = s_log ? xSemaphoreCreateMutex() : NULL;
     s_status_mtx = xSemaphoreCreateMutex();
     s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
+    s_job_queue = xQueueCreate(UI_JOB_QUEUE_DEPTH, sizeof(ui_job_t));
 
     ui_panel_variant_t variant = panel_reset_and_detect();
     if (variant == UI_PANEL_NONE)
@@ -3576,6 +3630,9 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         [](lv_timer_t *) {
             mooncake::GetMooncake().update();
             touch_observe();
+            /* after the canvas consumed its commands, so a term's blit
+               lands in the same frame it was parsed in */
+            ui_run_frame_work();
         },
         16, nullptr);
     lvgl_port_unlock();

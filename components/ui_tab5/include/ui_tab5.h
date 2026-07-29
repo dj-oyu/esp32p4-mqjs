@@ -251,7 +251,49 @@ void ui_tab5_cam_overlay_text(const char *utf8);
  * cam_tab5 registers its cancel here before each scan. */
 void ui_tab5_cam_set_dismiss_cb(void (*cb)(void));
 
+/* ------------------------------------------------------------------ */
+/* UI-task work seam (docs/term-design.md §5, §7.2).                   */
+/*                                                                     */
+/* The native terminal parses, resizes and serialises snapshots ON the */
+/* UI frame task, which is what keeps its grid single-writer and its   */
+/* snapshots frame-consistent. It needs three things from here and     */
+/* nothing else — ui_tab5 stays unaware that term_core exists.         */
+/* ------------------------------------------------------------------ */
+
+typedef void (*ui_tab5_job_fn)(void *arg);
+
+/* Queue fn(arg) for the UI task. Returns false when the queue is full
+ * or the UI is down; the caller reports an error rather than blocking.
+ * `arg` must stay alive until the job has run. */
+bool ui_tab5_post_job(ui_tab5_job_fn fn, void *arg, uint32_t timeout_ms);
+
+/* True when the calling task IS the UI task. A caller that is already
+ * there runs its work inline instead of posting to itself. */
+bool ui_tab5_is_ui_task(void);
+
+/* Run fn(arg) once per UI frame, after the canvas has consumed its
+ * command queue. One slot; a second call replaces the first, NULL
+ * clears. The callback runs on the UI task under the LVGL lock and
+ * must stay short — it shares the frame with LVGL. */
+void ui_tab5_set_frame_cb(ui_tab5_job_fn fn, void *arg);
+
 #else /* stubs: UI disabled (Stamp-P4 and default builds) */
+
+typedef void (*ui_tab5_job_fn)(void *arg);
+static inline bool ui_tab5_post_job(ui_tab5_job_fn fn, void *arg,
+                                    uint32_t timeout_ms)
+{
+    (void)fn;
+    (void)arg;
+    (void)timeout_ms;
+    return false;
+}
+static inline bool ui_tab5_is_ui_task(void) { return false; }
+static inline void ui_tab5_set_frame_cb(ui_tab5_job_fn fn, void *arg)
+{
+    (void)fn;
+    (void)arg;
+}
 
 static inline void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
 {

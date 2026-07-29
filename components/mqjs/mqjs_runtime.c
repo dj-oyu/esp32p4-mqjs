@@ -57,6 +57,11 @@
 /* Same deal: header-only, no ESP-IDF headers, so ui.cellWidth and the
    ui_tab5 cell renderer classify from one table on both targets. */
 #include "ui_cell_width.h"
+/* The native terminal (docs/term-design.md). term_registry.h and
+   term_port.h are pure C99 over a function-pointer seam, so they come in
+   unconditionally and term.* works in run_pc exactly as ui.* does. The
+   device glue behind term_ui_tab5.h is the only ESP-only part. */
+#include "term_registry.h"
 #include "app/mqjs_app_manager_internal.h"
 /* mkdir()/fsync() for the personal dictionary (S7). Outside the
    ESP_PLATFORM block on purpose: the same code runs in run_pc, and
@@ -85,6 +90,7 @@
 #include "sshc.h"
 #include "cam_tab5.h"
 #include "audio_tab5.h"
+#include "term_ui_tab5.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -528,11 +534,20 @@ void mqjs_set_uninstall_hook(void (*fn)(const char *name))
 
 /* Flush one assembled line to the sink. Non-dev apps get a "[name] "
    prefix so the shared console stays attributable (§3.5). */
+static void term_sink_line(const char *writer, const char *line, size_t len);
+
 static void sink_flush(void)
 {
     MqjsWorker *app = s_cur_wk;
     char *line = app ? app->sink_line : s_orphan_line;
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
+    /* §3.1's second sink: the same assembled line also goes to the term
+       registry's console, tagged with the app that wrote it (§4.4's
+       {writer_id, class} — the LP black box tees from here in phase 3).
+       Independent of s_print_sink: the console screen must work whether
+       or not the host wired a status-bar sink. */
+    if (*plen)
+        term_sink_line(app && app->name[0] ? app->name : "system", line, *plen);
     if (s_print_sink && *plen) {
         if (app && app->idx != MQJS_WORKER_DEV && app->name[0]) {
             char buf[sizeof(app->sink_line) + sizeof(app->name) + 4];
@@ -6010,6 +6025,407 @@ static void skk_release_app(int worker)
 }
 
 /* ------------------------------------------------------------------ */
+/* term.* — the native terminal (docs/term-design.md §8)               */
+/* ------------------------------------------------------------------ */
+/*
+ * Thin argument marshalling over term_registry, holding no state of its
+ * own. Three rules from the design shape every function here:
+ *
+ *   - The OWNER is never taken from JS. It is s_cur_wk->name, i.e. the
+ *     app identity the signed push established (§3.1 I3). An app cannot
+ *     name another app's namespace, so it cannot read or write another
+ *     app's terminal, and there is no cross-app read API at all (§7.2).
+ *   - Errors are RETURN VALUES, not exceptions (§8): a closed, reused or
+ *     foreign id yields a negative term_err_t (null for the two string
+ *     getters). A terminal error must not kill an app.
+ *   - Nothing blocks. create/log/feed/resize/show/close are copy-and-
+ *     return; snapshot/read post to the UI task and join with a cap
+ *     (§7.2), which the registry does, not this layer.
+ */
+
+/* Bring the subsystem up on first use. On the device this installs the
+   FreeRTOS port, starts the reaper and hooks the UI frame; on the host
+   it installs a single-threaded fake so run_pc exercises the same code.
+   Doing it lazily keeps ~100KB of PSRAM unspent until an app actually
+   asks for a terminal. */
+#ifndef ESP_PLATFORM
+/* PC port: run_pc is single-threaded, so the mutex is a debug counter,
+   the "UI task" is the caller, and the signal is never waited on. */
+static void *tp_mutex_create(void) { return calloc(1, sizeof(int)); }
+static void tp_mutex_destroy(void *m) { free(m); }
+static bool tp_mutex_lock(void *m, uint32_t ms)
+{
+    (void)ms;
+    int *held = m;
+    if (*held)
+        return false; /* would be a self-deadlock: report, never hang */
+    *held = 1;
+    return true;
+}
+static void tp_mutex_unlock(void *m) { *(int *)m = 0; }
+static int64_t tp_now_ms(void) { return time_ms(); }
+static void *tp_signal_create(void) { return calloc(1, sizeof(int)); }
+static void tp_signal_destroy(void *s) { free(s); }
+static void tp_signal_set(void *s) { *(int *)s = 1; }
+static bool tp_signal_wait(void *s, uint32_t ms) { (void)ms; return *(int *)s != 0; }
+static bool tp_ui_post(term_ui_job_fn fn, void *arg, uint32_t ms)
+{
+    (void)ms;
+    fn(arg);
+    return true;
+}
+static bool tp_ui_is_current(void) { return true; }
+static void *tp_mem_alloc(size_t n, unsigned flags) { (void)flags; return malloc(n); }
+static void tp_mem_free(void *p) { free(p); }
+
+static const term_port_t s_term_pc_port = {
+    tp_mutex_create, tp_mutex_destroy, tp_mutex_lock, tp_mutex_unlock,
+    tp_now_ms,
+    tp_signal_create, tp_signal_destroy, tp_signal_set, tp_signal_wait,
+    tp_ui_post, tp_ui_is_current,
+    tp_mem_alloc, tp_mem_free,
+    NULL, NULL,
+};
+#endif /* !ESP_PLATFORM */
+
+/* Grid that fills the canvas, clamped to what one term block was sized
+   for (§4.1 worst case: 142 cols / 53 rows / 4,260 cells). */
+static void term_default_grid(int *cols, int *rows)
+{
+    int cw = 9, ch = 24, w = 720, h = 1192;
+#ifdef ESP_PLATFORM
+    ui_tab5_cell_size(&cw, &ch);
+    ui_tab5_canvas_size(&w, &h);
+#endif
+    if (cw <= 0) cw = 9;
+    if (ch <= 0) ch = 24;
+    if (w <= 0) w = 720;
+    if (h <= 0) h = 1192;
+    *cols = w / cw;
+    *rows = h / ch;
+    if (*cols < 1) *cols = 1;
+    if (*rows < 1) *rows = 1;
+    if (*cols > TERM_MAX_COLS_DEFAULT) *cols = TERM_MAX_COLS_DEFAULT;
+    if (*rows > TERM_MAX_ROWS_DEFAULT) *rows = TERM_MAX_ROWS_DEFAULT;
+    while (*cols * *rows > TERM_MAX_CELLS_DEFAULT)
+        (*rows)--;
+}
+
+static bool term_ready(void)
+{
+    if (term_registry_ready())
+        return true;
+
+    /* The shared system console (§11.2's "汎用 console 画面"): a TERM_LOG
+       term owned by the platform that every app's print() tees into.
+       Created here rather than at boot so a device that never opens a
+       terminal never pays its ~110KB of PSRAM. */
+    term_create_opts_t console;
+    term_registry_config_t cfg;
+    int cols, rows;
+
+    term_default_grid(&cols, &rows);
+    memset(&console, 0, sizeof console);
+    console.name = "console";
+    console.owner = TERM_OWNER_SYSTEM; /* term_registry_init forces this */
+    console.mode = TERM_LOG;
+    console.cols = cols;
+    console.rows = rows;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.console = &console;
+
+#ifdef ESP_PLATFORM
+    return term_ui_tab5_start(&cfg) == TERM_OK;
+#else
+    if (!term_port_installed() && !term_port_install(&s_term_pc_port))
+        return false;
+    return term_registry_init(&cfg) == TERM_OK;
+#endif
+}
+
+/*
+ * Give the registry its frame time on builds that have no UI task
+ * (run_pc). On the device this is a no-op: the drain and the blit are
+ * driven by ui_tab5's frame hook, and the reaper by its own task —
+ * neither of them is js_task's business (§5, §3.1).
+ */
+static void mqjs_term_pump(void)
+{
+#ifndef ESP_PLATFORM
+    if (!term_registry_ready())
+        return;
+    term_registry_ui_drain();
+    term_registry_reap();
+#endif
+}
+
+/* The print sink's tee (§3.1 "print sink -> registry"). Silent until an
+   app has brought the subsystem up; never allocates, never blocks. */
+static void term_sink_line(const char *writer, const char *line, size_t len)
+{
+    if (!term_registry_ready())
+        return;
+    term_registry_system_log(writer, line, len);
+}
+
+/* The calling app's identity, or NULL when there is no app on the
+   stack (early init). NULL means "refuse", never "skip the gate". */
+static const char *term_owner(void)
+{
+    if (!s_cur_wk || !s_cur_wk->name[0])
+        return NULL;
+    return s_cur_wk->name;
+}
+
+static JSValue term_err_value(JSContext *ctx, term_err_t e)
+{
+    return JS_NewInt32(ctx, (int)e);
+}
+
+/* term.create({name, mode, persist, cols, rows}) -> id, or a negative
+   term_err_t. A second create with the same name from the same app
+   re-attaches to the persist term it left behind (§3.1, tmux). */
+JSValue js_term_create(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    if (!owner)
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    if (!term_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+
+    /* The name is the per-owner re-attach key (§3.1) — the thing that
+       makes term.create idempotent across an app restart — so there is
+       no default for it: a term nobody named could never be picked back
+       up. An over-long one is REJECTED, never truncated, for the reason
+       §3.1 gives about identities that silently collide; hence the
+       oversized landing buffer, so the length is measured before any
+       clamping can hide it. */
+    char name[TERM_NAME_MAX + 16];
+    char mode[8] = "";
+    int cols = 0, rows = 0, tmp = 0;
+    bool persist = false;
+    JSValue v;
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+        return term_err_value(ctx, TERM_ERR_INVAL);
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "name"),
+                     name, sizeof name))
+        return JS_EXCEPTION;
+    if (!name[0] || strlen(name) >= TERM_NAME_MAX)
+        return term_err_value(ctx, TERM_ERR_INVAL);
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "mode"),
+                     mode, sizeof mode))
+        return JS_EXCEPTION;
+    persist = uiw_truthy(ctx, JS_GetPropertyStr(ctx, argv[0], "persist"));
+    v = JS_GetPropertyStr(ctx, argv[0], "cols");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        cols = tmp;
+    v = JS_GetPropertyStr(ctx, argv[0], "rows");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        rows = tmp;
+    if (cols < 1 || rows < 1) {
+        int dc, dr;
+        term_default_grid(&dc, &dr);
+        if (cols < 1) cols = dc;
+        if (rows < 1) rows = dr;
+    }
+
+    term_create_opts_t o;
+    memset(&o, 0, sizeof o);
+    o.name = name;
+    o.owner = owner;
+    o.mode = (mode[0] == 'v') ? TERM_VT : TERM_LOG; /* default: log */
+    o.persist = persist;
+    o.cols = cols;
+    o.rows = rows;
+
+    term_id_t id = TERM_ID_INVALID;
+    term_err_t e = term_registry_create(&o, &id, NULL);
+    if (e != TERM_OK)
+        return term_err_value(ctx, e);
+    return JS_NewInt32(ctx, (int)id);
+}
+
+/* term.show(id, {x, y, w, h}) -> 0 or a negative term_err_t. A missing
+   rect hides the term without forgetting where it was (§8: tab
+   switching is show/hide, not create/destroy). */
+JSValue js_term_show(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0, tmp = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+
+    if (argc < 2 || JS_IsUndefined(argv[1]) || JS_IsNull(argv[1]))
+        return term_err_value(ctx,
+                              term_registry_show((term_id_t)id, owner, NULL));
+
+    term_view_t view;
+    memset(&view, 0, sizeof view);
+    view.visible = true;
+    JSValue v = JS_GetPropertyStr(ctx, argv[1], "x");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v)) view.x = (int16_t)tmp;
+    v = JS_GetPropertyStr(ctx, argv[1], "y");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v)) view.y = (int16_t)tmp;
+    v = JS_GetPropertyStr(ctx, argv[1], "w");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v)) view.w = (int16_t)tmp;
+    v = JS_GetPropertyStr(ctx, argv[1], "h");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v)) view.h = (int16_t)tmp;
+    return term_err_value(ctx, term_registry_show((term_id_t)id, owner, &view));
+}
+
+/* term.log(id, str) -> 0 or a negative term_err_t. Line-atomic and
+   lossy: a full ring drops the whole line and counts it (§3.2), which
+   is why logging can never stall the app that logs. */
+JSValue js_term_log(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    JSCStringBuf buf;
+    size_t len = 0;
+    const char *s = JS_ToCStringLen(ctx, &len, argv[1], &buf);
+    if (!s)
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx,
+                          term_registry_log((term_id_t)id, owner, s, len));
+}
+
+/* term.feed(id, str) -> 0 or a negative term_err_t. Raw bytes with full
+   VT interpretation; parsed later, on the UI task (§5). Piped terms
+   refuse it (TERM_ERR_BUSY = -10) because a VT term has exactly one
+   producer. */
+JSValue js_term_feed(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    JSCStringBuf buf;
+    size_t len = 0;
+    const char *s = JS_ToCStringLen(ctx, &len, argv[1], &buf);
+    if (!s)
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx,
+                          term_registry_feed((term_id_t)id, owner,
+                                             (const uint8_t *)s, len, NULL));
+}
+
+/* term.resize(id, cols, rows) -> 0 or a negative term_err_t. Notifying
+   the pty is the caller's business (§8). */
+JSValue js_term_resize(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0, cols = 0, rows = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) || JS_ToInt32(ctx, &cols, argv[1]) ||
+        JS_ToInt32(ctx, &rows, argv[2]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx,
+                          term_registry_resize((term_id_t)id, owner, cols, rows));
+}
+
+/* term.snapshot(id) -> the visible screen as text, or null. Serialised
+   on the UI task at a frame boundary, and non-mutating (§7.2). */
+JSValue js_term_snapshot(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return JS_NULL;
+    /* §7.2 bounds one screen at ~14KB; 16KB covers it with the row
+       separators. Off the JS heap on purpose — a screenful of text
+       should not move an app's 256KB arena. */
+    size_t cap = 16384;
+    char *buf = malloc(cap);
+    if (!buf)
+        return JS_NULL;
+    size_t len = 0;
+    term_err_t e = term_registry_snapshot((term_id_t)id, owner, buf, cap, &len);
+    if (e != TERM_OK && e != TERM_ERR_TRUNC) {
+        free(buf);
+        return JS_NULL;
+    }
+    if (len > cap - 1)
+        len = cap - 1; /* TRUNC reports what was needed, not what fits */
+    JSValue v = JS_NewStringLen(ctx, buf, len);
+    free(buf);
+    return v;
+}
+
+/* term.read(id, from, n) -> n logical scrollback lines joined by '\n',
+   or null. `from` below the surviving range starts at the oldest line
+   rather than failing (§8). */
+JSValue js_term_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0, from = 0, n = 1;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &from, argv[1]))
+        return JS_EXCEPTION;
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &n, argv[2]))
+        return JS_EXCEPTION;
+    if (n < 1)
+        n = 1;
+    if (!owner || !term_registry_ready())
+        return JS_NULL;
+    size_t cap = 8192;
+    char *buf = malloc(cap);
+    if (!buf)
+        return JS_NULL;
+    term_read_result_t res;
+    memset(&res, 0, sizeof res);
+    term_err_t e = term_registry_read((term_id_t)id, owner, (uint32_t)from, n,
+                                      buf, cap, &res);
+    if (e != TERM_OK) {
+        free(buf);
+        return JS_NULL;
+    }
+    JSValue v = JS_NewStringLen(ctx, buf, res.bytes);
+    free(buf);
+    return v;
+}
+
+/* term.close(id) -> 0 or a negative term_err_t. Stage 1 only: the id is
+   dead to the caller the moment this returns, and nothing is joined
+   (§3.1) — the reaper frees the memory once the acks are in. */
+JSValue js_term_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx, term_registry_close((term_id_t)id, owner));
+}
+
+/* ------------------------------------------------------------------ */
 /* scheduler (design §3.7)                                             */
 /* ------------------------------------------------------------------ */
 
@@ -6093,6 +6509,11 @@ static void app_reset_bindings(MqjsWorker *app)
     /* not inside the ESP_PLATFORM block: skk_core is pure logic and its
        dictionary is a real allocation on the host too */
     skk_release_app(app->idx);
+    /* §3.1's teardown hook, in the same sweep as the widget retain
+       stack: this app's non-persist terms enter stage 1, its persist
+       ones go DETACHED and wait to be re-attached (or LRU-evicted). */
+    if (app->name[0])
+        term_registry_owner_stopped(app->name);
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
         if (app->mqtt_subs[i].used) {
             JS_DeleteGCRef(ctx, &app->mqtt_subs[i].fn);
@@ -6771,6 +7192,7 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
         pump_one_event(idle);
         ui_tab5_w_commit(); /* §3.4: start a queued screen-load anim only
                                after this dispatch finished building */
+        mqjs_term_pump(); /* no-op on the device: the UI task drains */
         reap_idle_apps();
 #ifdef ESP_PLATFORM
         mqjs_power_update(time_ms()); /* dim/blank on idle, wake on touch */
@@ -6809,6 +7231,7 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
         int idle = run_all_timers(50 /* ms */);
         pump_one_event(idle);
         ui_tab5_w_commit();
+        mqjs_term_pump();
         for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
             MqjsWorker *app = &s_workers[i];
             if (app->used && (app->kill_req || !anything_pending(app)))

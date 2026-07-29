@@ -444,6 +444,48 @@ static const JSPropDef js_ui[] = {
 static const JSClassDef js_ui_obj =
     JS_OBJECT_DEF("UI", js_ui);
 
+/* ---- device API: term object (native terminal, docs/term-design.md §8).
+   Handle-style like ssh/skk: create() returns an int id and every other
+   call takes it first. The id is (generation << 3) | slot, so a stale
+   handle names a term that no longer exists rather than whatever now
+   occupies that slot. Ownership is C-side (§3.1): the term is NOT the
+   app's object, the app only holds the id, and the owner recorded at
+   create is the app's signed name — which is why there is no way to
+   reach another app's terminal from here (§7.2 gives other apps no
+   gate because the entry point does not exist).
+
+   Errors are RETURN VALUES, never exceptions (§8): a closed, reused or
+   foreign id gives a negative term_err_t (null from snapshot/read).
+   pipe/onReply are phase 4 and deliberately absent. ---- */
+static const JSPropDef js_term[] = {
+    JS_CFUNC_DEF("create", 1, js_term_create),     /* (opts) -> id | -err */
+    JS_CFUNC_DEF("show", 2, js_term_show),         /* (id, {x,y,w,h}) */
+    JS_CFUNC_DEF("log", 2, js_term_log),           /* (id, str) line-atomic */
+    JS_CFUNC_DEF("feed", 2, js_term_feed),         /* (id, bytes) VT input */
+    JS_CFUNC_DEF("resize", 3, js_term_resize),     /* (id, cols, rows) */
+    JS_CFUNC_DEF("snapshot", 1, js_term_snapshot), /* (id) -> text | null */
+    JS_CFUNC_DEF("read", 3, js_term_read),         /* (id, from, n) -> text */
+    JS_CFUNC_DEF("close", 1, js_term_close),
+    /* term_err_t values, so apps need no magic numbers */
+    JS_PROP_DOUBLE_DEF("OK", 0, 0),
+    JS_PROP_DOUBLE_DEF("INVAL", -1, 0),
+    JS_PROP_DOUBLE_DEF("NOT_READY", -2, 0),
+    JS_PROP_DOUBLE_DEF("BAD_ID", -3, 0),
+    JS_PROP_DOUBLE_DEF("STALE", -4, 0),
+    JS_PROP_DOUBLE_DEF("NOT_OWNER", -5, 0),
+    JS_PROP_DOUBLE_DEF("DYING", -6, 0),
+    JS_PROP_DOUBLE_DEF("NO_SLOT", -7, 0),
+    JS_PROP_DOUBLE_DEF("NO_MEM", -8, 0),
+    JS_PROP_DOUBLE_DEF("EXISTS", -9, 0),
+    JS_PROP_DOUBLE_DEF("BUSY", -10, 0),
+    JS_PROP_DOUBLE_DEF("MODE", -11, 0),
+    JS_PROP_DOUBLE_DEF("TIMEOUT", -12, 0),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_term_obj =
+    JS_OBJECT_DEF("Term", js_term);
+
 /* ---- device API: ssh object (wolfSSH client; no-op on non-SSH builds).
    W3 handle-style: connect() returns a session id (max 3 concurrent),
    every other call takes it as the first argument. ---- */
@@ -704,6 +746,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("net", &js_net_obj),
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
+    JS_PROP_CLASS_DEF("term", &js_term_obj),
     JS_PROP_CLASS_DEF("skk", &js_skk_obj),
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
