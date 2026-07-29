@@ -47,6 +47,27 @@ typedef enum {
                          bg=bg. Drawn with the terminal grid font (ui.cells). */
     UI_CMD_SCROLL,    /* scroll cell-rows [x=top, y=bot] by w lines
                          (w>0 up, w<0 down); vacated rows filled with color */
+    UI_CMD_OVERLAY,   /* floating window anchored to a caller-supplied point
+                         (docs/ui-overlay-plan.md).
+
+                         Drawn as LVGL objects ABOVE the canvas, never into
+                         it. That is the whole point: an app that draws a
+                         float itself has to remember which rows it covered
+                         and force them to repaint, because the cells
+                         renderer's dirty check is content-based and an
+                         overdraw on unchanged content survives forever.
+                         Compositing removes the problem instead of asking
+                         every app to solve it.
+
+                         x, y  anchor top-left (canvas pixels)
+                         h     anchor height, so "below" clears the line
+                         w     handle id, 0 .. UI_OVERLAY_MAX-1
+                         color selected item index, -1 for none
+                         bg    bit0-1 place: 0 auto, 1 below, 2 above
+                               bit2   items direction: 0 horizontal, 1 vertical
+                         text  content, or NULL to hide this handle:
+                                 line ("\1" line)* ["\2" item ("\1" item)*]
+                               i.e. \1 separates, \2 starts the item list. */
     UI_CMD_RESET,     /* foreground-app switch: clear + hide the canvas and
                          hide the keyboard (same hygiene as a task switch) */
 } ui_cmd_op_t;
@@ -62,6 +83,17 @@ typedef struct {
                        on success; stays owned by the caller when
                        ui_tab5_cmd() returns false. */
 } ui_cmd_t;
+
+/* Overlay handles per app, and how many items one overlay shows. Both are
+   small on purpose: overlays are transient decoration, and the labels are
+   allocated up-front per handle on first use. */
+#define UI_OVERLAY_MAX   4
+#define UI_OVERLAY_ITEMS 10
+
+/* Overlays are taken down by UI_CMD_RESET, which mqjs already posts both
+   when the foreground app switches and when a foreground app stops — the
+   same point that clears the canvas. No separate teardown call exists on
+   purpose: one hygiene point is easier to keep correct than two. */
 
 /* ------------------------------------------------------------------ */
 /* W1-2/3 widget layer (docs/widget-framework-design.md).              */

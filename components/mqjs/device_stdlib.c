@@ -431,6 +431,7 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("cells", 5, js_ui_cells),
     JS_CFUNC_DEF("scroll", 4, js_ui_scroll),
     JS_CFUNC_DEF("keyboard", 1, js_ui_keyboard),
+    JS_CFUNC_DEF("overlay", 2, js_ui_overlay),
     JS_CFUNC_DEF("onTouch", 1, js_ui_onTouch),
     JS_CFUNC_DEF("onKey", 1, js_ui_onKey),
     /* widget layer (W1) */

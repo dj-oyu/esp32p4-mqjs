@@ -79,6 +79,7 @@ var ERR_FG = 0xE05A4E;
    mquickjs の short int を外れて呼ぶたびにアリーナを確保する。差分を取る
    ぶんには値は正しいが、長時間稼働では計測自体が僅かに重くなる。 */
 var HAVE_US = (typeof sys.micros === "function");
+var HAVE_OVERLAY = (typeof ui.overlay === "function");
 var keyN = 0, keySum = 0, keyMin = 0, keyMax = 0;    /* 打鍵→再描画 (µs) */
 var convN = 0, convSum = 0, convMin = 0, convMax = 0; /* Space→候補 (µs) */
 var convTry = 0, convHit = 0;   /* 変換を試みた / 候補が出た */
@@ -133,10 +134,10 @@ var top = 0;
 var helpOn = false;   /* F4: 操作ヘルプのオーバーレイ */
 /* 差分描画をすり抜けて残る上描きを消すための「次回引き直す行」リスト。
    bodyDraw の署名は行の内容だけを見るので、内容が変わらない行に何かを
-   上描きすると、それが永久に残る。フロート窓とカーソルがまさにそれで、
-   カーソルは移動のたびに古い位置へ描いたぶんが消えずに溜まっていた
-   (実機報告 2026-07-29: 水色の下線が複数残る)。描いた行をここに積み、
-   次の bodyDraw の冒頭で署名を落として引き直させる。 */
+   上描きすると、それが永久に残る。カーソルがまさにそれで、移動のたびに
+   古い位置へ描いたぶんが消えずに溜まっていた (実機報告 2026-07-29)。
+   フロート窓は ui.overlay に移したのでもうここには載らない — 残って
+   いるのはキャンバスに直接描くカーソルだけ。 */
 var dirtyRows = [];
 /* カーソルの点滅。打鍵中は必ず表示 (点滅で見失わないため)。 */
 var blinkOn = true;
@@ -326,8 +327,7 @@ function cursorXY() {
 }
 
 function bodyDraw(force) {
-    /* 前回フロート窓とカーソルが覆った行を汚す。ここでやるので、この後の
-       描画で下の本文が戻り、続く imeFloatDraw が新しい位置に描く。 */
+    /* 前回カーソルが覆った行を汚す。この後の描画で下の本文が戻る。 */
     for (var fi = 0; fi < dirtyRows.length; fi++)
         drawn[dirtyRows[fi]] = null;
     dirtyRows = [];
@@ -418,85 +418,37 @@ function imeDraw() {
             BAR_FG);
 }
 
-/* 変換中のフロート窓。preedit と候補をカーソルの位置に重ねて出す。
- *
- * 設計 §9.1 が preedit を専用行に置けと言っているのは ssh_vt の話で、
- * あそこはグリッドをリモートが所有していて勝手に書くと再描画で消え、
- * 選択コピーの座標もずれる。このアプリは本文を自分で持っているので
- * その制約が無く、カーソル位置に出せる — 視線が下端と入力位置を往復
- * しないぶん段違いに読みやすい。
- *
- * 覆った行は floatRows に記録して、次の bodyDraw に引き直させる。 */
+/* 変換中のフロート窓。C 側の ui.overlay に丸投げする (docs/ui-overlay-plan.md)。
+   アプリが渡すのは「カーソルがどこか」だけで、クランプも上下反転も
+   キーボード回避も、覆った下地の復元も向こうの仕事。
+   以前はここで ui.rect/ui.text を使って自前で描き、覆った行を dirtyRows に
+   記帳していた — 約60行あったうえ、同じ記帳をカーソルで忘れて残像バグを
+   出した。オーバーレイは LVGL が合成するので、その種のバグが起こらない。
+   おまけに端末フォントではなく UI フォント (漢字3,517字) で描かれるので、
+   cells の全角対応を待たずに今日から読める。 */
 function imeFloatDraw() {
-    if (!imeReady || !imeOn || helpOn)
+    if (!HAVE_OVERLAY)
         return;
+    if (!imeReady || !imeOn || helpOn) {
+        ui.overlay(0, null);
+        return;
+    }
     var pre = skk.preedit(ime);
-    var n = cands.length;
-    if (!pre && !n)
+    if (!pre && !cands.length) {
+        ui.overlay(0, null);
         return;
-
+    }
     var xy = cursorXY();
-    var cr = xy[1];
-    if (cr < 0 || cr >= TROWS)
+    if (xy[1] < 0 || xy[1] >= TROWS) {
+        ui.overlay(0, null);
         return;
-
-    /* preedit はカーソルのある行に重ねる。未確定なので本文を隠してよい。 */
-    var pw = pre ? ui.textSize(pre)[0] : 0;
-    var px = xy[0];
-    if (px + pw + 8 > W)
-        px = W - pw - 8;
-    if (px < 0)
-        px = 0;
-    if (pre) {
-        ui.rect(px - 2, (BODY_TOP + cr) * LH, pw + 8, LH, BAR_BG);
-        ui.text(px + 2, (BODY_TOP + cr) * LH + 1, pre, PRE_FG);
-        dirtyRows.push(cr);
     }
-    if (!n)
-        return;
-
-    /* 候補は 1 行下。下端に当たるなら上に返す。 */
-    var br = cr + 1;
-    if (br >= TROWS)
-        br = cr - 1;
-    if (br < 0)
-        return;
-
-    /* 幅に収まる範囲で、選択位置を中心にウィンドウする (全候補一覧は
-       初版では作らない)。まず幅を測ってから箱を描く。 */
-    var first = candSel - 2;
-    if (first < 0)
-        first = 0;
-    var wsum = 8;
-    var last = first;
-    for (var i = first; i < n; i++) {
-        var w2 = ui.textSize(cands[i])[0] + 14;
-        if (wsum + w2 > W - 8)
-            break;
-        wsum += w2;
-        last = i + 1;
-    }
-    var bx = px;
-    if (bx + wsum > W)
-        bx = W - wsum;
-    if (bx < 0)
-        bx = 0;
-    var by = (BODY_TOP + br) * LH;
-    ui.rect(bx, by, wsum, LH, BAR_BG);
-
-    var x = bx + 6;
-    for (var j = first; j < last; j++) {
-        var t = cands[j];
-        var tw = ui.textSize(t)[0];
-        if (j === candSel) {
-            ui.rect(x - 3, by + 1, tw + 6, LH - 2, SEL_BG);
-            ui.text(x, by + 1, t, SEL_FG);
-        } else {
-            ui.text(x, by + 1, t, CAND_FG);
-        }
-        x += tw + 14;
-    }
-    dirtyRows.push(br);
+    ui.overlay(0, {
+        x: xy[0], y: (BODY_TOP + xy[1]) * LH, h: LH,
+        lines: pre ? [pre] : [],
+        items: cands,
+        sel: candSel
+    });
 }
 
 /* F4 の操作ヘルプ。SKK は「大文字で変換を始める」を知らないと一文字も

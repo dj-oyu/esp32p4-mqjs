@@ -1525,6 +1525,225 @@ static const kbd_key_t CB_KEY_FN[] = {
     KBD_K_F11, KBD_K_F12,
 };
 
+/* ------------------------------------------------------------------ */
+/* Overlay: a small window floated over the canvas, anchored to a point
+ * the app supplies (docs/ui-overlay-plan.md).
+ *
+ * WHY THIS IS NOT DRAWN INTO THE CANVAS. The cells renderer's dirty
+ * check is content-based, so anything drawn *over* an unchanged row
+ * survives every later repaint. An app that floats its own window must
+ * therefore remember the rows it covered and force them to repaint —
+ * and forgetting is not a crash, it is a smear that accumulates
+ * (skk_test.js shipped exactly that bug for its cursor). LVGL composites
+ * over the canvas instead, so the problem cannot occur and no app needs
+ * the bookkeeping.
+ *
+ * Second reason, specific to Japanese: these labels use ui_font()
+ * (Noto JP, 3,517 kanji), NOT the terminal grid font, which has zero
+ * CJK glyphs. An IME window is therefore readable today, before the
+ * cells renderer learns double-width and the terminal font is
+ * regenerated.
+ *
+ * Objects per handle are created on first use and then reused: text
+ * changes every keystroke, so per-keystroke object churn is exactly what
+ * we do not want. */
+struct ui_overlay_t {
+    lv_obj_t *box;                       /* container, positioned/clamped */
+    lv_obj_t *lines;                     /* the preedit line(s) */
+    lv_obj_t *row;                       /* item container (flex) */
+    lv_obj_t *item[UI_OVERLAY_ITEMS];    /* candidate chips */
+};
+static ui_overlay_t s_ovl[UI_OVERLAY_MAX];
+
+#define UI_OVL_PAD 6
+
+static void ovl_build(ui_overlay_t *o)
+{
+    lv_obj_t *parent = s_root_scr ? s_root_scr : lv_screen_active();
+
+    o->box = lv_obj_create(parent);
+    lv_obj_remove_style_all(o->box);
+    lv_obj_add_flag(o->box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_CLICKABLE); /* never steal touch */
+    lv_obj_set_style_bg_opa(o->box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(o->box, lv_color_hex(UI_COL_BAR), 0);
+    lv_obj_set_style_radius(o->box, 4, 0);
+    lv_obj_set_style_pad_all(o->box, UI_OVL_PAD, 0);
+    lv_obj_set_style_pad_row(o->box, 2, 0);
+    lv_obj_set_style_border_width(o->box, 1, 0);
+    lv_obj_set_style_border_color(o->box, lv_color_hex(UI_COL_DOWN), 0);
+    lv_obj_set_style_text_font(o->box, ui_font(), 0);
+    lv_obj_set_size(o->box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(o->box, LV_FLEX_FLOW_COLUMN);
+
+    o->lines = lv_label_create(o->box);
+    lv_obj_set_style_text_color(o->lines, lv_color_hex(UI_COL_EVENT), 0);
+    lv_label_set_text(o->lines, "");
+
+    o->row = lv_obj_create(o->box);
+    lv_obj_remove_style_all(o->row);
+    lv_obj_remove_flag(o->row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(o->row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_column(o->row, 10, 0);
+    lv_obj_set_style_pad_row(o->row, 2, 0);
+    for (int i = 0; i < UI_OVERLAY_ITEMS; i++) {
+        o->item[i] = lv_label_create(o->row);
+        lv_obj_set_style_text_color(o->item[i], lv_color_hex(UI_COL_TEXT), 0);
+        lv_obj_set_style_pad_hor(o->item[i], 4, 0);
+        lv_obj_set_style_radius(o->item[i], 3, 0);
+        lv_obj_add_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(o->item[i], "");
+    }
+}
+
+static void ovl_hide(int id)
+{
+    if (id < 0 || id >= UI_OVERLAY_MAX || !s_ovl[id].box)
+        return;
+    lv_obj_add_flag(s_ovl[id].box, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* UI task only. The public ui_tab5_overlay_hide_all() posts commands. */
+static void ovl_hide_all(void)
+{
+    for (int i = 0; i < UI_OVERLAY_MAX; i++)
+        ovl_hide(i);
+}
+
+/* Split `p` on `sep` into up to `max` NUL-terminated pieces, in place. */
+static int ovl_split(char *p, char sep, char **out, int max)
+{
+    int n = 0;
+    if (!p || !*p)
+        return 0;
+    out[n++] = p;
+    for (; *p; p++) {
+        if (*p != sep)
+            continue;
+        *p = '\0';
+        if (n < max)
+            out[n++] = p + 1;
+    }
+    return n;
+}
+
+extern "C" int ui_tab5_kb_reserved(int mode); /* defined below */
+
+/* Position the box against the anchor.
+ *
+ * The anchor is in CANVAS coordinates (what the app draws in); the box is
+ * a child of the screen, which starts UI_STATUSBAR_H higher.
+ *
+ * Rules, in the order they matter:
+ *   - below the anchor by default, above it when below would run past the
+ *     usable bottom — and "usable" subtracts the on-screen keyboard,
+ *     otherwise the window a user is typing into hides under the keys;
+ *   - keep the anchor's x if at all possible, because the entire point is
+ *     that the eye does not move. Only clamp when the box would leave the
+ *     screen;
+ *   - never cover the status bar. */
+static void ovl_place(ui_overlay_t *o, const ui_cmd_t &cmd)
+{
+    lv_obj_update_layout(o->box);
+    int bw = lv_obj_get_width(o->box);
+    int bh = lv_obj_get_height(o->box);
+
+    int scr_w = s_canvas_w > 0 ? s_canvas_w : UI_LCD_H_RES;
+    int top = UI_STATUSBAR_H;
+    int bottom = top + s_canvas_h - ui_tab5_kb_reserved(s_app_kb_mode);
+
+    int ax = cmd.x;
+    int ay = cmd.y + top;
+    int place = cmd.bg & 0x3;
+
+    int y;
+    if (place == 2) {
+        y = ay - bh;
+    } else {
+        y = ay + cmd.h;                       /* below */
+        if (place == 0 && y + bh > bottom)
+            y = ay - bh;                      /* auto: flip above */
+    }
+    if (y + bh > bottom)
+        y = bottom - bh;
+    if (y < top)
+        y = top;
+
+    int x = ax;
+    if (x + bw > scr_w)
+        x = scr_w - bw;
+    if (x < 0)
+        x = 0;
+
+    lv_obj_set_pos(o->box, x, y);
+}
+
+static void ovl_apply(const ui_cmd_t &cmd)
+{
+    int id = cmd.w;
+    if (id < 0 || id >= UI_OVERLAY_MAX)
+        return;
+    if (!cmd.text) {
+        ovl_hide(id);
+        return;
+    }
+    ui_overlay_t *o = &s_ovl[id];
+    if (!o->box)
+        ovl_build(o);
+
+    /* content: "line\1line\2item\1item" */
+    char *body = cmd.text;
+    char *items = strchr(body, '\2');
+    if (items)
+        *items++ = '\0';
+
+    /* LVGL renders '\n' as a line break, so the line separator only has
+       to become one. */
+    for (char *q = body; *q; q++)
+        if (*q == '\1')
+            *q = '\n';
+    lv_label_set_text(o->lines, body);
+    if (*body)
+        lv_obj_remove_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
+
+    char *iv[UI_OVERLAY_ITEMS];
+    int n = items ? ovl_split(items, '\1', iv, UI_OVERLAY_ITEMS) : 0;
+    int sel = (int)cmd.color;
+    bool vertical = (cmd.bg & 0x4) != 0;
+    lv_obj_set_flex_flow(o->row, vertical ? LV_FLEX_FLOW_COLUMN
+                                          : LV_FLEX_FLOW_ROW);
+    for (int i = 0; i < UI_OVERLAY_ITEMS; i++) {
+        if (i < n) {
+            lv_label_set_text(o->item[i], iv[i]);
+            bool on = (i == sel);
+            lv_obj_set_style_bg_opa(o->item[i],
+                                    on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            lv_obj_set_style_bg_color(o->item[i],
+                                      lv_color_hex(UI_COL_FLASH), 0);
+            lv_obj_set_style_text_color(
+                o->item[i], lv_color_hex(on ? 0xFFFFFF : UI_COL_TEXT), 0);
+            lv_obj_remove_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(o->item[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (n)
+        lv_obj_remove_flag(o->row, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(o->row, LV_OBJ_FLAG_HIDDEN);
+
+    /* Unhide BEFORE measuring: lv_obj_update_layout() does not lay out a
+       hidden subtree, so measuring first returns 0 and the box lands at
+       the wrong place (and, with LV_SIZE_CONTENT, can be shown at a size
+       that was never computed). */
+    lv_obj_remove_flag(o->box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(o->box);
+    ovl_place(o, cmd);
+}
+
 /* Mirror the engine's Ctrl/Alt state on the buttons: CHECKED (amber)
    while in effect. Only writes one ctrl bit per button and invalidates
    those buttons, so unlike a set_map this is safe to call from inside
@@ -2642,6 +2861,13 @@ public:
                 kb_show(cmd.x);
                 continue;
             }
+            if (cmd.op == UI_CMD_OVERLAY) {
+                /* not a canvas op: composited above, so it must not
+                   unhide the canvas or count as "drew" */
+                ovl_apply(cmd);
+                free(cmd.text);
+                continue;
+            }
             if (cmd.op == UI_CMD_RESET) {
                 /* foreground-app switch (P4a): same hygiene as a task
                    switch — stale pixels gone, console visible again,
@@ -2650,6 +2876,7 @@ public:
                 lv_obj_add_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
                 kb_show(0);
                 cbar_clear_mods(); /* one-shot state died with the app */
+                ovl_hide_all();    /* a dead app's float must not survive */
                 continue;
             }
             apply(cmd);

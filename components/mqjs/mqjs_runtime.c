@@ -1194,8 +1194,11 @@ JSValue js_i2c_writeReg(JSContext *ctx, JSValue *this_val, int argc, JSValue *ar
 typedef enum {
     UI_CMD_CLEAR = 0, UI_CMD_FILL, UI_CMD_RECT,
     UI_CMD_LINE, UI_CMD_TEXT, UI_CMD_PIXEL, UI_CMD_KEYBOARD,
-    UI_CMD_CELLS, UI_CMD_SCROLL, UI_CMD_RESET,
+    UI_CMD_CELLS, UI_CMD_SCROLL, UI_CMD_OVERLAY, UI_CMD_RESET,
 } ui_cmd_op_t;
+/* keep in step with ui_tab5.h — the order IS the wire format */
+#define UI_OVERLAY_MAX   4
+#define UI_OVERLAY_ITEMS 10
 /* PC stub of the deferred screen-load commit (§3.4) */
 #define ui_tab5_w_commit() ((void)0)
 #endif
@@ -1231,7 +1234,7 @@ static void ui_post_bg(uint8_t op, int x, int y, int w, int h,
 #else
     static const char *names[] =
         { "clear", "fill", "rect", "line", "text", "pixel", "keyboard",
-          "cells", "scroll", "reset" };
+          "cells", "scroll", "overlay", "reset" }; /* order == ui_cmd_op_t */
     printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, fg=0x%06x, bg=0x%06x%s%s) (stub)\n",
            names[op], x, y, w, h, (unsigned)color, (unsigned)bg,
            text ? ", " : "", text ? text : "");
@@ -1528,6 +1531,219 @@ static void dispatch_touch_event(MqjsWorker *app, const MqjsEvent *ev)
    bottom, so a terminal derives its grid without hardcoding it;
    ui.keyboard(-m) returns mode m's height without changing anything
    (the startup grid probe). */
+/* ui.overlay(id, spec | null) — a small window floated over the canvas at
+ * a point the app supplies (docs/ui-overlay-plan.md).
+ *
+ *   ui.overlay(0, { col, row } | { x, y, h },
+ *                 lines: [...], items: [...], sel: n,
+ *                 place: "auto"|"below"|"above", dir: "h"|"v" });
+ *   ui.overlay(0, null);   // hide
+ *
+ * The app supplies the ANCHOR and nothing else about placement: clamping,
+ * flipping above when the on-screen keyboard is in the way, and — the
+ * reason this is not a JS helper — repairing what the window covered.
+ * Drawing a float into the canvas means tracking the rows it dirtied,
+ * because the cells renderer's dirty check is content-based and an
+ * overdraw on unchanged content never goes away. LVGL composites, so
+ * that class of bug cannot happen and no app carries the bookkeeping.
+ *
+ * The content travels as ONE heap string in the existing ui_cmd_t (there
+ * is no richer payload and adding one would touch every command):
+ *   line ("\1" line)* ["\2" item ("\1" item)*]
+ */
+#define MQJS_OVL_TEXT_MAX 512
+
+static int uiw_copy_str(JSContext *ctx, JSValue v, char *dst, size_t cap);
+
+static int ovl_append(char *dst, size_t cap, size_t *len, const char *s)
+{
+    size_t n = strlen(s);
+    if (*len + n >= cap)
+        return -1;
+    memcpy(dst + *len, s, n);
+    *len += n;
+    dst[*len] = '\0';
+    return 0;
+}
+
+/* Collect arr[0..] into `dst`, separated by \1. Non-strings are skipped
+   rather than coerced: a stray object would otherwise be typed into the
+   window as "[object Object]". */
+/* How many entries an item array has, bounded. */
+static int ovl_count(JSContext *ctx, JSValue arr, int cap)
+{
+    int n = 0;
+    if (!JS_IsArray(ctx, arr))
+        return 0;
+    while (n < cap) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, (uint32_t)n);
+        if (JS_IsUndefined(v) || JS_IsNull(v))
+            break;
+        n++;
+    }
+    return n;
+}
+
+/* First item to show, per overlay handle. Only UI_OVERLAY_ITEMS labels
+   exist, so a long candidate list has to be windowed — and the window
+   has to be REMEMBERED, which is why this is state and not a pure
+   function of (count, sel).
+ *
+ * The window moves only when the selection would leave it. Recentring on
+ * every step was tried and is worse on the device: the highlight then
+ * never moves, the list slides underneath it, and you cannot tell that
+ * pressing Space did anything at all. Edge-triggered scrolling keeps the
+ * highlight visibly walking left and right, and the list only jumps when
+ * it has to.
+ *
+ * A fresh candidate set arrives with sel = 0, which is below any nonzero
+ * window and therefore resets it — no explicit "new list" signal needed. */
+static int s_ovl_first[UI_OVERLAY_MAX];
+
+static int ovl_window(int id, int count, int sel, int visible)
+{
+    int first = s_ovl_first[id];
+
+    if (count <= visible || sel < 0) {
+        s_ovl_first[id] = 0;
+        return 0;
+    }
+    if (first > count - visible)
+        first = count - visible;
+    if (first < 0)
+        first = 0;
+    if (sel < first)
+        first = sel;                        /* stepped off the left edge */
+    else if (sel >= first + visible)
+        first = sel - visible + 1;          /* stepped off the right edge */
+    s_ovl_first[id] = first;
+    return first;
+}
+
+static int ovl_join(JSContext *ctx, JSValue arr, char *dst, size_t cap,
+                    size_t *len, int from, int max)
+{
+    int wrote = 0;
+    if (!JS_IsArray(ctx, arr))
+        return 0;
+    for (int i = from; i < from + max; i++) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+        if (JS_IsUndefined(v) || JS_IsNull(v))
+            break;
+        if (!JS_IsString(ctx, v))
+            continue;
+        char item[128];
+        if (uiw_copy_str(ctx, v, item, sizeof item))
+            return -1;
+        if (wrote && ovl_append(dst, cap, len, "\1"))
+            break;
+        if (ovl_append(dst, cap, len, item))
+            break;
+        wrote++;
+    }
+    return wrote;
+}
+
+JSValue js_ui_overlay(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    int id = 0;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (id < 0 || id >= UI_OVERLAY_MAX)
+        return JS_ThrowRangeError(ctx, "ui.overlay: id 0..%d",
+                                  UI_OVERLAY_MAX - 1);
+
+    JSValue spec = argc >= 2 ? argv[1] : JS_UNDEFINED;
+    if (JS_IsUndefined(spec) || JS_IsNull(spec)) {
+        ui_post(UI_CMD_OVERLAY, 0, 0, id, 0, 0, NULL); /* hide */
+        return JS_UNDEFINED;
+    }
+
+    /* Anchor: pixels win when both are given, because an app that can
+       give pixels (proportional text) cannot express its cursor in
+       cells without lying about the width. */
+    int cw = 9, ch = 24;
+#ifdef ESP_PLATFORM
+    ui_tab5_cell_size(&cw, &ch);
+#endif
+    if (cw <= 0) cw = 9;
+    if (ch <= 0) ch = 24;
+
+    int x = 0, y = 0, h = ch, tmp = 0;
+    JSValue v = JS_GetPropertyStr(ctx, spec, "col");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        x = tmp * cw;
+    v = JS_GetPropertyStr(ctx, spec, "row");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        y = tmp * ch;
+    v = JS_GetPropertyStr(ctx, spec, "x");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        x = tmp;
+    v = JS_GetPropertyStr(ctx, spec, "y");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+        y = tmp;
+    v = JS_GetPropertyStr(ctx, spec, "h");
+    if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v) && tmp > 0)
+        h = tmp;
+
+    int sel = -1;
+    v = JS_GetPropertyStr(ctx, spec, "sel");
+    if (JS_IsNumber(ctx, v) && JS_ToInt32(ctx, &sel, v))
+        return JS_EXCEPTION;
+
+    char place[8], dir[4];
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, spec, "place"),
+                     place, sizeof place))
+        return JS_EXCEPTION;
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, spec, "dir"), dir, sizeof dir))
+        return JS_EXCEPTION;
+    uint32_t flags = 0;
+    if (strcmp(place, "below") == 0) flags |= 1;
+    else if (strcmp(place, "above") == 0) flags |= 2;
+    if (dir[0] == 'v') flags |= 4;
+
+    char body[MQJS_OVL_TEXT_MAX];
+    size_t len = 0;
+    body[0] = '\0';
+    if (ovl_join(ctx, JS_GetPropertyStr(ctx, spec, "lines"), body,
+                 sizeof body, &len, 0, 8) < 0)
+        return JS_EXCEPTION;
+    JSValue items = JS_GetPropertyStr(ctx, spec, "items");
+    if (JS_IsArray(ctx, items)) {
+        /* Slide the window so `sel` is inside it, and report sel relative
+           to what we actually send — the drawing side only ever sees the
+           window, so an absolute index would highlight the wrong chip. */
+        int total = ovl_count(ctx, items, 256);
+        int first = ovl_window(id, total, sel, UI_OVERLAY_ITEMS);
+        if (sel >= 0)
+            sel -= first;
+        if (ovl_append(body, sizeof body, &len, "\2") == 0) {
+            if (ovl_join(ctx, items, body, sizeof body, &len, first,
+                         UI_OVERLAY_ITEMS) < 0)
+                return JS_EXCEPTION;
+        }
+    }
+    if (!body[0]) {
+        ui_post(UI_CMD_OVERLAY, 0, 0, id, 0, 0, NULL); /* nothing to show */
+        return JS_UNDEFINED;
+    }
+
+    /* ui_post_bg TAKES OWNERSHIP and the UI task free()s it, so this has
+       to be a heap copy — handing it `body` (a stack array) made the UI
+       task free a stack address, which corrupted the heap and blew up
+       later in an unrelated allocation (tlsf block_next assert inside
+       LVGL's invalidate path). Same contract as js_ui_cells. */
+    size_t blen = strlen(body);
+    char *copy = malloc(blen + 1);
+    if (!copy)
+        return JS_ThrowOutOfMemory(ctx);
+    memcpy(copy, body, blen + 1);
+    ui_post_bg(UI_CMD_OVERLAY, x, y, id, h, (uint32_t)sel, flags, copy);
+    return JS_UNDEFINED;
+}
+
 JSValue js_ui_keyboard(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     int mode = 1;
