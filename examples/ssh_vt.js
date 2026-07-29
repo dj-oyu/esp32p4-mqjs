@@ -1128,6 +1128,10 @@ if (SELFTEST) {
             /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
             ssh.resize(sessions[i].id, COLS, ROWS);
         }
+        /* 選択はセル座標で持っている。ROWS が縮むと drawSel が t.rows[r] の
+           外を触って TypeError — ドックを挿した指がまだ画面に乗っている間
+           (長押し選択中の回転) に実際に起きる */
+        sel = null;
         /* オーバーレイのアンカーは古い桁/行のまま陳腐化しているので
            張り直す (フォーム中なら imeFloat が畳む) */
         imeFloat();
