@@ -74,3 +74,23 @@ CONFIG_MQJS_TAB5_AUDIO=y
 # CONFIG_OPUS_PLAYER=y
 # CONFIG_OPUS_PLAYER_BOOT_OPUS=y
 # CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY=y
+
+# --- SKK Japanese input: which dictionary goes INTO the firmware -------
+# The default (M, ~8,300 headings, 303 KB) needs nothing set here. It is
+# only the fallback: skk.open() prefers the `jisyo` partition, so the way
+# to get a big dictionary is to flash one there (README 3.5), not to grow
+# the app image.
+#
+# CONFIG_MQJS_SKK_DICT_NONE=y      # no dictionary in the image (-303 KB);
+#                                  # the device must have `jisyo` flashed
+# CONFIG_MQJS_SKK_DICT_S=y         # 3,379 headings, 117 KB
+# CONFIG_MQJS_SKK_DICT_ML=y        # 48,750 headings, 1.86 MB — links with
+#                                  # only 2% of `factory` left; prefer the
+#                                  # partition
+#
+# The choice above is only ACTED ON when this points at a directory
+# holding SKK-JISYO.{S,M,ML,L} from https://github.com/skk-dev/dict ;
+# the build then regenerates the image with tools/skk_prep.py. Left
+# empty, components/skk_core/skk_dict.bin is used exactly as it is and
+# the build prints how many headings it actually contains.
+# CONFIG_MQJS_SKK_DICT_SOURCE_DIR="../skk-dict"

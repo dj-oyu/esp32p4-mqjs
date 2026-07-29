@@ -313,6 +313,13 @@ SKK IME は辞書なしでも動きます (`SKK-JISYO.M` 約 8,300 見出しが�
 焼きます。**アプリ側の変更は要りません** — `skk.open()` は
 `jisyo` → 埋め込み → ファイルの順に試し、いちばん良いものを使います。
 
+> **ファームに埋め込む辞書は menuconfig で選べます** (`mqjs SKK Japanese
+> input`)。ただし埋め込みは `jisyo` が無いときの受け皿で、**語彙を増やす
+> 手段としてはパーティションのほうが正解**です — mmap するので速度は同じ、
+> app image を太らせず、再ビルドなしで差し替えられます。ML を埋め込むと
+> `factory` の残りが 2% になります。埋め込みを消して 303 KB 取り戻すなら
+> `CONFIG_MQJS_SKK_DICT_NONE=y`。詳細は `sdkconfig.tab5.defaults.example`。
+
 ```powershell
 # 1. 辞書を落として、UTF-8 へ再ソート＋索引化する (skk_prep.py が検証まで行う)
 curl.exe -o SKK-JISYO.ML https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.ML
