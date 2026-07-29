@@ -532,7 +532,7 @@ packet時間から除外する。各周でdecoderを再生成し、実際のpack
 $env:ESP_IDF_VERSION='6.0'
 idf.py -B build_opus_bench `
   -D SDKCONFIG=build_opus_bench/sdkconfig `
-  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus-bench.defaults" `
+  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus/bench.defaults" `
   build
 ```
 
@@ -635,7 +635,7 @@ verify専用buildは通常buildと分離する。
 $env:ESP_IDF_VERSION='6.0'
 idf.py -B build_opus_asm_verify `
   -D SDKCONFIG=build_opus_asm_verify/sdkconfig `
-  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus-bench.defaults;sdkconfig.opus-asm-verify.defaults" `
+  -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults.example;sdkconfig.opus/bench.defaults;sdkconfig.opus/asm-verify.defaults" `
   build
 ```
 
@@ -1115,12 +1115,12 @@ comb 実装が雛形になる。各々 ~10-25 build/flash iteration を見込む
 . C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1; $env:ESP_IDF_VERSION='6.0'
 # fixed + PIE comb の decode bench:
 idf.py -B build_opus_combpie "-DSDKCONFIG=sdkconfig.opus_combpie" `
-  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults;sdkconfig.opus-bench.defaults;sdkconfig.opus-fixed.defaults;sdkconfig.opus-comb-pie.defaults" build
+  "-DSDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.tab5.defaults;sdkconfig.opus/bench.defaults;sdkconfig.opus/fixed.defaults;sdkconfig.opus/comb-pie.defaults" build
 idf.py -B build_opus_combpie -p COM8 flash
 python -m esptool --chip esp32p4 -p COM8 --before default-reset --after watchdog-reset flash-id
 python tools/capture_com8.py COM8 40
 # .S 単体アセンブル確認: riscv32-esp-elf-gcc -c -march=rv32imafc_..._xesploop_xespv2p1 ...
-# 音質確認は build_opus_playpie（sdkconfig.opus-play.defaults を足す）で autoplay。
+# 音質確認は build_opus_playpie（sdkconfig.opus/play.defaults を足す）で autoplay。
 ```
 microbench（C vs PIE の maxdiff/速度）は `opus_p4_kernels.c` の `opus_p4_comb_bench`
 が雛形。新カーネルも同様に boot で 1 回計測してから codec 統合する。

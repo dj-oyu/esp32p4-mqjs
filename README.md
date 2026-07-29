@@ -675,6 +675,7 @@ tools/agents/skills/     AI エージェント向けスキル (canonical / ESP32
 .claude/skills/          Claude Code プロジェクトスキル (tools/agents/skills/ から tools/sync-claude-skills.sh で再生成。手編集しない)
 docs/                    現役の設計文書 ([docs/README.md](docs/README.md))
 docs/history/            決着済みキャンペーンの記録 (実測値・採否の理由・検死)
+sdkconfig.opus/          Opus 実験ビルド用の Kconfig 断片 (組み合わせ方は docs/history/opus-decoder-plan.md)
 ```
 
 実装を拡張するときは、まず以下を参照してください。
