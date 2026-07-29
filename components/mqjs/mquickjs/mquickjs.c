@@ -5128,6 +5128,39 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
     pc = NULL;
     goto function_call;
 
+/* --- mqjs local patch 1/3: computed-goto dispatch (docs/mquickjs-patches.md).
+   The upstream switch is kept as the fallback; nothing else here changes. --- */
+#if defined(__GNUC__) && !defined(JS_NO_COMPUTED_GOTO)
+#define JS_COMPUTED_GOTO
+#endif
+
+#ifdef JS_COMPUTED_GOTO
+
+#define CASE(op)        OPL_ ## op
+#define DEFAULT         OPL_default
+#define BREAK           DISPATCH()
+#define DISPATCH()      do { opcode = *pc++; goto *dispatch_table[opcode]; } while (0)
+
+    {
+    static const void *const dispatch_table[256] = {
+        /* opcodes the body has no CASE label for reach the invalid-opcode
+           handler, exactly as they did through `default:` before. Adding a
+           new opcode upstream without a case label is a build error
+           ("label OPL_OP_x used but not defined"), never a silent fall. */
+        [0 ... 255] = &&OPL_default,
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) [OP_ ## id] = &&OPL_OP_ ## id,
+#define def(id, size, n_pop, n_push, f)
+#include "mquickjs_opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+    };
+    DISPATCH();
+    {
+
+#else /* upstream */
+
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -5144,6 +5177,9 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
         }
 #endif
         switch(opcode) {
+
+#endif /* JS_COMPUTED_GOTO */
+
         CASE(OP_push_minus1):
         CASE(OP_push_0):
         CASE(OP_push_1):
@@ -6621,7 +6657,13 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
                 goto exception;
             sp -= 2;
             BREAK;
-        default:
+/* --- mqjs local patch 2/3: the switch never had a case for these, so the
+   dense dispatch table needs the labels to exist. --- */
+#ifdef JS_COMPUTED_GOTO
+        OPL_OP_invalid: OPL_OP_nop: OPL_OP_dup1:
+        OPL_OP_push_const8: OPL_OP_fclosure8: OPL_OP_push_empty_string:
+#endif
+        DEFAULT:
             {
                 JSByteArray *byte_code = JS_VALUE_TO_PTR(b->byte_code);
                 SAVE();
@@ -6631,8 +6673,16 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
             }
             goto exception;
         }
-      restart: ;
-    } /* switch */
+/* --- mqjs local patch 3/3: `restart` is the "go round again" site; under
+   computed goto that is a dispatch, and the two braces close the table
+   block instead of the switch + for. --- */
+      restart:
+#ifdef JS_COMPUTED_GOTO
+        DISPATCH();
+#else
+        ;
+#endif
+    }
  done:
     ctx->sp = sp;
     ctx->fp = fp;

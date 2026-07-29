@@ -66,10 +66,18 @@ CODE_END = 0x00      # SKK_CODE_END
 CODE_ESC = 0xFF      # SKK_CODE_ESC
 
 IMAGE_MAGIC = 0x314B4B53  # "SKK1"
-IMAGE_VERSION = 1
+IMAGE_VERSION = 2         # 2 added the sampled search tree
 IMAGE_ALIGN = 8
 HDR_SIZE = 64
-HDR_FMT = "<IHHIIIIIIIIIII12x"
+HDR_FMT = "<IHHIIIIIIIIIIIII4x"
+
+# The sampled search tree above each key array (skk_core.h, design 6.5).
+# Level 1 is every FANOUT-th key, level 2 every FANOUT-th of those, and
+# so on while a level still holds FANOUT.  Eight uint64 is one 64-byte
+# cache line, which is the whole point: the search touches log8(n) lines
+# instead of log2(n).
+FANOUT = 8               # SKK_FANOUT
+FAN_LEVELS_MAX = 12      # SKK_FAN_LEVELS_MAX
 
 BLK_NASI = 0
 BLK_ARI = 1
@@ -275,6 +283,38 @@ def align_up(n, a):
     return (n + a - 1) // a * a
 
 
+def fan_level_sizes(count):
+    """skk_fan_levels(): [count, n1, n2, ...], derived from count alone.
+
+    Mirrors the C exactly, cap included.  Only the SIZES need to agree --
+    if they did not, the reader would slice the tree at the wrong places
+    and every lookup past that level would answer wrong without failing.
+    So neither side stores them: both compute them.
+    """
+    sizes = [count]
+    n = count
+    while n >= FANOUT and len(sizes) < FAN_LEVELS_MAX:
+        n //= FANOUT
+        sizes.append(n)
+    return sizes
+
+
+def fan_total(count):
+    return sum(fan_level_sizes(count)[1:])
+
+
+def fan_build(keys):
+    """skk_fan_build(): the levels, flattened, bottom level first."""
+    sizes = fan_level_sizes(len(keys))
+    out = []
+    cur = keys
+    for n in sizes[1:]:
+        nxt = [cur[(j + 1) * FANOUT - 1] for j in range(n)]
+        out.extend(nxt)
+        cur = nxt
+    return out
+
+
 def build_image(blocks, sort=True):
     """Serialise both blocks into the skk_core image.
 
@@ -303,12 +343,18 @@ def build_image(blocks, sort=True):
         text_offs.append(offs)
 
     counts = [len(b) for b in sorted_blocks]
+    fans = [fan_total(c) for c in counts]
     off = HDR_SIZE
     sec = {}
     for blk in (BLK_NASI, BLK_ARI):
         off = align_up(off, 8)
         sec["keys%d" % blk] = off
         off += 8 * counts[blk]
+        # The tree sits next to the keys it samples, ahead of offs[]:
+        # the search reads it on every lookup and offs[] once.
+        off = align_up(off, 8)
+        sec["fan%d" % blk] = off if fans[blk] else 0
+        off += 8 * fans[blk]
         off = align_up(off, 4)
         sec["offs%d" % blk] = off
         off += 4 * counts[blk]
@@ -319,12 +365,18 @@ def build_image(blocks, sort=True):
     body = bytearray(image_len)
     body[text_off:image_len] = text
     for blk in (BLK_NASI, BLK_ARI):
-        keys = struct.pack("<%dQ" % counts[blk],
-                           *(pack(e.reading) for e in sorted_blocks[blk]))
+        key_list = [pack(e.reading) for e in sorted_blocks[blk]]
+        keys = struct.pack("<%dQ" % counts[blk], *key_list)
         offs = struct.pack("<%dI" % counts[blk],
                            *(text_off + o for o in text_offs[blk]))
         p = sec["keys%d" % blk]
         body[p:p + len(keys)] = keys
+        if fans[blk]:
+            lvls = fan_build(key_list)
+            assert len(lvls) == fans[blk], (len(lvls), fans[blk])
+            fan = struct.pack("<%dQ" % fans[blk], *lvls)
+            p = sec["fan%d" % blk]
+            body[p:p + len(fan)] = fan
         p = sec["offs%d" % blk]
         body[p:p + len(offs)] = offs
 
@@ -334,7 +386,8 @@ def build_image(blocks, sort=True):
         IMAGE_MAGIC, IMAGE_VERSION, 0, image_len, crc, ALPHABET_CRC32,
         text_off, len(text),
         counts[BLK_NASI], sec["keys0"], sec["offs0"],
-        counts[BLK_ARI], sec["keys1"], sec["offs1"])
+        counts[BLK_ARI], sec["keys1"], sec["offs1"],
+        sec["fan0"], sec["fan1"])
     assert len(hdr) == HDR_SIZE, len(hdr)
     body[0:HDR_SIZE] = hdr
     return bytes(body), sorted_blocks, sec, text_off, len(text)
@@ -374,7 +427,8 @@ class Image:
         (self.magic, self.version, self.flags, self.image_len, self.payload_crc32,
          self.alphabet_crc32, self.text_off, self.text_len,
          self.nasi_count, self.nasi_keys_off, self.nasi_offs_off,
-         self.ari_count, self.ari_keys_off, self.ari_offs_off) = f
+         self.ari_count, self.ari_keys_off, self.ari_offs_off,
+         self.nasi_fan_off, self.ari_fan_off) = f
         if self.magic != IMAGE_MAGIC:
             raise ValueError("bad magic 0x%08x (SKK_ERR_MAGIC)" % self.magic)
         if self.version != IMAGE_VERSION:
@@ -386,6 +440,7 @@ class Image:
         self.count = (self.nasi_count, self.ari_count)
         self.keys_off = (self.nasi_keys_off, self.ari_keys_off)
         self.offs_off = (self.nasi_offs_off, self.ari_offs_off)
+        self.fan_off = (self.nasi_fan_off, self.ari_fan_off)
 
     def section_checks(self):
         for blk in (BLK_NASI, BLK_ARI):
@@ -398,6 +453,17 @@ class Image:
                 raise ValueError("%s keys run past the image" % BLK_NAME[blk])
             if self.offs_off[blk] + 4 * self.count[blk] > self.image_len:
                 raise ValueError("%s offsets run past the image" % BLK_NAME[blk])
+            n = fan_total(self.count[blk])
+            if not self.fan_off[blk]:
+                if n:
+                    raise ValueError("%s has %d entries but no search tree"
+                                     % (BLK_NAME[blk], self.count[blk]))
+                continue
+            if self.fan_off[blk] % 8:
+                raise ValueError("%s search tree is not 8-byte aligned "
+                                 "(SKK_ERR_ALIGN)" % BLK_NAME[blk])
+            if self.fan_off[blk] + 8 * n > self.image_len:
+                raise ValueError("%s search tree runs past the image" % BLK_NAME[blk])
         if self.text_off + self.text_len > self.image_len:
             raise ValueError("text runs past the image (SKK_ERR_TRUNCATED)")
 
@@ -418,6 +484,16 @@ class Image:
     def offs(self, blk):
         p = self.offs_off[blk]
         return struct.unpack_from("<%dI" % self.count[blk], self.blob, p)
+
+    def levels(self, blk, keys):
+        """[keys, L1, L2, ...] as the engine slices the tree at open."""
+        sizes = fan_level_sizes(self.count[blk])
+        out = [keys]
+        p = self.fan_off[blk]
+        for n in sizes[1:]:
+            out.append(struct.unpack_from("<%dQ" % n, self.blob, p))
+            p += 8 * n
+        return out
 
     def line(self, off):
         end = self.blob.index(b"\n", off)
@@ -474,17 +550,51 @@ def verify_image(blob, search="full", progress=None):
             readings.append(r)
             report["checked"] += 1
 
+        # The sampled tree.  It is derived data, and a tree that does not
+        # match its keys does not fail any check above -- it just steers
+        # the descent into the wrong eight keys and the lookup comes back
+        # empty.  Same silent-wrong-answer family as the sort order, so
+        # check it the same way: structurally, then by searching.
+        lvls = None
+        if img.fan_off[blk]:
+            lvls = img.levels(blk, keys)
+            for k in range(1, len(lvls)):
+                up, dn = lvls[k], lvls[k - 1]
+                for j in range(len(up)):
+                    if up[j] != dn[(j + 1) * FANOUT - 1]:
+                        raise ValueError(
+                            "%s: search tree level %d entry %d is 0x%016x but "
+                            "samples key 0x%016x. Lookups would silently miss."
+                            % (BLK_NAME[blk], k, j, up[j], dn[(j + 1) * FANOUT - 1]))
+                report["checked"] += len(up)
+
         if search == "none" or not readings:
             continue
         probe = readings if search == "full" else readings[::max(1, len(readings) // 512)]
+        lines = 0
         for r in probe:
             i = bsearch(img, blk, keys, offs, r)
             if i < 0 or img.reading_at(offs[i]) != r:
                 raise ValueError("%s: binary search lost %r" % (BLK_NAME[blk], r))
+            if lvls is not None:
+                # Run the descent the firmware actually runs and require
+                # it to land on the same entry.  This is the check that
+                # makes the tree trustworthy; the structural pass above
+                # cannot see a wrong LEVEL COUNT, which lands the search
+                # in an unrelated part of the array.
+                t, ln = tsearch(img, blk, lvls, offs, r)
+                lines += ln
+                if t != i:
+                    raise ValueError("%s: tree search put %r at %d, binary "
+                                     "search at %d" % (BLK_NAME[blk], r, t, i))
         report["searched"] += len(probe)
         if progress:
-            progress("  verified %s: %d entries ascending, %d binary searches"
-                     % (BLK_NAME[blk], len(readings), len(probe)))
+            note = ""
+            if lvls is not None:
+                note = (", tree agrees (%.1f lines/lookup vs %.1f bisecting)"
+                        % (lines / len(probe), math.log2(max(2, len(readings)))))
+            progress("  verified %s: %d entries ascending, %d binary searches%s"
+                     % (BLK_NAME[blk], len(readings), len(probe), note))
     return img, report
 
 
@@ -508,6 +618,42 @@ def bsearch(img, blk, keys, offs, reading):
             else:
                 return mid
     return -1
+
+
+def fan_lower_bound(lvls, target_key):
+    """key_lower_bound() through the sampled tree, exactly as the C does.
+
+    At every level the window is eight consecutive, 8-aligned elements,
+    because each separator IS one of the keys below it.  Returns the
+    lower bound in lvls[0] and the number of levels touched (= 64-byte
+    lines, which is what the search costs on mmap'd flash).
+    """
+    i, lines = 0, 0
+    for k in range(len(lvls) - 1, -1, -1):
+        a = lvls[k]
+        top = (k == len(lvls) - 1)
+        lo = 0 if top else i * FANOUT
+        hi = len(a) if top else min(lo + FANOUT, len(a))
+        lines += 1
+        while lo < hi and a[lo] < target_key:
+            lo += 1
+        i = lo
+    return i, lines
+
+
+def tsearch(img, blk, lvls, offs, reading):
+    """find_entry(): descend the tree, then walk the collision group."""
+    target_key = pack(reading.decode("utf-8"))
+    i, lines = fan_lower_bound(lvls, target_key)
+    keys = lvls[0]
+    while i < len(keys) and keys[i] == target_key:
+        r = img.reading_at(offs[i])
+        if r == reading:
+            return i, lines
+        if r > reading:
+            break
+        i += 1
+    return -1, lines
 
 
 # --------------------------------------------------------------------
@@ -636,6 +782,11 @@ def print_stats(st, out=sys.stdout):
         p("  image                  %s" % kb(im["image_bytes"]))
         p("    text                 %s" % kb(im["text_bytes"]))
         p("    packed keys          %s" % kb(im["key_bytes"]))
+        if "fan_bytes" in im:
+            p("    search tree          %s  (%s)"
+              % (kb(im["fan_bytes"]),
+                 ", ".join("%s %d levels -> %d lines/lookup" % (n, v, v + 1)
+                           for n, v in im["fan_levels"].items())))
         p("    offsets              %s" % kb(im["offs_bytes"]))
         p("    header+padding       %d B" % im["overhead_bytes"])
         p("  alphabet crc32         0x%08x" % ALPHABET_CRC32)
@@ -769,12 +920,16 @@ def command_build(args):
     st = dict_stats(sorted_blocks, violations, len(raw))
     key_bytes = 8 * (img.nasi_count + img.ari_count)
     offs_bytes = 4 * (img.nasi_count + img.ari_count)
+    fan_bytes = 8 * (fan_total(img.nasi_count) + fan_total(img.ari_count))
     st["image"] = {
         "image_bytes": len(blob),
         "text_bytes": text_len,
         "key_bytes": key_bytes,
+        "fan_bytes": fan_bytes,
+        "fan_levels": {BLK_NAME[b]: len(fan_level_sizes(img.count[b])) - 1
+                       for b in (BLK_NASI, BLK_ARI)},
         "offs_bytes": offs_bytes,
-        "overhead_bytes": len(blob) - text_len - key_bytes - offs_bytes,
+        "overhead_bytes": len(blob) - text_len - key_bytes - offs_bytes - fan_bytes,
         "payload_crc32": img.payload_crc32,
         "alphabet_crc32": ALPHABET_CRC32,
         "verified_entries": rep["checked"],
@@ -794,6 +949,14 @@ def command_build(args):
 
     # Nothing is written before verification has passed.
     if args.output:
+        if args.max_size and len(blob) > args.max_size:
+            raise ValueError(
+                "image is %d B but the target holds %d B. Flashing it would be "
+                "truncated at the partition boundary, and a truncated image is "
+                "not obviously broken -- it opens, searches, and answers wrong "
+                "past the cut. Use a smaller dictionary, --strip-annotations, "
+                "or grow `jisyo` in partitions.csv (it is the last partition, "
+                "so growing it moves nothing)." % (len(blob), args.max_size))
         Path(args.output).write_bytes(blob)
     if args.emit_dict:
         header = ";; SKK-JISYO re-sorted into UTF-8 byte order by tools/skk_prep.py\n" \
@@ -871,6 +1034,12 @@ def command_inspect(args):
           % (img.image_len, img.text_len, img.text_off))
     print("  entries                %d (okuri-nasi %d / okuri-ari %d)"
           % (st["entries"], img.nasi_count, img.ari_count))
+    for blk in (BLK_NASI, BLK_ARI):
+        sizes = fan_level_sizes(img.count[blk])[1:]
+        print("  search tree %-11s %s  ->  %d lines/lookup (bisecting: %.1f)"
+              % (BLK_NAME[blk],
+                 (" ".join(str(n) for n in sizes) if sizes else "(none)"),
+                 len(sizes) + 1, math.log2(max(2, img.count[blk]))))
     print("  payload crc32          0x%08x  OK" % img.payload_crc32)
     print("  alphabet crc32         0x%08x  OK" % img.alphabet_crc32)
     print("  verified               %d index entries, %d binary searches, "
@@ -1026,11 +1195,80 @@ def command_selftest(args):
     expect_error("a truncated image is caught",
                  lambda: verify_image(short, search="none"), "SKK_ERR_TRUNCATED")
 
-    # t6 -- the emitted dictionary keeps the SKK file convention
+    # t6 -- the sampled search tree.  The synthetic dictionary above has
+    # three entries, which is below SKK_FANOUT and gets no tree at all, so
+    # this needs its own corpus large enough for several levels.
+    #
+    # A wrong tree is the same class of bug as a wrong sort order: nothing
+    # crashes, nothing fails a CRC, the descent simply lands in the wrong
+    # eight keys and the word is "not in the dictionary".  So sabotage it
+    # and RESEAL the CRC first -- otherwise the integrity check fires and
+    # proves nothing about the tree.
+    kana = "あいうえおかきくけこさしすせそたちつてとなにぬねの"
+    big = set()
+    while len(big) < 5000:
+        big.add("".join(rng.choice(kana) for _ in range(rng.randint(2, 10))))
+    big = sorted(big)
+    bsrc = ("%s\n" % ARI_MARK + "%s\n" % NASI_MARK +
+            "".join("%s /%s/\n" % (r, r) for r in big))
+    bblocks = parse_dict(bsrc, "<selftest-tree>", lambda m: None)
+    timg, tsorted, tsec, _, _ = build_image(bblocks)
+
+    sizes = fan_level_sizes(len(big))
+    check("tree levels are %s" % (sizes[1:],),
+          sizes == [5000, 625, 78, 9, 1] and fan_total(5000) == 713)
+    verify_image(timg, search="full")
+    check("5000-entry tree verifies and agrees with bisection on every entry",
+          True)
+
+    def reseal(buf):
+        buf[12:16] = struct.pack("<I", zlib.crc32(bytes(buf[HDR_SIZE:])) & 0xFFFFFFFF)
+        return bytes(buf)
+
+    # Separator 3 of level 1 is given separator 4's value.  Bumping it by
+    # one would be undetectable and mean nothing: the keys are sparse
+    # 64-bit values, so widening a separator by 1 changes the answer only
+    # for a key that is literally sep+1.  Overshooting it into the NEXT
+    # group is the realistic shape of the bug -- an off-by-one in the
+    # sampling stride -- and it swallows that group whole.
+    bent = bytearray(timg)
+    p = tsec["fan0"] + 8 * 3          # level 1, separator 3
+    bent[p:p + 8] = bent[p + 8:p + 16]
+    expect_error("one bent separator is REJECTED",
+                 lambda: verify_image(reseal(bent), search="full"), "samples key")
+
+    # ... and show what that rejection buys, the way t4 does for the sort
+    # order: with the separator bent, the descent steps into the wrong
+    # eight keys and those readings are simply gone.  Bisection over the
+    # same (still perfectly sorted) array finds every one of them, so no
+    # other check in this file can see the damage.
+    bimg2 = Image(reseal(bent))
+    bkeys, boffs = bimg2.keys(BLK_NASI), bimg2.offs(BLK_NASI)
+    blvls = bimg2.levels(BLK_NASI, bkeys)
+    gone = [r for r in big
+            if tsearch(bimg2, BLK_NASI, blvls, boffs, r.encode("utf-8"))[0] < 0]
+    still = [r for r in gone
+             if bsearch(bimg2, BLK_NASI, bkeys, boffs, r.encode("utf-8")) >= 0]
+    check("a bent tree silently loses words (this is the bug)",
+          len(gone) > 0 and len(still) == len(gone),
+          "lost %d, of which %d are still there by bisection" % (len(gone), len(still)))
+
+    # A tree that is internally consistent but built one level short: the
+    # reader slices it by count, so every level lands on the wrong data.
+    # The structural check must catch this too -- it is what a fanout
+    # mismatch between the writer and the engine would look like.
+    shifted = bytearray(timg)
+    lv = fan_build([pack(e.reading) for e in tsorted[BLK_NASI]])
+    lv = lv[sizes[1]:] + lv[:sizes[1]]        # rotate the levels
+    shifted[tsec["fan0"]:tsec["fan0"] + 8 * len(lv)] = struct.pack("<%dQ" % len(lv), *lv)
+    expect_error("a tree whose levels are shifted is REJECTED",
+                 lambda: verify_image(reseal(shifted), search="full"), "samples key")
+
+    # t7 -- the emitted dictionary keeps the SKK file convention
     check_dict_text(render_dict_text(sorted_blocks, ";; selftest\n"))
     check("emitted dictionary is nasi-ascending / ari-descending", True)
 
-    # t7 -- annotations
+    # t8 -- annotations
     e = parse_dict("%s\n%s\nかんじ /漢字;kanji/感じ/\n" % (ARI_MARK, NASI_MARK),
                    "<selftest>", lambda m: None)
     kept, dc, de = strip_annotations(e[BLK_NASI])
@@ -1067,6 +1305,10 @@ def parser():
     build.add_argument("--verify", choices=("full", "sample", "none"), default="full",
                        help="binary-search every reading back (default), a sample, "
                             "or skip. Monotonicity is always checked")
+    build.add_argument("--max-size", type=lambda s: int(s, 0), metavar="BYTES",
+                       help="refuse to write an image larger than this. Pass the "
+                            "`jisyo` partition size (0x880000) when building for "
+                            "the partition")
     build.add_argument("--json", action="store_true", help="machine-readable stats")
     build.add_argument("-q", "--quiet", action="store_true")
     build.set_defaults(func=command_build)

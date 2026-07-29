@@ -58,6 +58,11 @@
    ui_tab5 cell renderer classify from one table on both targets. */
 #include "ui_cell_width.h"
 #include "app/mqjs_app_manager_internal.h"
+/* mkdir()/fsync() for the personal dictionary (S7). Outside the
+   ESP_PLATFORM block on purpose: the same code runs in run_pc, and
+   inside it the host build fell back to an implicit declaration. */
+#include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef ESP_PLATFORM
 #include <stdlib.h>
@@ -69,6 +74,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include <dirent.h>
 #include "mqtt_client.h"
 #include "esp_http_client.h"
@@ -5138,10 +5144,31 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 #define MQJS_SKK_IMAGE_MAX (9u * 1024 * 1024) /* pine (L) is 8.3 MB */
 
 #ifdef ESP_PLATFORM
-#define MQJS_SKK_DEFAULT_DICT "/littlefs/skk/skk_dict_M.bin"
+#define MQJS_SKK_DIR          "/littlefs/skk"
 #else
-#define MQJS_SKK_DEFAULT_DICT "skk/skk_dict_M.bin"
+#define MQJS_SKK_DIR          "skk"
 #endif
+#define MQJS_SKK_DEFAULT_DICT MQJS_SKK_DIR "/skk_dict_M.bin"
+#define MQJS_SKK_MRU_PATH     MQJS_SKK_DIR "/mru.txt"
+
+/* Where a dictionary can come from. The string is both the selector an
+ * app may pass to skk.open() and the cache key, so each source names
+ * exactly one set of bytes:
+ *
+ *   ""              the image linked into the firmware (plum, §6.6)
+ *   "part:<name>"   a flash partition, mmap'd and read in place —
+ *                   bamboo and pine (§6.7)
+ *   anything else   a file, read into PSRAM
+ *
+ * skk.open() with no argument tries them in that order, best first, so
+ * flashing a bigger dictionary into `jisyo` upgrades every app without
+ * an app change and removing it falls back instead of failing. */
+#define MQJS_SKK_PART_PREFIX "part:"
+#define MQJS_SKK_PARTITION   "jisyo"
+/* The custom data subtype partitions.csv gives `jisyo`. No built-in
+   subtype means "a blob we mmap", and 0x40 is the first of the range
+   reserved for applications. */
+#define MQJS_SKK_PART_SUBTYPE 0x40
 
 /* One loaded image, shared by every handle that named the same path:
    skk_dict_t is explicitly read-only and shareable, and two apps each
@@ -5149,13 +5176,17 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
    grows to 8 MB at the pine stage. Refcounted, freed at zero. */
 typedef struct {
     bool       used;
-    bool       owned;     /* false = built-in rodata, never free it */
+    bool       owned;     /* malloc'd; rodata and mmap are not */
     uint16_t   refs;
     char       path[MQJS_SKK_PATH_MAX]; /* "" = the built-in image */
     const uint8_t *base;  /* 8-byte aligned image */
     size_t     len;
     skk_dict_t dict;
     uint32_t   load_us;   /* read + open, for skk.stats() */
+#ifdef ESP_PLATFORM
+    esp_partition_mmap_handle_t mmap_h;
+    bool       mapped;    /* base is an mmap window, munmap it at zero */
+#endif
 } SkkImage;
 static SkkImage s_skk_img[MQJS_MAX_SKK_DICT];
 
@@ -5227,6 +5258,174 @@ static void skk_image_free(uint8_t *p)
 #endif
 }
 
+#ifdef ESP_PLATFORM
+/* Attach a dictionary partition without reading it.
+ *
+ * This chip maps flash through the MMU, so bamboo and pine cost exactly
+ * what plum costs: no allocation, no load, no copy. skk_dict_t just
+ * points at the window (design §6.6/§6.7) and the search reads the
+ * mmap'd bytes in place, the same way font_term_mono's 772 KB of glyphs
+ * are read on the draw path.
+ *
+ * Mapped in TWO steps, and the second one matters: `jisyo` is sized for
+ * pine (8.5 MB) but bamboo only fills 1.86 MB of it. The header says how
+ * long the image really is, so map a page, read image_len, and map only
+ * that — otherwise 6.6 MB of erased flash would sit in the MMU window,
+ * which this SoC shares between PSRAM, the instruction cache and every
+ * other mapping.
+ *
+ * The image base lands on a partition boundary, so the 8-byte alignment
+ * skk_dict_open() requires comes for free — but it is still checked
+ * there rather than assumed here. */
+static int skkpart_open(const char *name, SkkImage *im)
+{
+    const esp_partition_t *p;
+    esp_partition_mmap_handle_t h;
+    const void *win = NULL;
+    uint32_t magic, image_len;
+    size_t probe;
+    int rc;
+
+    p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                 (esp_partition_subtype_t)MQJS_SKK_PART_SUBTYPE,
+                                 name);
+    if (!p)
+        return -103;                      /* no such partition in the table */
+
+    probe = p->size < 4096 ? p->size : 4096;
+    if (probe < sizeof(skk_image_hdr_t) ||
+        esp_partition_mmap(p, 0, probe, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
+        return -100;
+    magic     = ((const uint32_t *)win)[0];
+    image_len = ((const uint32_t *)win)[2];   /* skk_image_hdr_t.image_len */
+    esp_partition_munmap(h);
+
+    /* An erased partition reads as 0xFF everywhere, which is the normal
+       state of a device that has never been given a dictionary. Say so
+       distinctly instead of reporting a corrupt image. */
+    if (magic == 0xFFFFFFFFu)
+        return -104;
+    if (magic != SKK_IMAGE_MAGIC)
+        return SKK_ERR_MAGIC;
+    if (image_len < sizeof(skk_image_hdr_t) || image_len > p->size)
+        return SKK_ERR_TRUNCATED;
+
+    if (esp_partition_mmap(p, 0, image_len, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
+        return -100;
+
+    /* VERIFY, unlike the built-in image: this one lives OUTSIDE the app
+       image, so the bootloader's per-boot SHA-256 never saw it and a
+       half-written flash would show up as wrong conversions rather than
+       as a failure (design §6.10). ~190 ms for bamboo, paid once. */
+    skk_blob_t blob = { (const uint8_t *)win, image_len };
+    rc = skk_dict_open(&im->dict, blob, SKK_OPEN_VERIFY);
+    if (rc != SKK_OK) {
+        esp_partition_munmap(h);
+        return rc;
+    }
+    im->base   = (const uint8_t *)win;
+    im->len    = image_len;
+    im->mmap_h = h;
+    im->mapped = true;
+    im->owned  = false;
+    return SKK_OK;
+}
+#endif /* ESP_PLATFORM */
+
+/* ---- the personal dictionary (design S7) ------------------------- */
+/*
+ * ONE store for the device, shared by every IME handle, kept in PSRAM
+ * and written back to littlefs.
+ *
+ * Shared rather than per app, and that is a deliberate line: it matches
+ * store.* (one NVS namespace, no per-app prefix) rather than vault.*
+ * (isolated per owner). What is in it is which kanji you picked for
+ * which reading — the same class of thing as store.*, and an IME that
+ * only learns inside one app is not much of an IME. If that ever needs
+ * to change, the change is here: key the file by app name and hand each
+ * worker its own skk_mru_t.
+ *
+ * Sharing a MUTABLE structure between handles is safe only because
+ * every mqjs worker runs on the single `mqjs` task (app_main.c), so
+ * nothing here locks. skk_core says the same about skk_t.
+ *
+ * PERSISTENCE POLICY: written on close (which includes an app being
+ * stopped or evicted) and on an explicit skk.save(). NOT on every
+ * commit — the file is up to 4.9 KB and littlefs would stall the key
+ * path. A power cut therefore loses learning since the last of those
+ * two events; ssh_vt calls skk.save() when the IME is switched off,
+ * which is the natural quiet moment.
+ */
+static skk_mru_t *s_skk_mru;
+static bool       s_skk_mru_dirty;
+
+static skk_mru_t *skk_mru_get(void)
+{
+    if (s_skk_mru)
+        return s_skk_mru;
+#ifdef ESP_PLATFORM
+    s_skk_mru = heap_caps_malloc(sizeof *s_skk_mru,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    s_skk_mru = malloc(sizeof *s_skk_mru);
+#endif
+    if (!s_skk_mru)
+        return NULL;                 /* no learning is better than no IME */
+    skk_mru_init(s_skk_mru);
+
+    FILE *f = fopen(MQJS_SKK_MRU_PATH, "rb");
+    if (f) {
+        char *buf = malloc(SKK_MRU_SAVE_MAX);
+        if (buf) {
+            size_t n = fread(buf, 1, SKK_MRU_SAVE_MAX, f);
+            /* skk_mru_load() skips lines it cannot parse rather than
+               failing, so a truncated file costs the tail and not the
+               whole personal dictionary. */
+            (void)skk_mru_load(s_skk_mru, buf, n);
+            free(buf);
+        }
+        fclose(f);
+    }
+    s_skk_mru_dirty = false;
+    return s_skk_mru;
+}
+
+/* Write the store back. True when the file is up to date afterwards,
+   including the "nothing to do" case. */
+static bool skk_mru_flush(void)
+{
+    if (!s_skk_mru || !s_skk_mru_dirty)
+        return true;
+
+    char *buf = malloc(SKK_MRU_SAVE_MAX);
+    size_t len = 0;
+    if (!buf)
+        return false;
+    if (skk_mru_save(s_skk_mru, buf, SKK_MRU_SAVE_MAX, &len) != SKK_OK) {
+        free(buf);
+        return false;
+    }
+    mkdir(MQJS_SKK_DIR, 0777);       /* EEXIST is the normal case */
+    FILE *f = fopen(MQJS_SKK_MRU_PATH, "wb");
+    if (!f) {
+        free(buf);
+        return false;
+    }
+    size_t wr = fwrite(buf, 1, len, f);
+    /* fsync before fclose. littlefs syncs on close and this ought to be
+       redundant, but the thing being defended against is a reset landing
+       between the write and the metadata commit, and that is exactly the
+       failure this file is FOR — learning that survives a reboot. */
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    free(buf);
+    if (wr != len)
+        return false;
+    s_skk_mru_dirty = false;
+    return true;
+}
+
 /* Load `path` (or take another reference to it) and return its index in
    s_skk_img, or -1 with *out_err set to an skk_err_t / -100 for I/O. */
 static int skkimg_acquire(const char *path, int *out_err)
@@ -5277,6 +5476,29 @@ static int skkimg_acquire(const char *path, int *out_err)
         bi->path[0] = '\0';
         *out_err = SKK_OK;
         return free_slot;
+    }
+
+    /* "part:<name>" — mmap'd flash, the bamboo/pine stages. Also
+       allocation-free and load-free; see skkpart_open(). */
+    if (strncmp(path, MQJS_SKK_PART_PREFIX, sizeof(MQJS_SKK_PART_PREFIX) - 1) == 0) {
+#ifdef ESP_PLATFORM
+        SkkImage *pi = &s_skk_img[free_slot];
+        int rc = skkpart_open(path + sizeof(MQJS_SKK_PART_PREFIX) - 1, pi);
+        if (rc != SKK_OK) {
+            memset(pi, 0, sizeof *pi);   /* skkpart_open may have half-filled it */
+            *out_err = rc;
+            return -1;
+        }
+        pi->used = true;
+        pi->refs = 1;
+        pi->load_us = (uint32_t)(time_us() - t0);
+        snprintf(pi->path, sizeof pi->path, "%s", path);
+        *out_err = SKK_OK;
+        return free_slot;
+#else
+        *out_err = -103;                 /* no partitions off-device */
+        return -1;
+#endif
     }
 
     FILE *f = fopen(path, "rb");
@@ -5340,7 +5562,11 @@ static void skkimg_release(int idx)
         return;
     if (--s_skk_img[idx].refs)
         return;
-    if (s_skk_img[idx].owned) /* the built-in image lives in rodata */
+#ifdef ESP_PLATFORM
+    if (s_skk_img[idx].mapped)   /* give the MMU window back */
+        esp_partition_munmap(s_skk_img[idx].mmap_h);
+#endif
+    if (s_skk_img[idx].owned) /* rodata and mmap windows are not owned */
         skk_image_free((uint8_t *)s_skk_img[idx].base);
     memset(&s_skk_img[idx], 0, sizeof s_skk_img[idx]);
 }
@@ -5349,6 +5575,10 @@ static void skkslot_free(SkkSlot *s)
 {
     if (!s->used)
         return;
+    /* Closing is the one moment we are guaranteed to get — an app that
+       stops, is evicted, or just calls skk.close(). Learning that never
+       reached the file is lost otherwise. */
+    (void)skk_mru_flush();
     skkimg_release(s->img);
 #ifdef ESP_PLATFORM
     heap_caps_free(s->core);
@@ -5361,25 +5591,39 @@ static void skkslot_free(SkkSlot *s)
     s->img = -1;
 }
 
-/* skk.open([dictPath]) -> handle.
-   No argument = the image linked into the firmware: read in place out of
-   flash rodata, so this costs no allocation and no load (§6.6). A path
-   loads a file instead — that is how the bamboo/pine stages and a
-   dev-loop dictionary swap work, and it pays a copy plus a CRC pass.
-   Either way it happens here and not at boot, so an app whose user never
-   types Japanese never touches a dictionary. */
+/* skk.open([dictSource]) -> handle.
+ *
+ * No argument means "the best dictionary this device has", tried in
+ * order: the `jisyo` partition (bamboo/pine — mmap'd, no allocation, no
+ * load), then the image linked into the firmware (plum — flash rodata,
+ * likewise free), then the conventional file. That order is why S8 needs
+ * no app change: flashing SKK-JISYO.ML into `jisyo` upgrades every app's
+ * vocabulary, and erasing it falls back instead of failing.
+ *
+ * An explicit argument pins one source: "part:<name>" for a partition,
+ * anything else for a file (which does pay a copy into PSRAM plus a CRC
+ * pass — that is the dev-loop path). Either way it happens here and not
+ * at boot, so an app whose user never types Japanese never touches a
+ * dictionary. */
 JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     (void)this_val;
     (void)argc;
     char path[MQJS_SKK_PATH_MAX];
+    const char *tried[3];
+    int ntried = 0;
 
     if (uiw_copy_str(ctx, argv[0], path, sizeof path))
         return JS_EXCEPTION;
-    /* No path and no built-in image: fall back to the conventional file
-       location so a dictionary can still be dropped on the device. */
-    if (!path[0] && !skk_builtin_image().base)
-        snprintf(path, sizeof path, "%s", MQJS_SKK_DEFAULT_DICT);
+    if (path[0]) {
+        tried[ntried++] = path;
+    } else {
+        tried[ntried++] = MQJS_SKK_PART_PREFIX MQJS_SKK_PARTITION;
+        if (skk_builtin_image().base)
+            tried[ntried++] = "";                    /* plum, in rodata */
+        else
+            tried[ntried++] = MQJS_SKK_DEFAULT_DICT; /* nothing built in */
+    }
 
     int slot = -1;
     for (int i = 0; i < MQJS_MAX_SKK; i++) {
@@ -5392,16 +5636,32 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
                                      MQJS_MAX_SKK);
 
-    int err = 0;
-    int img = skkimg_acquire(path, &err);
+    int err = 0, img = -1;
+    for (int i = 0; i < ntried && img < 0; i++)
+        img = skkimg_acquire(tried[i], &err);
     if (img < 0) {
         if (err == -102)
             return JS_ThrowInternalError(
                 ctx, "skk: no built-in dictionary — build one with "
                      "tools/skk_prep.py into components/skk_core/skk_dict.bin, "
-                     "or pass a path to skk.open()");
-        return JS_ThrowInternalError(ctx, "skk: cannot load %s (err %d)",
-                                     path[0] ? path : "(built-in)", err);
+                     "flash one into the `jisyo` partition, or pass a path to "
+                     "skk.open()");
+        /* -100 I/O, -101 out of memory, -103 no such partition,
+           -104 the partition is erased; anything else is an skk_err_t. */
+        return JS_ThrowInternalError(
+            ctx, "skk: cannot load %s (%s)",
+            tried[ntried - 1][0] ? tried[ntried - 1] : "(built-in)",
+            err == -103 ? "no such partition — check partitions.csv"
+          : err == -104 ? "partition is erased — flash a dictionary into it "
+                          "(README 3.5)"
+          : err == SKK_ERR_VERSION ? "image built by a different format "
+                                     "version — rebuild it with "
+                                     "tools/skk_prep.py"
+          : err == SKK_ERR_CRC ? "CRC mismatch — the image is damaged"
+          : err == SKK_ERR_ALPHABET ? "collation table mismatch — rebuild "
+                                      "the image with this tree's "
+                                      "tools/skk_prep.py"
+          : "I/O or format error");
     }
 
     skk_t *core;
@@ -5416,6 +5676,9 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     }
     skk_init(core);
     skk_attach(core, &s_skk_img[img].dict);
+    /* NULL is fine — skk_core simply stops learning, so a device with a
+       full or unwritable littlefs still has a working IME. */
+    skk_attach_mru(core, skk_mru_get());
     skk_enable(core, true);
 
     SkkSlot *s = &s_skk[slot];
@@ -5516,6 +5779,14 @@ JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
        before the call. */
     if (st == SKK_ST_PASSTHROUGH)
         return JS_NewInt32(ctx, 0);
+
+    /* A commit out of SELECT is the only thing that reaches the personal
+       dictionary (skk_attach_mru), and the other COMMIT kinds — raw kana,
+       katakana — are cheap to over-count. Marking here rather than saving
+       here is the whole policy: the file is up to 4.9 KB and writing it
+       on the key path would stall typing. */
+    if (st & SKK_ST_COMMIT)
+        s_skk_mru_dirty = true;
 
     uint32_t us = (uint32_t)(time_us() - t0);
     /* Attribute the µs to the right bucket. "Did this key search the
@@ -5664,13 +5935,17 @@ JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     skk_stats_t st;
     skk_stats(s->core, &st);
     const SkkImage *im = &s_skk_img[s->img];
-    char buf[512];
+    /* 512 no longer fits: the source string is up to MQJS_SKK_PATH_MAX
+       and snprintf would truncate the JSON into something JS cannot
+       parse rather than fail visibly. */
+    char buf[512 + MQJS_SKK_PATH_MAX + 32];
     snprintf(buf, sizeof buf,
              "{\"keys\":%lu,\"consumed\":%lu,\"lookups\":%lu,\"probes\":%lu,"
              "\"fullcmp\":%lu,\"cands\":%lu,\"dropped\":%lu,\"commits\":%lu,"
              "\"keyCalls\":%lu,\"keyUs\":%lu,\"keyMaxUs\":%lu,"
              "\"convCalls\":%lu,\"convUs\":%lu,\"convMaxUs\":%lu,"
-             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu}",
+             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu,"
+             "\"dict\":\"%s\",\"levels\":%u}",
              (unsigned long)st.keys, (unsigned long)st.consumed,
              (unsigned long)st.lookups, (unsigned long)st.probes,
              (unsigned long)st.fullcmp, (unsigned long)st.cands,
@@ -5681,8 +5956,31 @@ JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
              (unsigned long)s->conv_max_us,
              (unsigned long)im->len, (unsigned long)im->load_us,
              (unsigned long)im->dict.blk[SKK_BLK_NASI].count,
-             (unsigned long)im->dict.blk[SKK_BLK_ARI].count);
+             (unsigned long)im->dict.blk[SKK_BLK_ARI].count,
+             /* which source skk.open() settled on, and how many tree
+                levels it is searching through — the two things you need
+                to tell plum from bamboo without guessing from the size */
+             im->path[0] ? im->path : "builtin",
+             (unsigned)im->dict.blk[SKK_BLK_NASI].levels);
     return JS_NewString(ctx, buf);
+}
+
+/* skk.save(h) -> bool. Write the personal dictionary to littlefs now.
+ *
+ * Cheap when nothing was learned since the last write (returns true
+ * without touching the filesystem), so an app may call it freely — at
+ * the IME toggle, on losing focus, wherever it has a quiet moment. It
+ * also happens automatically on skk.close() and when an app is stopped;
+ * this exists so the window a power cut can eat is the app's to choose.
+ * The handle is taken for the usual ownership check, not because the
+ * store is per handle — there is one per device (see skk_mru_get). */
+JSValue js_skk_save(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    if (!skk_arg_slot(ctx, argv))
+        return JS_EXCEPTION;
+    return JS_NewBool(skk_mru_flush());
 }
 
 JSValue js_skk_statsReset(JSContext *ctx, JSValue *this_val, int argc,

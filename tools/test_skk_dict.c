@@ -343,14 +343,18 @@ static size_t align_up(size_t v, size_t a)
 static uint8_t *image_build(const rawdict_t *rd, size_t *out_len, void **out_free)
 {
     size_t n0 = rd->n[SKK_BLK_NASI], n1 = rd->n[SKK_BLK_ARI];
+    size_t f0 = skk_fan_total((uint32_t)n0), f1 = skk_fan_total((uint32_t)n1);
     size_t off = 64;
     size_t nasi_keys_off, nasi_offs_off, ari_keys_off, ari_offs_off, text_off;
+    size_t nasi_fan_off, ari_fan_off;
     size_t total, i;
     uint8_t *img;
 
     nasi_keys_off = off;                 off += n0 * 8;
+    nasi_fan_off  = align_up(off, 8);    off = nasi_fan_off + f0 * 8;
     nasi_offs_off = align_up(off, 4);    off = nasi_offs_off + n0 * 4;
     ari_keys_off  = align_up(off, 8);    off = ari_keys_off + n1 * 8;
+    ari_fan_off   = align_up(off, 8);    off = ari_fan_off + f1 * 8;
     ari_offs_off  = align_up(off, 4);    off = ari_offs_off + n1 * 4;
     text_off      = off;                 off += rd->raw_len;
     total         = off;
@@ -375,6 +379,14 @@ static uint8_t *image_build(const rawdict_t *rd, size_t *out_len, void **out_fre
              (uint32_t)(text_off + base + rd->ent[SKK_BLK_ARI][i].off));
     }
 
+    /* The sampled search tree, from the keys just written. Read back in
+       place rather than from rd->ent so this exercises the same bytes the
+       engine will: little-endian host, which skk_dict.c already assumes. */
+    skk_fan_build((const uint64_t *)(void *)(img + nasi_keys_off), (uint32_t)n0,
+                  (uint64_t *)(void *)(img + nasi_fan_off));
+    skk_fan_build((const uint64_t *)(void *)(img + ari_keys_off), (uint32_t)n1,
+                  (uint64_t *)(void *)(img + ari_fan_off));
+
     wr32(img + 0,  SKK_IMAGE_MAGIC);
     wr16(img + 4,  (uint16_t)SKK_IMAGE_VERSION);
     wr16(img + 6,  0);
@@ -389,6 +401,8 @@ static uint8_t *image_build(const rawdict_t *rd, size_t *out_len, void **out_fre
     wr32(img + 40, (uint32_t)n1);
     wr32(img + 44, (uint32_t)ari_keys_off);
     wr32(img + 48, (uint32_t)ari_offs_off);
+    wr32(img + 52, f0 ? (uint32_t)nasi_fan_off : 0u);
+    wr32(img + 56, f1 ? (uint32_t)ari_fan_off : 0u);
     wr32(img + 12, skk_crc32(0, img + 64, total - 64));
 
     *out_len = total;
@@ -1035,6 +1049,70 @@ static void roundtrip_block(const skk_dict_t *d, skk_blk_t blk,
     acc->hits    += n - bad_find;
 }
 
+/* The sampled tree against the bisection it replaces.
+ *
+ * A wrong tree does not crash and does not fail the CRC — it steers the
+ * descent into the wrong eight keys, and the reading is simply "not in
+ * the dictionary". The only thing that can see that is the answer
+ * itself, so run every heading (and a guaranteed-absent variant of it,
+ * to cover the lower bounds that fall BETWEEN entries) through
+ * key_lower_bound twice: once with the tree, once with the same image
+ * and levels forced to 0. Every index must match. The probe counts are
+ * the measurement the design is claiming — printed, not asserted, since
+ * they follow from the block size. */
+static void tree_compare_block(const skk_dict_t *d, skk_blk_t blk,
+                               const ent_t *e, size_t n, const char *what)
+{
+    skk_dict_t flat = *d;
+    const skk_index_t *ix = &d->blk[blk];
+    uint32_t p_tree = 0, p_flat = 0;
+    size_t bad = 0, i, tried = 0;
+
+    if (!ix->keys || n == 0) {
+        return;
+    }
+    CHECK(ix->levels > 0, "%s: the image carries no search tree", what);
+    flat.blk[blk].levels = 0;
+
+    for (i = 0; i < n; i++) {
+        char buf[SKK_READING_MAX * 2];
+        static const char *sfx[] = { "ゐ", "ゑ", "ゐゑゐゑゐゑゐゑ" };
+        const char *s = sfx[i % 3];
+        size_t sl = strlen(s);
+        uint64_t k[2];
+        int j;
+
+        k[0] = skk_pack(e[i].rd, e[i].rdlen, NULL);
+        if (e[i].rdlen + sl < sizeof(buf)) {
+            memcpy(buf, e[i].rd, e[i].rdlen);
+            memcpy(buf + e[i].rdlen, s, sl);
+            k[1] = skk_pack(buf, e[i].rdlen + sl, NULL);
+        } else {
+            k[1] = k[0];
+        }
+        for (j = 0; j < 2; j++) {
+            uint32_t a = key_lower_bound(ix, k[j], &p_tree);
+            uint32_t b = key_lower_bound(&flat.blk[blk], k[j], &p_flat);
+            if (a != b) {
+                if (bad == 0) {
+                    printf("    TREE DISAGREES: key 0x%016llx -> %u, "
+                           "bisection -> %u\n",
+                           (unsigned long long)k[j], a, b);
+                }
+                bad++;
+            }
+            tried++;
+        }
+    }
+    CHECK(bad == 0, "%s: the tree answered differently %zu times out of %zu",
+          what, bad, tried);
+    printf("    %-28s %zu bounds, %.2f lines/lookup with the tree, "
+           "%.2f bisecting (%.0f%% fewer, %u levels)\n",
+           what, tried,
+           (double)p_tree / (double)tried, (double)p_flat / (double)tried,
+           100.0 * (1.0 - (double)p_tree / (double)p_flat), ix->levels);
+}
+
 /* Readings guaranteed absent: every real heading with a suffix appended,
    which lands the search on a real probe path rather than off the end. */
 static void miss_block(const skk_dict_t *d, skk_blk_t blk,
@@ -1221,6 +1299,12 @@ static void run_dict(const dictspec_t *sp, const char *srcdir, const char *imgdi
     snprintf(label, sizeof(label), "%s okuri-nasi misses", sp->name);
     miss_block(&d, SKK_BLK_NASI, rd.ent[SKK_BLK_NASI], rd.n[SKK_BLK_NASI],
                label, acc);
+    snprintf(label, sizeof(label), "%s okuri-nasi tree", sp->name);
+    tree_compare_block(&d, SKK_BLK_NASI, rd.ent[SKK_BLK_NASI],
+                       rd.n[SKK_BLK_NASI], label);
+    snprintf(label, sizeof(label), "%s okuri-ari tree", sp->name);
+    tree_compare_block(&d, SKK_BLK_ARI, rd.ent[SKK_BLK_ARI],
+                       rd.n[SKK_BLK_ARI], label);
 
     /* Boundaries of a real dictionary: the very first and very last key,
        and absent readings at both ends of the index, where lower_bound

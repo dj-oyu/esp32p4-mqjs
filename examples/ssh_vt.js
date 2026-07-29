@@ -956,10 +956,15 @@ if (SELFTEST) {
         var hadPend = imePre !== "" || cands.length > 0;
         imeOn = !imeOn;
         skk.enable(ime, imeOn);
-        if (imeOn)
+        if (imeOn) {
             skk.setMode(ime, skk.KANA); /* C-j が届かないので明示的に戻す */
-        else
+        } else {
             skk.reset(ime);
+            /* 学習の書き戻しはここでやる。close() でも走るが、電源が落ちる
+               ほうが先に来る端末なので、IME を切る = 打鍵が止まる瞬間に
+               確定させておく。何も学んでいなければ何も書かない。 */
+            skk.save(ime);
+        }
         imeMode = skk.mode(ime);
         imePre = "";
         cands = [];

@@ -34,9 +34,24 @@ idf_component_register(
 # (string_buffer_push stores &local into ctx->top_gc_ref on purpose;
 # the root is popped before return). Keep upstream pristine and relax
 # the warnings for those files only.
+#
+# Jump tables: IDF appends -fno-jump-tables -fno-tree-switch-conversion to
+# EVERY translation unit (esp-idf/CMakeLists.txt) so that jump tables, which
+# land in flash .rodata, can never be reached by IRAM-placed code. The IDF
+# docs (api-guides/memory-types) say to re-enable it per source file for
+# files that do not need to be in IRAM. The engine qualifies: it runs only
+# on the JS task, never from an ISR, and JS_Call is flash-resident. Without
+# this, the ~200-way opcode switch compiles to a binary-search chain of
+# 8-14 compare-and-branch per bytecode instead of one indexed jump.
+# Measured on mquickjs.c: 353 -> 240 conditional branches in JS_Call, and
+# 3839 -> 3427 over the whole TU (the compiler, regexp engine and JSON
+# parser have their own big switches), for +3 kB of flash.
+# -Wno-override-init: the computed-goto table below fills [0 ... 255] with
+# the invalid-opcode label first and then overrides the real opcodes.
 set_source_files_properties(
     ${MQJS_DIR}/mquickjs.c ${MQJS_DIR}/cutils.c ${MQJS_DIR}/dtoa.c ${MQJS_DIR}/libm.c
-    PROPERTIES COMPILE_OPTIONS "-Wno-format;-Wno-type-limits;-Wno-dangling-pointer"
+    PROPERTIES COMPILE_OPTIONS
+        "-Wno-format;-Wno-type-limits;-Wno-dangling-pointer;-Wno-override-init;-fjump-tables;-ftree-switch-conversion"
 )
 
 # device_stdlib.c is primarily the HOST generator source (its main() is
