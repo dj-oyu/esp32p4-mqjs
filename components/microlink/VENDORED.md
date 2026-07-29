@@ -7,7 +7,7 @@ upstream targets ESP-IDF 5.x and does **not** build unmodified on ESP-IDF 6.0 /
 ESP32-P4. The bundled `components/wireguard_lwip` is vendored alongside it (it is
 a nested component upstream; flattened to a sibling here for Windows/IDF
 component discovery). Rationale and the full de-risking record:
-[`docs/tailscale-microlink-plan.md`](../../docs/tailscale-microlink-plan.md).
+[`docs/history/tailscale-microlink-plan.md`](../../docs/history/tailscale-microlink-plan.md).
 
 ## Local patches vs upstream (IDF 6.0 / ESP32-P4 / GCC 15)
 

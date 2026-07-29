@@ -33,7 +33,7 @@
  * 検証モード (いずれも committed 版は false):
  *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
  *   REPORT=true   … 実機で色付きデモを画面に流し続ける (SSH 不要・目視用)
- * IME のキー順序は tools/ssh_vt_imetest.sh が見る (末尾のマーカー行へ台本を
+ * IME のキー順序は tools/tests/ssh_vt_imetest.sh が見る (末尾のマーカー行へ台本を
  * 注入して run_pc で走らせる)。 */
 "use strict";
 sys.setAppName("ssh_vt");
@@ -1143,7 +1143,7 @@ if (SELFTEST) {
     };
 
     /* ハンドラは無名関数にせず名前を付ける — run_pc では ui.onKey が絶対に
-       発火しないので、台本 (tools/ssh_vt_imetest.sh) がここを直接叩けないと
+       発火しないので、台本 (tools/tests/ssh_vt_imetest.sh) がここを直接叩けないと
        「キーを渡す順序」のバグが実機まで残る。 */
     var onKey = function (k) {
         /* レイアウト変更はセッションが無くても処理する (下の actIdx
@@ -1687,8 +1687,8 @@ if (SELFTEST) {
         }
     });
 
-    /* @imetest-inject — tools/ssh_vt_imetest.sh がこの行を tools/
-       ssh_vt_imetest.js.inc の中身に差し替えて run_pc に食わせる。台本は
+    /* @imetest-inject — tools/tests/ssh_vt_imetest.sh がこの行を
+       tools/tests/ssh_vt_imetest.js.inc の中身に差し替えて run_pc に食わせる。台本は
        ssh_vt のクロージャ (onKey / imeSend / imePre / cands …) に届く必要が
        あるのでこの位置でしか成立しないが、出荷アプリには 1 バイトも乗せない。
        守っているのは上の IME フックが **TOKSEQ 展開より前**にあること。

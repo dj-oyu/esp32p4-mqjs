@@ -182,7 +182,7 @@ v1 payload:
 - QR は暗号化ではない。表示・画像・印刷物を credential として扱う。
 - QR生成側は最低3 pixel/moduleで表示する。combined payloadは400x300解析面上で
   辺220px以上を目安にする。詳細は
-  [`qr-read-performance.md`](qr-read-performance.md)を参照する。
+  [`qr-read-performance.md`](history/qr-read-performance.md)を参照する。
 
 初期 v1 は署名なしで、端末確認画面を必須とする。署名を追加する場合は envelope を
 `MQJSP2` とし、既存 v1 の意味を変更しない。CBOR は QR 容量が実測上問題になった時に
@@ -224,7 +224,7 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
 ### Phase 3: microlink
 
 実装方針・選択肢調査・de-risking 手順は
-[`tailscale-microlink-plan.md`](tailscale-microlink-plan.md)。採用候補は MicroLink
+[`tailscale-microlink-plan.md`](history/tailscale-microlink-plan.md)。採用候補は MicroLink
 (ネイティブ C の Tailscale 互換クライアント、`tskey-auth` をそのまま消費)。
 
 - microlink adapter と lifecycle task
@@ -240,7 +240,7 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
   - **解析解像度がカギ**: 旧 0.5x s_mid(400x300) では実カメラのボケで
     quirc が候補ゼロ。フルフレーム中央 **800x600 を直接 quirc** に渡して解決。
     自作 finder prefilter は実機で markers=0 のため撤去し、quirc 自身の検出に
-    委ねる。詳細は [`qr-read-performance.md`](qr-read-performance.md)。
+    委ねる。詳細は [`qr-read-performance.md`](history/qr-read-performance.md)。
   - **プレビューを止めない**ため、gray変換+quirc(~220ms)は**別ワーカータスク**
     (core0/prio3, LVGLのcore1を避ける) で実行。scan_task は 800x600 crop を
     コピーして渡し、結果は非ブロッキングで回収。ビューファインダは ~47ms/frame
@@ -260,7 +260,7 @@ dependency `qrcode` がある場合だけ行い、`--text-out`
     Tailscale auth key は「設定あり（非表示）」とだけ表示する。有効期限は SNTP
     前で時刻未同期なら「確認不可」、同期済みなら有効/期限切れを表示する
     (best-effort; 期限切れは警告のみで適用はユーザの明示確認に委ねる)。
-  - host test: `tools/test_provision_parse.mjs` (28 ケース、Python 生成 wire text
+  - host test: `tools/tests/test_provision_parse.mjs` (28 ケース、Python 生成 wire text
     の往復・拒否・秘密非漏洩・clock相対 expiry)。**device 実機確認は未**。
 - 明示確認後に用途別 API へ投入 **(DONE)**
   - 「この設定を適用」で `system.wifiSet(ssid, password)` /

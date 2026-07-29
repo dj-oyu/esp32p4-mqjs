@@ -83,8 +83,8 @@ print("hello");
   大きいものを焼けば**アプリを変えずに**そちらが使われる (ルート README 3.5)。
   変換の学習は端末全体で共有され、IME をオフにしたとき (`skk.save()`) と
   アプリ停止時に littlefs へ書き戻される。
-  IME のキー経路は `tools/ssh_vt_imetest.sh` が見る — `@imetest-inject`
-  マーカーへ `tools/ssh_vt_imetest.js.inc` を注入したものを run_pc で走らせ、
+  IME のキー経路は `tools/tests/ssh_vt_imetest.sh` が見る — `@imetest-inject`
+  マーカーへ `tools/tests/ssh_vt_imetest.js.inc` を注入したものを run_pc で走らせ、
   `PASS` / `FAIL x<n>` を出す (**出荷アプリにテストのバイトは乗らない**)。
   検出しているのは変換の正しさではなく **IME フックが TOKSEQ 展開より前に
   あること** で、効いているのは `arrow-swallow` の項目。辞書は

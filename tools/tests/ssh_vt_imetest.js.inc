@@ -1,6 +1,6 @@
 /* ssh_vt の IME 台本テスト (docs/skk-ime-design.md S6)。
  *
- * これは単体で動くスクリプトではなく、tools/ssh_vt_imetest.sh が
+ * これは単体で動くスクリプトではなく、tools/tests/ssh_vt_imetest.sh が
  * examples/ssh_vt.js の "@imetest-inject" マーカー行の位置へ注入してから
  * run_pc に食わせる断片です。ssh_vt のクロージャ (onKey / imeSend /
  * imePre / cands / sessions …) に届く必要があるので、この位置でしか

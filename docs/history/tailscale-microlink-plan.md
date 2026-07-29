@@ -1,6 +1,6 @@
 # Tailscale 統合 (microlink) Phase 3 計画
 
-[`system-settings-design.md`](system-settings-design.md) Phase 3 の実装方針。Tab5
+[`system-settings-design.md`](../system-settings-design.md) Phase 3 の実装方針。Tab5
 (ESP32-P4 + esp_hosted の C6 で Wi-Fi、lwIP スタック) 上で、System Vault に保管した
 Tailscale auth key を実消費して端末を tailnet ノードにする。
 
@@ -399,7 +399,7 @@ microlink は内部で自動再接続 (~5-10s) し、`ERROR`/`RECONNECTING` は 
 - **Secure NVS**: auth key は現状 **平文 NVS**。製品 build で Flash Encryption + NVS
   Encryption (保存時暗号化)、Key Manager + HUK によるハード束縛鍵、Secure Boot を入れて
   固める。P4 の「拡張命令 (PIE/SIMD)」は演算用で**この用途には無関係**。
-  cf. [`system-settings-design.md`](system-settings-design.md) の System Vault 不変条件。
+  cf. [`system-settings-design.md`](../system-settings-design.md) の System Vault 不変条件。
 
 ## 検証基準 (Phase 3)
 
@@ -424,8 +424,8 @@ microlink は内部で自動再接続 (~5-10s) し、`ERROR`/`RECONNECTING` は 
 
 ### レイヤ1: ホスト単体テスト (実機不要・最重要) — **DONE (19/19 pass)**
 **ChaCha20-Poly1305 AEAD KAT** — PSA 移植の正しさ。オラクルは Python `cryptography`
-(48.0.0, RFC 8439 ChaCha20Poly1305, 12byte nonce)。`tools/test_chacha20poly1305_kat.py`
-(`python tools/test_chacha20poly1305_kat.py`、19/19 pass・golden ベクタ出力):
+(48.0.0, RFC 8439 ChaCha20Poly1305, 12byte nonce)。`tools/tests/test_chacha20poly1305_kat.py`
+(`python tools/tests/test_chacha20poly1305_kat.py`、19/19 pass・golden ベクタ出力):
 - 公式 RFC 8439 §2.8.2 ベクタでオラクル健全性を確認
 - **Tailscale nonce 構築** (4byte 0 + 8byte **big-endian** counter) の検証
   (ml_noise.c のバイト順ロジックと一致するか)。WireGuard refc は LE なので不適、注意

@@ -179,7 +179,7 @@ monitorログの代表値:
 
 ## ホスト光学ベンチ
 
-[`tools/qr_read_bench.py`](../tools/qr_read_bench.py) は実際の`MQJSP1` payloadを生成し、
+[`tools/qr_read_bench.py`](../../tools/qr_read_bench.py) は実際の`MQJSP1` payloadを生成し、
 400x300画像へ次の劣化を加えて成功率とhost decode時間を測る。
 
 - QR表示辺長とpixel/module

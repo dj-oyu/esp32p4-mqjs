@@ -903,7 +903,7 @@ pcm hash 不変＝直書き path は memcpy path とビット同一（正当性�
 確立した追加知見:
 - `esp.vldbc.16.ip` の post-inc 即値は **step 4**（or 0）必須。±2 は
   `bad value for offset_256_4` でアセンブル不可→base を `addi` で進める。
-- host bit-exact test は WSL gcc（`tools/test_opus_denorm.c`、21664 cases 0 fail）。
+- host bit-exact test は WSL gcc（`tools/tests/test_opus_denorm.c`、21664 cases 0 fail）。
   PIE body は device microbench で C 比 maxdiff、実機 pcm hash で回帰確認。
 
 ### PIE normalise_residual 結果（2026-06-14）— 正しいが end-to-end 中立
@@ -940,7 +940,7 @@ normres pie_calls=46408 で engage 済み）。理由: **~7% の見積りは flo
   ビット一致で実装（`p4_mult16_32_q15` + 32bit modular add/sub + arithmetic
   HALF_OF）。ABI `(int32_t *Fout, int m, const int16_t *tw, int fstride,
   int16_t epi3_i)`、Fout は interleaved int32 complex の 1 i-block（3m）。
-- host test `tools/test_opus_bfly3.c`: 独立 int64 complex golden と照合、
+- host test `tools/tests/test_opus_bfly3.c`: 独立 int64 complex golden と照合、
   **10366 cases 0 fail**（overflow-wrap 境界含む）。
 
 **PIE 命令の実在確認（toolchain アセンブル、2026-06-14）— 前 §「【訂正】」の

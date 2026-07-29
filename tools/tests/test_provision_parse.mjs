@@ -3,7 +3,7 @@
 // against wire text emitted by mqjs_provision_qr.py.
 import fs from "node:fs";
 
-const src = fs.readFileSync(new URL("../examples/device_settings.js", import.meta.url), "utf8");
+const src = fs.readFileSync(new URL("../../examples/device_settings.js", import.meta.url), "utf8");
 
 // Chainable no-op UI so the file's top-level mainPage() render is harmless.
 const handle = { setText() {}, value: () => "", add() {} };

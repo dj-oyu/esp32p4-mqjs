@@ -6,7 +6,7 @@ escape sequences that an untrusted SSH server can send. A timeout, exception,
 or non-zero exit means the server was able to disrupt the terminal app.
 
 Usage:
-    python3 tools/test_ssh_vt_security.py [/path/to/run_pc]
+    python3 tools/tests/test_ssh_vt_security.py [/path/to/run_pc]
 """
 
 import os
@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "examples" / "ssh_vt.js"
 RUN_PC = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("RUN_PC", "/tmp/run_pc"))
 

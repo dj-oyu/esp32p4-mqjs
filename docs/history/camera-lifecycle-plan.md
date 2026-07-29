@@ -1,12 +1,15 @@
 # Camera pipeline lifecycle redesign (QR / barcode) — design plan
 
-Status: **Phase 1 implemented** (2026-06-16), pending on-device verification.
-Phase 2 (QR reticle window + internal-SRAM quirc + full Wi-Fi-off) remains
-design, gated on the M1/M2/M3 device measurements. Supersedes the ad-hoc
-`cam_tab5` scan path. Companion to the `tailscale_adapter` single-owner
-lifecycle refactor (commit `aa58c85`), whose pattern this mirrors.
+Status: **closed** — this is the record, not a live plan. Phase 1 (single-owner
+camera task + microlink mutual exclusion) is device-verified and on `main`
+(`7b76ffd`); the single-owner design it describes is the shipping architecture.
+Of Phase 2, the **QR reticle window + native-res decode crop landed**
+(`fd98fac`), while **internal-SRAM quirc was proven infeasible on this board**
+and is not coming back — see the note in §6. Supersedes the ad-hoc `cam_tab5`
+scan path. Companion to the `tailscale_adapter` single-owner lifecycle refactor
+(commit `aa58c85`), whose pattern this mirrors.
 
-## Phase 1 — what landed (code, not yet device-verified)
+## Phase 1 — what landed
 
 - **Single-owner camera task.** `cam_tab5.c` now has a resident `cam_owner_task`
   + `cam_cmd_queue` (`cam_scan_req_t`, depth 1). `scan_start` posts a request
@@ -211,6 +214,13 @@ full pixel density while the buffer stays small.
 Open item **M2**: find the smallest reticle that reliably captures an aligned QR
 (empirical sweep with real codes), and the decode-crop size around it.
 
+> **Settled (`fd98fac`, device-verified):** the shipping crop is **640×640**,
+> not the 400×400 sketched above. Crop size turned out to be driven by decode
+> quality (px per module), not by the SRAM budget: the provisioning QR is
+> v11/12, so 400×400 gives 4.6 px/module and fails ECC while 640×640 gives
+> 8 px/module and decodes. 640×640 = 410 KB, which never had a chance of
+> fitting internal SRAM — see the note in §8.
+
 ---
 
 ## 7. Cancel — flag, not a cross-task kill
@@ -259,6 +269,13 @@ off + camera buffers in PSRAM to confirm the achievable contiguous block.
 Open item **M3**: micro-bench quirc `identify` on the same crop in internal vs
 PSRAM — only worth the SRAM placement if it is PSRAM-cache-bound (vs compute-bound).
 (Note: quirc runs on a worker, so this speeds *decode latency*, not preview fps.)
+
+> **Settled — this whole section is dead. Do not re-attempt.** M1 was measured
+> on device: with esp-hosted up, P4 internal SRAM is held by lwIP/SDIO and the
+> largest contiguous INTERNAL block is only ~34–43 KB. Turning Wi-Fi off frees
+> almost nothing here, because the radio lives on the C6, not the P4. And the
+> crop that actually decodes is 640×640 = 410 KB (§6), an order of magnitude
+> past the ceiling. **quirc stays in PSRAM.**
 
 ---
 
@@ -398,6 +415,6 @@ resource metric trends downward, and the next scan behaves like the first.
 - `tailscale_adapter.c` single-owner lifecycle + `ts_lifecycle_cmd_t` (commit
   `aa58c85`) — the pattern this mirrors; also the tcpip_thread deadlock write-up.
 - `components/cam_tab5/cam_tab5.c` — current scan path, PPA two-pass, quirc worker.
-- `docs/qr-read-performance.md`, `docs/scanline-opt-plan.md` — prior QR/barcode work.
+- `docs/history/qr-read-performance.md`, `docs/history/scanline-opt-plan.md` — prior QR/barcode work.
 - Measurement: device capture 2026-06-15 (0.2 fps, quirc id 26 s, task_wdt
   ml_derp_tx×14 / ml_wg_mgr×7).

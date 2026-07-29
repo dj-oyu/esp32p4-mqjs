@@ -101,7 +101,7 @@ upstream が **case ラベルの無い opcode を追加**した場合、`DEF()` 
 ## 関連
 
 - 調査の全体像と他の候補（XIP-from-PSRAM、flash QIO、GC）は
-  [runtime-hotspot-audit.md](runtime-hotspot-audit.md) と併せて参照
+  [runtime-hotspot-audit.md](history/runtime-hotspot-audit.md) と併せて参照
 - GC は今回スコープ外（体感のボトルネックが無いため）。将来、複雑で長寿命な
   アプリが出てきたら着手する。分かっていること:
   - GC は bump アロケータが尽きたときだけ発火し、`gc_compact_heap` は

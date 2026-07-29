@@ -7,7 +7,7 @@
  *
  * Build/run (host):
  *   gcc -O2 -Wall -I components/opus_p4_kernels/include \
- *       tools/test_opus_comb.c components/opus_p4_kernels/opus_p4_kernels.c \
+ *       tools/tests/test_opus_comb.c components/opus_p4_kernels/opus_p4_kernels.c \
  *       -o /tmp/test_opus_comb && /tmp/test_opus_comb
  */
 #include <assert.h>

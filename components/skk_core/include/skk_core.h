@@ -311,7 +311,7 @@ typedef enum {
  *   ML  okuri-nasi  44,401    15.5 ln    6 ln   50,720 B  (+9.5%)
  *   L   okuri-nasi 159,795    17.4 ln    6 ln  182,600 B  (+9.5%)
  *
- * (measured by tools/test_skk_dict.c over every heading of every shipped
+ * (measured by tools/tests/test_skk_dict.c over every heading of every shipped
  * dictionary, both blocks, plus a guaranteed-absent variant of each so
  * the bounds that fall BETWEEN entries are covered too; the percentage
  * is against that block's keys[] + offs[]). The top levels are small

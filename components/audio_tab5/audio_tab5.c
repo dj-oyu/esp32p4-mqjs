@@ -302,7 +302,7 @@ size_t audio_tab5_write(const int16_t *pcm, size_t frames, uint32_t timeout_ms)
            either mono (duplicate the sample) or stereo folded to mono for
            the mono speaker ((L+R)/2 — the codec does NOT sum L/R, and the
            NS4150B has one input, so an unfolded stereo source would drop a
-           channel; see docs/audio-tab5-status.md). */
+           channel; see docs/history/audio-tab5-status.md). */
         int16_t st[256 * 2];
         while (done < frames) {
             size_t n = frames - done;

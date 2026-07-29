@@ -189,4 +189,4 @@ right_shift_loop:
 
 - **Full instruction listing**: See `references/instructions.md` for all instructions organized by category with syntax and semantics
 - **Code examples**: See `references/examples.md` for patterns from esp-dl (conv2d, elementwise ops, depthwise conv, etc.)
-- **Project SIMD examples**: `components/cam_tab5/bc_tensor_p4.S`, `main/ppa_bench.c`, `docs/pie-tensor-asm-plan.md`
+- **Project SIMD examples**: `components/cam_tab5/bc_tensor_p4.S`, `main/ppa_bench.c`, `docs/history/pie-tensor-asm-plan.md`

@@ -44,7 +44,7 @@ Tab5 の単一スピーカーへ安全に合流させる `audio_device` 層を�
 物理 I2S / codec / speaker 制御は既存の `audio_tab5` が担い、
 `audio_device` はその上で所有権、要求キュー、cancel、将来の overdub を管理する。
 
-- 物理 PCM パイプライン: [audio-pipeline.md](audio-pipeline.md)
+- 物理 PCM パイプライン: [audio-pipeline.md](../audio-pipeline.md)
 - Opus デコーダ統合: [opus-decoder-plan.md](opus-decoder-plan.md)
 
 ---

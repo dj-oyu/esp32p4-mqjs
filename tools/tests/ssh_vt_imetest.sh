@@ -1,9 +1,9 @@
 #!/bin/sh
 # ssh_vt の IME 台本テストを run_pc で走らせる (docs/skk-ime-design.md S6)。
 #
-#   tools/ssh_vt_imetest.sh [/path/to/run_pc]
+#   tools/tests/ssh_vt_imetest.sh [/path/to/run_pc]
 #
-# examples/ssh_vt.js の "@imetest-inject" マーカー行を tools/ssh_vt_imetest.js.inc
+# examples/ssh_vt.js の "@imetest-inject" マーカー行を tools/tests/ssh_vt_imetest.js.inc
 # の中身に差し替えたものを一時ファイルに吐き、run_pc に食わせる。台本は ssh_vt
 # のクロージャに届く必要があるので注入でしか成立しないが、この方式なら出荷
 # アプリにはテストのバイトが 1 つも乗らない。
@@ -13,9 +13,9 @@
 # ../skk_core/skk_dict.bin がそこから解決される)。
 set -eu
 
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=$(cd "$(dirname "$0")/../.." && pwd)
 app="$root/examples/ssh_vt.js"
-inc="$root/tools/ssh_vt_imetest.js.inc"
+inc="$root/tools/tests/ssh_vt_imetest.js.inc"
 run=${1:-/tmp/run_pc}
 out=${TMPDIR:-/tmp}/ssh_vt_imetest.js
 
