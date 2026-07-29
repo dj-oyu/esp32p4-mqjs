@@ -9,11 +9,13 @@ ROM header regen. Out of scope: LP SRAM black box and the MQTT responder
 Owner of this file: **opus_A** (implementation). Updated as the phase
 proceeds — it is a running contract, not a plan written once.
 
-Status: **implementation complete; host suite and PC bindings green. The
-first device build was attempted and failed in the generated ROM header (not
-in term_core) — fixed, headers regenerated, PC suites re-verified; no
-successful device build and no flash yet** (that is the orchestrator's step).
-See Decisions #11.
+Status: **implementation complete and device-verified (230f543).** Two
+contract gaps that the device probe and the test author's dry run surfaced
+afterwards are fixed on top of that commit — the missing `term.POST` /
+`term.TRUNC` constants and `read`'s `n <= 0` clamp. Both header sets
+regenerated, 22 host suites and 4 PC suites green; the device build of the
+fixes is the orchestrator's step. See Decisions #11 (the earlier ROM-header
+break), #12 and #13.
 
 ## Why this ledger exists
 
@@ -55,8 +57,8 @@ the `.c`.
 
 | File | Change | Status |
 |---|---|---|
-| `components/mqjs/mqjs_runtime.c` | `js_term_*` bindings (§8 minus pipe/onReply); the PC port; lazy bring-up incl. the system console; print-sink tee; `term_registry_owner_stopped` in the app teardown; `mqjs_term_pump()` in both scheduler loops (no-op on device) | done |
-| `components/mqjs/device_stdlib.c` | `js_term[]` prop table + `JS_PROP_CLASS_DEF("term", …)` + the `term_err_t` constants | done |
+| `components/mqjs/mqjs_runtime.c` | `js_term_*` bindings (§8 minus pipe/onReply); the PC port; lazy bring-up incl. the system console; print-sink tee; `term_registry_owner_stopped` in the app teardown; `mqjs_term_pump()` in both scheduler loops (no-op on device). `js_term_read` no longer clamps `n` — Decisions #13 | done |
+| `components/mqjs/device_stdlib.c` | `js_term[]` prop table + `JS_PROP_CLASS_DEF("term", …)` + all 15 `term_err_t` constants (`POST`/`TRUNC` added after the device probe — Decisions #12) | done |
 | `components/mqjs/mquickjs/mquickjs_build.c` | Local patch to the vendored generator: a short-int property value is emitted as `N * 2`, not `N << 1`, so the negative `term_err_t` constants do not become UB / a `-Werror=shift-negative-value` error on the device. One line; see Decisions #11 and `docs/mquickjs-patches.md` patch 2 | done |
 | `components/mqjs/gen/device_stdlib.h` | ROM stdlib regen (-m32) | done |
 | `components/mqjs/gen/mquickjs_atom.h` | Regenerated; **byte-identical** to the committed file (the new property names land in the stdlib string table, not the atom table), so it is not in the diff | done |
@@ -253,7 +255,36 @@ discover them in the code.
     were regenerated (`gen/` -m32, `gen_pc/` -m64); the only change in
     `gen/device_stdlib.h` is 47 lines of `N << 1,` → `N * 2,` with the
     integer sequence unchanged, and the four PC suites plus a direct
-    read-back of all 13 `term.*` constants confirm the values.
+    read-back of all `term.*` constants confirm the values.
+12. **`term.POST` and `term.TRUNC` were missing from the export table**
+    (found by the device probe, 2026-07-30). The table stopped at
+    `TIMEOUT` (-12) while `term_err_t` runs to -14, and `term_registry.h`
+    documents `TERM_ERR_POST` as the ordinary return of `resize`/`show` when
+    the UI queue refuses a job — a value an app receives in normal operation
+    and had no name for. `TERM_ERR_TRUNC` is not returned by any *binding*
+    today (`snapshot`'s truncation collapses into `null`), but exporting one
+    half of the tail and not the other is a worse contract than exporting
+    both: the rule "every `term_err_t` has a `term.*` name" is checkable, and
+    "every one the current bindings happen to produce" is not. Both added;
+    both header sets regenerated.
+13. **`term.read(id, from, n)` clamped `n` up to 1 instead of rejecting
+    `n <= 0`** (found by the device probe, 2026-07-30, confirmed against the
+    test author's dry run: `term.read(id, 0, -1)` returned a 12-character
+    string). The check was **not** missing in the registry —
+    `term_registry_read` has always had `if (!out || !out_size || n <= 0)
+    return TERM_ERR_INVAL;`. The binding layer dropped it: `js_term_read`
+    ran `if (n < 1) n = 1;` before the call, so a malformed request was
+    silently rewritten into a valid one and answered with real scrollback.
+    That is the worst shape for this bug — the header's contract held in C
+    and was unobservable from JS, which is exactly where a test written
+    against the header disagrees with the device.
+
+    The clamp is deleted rather than the header relaxed. `n` defaults to 1
+    when the argument is *absent*, which is a different statement from "0
+    means 1": an explicit 0 or negative is a caller error and now returns
+    `null`. A binding that repairs its arguments hides the caller's bug and
+    makes the surface untestable, and there is no plausible reading of
+    `read(id, 0, -1)` that "one line from the oldest" satisfies.
 
 ## JS surface actually shipped (§8 minus pipe/onReply)
 
@@ -269,10 +300,21 @@ term.close(id);
 ```
 
 - `create` returns a positive id, everything else 0, and every failure is a
-  **negative `term_err_t`** (`term.BAD_ID`, `term.NOT_OWNER`, `term.STALE`,
-  `term.EXISTS`, … are exported as constants). `snapshot`/`read` return
-  `null` instead, because their success value is a string. No `term.*` call
-  throws for a terminal-level error (§8).
+  **negative `term_err_t`**. All 15 enumerators are exported as constants, so
+  no app needs a magic number for any value the registry can return:
+
+  ```
+  term.OK 0   term.INVAL -1   term.NOT_READY -2  term.BAD_ID -3
+  term.STALE -4   term.NOT_OWNER -5   term.DYING -6   term.NO_SLOT -7
+  term.NO_MEM -8  term.EXISTS -9  term.BUSY -10   term.MODE -11
+  term.TIMEOUT -12    term.POST -13   term.TRUNC -14
+  ```
+
+  `snapshot`/`read` return `null` instead, because their success value is a
+  string. No `term.*` call throws for a terminal-level error (§8).
+- `read`'s `n` is **not clamped** by the binding: `n <= 0` is
+  `TERM_ERR_INVAL` per `term_registry.h`, which surfaces as `null`. Omitting
+  the argument still means one line. See Decisions #13.
 - `name` is required and is the per-owner re-attach key; `mode` defaults to
   `"log"`; `cols`/`rows` default to the grid that fills the canvas, clamped
   to the §4.1 worst case (142 × 53, ≤ 4,260 cells).

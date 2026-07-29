@@ -480,6 +480,8 @@ static const JSPropDef js_term[] = {
     JS_PROP_DOUBLE_DEF("BUSY", -10, 0),
     JS_PROP_DOUBLE_DEF("MODE", -11, 0),
     JS_PROP_DOUBLE_DEF("TIMEOUT", -12, 0),
+    JS_PROP_DOUBLE_DEF("POST", -13, 0),
+    JS_PROP_DOUBLE_DEF("TRUNC", -14, 0),
     JS_PROP_END,
 };
 

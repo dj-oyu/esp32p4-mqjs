@@ -6388,8 +6388,11 @@ JSValue js_term_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return JS_EXCEPTION;
     if (argc >= 3 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &n, argv[2]))
         return JS_EXCEPTION;
-    if (n < 1)
-        n = 1;
+    /* No clamp on n: term_registry.h makes n <= 0 a TERM_ERR_INVAL, and a
+     * binding that silently turned -1 into 1 would answer a malformed
+     * request with somebody's scrollback. The omitted argument still
+     * defaults to 1; an explicit 0 or negative goes to the registry and
+     * comes back as null. */
     if (!owner || !term_registry_ready())
         return JS_NULL;
     size_t cap = 8192;
