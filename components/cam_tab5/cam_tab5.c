@@ -14,6 +14,7 @@
 #include "cam_tab5.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #if CONFIG_MQJS_CAMERA
 
@@ -717,8 +718,13 @@ static bool ppa_once(void)
 
 static uint16_t *s_mid;
 static struct quirc *s_quirc;
-static struct quirc_code s_qr_code;
-static struct quirc_data s_qr_data;
+/* decode temporaries (~12.6 KB): heap-allocated per decode run instead
+ * of permanent .bss — resident cost is zero while no QR scan runs, and
+ * one malloc per ~220 ms decode is noise */
+struct qr_tmp {
+    struct quirc_code code;
+    struct quirc_data data;
+};
 /* QR decode crop: a NATIVE-RES reticle window (camera-lifecycle-plan §6), NOT a
  * downscale. The old 400x300 failed because it DOWNSCALED the 800x600 crop 0.5x,
  * dropping module density below quirc's finder threshold. We instead CROP a
@@ -841,24 +847,33 @@ static void qr_decode_once(void)
     s_qr_candidates = n;
 
     t = esp_timer_get_time();
-    for (int i = 0; i < n; i++) {
-        quirc_extract(s_quirc, i, &s_qr_code);
-        quirc_decode_error_t err = quirc_decode(&s_qr_code, &s_qr_data);
+    struct qr_tmp *qt = NULL;
+    if (n > 0) {
+        qt = heap_caps_malloc(sizeof *qt,
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!qt) /* internal tight (scan-time transient): PSRAM works too */
+            qt = heap_caps_malloc(sizeof *qt,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    for (int i = 0; qt && i < n; i++) {
+        quirc_extract(s_quirc, i, &qt->code);
+        quirc_decode_error_t err = quirc_decode(&qt->code, &qt->data);
         if (err == QUIRC_ERROR_DATA_ECC) {
-            quirc_flip(&s_qr_code);
-            err = quirc_decode(&s_qr_code, &s_qr_data);
+            quirc_flip(&qt->code);
+            err = quirc_decode(&qt->code, &qt->data);
         }
         s_qr_last_err = err;             /* diag (last candidate wins) */
-        s_qr_last_size = s_qr_code.size; /* diag: QR cells/side */
-        if (err != QUIRC_SUCCESS || s_qr_data.payload_len <= 0 ||
-            (size_t)s_qr_data.payload_len >= sizeof s_qr_payload ||
-            memchr(s_qr_data.payload, '\0', s_qr_data.payload_len))
+        s_qr_last_size = qt->code.size;  /* diag: QR cells/side */
+        if (err != QUIRC_SUCCESS || qt->data.payload_len <= 0 ||
+            (size_t)qt->data.payload_len >= sizeof s_qr_payload ||
+            memchr(qt->data.payload, '\0', qt->data.payload_len))
             continue;
-        memcpy(s_qr_payload, s_qr_data.payload, s_qr_data.payload_len);
-        s_qr_payload[s_qr_data.payload_len] = '\0';
+        memcpy(s_qr_payload, qt->data.payload, qt->data.payload_len);
+        s_qr_payload[qt->data.payload_len] = '\0';
         s_qr_hit = true;
         break;
     }
+    free(qt);
     s_qr_dec_us += esp_timer_get_time() - t;
     s_qr_runs++;
 }
@@ -1087,7 +1102,9 @@ typedef struct {
  * delete the task) — the owner loops for the next command. */
 static void cam_run_scan(void)
 {
-    static uint8_t line[CAM_W]; /* one scan at a time (s_busy) */
+    /* scan-lifetime scratch (freed in teardown): one scanline at a time
+       (s_busy). Was permanent .bss; now costs nothing between scans. */
+    uint8_t *line = malloc(CAM_W);
     char code[CAM_TAB5_QR_PAYLOAD_MAX + 1];
     char lbl[112], lbl_cache[112];
     FrameHit disp, last_hit;
@@ -1122,7 +1139,9 @@ static void cam_run_scan(void)
         led.net = CAM_NET_MICROLINK;
     }
 
-    bool pipe_ok = pipeline_once(); /* on failure it set s_status */
+    bool pipe_ok = line && pipeline_once(); /* on failure it set s_status */
+    if (!line)
+        fail = "no memory (scanline)";
 
     if (pipe_ok) {
         /* bound DQBUF so the loop's deadline/cancel check actually runs */
@@ -1308,6 +1327,9 @@ static void cam_run_scan(void)
         ui_tab5_cam_set_dismiss_cb(NULL);
     if (led.net != CAM_NET_NONE && s_net_resume)
         s_net_resume();   /* re-arm the network now the camera released the bus */
+    free(line);
+    ean13_scratch_release(); /* barcode scratch (~24 KB + ~10 KB): freed */
+    bc_locate_release();     /* between scans, reallocated on the next one */
 
     char done[256];
     char perf[192] = "";

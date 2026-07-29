@@ -3,7 +3,11 @@
 #include "bc_locate.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 /* NOTE on PIE: the tensor sums were tried as three esp-dsp dot
  * products (dsps_dotprod_s16_arp4, PIE-accelerated, 16B-aligned
@@ -29,6 +33,37 @@
 #define COH_DEN 100
 /* cluster joins blocks whose orientation agrees within this (deg) */
 #define TH_JOIN 20
+
+/* Locator scratch (~10.4 KB). Heap-allocated on first bc_locate() and
+ * freed by bc_locate_release() at scan teardown — zero resident cost
+ * while no scan runs (it used to be permanent .bss). Internal RAM
+ * preferred on device; non-reentrant like the rest of the scanner. */
+typedef struct {
+    int32_t energy[MAX_BY][MAX_BX];
+    int16_t theta[MAX_BY][MAX_BX]; /* deg 0..179; -1 = not ok */
+    uint8_t in[MAX_BY][MAX_BX];
+    int16_t qx[MAX_BX * MAX_BY], qy[MAX_BX * MAX_BY];
+} bc_scratch_t;
+
+static bc_scratch_t *s_scratch;
+
+static bc_scratch_t *scratch_get(void)
+{
+#ifdef ESP_PLATFORM
+    if (!s_scratch)
+        s_scratch = heap_caps_malloc(sizeof *s_scratch,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
+    if (!s_scratch)
+        s_scratch = malloc(sizeof *s_scratch);
+    return s_scratch;
+}
+
+void bc_locate_release(void)
+{
+    free(s_scratch);
+    s_scratch = NULL;
+}
 
 static inline int luma(uint16_t v)
 {
@@ -104,7 +139,15 @@ static uint32_t bc_xs32(uint32_t *st)
  * on the first bc_locate() call on device. */
 static void bc_tensor_selfcheck(void)
 {
-    static uint16_t blk[32 * 32] __attribute__((aligned(16)));
+    /* the PIE kernel needs 16B alignment; the buffer lives only for
+       this one check (it used to be 2 KB of permanent .bss) */
+    uint16_t *blk = heap_caps_aligned_alloc(16, 32 * 32 * sizeof *blk,
+                                            MALLOC_CAP_INTERNAL |
+                                                MALLOC_CAP_8BIT);
+    if (!blk) {
+        s_tensor_mode = 2; /* no buffer to prove PIE with: C fallback */
+        return;
+    }
     uint32_t st = 0x1b6f3a9du; /* fixed seed */
     int mismatch = 0;
     for (int n = 0; n < 8 && !mismatch; n++) {
@@ -116,6 +159,7 @@ static void bc_tensor_selfcheck(void)
         if (c[0] != p[0] || c[1] != p[1] || c[2] != p[2])
             mismatch = 1;
     }
+    free(blk);
     s_tensor_mode = mismatch ? 2 : 1;
 }
 
@@ -173,8 +217,11 @@ int bc_locate(const uint16_t *rgb565, int w, int h, int coord_scale,
     if (nby > MAX_BY)
         nby = MAX_BY;
 
-    static int32_t energy[MAX_BY][MAX_BX];
-    static int16_t theta[MAX_BY][MAX_BX]; /* deg 0..179; -1 = not ok */
+    bc_scratch_t *scr = scratch_get();
+    if (!scr)
+        return 0;
+    int32_t(*const energy)[MAX_BX] = scr->energy;
+    int16_t(*const theta)[MAX_BX] = scr->theta;
 
     for (int by = 0; by < nby; by++) {
         for (int bx = 0; bx < nbx; bx++) {
@@ -220,9 +267,9 @@ int bc_locate(const uint16_t *rgb565, int w, int h, int coord_scale,
         return 0;
 
     /* BFS over 4-neighbors with agreeing orientation */
-    static uint8_t in[MAX_BY][MAX_BX];
-    static int16_t qx[MAX_BX * MAX_BY], qy[MAX_BX * MAX_BY];
-    memset(in, 0, sizeof in);
+    uint8_t(*const in)[MAX_BX] = scr->in;
+    int16_t *const qx = scr->qx, *const qy = scr->qy;
+    memset(in, 0, sizeof scr->in);
     int qh = 0, qt = 0;
     int seed_th = theta[sy0][sx0];
     qx[qt] = (int16_t)sx0;

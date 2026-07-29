@@ -81,6 +81,10 @@ void bc_tensor_block(const uint16_t *base, int stride_px, int32_t out[3]);
  * Stable string, safe to append to a status line. */
 const char *bc_tensor_impl(void);
 
+/* Free the lazily-allocated locator scratch (~10 KB). Call when a scan
+ * session ends; the next bc_locate() reallocates transparently. */
+void bc_locate_release(void);
+
 #ifdef __cplusplus
 }
 #endif

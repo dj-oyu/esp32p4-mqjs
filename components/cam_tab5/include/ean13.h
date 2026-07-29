@@ -33,6 +33,10 @@ typedef struct {
 
 int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st);
 
+/* Free the lazily-allocated scan scratch (~24 KB). Call when a scan
+ * session ends; the next scan reallocates transparently. */
+void ean13_scratch_release(void);
+
 #ifdef __cplusplus
 }
 #endif
