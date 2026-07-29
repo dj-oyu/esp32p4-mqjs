@@ -108,9 +108,22 @@ const char *cam_tab5_status(void)
     return s_status;
 }
 
+static bool cam_owner_once(void); /* fwd: pre-created at boot, see below */
+
 void cam_tab5_set_i2c(void *i2c_master_bus_handle)
 {
     s_bus = (i2c_master_bus_handle_t)i2c_master_bus_handle;
+    /* Pre-create the resident owner task NOW, on the boot-fresh heap.
+       Created lazily on the first scan, its 16 KB stack landed in the
+       middle of the heap's tail free block and split the largest
+       contiguous region (heap-walk audit 2026-07-29: 98.6K -> 7.7+56.8K
+       was mostly this stack plus driver allocs). At boot the same 16 KB
+       packs into the low free space and the tail stays whole. The scan
+       lifecycle is unchanged — the task just blocks on its queue.
+       (A static .bss stack was tried first and measured WORSE: .bss and
+       the heap share L2 one-for-one, so the reservation shrank the tail
+       by the same bytes it saved — placement is the only real lever.) */
+    cam_owner_once();
 }
 
 static bool xclk_once(void)
