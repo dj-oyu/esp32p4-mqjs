@@ -164,6 +164,101 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Learning, end to end against the real dictionary and the real
+     * state machine (S7). test_skk_kana.c checks WHEN the engine learns
+     * with a stub; only here can the loop be closed — pick a candidate
+     * that is not first, and see it come back first, through a save and
+     * a reload of the file the runtime writes to littlefs. */
+    {
+        static skk_mru_t M;
+        char first_before[128] = "", first_after[128] = "", first_reload[128] = "";
+        char save[SKK_MRU_SAVE_MAX];
+        size_t slen = 0;
+        int nth = 2;                 /* 3rd candidate: not one that is already first */
+
+        skk_mru_init(&M);
+        skk_init(&S);
+        skk_attach(&S, &D);
+        skk_enable(&S, true);
+
+        for (const char *p = "Kanji "; *p; p++) (void)skk_key(&S, p, 1);
+        int have = skk_cand_count(&S);
+        if (have <= nth) nth = have - 1;
+        {
+            size_t n = 0;
+            const char *c = skk_cand(&S, 0, &n);
+            if (c && n < sizeof first_before) memcpy(first_before, c, n);
+        }
+        /* walk to the nth candidate and commit it */
+        for (int i = 0; i < nth; i++) (void)skk_key(&S, " ", 1);
+        char chosen[128] = "";
+        {
+            size_t n = 0;
+            const char *c = skk_cand(&S, skk_sel(&S), &n);
+            if (c && n < sizeof chosen) memcpy(chosen, c, n);
+        }
+        (void)skk_key(&S, "\n", 1);
+
+        if (M.n != 0) {
+            printf("FAIL learning happened without skk_attach_mru()\n");
+            bad++;
+        }
+
+        /* Now with the store attached, do it again and re-convert. */
+        skk_init(&S);
+        skk_attach(&S, &D);
+        skk_attach_mru(&S, &M);
+        skk_enable(&S, true);
+        for (const char *p = "Kanji "; *p; p++) (void)skk_key(&S, p, 1);
+        for (int i = 0; i < nth; i++) (void)skk_key(&S, " ", 1);
+        (void)skk_key(&S, "\n", 1);
+
+        skk_reset(&S);
+        for (const char *p = "Kanji "; *p; p++) (void)skk_key(&S, p, 1);
+        {
+            size_t n = 0;
+            const char *c = skk_cand(&S, 0, &n);
+            if (c && n < sizeof first_after) memcpy(first_after, c, n);
+        }
+        (void)skk_key(&S, "\x07", 1);
+
+        /* Round trip through the bytes the runtime writes to littlefs. */
+        skk_mru_t M2;
+        if (skk_mru_save(&M, save, sizeof save, &slen) != SKK_OK ||
+            skk_mru_load(&M2, save, slen) != SKK_OK) {
+            printf("FAIL personal dictionary did not survive save/load\n");
+            bad++;
+        }
+        skk_init(&S);
+        skk_attach(&S, &D);
+        skk_attach_mru(&S, &M2);
+        skk_enable(&S, true);
+        for (const char *p = "Kanji "; *p; p++) (void)skk_key(&S, p, 1);
+        {
+            size_t n = 0;
+            const char *c = skk_cand(&S, 0, &n);
+            if (c && n < sizeof first_reload) memcpy(first_reload, c, n);
+        }
+
+        printf("\nlearning: かんじ 1st was %s, chose %s (#%d)\n",
+               first_before, chosen, nth + 1);
+        if (nth <= 0 || strcmp(chosen, first_before) == 0) {
+            printf("FAIL the test picked a candidate that was already first\n");
+            bad++;
+        } else if (strcmp(first_after, chosen) != 0) {
+            printf("FAIL after learning, 1st is %s, want %s\n",
+                   first_after, chosen);
+            bad++;
+        } else if (strcmp(first_reload, chosen) != 0) {
+            printf("FAIL after save+load, 1st is %s, want %s — learning does "
+                   "not survive a reboot\n", first_reload, chosen);
+            bad++;
+        } else {
+            printf("ok   learning: 1st is now %s, and still is after "
+                   "save+load (%zu B)\n", first_reload, slen);
+        }
+    }
+
     /* The counters must actually fill in. convert() used to call
        skk_lookup() rather than skk_lookup_stats(), which left probes,
        fullcmp and dropped at zero forever — skk.stats() reported a

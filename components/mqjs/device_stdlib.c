@@ -485,6 +485,10 @@ static const JSPropDef js_skk[] = {
     JS_CFUNC_DEF("reset", 1, js_skk_reset),
     JS_CFUNC_DEF("stats", 1, js_skk_stats),
     JS_CFUNC_DEF("statsReset", 1, js_skk_statsReset),
+    /* S7: flush the personal dictionary to littlefs. Free when nothing
+       was learned, so an app can call it at any quiet moment; close()
+       and being stopped do it too. */
+    JS_CFUNC_DEF("save", 1, js_skk_save),
     /* status bits returned by key(), so apps need no magic numbers */
     JS_PROP_DOUBLE_DEF("CONSUMED", 1, 0),
     JS_PROP_DOUBLE_DEF("PREEDIT", 2, 0),

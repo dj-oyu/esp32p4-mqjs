@@ -58,6 +58,11 @@
    ui_tab5 cell renderer classify from one table on both targets. */
 #include "ui_cell_width.h"
 #include "app/mqjs_app_manager_internal.h"
+/* mkdir()/fsync() for the personal dictionary (S7). Outside the
+   ESP_PLATFORM block on purpose: the same code runs in run_pc, and
+   inside it the host build fell back to an implicit declaration. */
+#include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef ESP_PLATFORM
 #include <stdlib.h>
@@ -5139,10 +5144,12 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 #define MQJS_SKK_IMAGE_MAX (9u * 1024 * 1024) /* pine (L) is 8.3 MB */
 
 #ifdef ESP_PLATFORM
-#define MQJS_SKK_DEFAULT_DICT "/littlefs/skk/skk_dict_M.bin"
+#define MQJS_SKK_DIR          "/littlefs/skk"
 #else
-#define MQJS_SKK_DEFAULT_DICT "skk/skk_dict_M.bin"
+#define MQJS_SKK_DIR          "skk"
 #endif
+#define MQJS_SKK_DEFAULT_DICT MQJS_SKK_DIR "/skk_dict_M.bin"
+#define MQJS_SKK_MRU_PATH     MQJS_SKK_DIR "/mru.txt"
 
 /* Where a dictionary can come from. The string is both the selector an
  * app may pass to skk.open() and the cache key, so each source names
@@ -5325,6 +5332,100 @@ static int skkpart_open(const char *name, SkkImage *im)
 }
 #endif /* ESP_PLATFORM */
 
+/* ---- the personal dictionary (design S7) ------------------------- */
+/*
+ * ONE store for the device, shared by every IME handle, kept in PSRAM
+ * and written back to littlefs.
+ *
+ * Shared rather than per app, and that is a deliberate line: it matches
+ * store.* (one NVS namespace, no per-app prefix) rather than vault.*
+ * (isolated per owner). What is in it is which kanji you picked for
+ * which reading — the same class of thing as store.*, and an IME that
+ * only learns inside one app is not much of an IME. If that ever needs
+ * to change, the change is here: key the file by app name and hand each
+ * worker its own skk_mru_t.
+ *
+ * Sharing a MUTABLE structure between handles is safe only because
+ * every mqjs worker runs on the single `mqjs` task (app_main.c), so
+ * nothing here locks. skk_core says the same about skk_t.
+ *
+ * PERSISTENCE POLICY: written on close (which includes an app being
+ * stopped or evicted) and on an explicit skk.save(). NOT on every
+ * commit — the file is up to 4.9 KB and littlefs would stall the key
+ * path. A power cut therefore loses learning since the last of those
+ * two events; ssh_vt calls skk.save() when the IME is switched off,
+ * which is the natural quiet moment.
+ */
+static skk_mru_t *s_skk_mru;
+static bool       s_skk_mru_dirty;
+
+static skk_mru_t *skk_mru_get(void)
+{
+    if (s_skk_mru)
+        return s_skk_mru;
+#ifdef ESP_PLATFORM
+    s_skk_mru = heap_caps_malloc(sizeof *s_skk_mru,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    s_skk_mru = malloc(sizeof *s_skk_mru);
+#endif
+    if (!s_skk_mru)
+        return NULL;                 /* no learning is better than no IME */
+    skk_mru_init(s_skk_mru);
+
+    FILE *f = fopen(MQJS_SKK_MRU_PATH, "rb");
+    if (f) {
+        char *buf = malloc(SKK_MRU_SAVE_MAX);
+        if (buf) {
+            size_t n = fread(buf, 1, SKK_MRU_SAVE_MAX, f);
+            /* skk_mru_load() skips lines it cannot parse rather than
+               failing, so a truncated file costs the tail and not the
+               whole personal dictionary. */
+            (void)skk_mru_load(s_skk_mru, buf, n);
+            free(buf);
+        }
+        fclose(f);
+    }
+    s_skk_mru_dirty = false;
+    return s_skk_mru;
+}
+
+/* Write the store back. True when the file is up to date afterwards,
+   including the "nothing to do" case. */
+static bool skk_mru_flush(void)
+{
+    if (!s_skk_mru || !s_skk_mru_dirty)
+        return true;
+
+    char *buf = malloc(SKK_MRU_SAVE_MAX);
+    size_t len = 0;
+    if (!buf)
+        return false;
+    if (skk_mru_save(s_skk_mru, buf, SKK_MRU_SAVE_MAX, &len) != SKK_OK) {
+        free(buf);
+        return false;
+    }
+    mkdir(MQJS_SKK_DIR, 0777);       /* EEXIST is the normal case */
+    FILE *f = fopen(MQJS_SKK_MRU_PATH, "wb");
+    if (!f) {
+        free(buf);
+        return false;
+    }
+    size_t wr = fwrite(buf, 1, len, f);
+    /* fsync before fclose. littlefs syncs on close and this ought to be
+       redundant, but the thing being defended against is a reset landing
+       between the write and the metadata commit, and that is exactly the
+       failure this file is FOR — learning that survives a reboot. */
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    free(buf);
+    if (wr != len)
+        return false;
+    s_skk_mru_dirty = false;
+    return true;
+}
+
 /* Load `path` (or take another reference to it) and return its index in
    s_skk_img, or -1 with *out_err set to an skk_err_t / -100 for I/O. */
 static int skkimg_acquire(const char *path, int *out_err)
@@ -5474,6 +5575,10 @@ static void skkslot_free(SkkSlot *s)
 {
     if (!s->used)
         return;
+    /* Closing is the one moment we are guaranteed to get — an app that
+       stops, is evicted, or just calls skk.close(). Learning that never
+       reached the file is lost otherwise. */
+    (void)skk_mru_flush();
     skkimg_release(s->img);
 #ifdef ESP_PLATFORM
     heap_caps_free(s->core);
@@ -5571,6 +5676,9 @@ JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     }
     skk_init(core);
     skk_attach(core, &s_skk_img[img].dict);
+    /* NULL is fine — skk_core simply stops learning, so a device with a
+       full or unwritable littlefs still has a working IME. */
+    skk_attach_mru(core, skk_mru_get());
     skk_enable(core, true);
 
     SkkSlot *s = &s_skk[slot];
@@ -5671,6 +5779,14 @@ JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
        before the call. */
     if (st == SKK_ST_PASSTHROUGH)
         return JS_NewInt32(ctx, 0);
+
+    /* A commit out of SELECT is the only thing that reaches the personal
+       dictionary (skk_attach_mru), and the other COMMIT kinds — raw kana,
+       katakana — are cheap to over-count. Marking here rather than saving
+       here is the whole policy: the file is up to 4.9 KB and writing it
+       on the key path would stall typing. */
+    if (st & SKK_ST_COMMIT)
+        s_skk_mru_dirty = true;
 
     uint32_t us = (uint32_t)(time_us() - t0);
     /* Attribute the µs to the right bucket. "Did this key search the
@@ -5847,6 +5963,24 @@ JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
              im->path[0] ? im->path : "builtin",
              (unsigned)im->dict.blk[SKK_BLK_NASI].levels);
     return JS_NewString(ctx, buf);
+}
+
+/* skk.save(h) -> bool. Write the personal dictionary to littlefs now.
+ *
+ * Cheap when nothing was learned since the last write (returns true
+ * without touching the filesystem), so an app may call it freely — at
+ * the IME toggle, on losing focus, wherever it has a quiet moment. It
+ * also happens automatically on skk.close() and when an app is stopped;
+ * this exists so the window a power cut can eat is the app's to choose.
+ * The handle is taken for the usual ownership check, not because the
+ * store is per handle — there is one per device (see skk_mru_get). */
+JSValue js_skk_save(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    if (!skk_arg_slot(ctx, argv))
+        return JS_EXCEPTION;
+    return JS_NewBool(skk_mru_flush());
 }
 
 JSValue js_skk_statsReset(JSContext *ctx, JSValue *this_val, int argc,

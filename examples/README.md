@@ -81,6 +81,8 @@ print("hello");
   そのままグリッドに出る。
   辞書は既定でファーム埋め込みの SKK-JISYO.M だが、`jisyo` パーティションへ
   大きいものを焼けば**アプリを変えずに**そちらが使われる (ルート README 3.5)。
+  変換の学習は端末全体で共有され、IME をオフにしたとき (`skk.save()`) と
+  アプリ停止時に littlefs へ書き戻される。
   IME のキー経路は `tools/ssh_vt_imetest.sh` が見る — `@imetest-inject`
   マーカーへ `tools/ssh_vt_imetest.js.inc` を注入したものを run_pc で走らせ、
   `PASS` / `FAIL x<n>` を出す (**出荷アプリにテストのバイトは乗らない**)。

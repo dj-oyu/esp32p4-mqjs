@@ -8,6 +8,10 @@ compile_commands.json
 
 # PC test artifacts (see README "PC でのテスト")
 components/mqjs/gen_pc/
+# run_pc writes the personal dictionary relative to its cwd (on the
+# device it is /littlefs/skk/mru.txt), so running the ssh_vt IME test
+# from components/mqjs leaves one behind.
+components/mqjs/skk/
 
 # SDK config local artifacts
 sdkconfig

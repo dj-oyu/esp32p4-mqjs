@@ -552,6 +552,14 @@ int  skk_mru_load(skk_mru_t *m, const char *buf, size_t len);
 typedef struct {
     /* ---- private ---- */
     const skk_dict_t *dict;
+    /* The personal dictionary, or NULL for an IME that does not learn.
+       A POINTER, like the dictionary, for the same two reasons: a
+       skk_mru_t is 4.7 KB and would quadruple this struct, and learning
+       belongs to the user rather than to one IME instance, so several
+       skk_t may share one. Unlike the dictionary it is written through,
+       so the sharers must be on one task — which they are: every mqjs
+       worker runs on the single `mqjs` task. */
+    skk_mru_t *mru;
     uint8_t  enabled;
     uint8_t  mode;        /* skk_mode_t */
     uint8_t  base_mode;   /* KANA or KATA: where ~/v return to */
@@ -598,6 +606,20 @@ void skk_init(skk_t *s);
    is shared read-only, so several skk_t may use one. Conversion without
    a dictionary returns SKK_ERR_NODICT rather than misbehaving. */
 void skk_attach(skk_t *s, const skk_dict_t *d);
+
+/* Point at a personal dictionary (or NULL to stop learning). `m` must
+ * outlive `s` and is WRITTEN THROUGH on every commit from SELECT, so
+ * every skk_t sharing one must run on the same task.
+ *
+ * With one attached, a conversion pulls previously chosen candidates to
+ * the front, and a candidate the dictionary no longer offers is still
+ * presented (sourced from `m`, SKK_SRC_USER). Only a commit out of
+ * SELECT is recorded: taking the raw kana with Enter, or katakana with
+ * 'q', expresses no preference between candidates.
+ *
+ * skk_core does no I/O, so persistence is the caller's: skk_mru_save()
+ * renders `m` to a buffer and skk_mru_load() parses one back. */
+void skk_attach_mru(skk_t *s, skk_mru_t *m);
 
 /* Abandon any preedit/candidates and return to base_mode. Whatever was
    being typed is discarded, NOT committed — call it when an app loses

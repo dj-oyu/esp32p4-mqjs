@@ -344,6 +344,10 @@ parttool.py --port COM8 --partition-table-file build_tab5/partition_table/partit
 **静かに切り詰められ**、切れたイメージは開けるし引けるのに切れ目から先だけ
 誤答します。
 
+変換の学習 (どの候補を選んだか) は端末全体で共有され、`/littlefs/skk/mru.txt`
+へ書き戻されます。書くのは `skk.save()` を呼んだときとアプリ停止時で、打鍵ごと
+ではありません。`ssh_vt` は IME をオフにした瞬間に呼びます。
+
 `--strip-annotations` で候補の注釈を落とすと L が 538 KB 縮みます。
 `python tools/skk_prep.py inspect jisyo.bin --lookup かんじ` で中身を確認できます。
 仕組みは [`docs/skk-ime-design.md`](docs/skk-ime-design.md) を参照してください。
