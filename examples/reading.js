@@ -16,6 +16,9 @@
 //    する。どちらも不在でも手入力で全機能が使える (ローカルファースト)
 //  - ISBN はカメラのバーコード読取 (camera.scan、978/979 のみ受理) でも
 //    入れられる。読めたらそのまま NDL 検索まで自動で進む
+//  - タイトルと著者は SKK で日本語入力できる (「あ」ボタン)。ウィジェットの
+//    field は打鍵が C 側の lv_keyboard から textarea へ直行して JS からは
+//    見えないため、そこだけキャンバスの 1 行エディタへ寄せている
 //  - データは NVS (rd_books / rd_game)。microSD 不要、最大 25 冊
 //
 // 検索機能・書影は意図的に無し (目的は読書支援であって蔵書管理ではない)。
@@ -252,8 +255,206 @@ function mqTick() {
     }
 }
 
+/* ===== 日本語入力 (SKK) =====
+   ウィジェットの field は打鍵が C 側の lv_keyboard から textarea へ直接入る経路で、
+   mqjs_post_key を通らない = JS からは一度も見えないので SKK を挟む隙が無い。
+   そこで日本語を入れる欄だけキャンバスの 1 行エディタへ寄せる。構えは ssh_vt と
+   同じで、ui.onKey -> skk.key() -> preedit と候補は ui.overlay (窓の位置決めも
+   ウィンドウ送りも C 側)。編集が終わったらフォームを作り直して setText で戻す。 */
+/* skk.open() に渡す辞書パス。"" = ファーム埋め込み (実機の既定)。run_pc は
+   SKK_HAVE_BUILTIN_IMAGE 無しでビルドされるので、ホストで叩くときだけ実体を指す */
+var IME_DICT = "";
+var HAVE_OVERLAY = HAS_UI && typeof ui.overlay === "function";
+var OVL_IME = 0;
+var IME_NO_BINDING = "no-binding";
+var ime = 0, imeReady = false, imeOn = false, imeMode = 0, imeErr = "";
+var ovlOn = false;
+var edit = null; /* 編集中だけ非 null: {label, buf, pre, cands, sel, max, done} */
+
+/* 恒久ラッチはバインディングが無いときだけ。辞書の open 失敗でラッチすると、
+   辞書を焼いた後もアプリを再起動するまで直らない (skk_dict.bin は gitignore 対象で
+   クリーンビルドのファームには埋め込みが無い = 実際に起きる)。 */
+function imeOpen() {
+    if (imeReady)
+        return true;
+    if (imeErr === IME_NO_BINDING)
+        return false;
+    if (typeof skk === "undefined") {
+        imeErr = IME_NO_BINDING;
+        return false;
+    }
+    try {
+        ime = skk.open(IME_DICT);
+    } catch (e) {
+        imeErr = "" + e;
+        return false;
+    }
+    imeErr = "";
+    imeReady = true;
+    imeOn = true;
+    skk.enable(ime, true);
+    skk.setMode(ime, skk.KANA); /* C-j が届かないので明示的にかなから始める */
+    imeMode = skk.mode(ime);
+    return true;
+}
+
+var ED_BG = 0x0B0E11, ED_FG = 0xC9D1D9, ED_DIM = 0x8B98A5, ED_ACC = 0x4FC3F7;
+var ED_X = 16, ED_Y = 96, ED_LH = 30;
+
+/* 変換中のフロート窓。渡すのはキャレット位置と中身だけで、画面端のクランプも
+   上下反転も候補のウィンドウ送りも C 側 (ovl_window)。ここで中央寄せを書いては
+   いけない — C 側は edge-triggered。 */
+function edFloat() {
+    if (!HAVE_OVERLAY)
+        return;
+    if (!edit || (edit.pre === "" && edit.cands.length === 0)) {
+        if (ovlOn) {
+            ui.overlay(OVL_IME, null);
+            ovlOn = false;
+        }
+        return;
+    }
+    ui.overlay(OVL_IME, {
+        x: ED_X + ui.textSize(edit.buf)[0], y: ED_Y, h: ED_LH,
+        lines: edit.pre ? [edit.pre] : [],
+        items: edit.cands,
+        sel: edit.sel
+    });
+    ovlOn = true;
+}
+
+function edDraw() {
+    if (!edit)
+        return;
+    ui.clear(ED_BG);
+    ui.text(ED_X, 24, edit.label, ED_ACC);
+    /* 確定済み + 変換中を 1 本の行として出す (フロート窓は候補だけを持つ) */
+    var body = edit.buf + edit.pre;
+    ui.text(ED_X, ED_Y, body || "(空のまま確定すると変更しません)",
+            body ? ED_FG : ED_DIM);
+    ui.rect(ED_X + ui.textSize(body)[0] + 2, ED_Y + ED_LH - 4, 12, 3, ED_ACC);
+    ui.text(ED_X, ED_Y + 64, "Enter = 確定   ESC = 取消", ED_DIM);
+    ui.text(ED_X, ED_Y + 100, "変換 = 大文字で始めて Space", ED_DIM);
+    ui.text(ED_X, ED_Y + 136,
+            imeOn ? "「あ」ボタン: かな入力 (押すと英数)"
+                  : "「あ」ボタン: 英数入力 (押すとかな)", ED_DIM);
+    edFloat();
+}
+
+/* かな/英数の切り替え。オフに落とすと skk.reset で ▽/▼ の読みが消えるので、
+   ssh_vt と同じく黙って捨てずに告知する (確定に化けさせるのは誤タップが怖い)。 */
+function imeToggle() {
+    if (!imeReady || !edit)
+        return;
+    imeOn = !imeOn;
+    skk.enable(ime, imeOn);
+    if (imeOn)
+        skk.setMode(ime, skk.KANA);
+    else
+        skk.reset(ime);
+    imeMode = skk.mode(ime);
+    edit.pre = "";
+    edit.cands = [];
+    edit.sel = 0;
+    edDraw();
+    sys.notify(imeOn ? "かな入力" : "英数入力");
+}
+
+function edClose(commit) {
+    var e = edit;
+    edit = null;
+    if (imeReady) {
+        skk.reset(ime);
+        /* 学習の書き戻しは打鍵が止まるこの瞬間に。何も学んでいなければ書かない */
+        skk.save(ime);
+    }
+    edFloat(); /* edit が null なので畳むだけ */
+    ui.keyboard(0);
+    e.done(commit ? e.buf : null);
+}
+
+/* IME が消費した打鍵。何を引き直すかは bitmask だけで決める (設計 §4.4)。 */
+function edConsumed(st) {
+    if (st & skk.COMMIT) {
+        var out = skk.commit(ime);
+        if (out && edit.buf.length < edit.max)
+            edit.buf += out;
+    }
+    if (st & skk.MODE)
+        imeMode = skk.mode(ime);
+    if (st & (skk.PREEDIT | skk.COMMIT))
+        edit.pre = skk.preedit(ime);
+    if (st & skk.CANDS) {
+        edit.cands = skk.candidates(ime);
+        edit.sel = skk.sel(ime);
+    } else if (st & skk.SEL) {
+        edit.sel = skk.sel(ime);
+    } else if (imeMode !== skk.SELECT && edit.cands.length) {
+        edit.cands = []; /* ▼ を抜けた: 候補バーを畳む */
+        edit.sel = 0;
+    }
+    edDraw();
+}
+
+function edKey(k) {
+    if (!edit)
+        return; /* フォーム操作中: キーはウィジェット側の持ち物 */
+    var code = k.charCodeAt(0);
+    if (code === 0) {
+        /* レイアウトと IME トグルは SKK より前 (skk に渡す意味が無い) */
+        var name = k.slice(1);
+        if (name === "rotate") { edDraw(); return; }
+        if (name === "ime") { imeToggle(); return; }
+    }
+    /* ⚠️ ESC と矢印は **skk より後**。▽ が開いている間、skk はこれを
+       TOK_SWALLOW で飲んで「変換の取消」にする。先に取ると、変換をやめたい
+       だけの ESC で編集そのものが消える。 */
+    if (imeOn && imeReady) {
+        var st = skk.key(ime, k);
+        if (st !== 0) {
+            edConsumed(st);
+            return;
+        }
+    }
+    if (code === 0) {
+        if (k.slice(1) === "esc") { edClose(false); return; }
+        return; /* 矢印など: 1 行編集に効くものは無い */
+    }
+    if (k === "\x1b") { edClose(false); return; }
+    if (k === "\n" || k === "\r") { edClose(true); return; }
+    if (k === "\b" || k === "\x7f") {
+        if (edit.buf)
+            edit.buf = edit.buf.slice(0, -1);
+        edDraw();
+        return;
+    }
+    if (code >= 0x20 && edit.buf.length < edit.max) {
+        edit.buf += k;
+        edDraw();
+    }
+}
+
+/* 1 行編集を開く。開けたら true — 開けないときはフォームを畳まないので、
+   呼び側はそのまま英数の field を使い続けられる。 */
+function imeEdit(label, initial, max, done) {
+    if (!imeOpen()) {
+        sys.notify(imeErr === IME_NO_BINDING
+            ? "このファームは日本語入力に非対応です"
+            : "SKK 辞書を開けません (英数の欄に直接どうぞ)");
+        return false;
+    }
+    while (ui.back()) {} /* ウィジェット画面を畳んでキャンバスを出す */
+    edit = { label: label, buf: initial || "", pre: "", cands: [], sel: 0,
+             max: max, done: done };
+    ui.keyboard(2); /* キーボード + 制御バー (「あ」と ESC がここに居る) */
+    edDraw();
+    return true;
+}
+
 /* モデルが変わったら home から作り直す (動的リストの標準パターン) */
 function goHome() {
+    edit = null; /* 編集中に別画面へ飛ばされたら捨てる (フロートも畳む) */
+    edFloat();
     while (ui.back()) {}
     buildHome();
 }
@@ -281,7 +482,7 @@ function buildHome() {
                                off: 0, hold: HOLD_HEAD });
         })(i);
     }
-    s.button("本を追加", buildAdd);
+    s.button("本を追加", function () { buildAdd(null); });
     s.button("実績とバッジ", buildStats);
     s.button("コンソールへ戻る", ui.back);
 }
@@ -331,15 +532,44 @@ function buildBook(k) {
     s.button("戻る", goHome);
 }
 
-function buildAdd() {
+/* draft: 日本語入力へ寄り道した後の復帰用。ウィジェット画面は畳むと消えるので、
+   出る前に 4 欄を控えて戻ってきたら書き戻す (NDL の取得結果も道連れにしない)。 */
+function buildAdd(draft) {
     gen++;
     var myGen = gen;
+    var d = (draft && typeof draft === "object") ? draft : {};
     var s = ui.screen("本を追加");
-    var status = s.label("ISBN から自動入力するか、手で入れてください");
+    var status = s.label(d.msg || "ISBN から自動入力するか、手で入れてください");
     var fIsbn = s.field("ISBN");
     var fTitle = s.field("タイトル (必須)");
     var fAuthor = s.field("著者");
     var fPages = s.field("総ページ数 (必須)");
+    if (d.isbn) fIsbn.setText(d.isbn);
+    if (d.title) fTitle.setText(d.title);
+    if (d.author) fAuthor.setText(d.author);
+    if (d.pages) fPages.setText(d.pages);
+    /* 日本語はここから。field の打鍵は C 側で textarea へ直行して JS に見えず、
+       LVGL のキーボードも ASCII しか持っていないので、SKK はキャンバス側で回す */
+    var snap = function (msg) {
+        return { isbn: fIsbn.value(), title: fTitle.value(),
+                 author: fAuthor.value(), pages: fPages.value(), msg: msg };
+    };
+    var jaEdit = function (label, cur, max, set) {
+        var back = snap();
+        imeEdit(label, cur, max, function (v) {
+            if (v !== null)
+                set(back, v);
+            buildAdd(back);
+        });
+    };
+    s.button("あ  タイトルを日本語で", function () {
+        jaEdit("タイトル", fTitle.value(), 40,
+               function (b, v) { b.title = v; });
+    });
+    s.button("あ  著者を日本語で", function () {
+        jaEdit("著者", fAuthor.value(), 24,
+               function (b, v) { b.author = v; });
+    });
     /* 解析済みレコードでフィールドを埋める (HTTP/MQTT 両経路で共通) */
     function fillBook(rec) {
         if (rec.title) fTitle.setText(cap(rec.title, 40));
@@ -593,6 +823,13 @@ if (HAS_UI) {
     buildHome();
     setInterval(mqTick, MQ_TICK);
     sys.onForeground(goHome);
+    /* 打鍵は編集中しか要らないが、登録はここで一度だけ (edKey が edit を見る) */
+    ui.onKey(edKey);
+    /* 停止直前に学習を littlefs へ。5 秒ウォッチドッグの中なので save だけ */
+    sys.onStop(function () {
+        if (imeReady)
+            skk.save(ime);
+    });
 } else {
     selftest();
 }

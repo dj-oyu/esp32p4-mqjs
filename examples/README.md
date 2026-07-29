@@ -90,7 +90,10 @@ print("hello");
   あること** で、効いているのは `arrow-swallow` の項目。辞書は
   `tools/skk_prep.py` が生成する gitignore 対象なので、無ければ `FAIL dict`
   が出る (静かなスキップにはならない)
-- `reading.js`: NVS 永続化、一覧 UI、ISBN 入力
+- `reading.js`: NVS 永続化、一覧 UI、ISBN 入力。タイトルと著者は SKK で日本語入力
+  できる — ウィジェットの `field` は打鍵が C 側の `lv_keyboard` から textarea へ
+  直行して JS に見えないので IME を挟めない。そこで「あ」ボタンだけキャンバスの
+  1 行エディタへ寄せ、確定した文字列をフォームへ書き戻している
 - `circuit.js`: キャンバス UI、式評価、永続化
 
 ### アルゴリズムと描画
