@@ -1,8 +1,12 @@
-/* NEW-PATH trace: the same key script through ime_core, with the same real
-   dictionary and a learning dictionary attached (the JS binding attaches one
-   at mqjs_runtime.c:5707, so leaving it off here would change candidate order
-   and produce a false mismatch). Emits the same lines as ime_diff_old.js.inc.
-   Throwaway.
+/* The driver behind tools/tests/ime_diff.sh: a fixed key script through
+   ime_core with the real dictionary and a learning dictionary attached (the
+   JS binding attaches one at mqjs_runtime.c skk_attach_mru, so leaving it off
+   here would change candidate order). One line per key, diffed against
+   tools/tests/ime_golden.trace.
+
+   The line format is not free to change: it is the format the golden was
+   recorded in, back when the other side of the diff was the JS glue inside
+   examples/ssh_vt.js. Changing it means re-recording the golden.
  *
  *   gcc -O2 -std=c99 -I components/skk_core/include -I components/ime_core/include \
  *       ime_diff_new.c components/ime_core/ime_core.c components/skk_core/skk_kana.c \
