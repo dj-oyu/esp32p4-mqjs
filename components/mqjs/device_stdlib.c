@@ -693,6 +693,14 @@ static const JSPropDef js_sys[] = {
        that read is gated on the dev slot or an embedded system app (§7.2).
        Returns a JSON string. */
     JS_CFUNC_DEF("blackbox", 2, js_sys_blackbox),
+    /* The black box's drill button (PHASE3_MANIFEST.md §3, device plan step
+       4): deliberately faults the device — a volatile NULL read, so the note
+       carries a real pc/cause — to exercise the panic note and `lastboot`.
+       Same gate as the blackbox content reads (dev slot or embedded system
+       app); everyone else gets a TypeError. Arms the fault 500 ms out and
+       returns 0 at once, so the caller's "about to panic" MQTT publish can
+       leave the device first. Off-device it is inert and returns -1. */
+    JS_CFUNC_DEF("panic", 0, js_sys_panic),
     JS_PROP_END,
 };
 

@@ -12,8 +12,12 @@ phase 2: the test author works from headers and `docs/term-design.md`, never
 from an implementation `.c`.
 
 Status: **§1 (the retention probe) done and device-verified 2026-07-30; §2 (the
-ring, the boot-time `lastboot` capture and the JS introspection) implemented and
-verified off-device, device run pending. §3 (the MQTT responder) not started.**
+ring, the boot-time `lastboot` capture and the JS introspection) done and
+device-verified 2026-07-30 (7ad253e); §2a (the panic reason in the SYS
+partition) and §3 (the MQTT responder + signature gate, and
+`tools/bb_pull.py`) implemented and verified off-device — device build, flash
+and device run are the orchestrator's steps and were deliberately not run
+here.**
 
 The probe of §1 has been **removed from the firmware** now that it has answered
 its question — it claimed the same LP region the ring needs, and the device must
@@ -261,11 +265,16 @@ matching the linker-script prediction exactly).
 this firmware preserves the region bit-perfectly → §4.4's ring is implementable
 as written; the region-level CRC suffices, no per-record CRC for correctness.
 Boot marker still distinguishes "wiped" (brownout/power loss) from "empty".
-**Open product question for the user**: with TASK_WDT_PANIC off, a task-WDT
-hang never reboots — so it also never produces a `lastboot`. Enabling it would
-align with the design's "WDT が落とす直前に何が出ていたか" motivation, but it
-changes device behaviour on hangs (reset instead of limp-along) and is not
-this component's call.
+**Product question RESOLVED by the user 2026-07-30**: TASK_WDT_PANIC stays
+**off**. The user's rule: on failure, prefer preserving state for log
+retrieval over automatic reset. A hung-but-alive device keeps its full RAM
+and its live ring, both readable over MQTT (the §3 responder runs off the
+task-MQTT context, not js_task, so it answers even when JS is wedged).
+Corollary kept as-is: real panics continue to auto-reboot (IDF default) —
+that IS the log-preserving path, because LP SRAM survives reset but not the
+power cycle a user gives a halted device. Follow-up added to §2's scope:
+the panic handler writes the panic reason into the SYS partition so
+`lastboot` carries the cause, not just the boot marker's reset id.
 
 What the answers decide:
 
@@ -721,13 +730,533 @@ transcript:
   visible end to end (`last: sys rec=2, app rec=4`); `dropped=0 trunc=0
   refused=0 unnamed=0`.
 
-## 3. MQTT responder + signature gate (§7.3)
+## 2a. Addendum: the panic reason (§4.4's "panic 理由") — implemented
 
-Not started. Depends on §2 for `lastboot` — and only on its **read** API:
-`term_lp_report` / `term_lp_dump_json` / the iterator over
-`term_lp_source(TERM_LP_SRC_LASTBOOT)`, all of which exist and are verified.
-The accepted-counter high-water mark goes in **NVS, not LP SRAM** (§7.3 is
-explicit: LP is lost on a power cut, so a replay window would reopen after one
-power cycle). Note that `nvs_flash` was dropped from this component's
-`PRIV_REQUIRES` when the probe went; the responder will need it back (or,
-better, will live where the MQTT client already does).
+§4.4 lists panic reasons as SYS-partition content and §2 shipped without them:
+`lastboot` said what the device was saying, not what killed it. This closes
+that, in one line per panic.
+
+User rule that frames it: **on failure, preserve state for log retrieval
+rather than auto-reset** — so `CONFIG_ESP_TASK_WDT_PANIC` stays off (a task-WDT
+hang limps along and never produces a `lastboot`, §1's open question answered)
+and the panic auto-reboot stays (LP survives a reset, not a power-off).
+
+| File | Role | Read by tests | Status |
+|---|---|---|---|
+| `term_lp_ring.h` | `term_lp_panic_t`, `TERM_LP_PANIC_MAX`, `term_lp_panic_fmt`, `term_lp_panic_note` — the contract, including what makes the append panic-safe | yes | done |
+| `term_lp_ring.c` | `bputhex`/`bputclip`, the formatter, the one-shot note | NO | done |
+| `main/panic_note.c` | `__wrap_esp_panic_handler`: panic_info_t -> term_lp_panic_t, then `__real_` | NO | done |
+| `main/CMakeLists.txt` | `panic_note.c` in `SRCS`, `-Wl,--wrap=esp_panic_handler` | NO | done |
+
+### The line
+
+```
+panic: fault Load access fault task=js_task core=0 pc=0x4800f2a4 cause=5
+panic: abort assert failed: foo bar task=IDLE core=1 pc=0x40001234 cause=2
+```
+
+Writer `panic`, class SYS, ≤ 159 bytes. `kind` is IDF's
+`panic_exception_t` reduced to a word (fault/abort/iwdt/twdt/debug), `reason`
+is the architecture's string (for an abort, `g_panic_abort_details` — the same
+override `esp_panic_handler` makes a few lines later), `pc` is `info->addr`
+(mepc), `cause` is `panic_get_cause(info->frame)` (mcause). No backtrace, no
+registers, no stack: coredump exists separately and this is a flight-recorder
+note. Fields are clipped individually so a long task name can never push the
+numbers off the end — the numbers are the part a human cannot reconstruct.
+
+### Decisions
+
+1. **A linker wrap, because IDF 6 offers no hook.** `panic.c` calls nothing
+   weak and nothing registrable on the panic path (the only `__attribute__
+   ((weak))` symbols there are the reset-reason hint pair), and
+   `esp_register_shutdown_handler` is **not** called on a panic — it runs on
+   `esp_restart`, i.e. exactly the case that does not need this. So
+   `-Wl,--wrap=esp_panic_handler`, which is sound here because the call site
+   (`port/panic_handler.c`) is a different translation unit from the
+   definition, and which is the mechanism `components/ui_tab5` already uses
+   twice (`esp_hosted_init`, `lvgl_port_ppa_create`). `panic_info_t` comes
+   from `esp_private/panic_internal.h`; `esp_system` is a common requirement,
+   so no `REQUIRES` change was needed.
+
+2. **The note is written BEFORE `__real_esp_panic_handler`.** After it there is
+   no "after" — the real handler prints, feeds the WDTs, may write a coredump
+   and then reboots. Going first means the line lands even if a later stage of
+   the handler dies. The cost is symmetric and accepted: if *our* line were to
+   hang, the operator loses the Guru Meditation print, but the RTC WDT is still
+   armed at this point and reboots the chip, so the black box still holds
+   whatever landed. This adds no new failure class: `panic.c` itself is
+   flash-resident by default, so the panic path already assumes flash is
+   reachable (the entry code re-enables the cache before calling it).
+
+3. **Panic-safety is a geometry re-check, not a new lock or a raw entry
+   point.** §2's decision 6 says the ring has no lock and term_registry's table
+   mutex is the serialisation — and in panic context that guarantee is simply
+   gone: interrupts are off, the other core was stalled by `esp_cpu_stall`
+   wherever it happened to be, possibly inside `term_lp_ring_append`. The
+   dangerous windows are the ones where the DRAM shadow header is *between*
+   two updates (inside `lp_evict_one`, or after a PAD's `used +=` but before
+   `head = 0`): appending from such a shadow would publish a header describing
+   a region state that never existed, and `open()` would then reject the
+   **whole** black box on `geometry_ok` — trading a few hundred lines for one
+   line about the crash. So `term_lp_panic_note()` runs `lp_geom_ok()` on the
+   shadow first and **refuses** if it does not hold. Losing the note is the
+   cheaper failure and it is bounded to a crash landing inside the handful of
+   instructions an append window spans. Outside those windows P5 already
+   bounds the damage to the record in flight.
+
+   What this deliberately does **not** do: allocate, take a lock, call
+   FreeRTOS beyond `xTaskGetCurrentTaskHandleForCore`/`pcTaskGetName` (IDF's
+   own panic-context idiom, from `panic_arch.c`), or log. The clock is
+   `esp_timer_get_time()`, which is IRAM-resident for ISR use.
+
+4. **One-shot, set before anything else.** A panic inside the panic handler
+   must not walk this code again — at that point nothing about the ring can be
+   trusted — and there is no "later" to reset the flag for.
+
+5. **The formatter is separate from the append** (`term_lp_panic_fmt`) so the
+   whole of the interesting logic is pure and host-testable; the wrap is 30
+   lines of translation in `main/`, where every other piece of system
+   integration in this phase lives. The `ESP_PLATFORM` guard is therefore not
+   needed — the device-only code is in a device-only component.
+
+6. **`term_lp_panic_fmt` returns the length it actually WROTE, not `cap - 1`.**
+   `test_lp_panic`'s "…and the length it returns is the length it actually
+   wrote" case (`host_test/test_lp_panic.c`, formatting into a buffer pre-filled
+   with `0xAA`) caught the original: on a `cap` too small for the whole line the
+   function clamped `b.n = b.cap`, so the bytes between the end of the text and
+   `cap - 1` were never written — and the header's "returns the length written"
+   invited the caller to pass that length to `term_lp_ring_append()`, i.e. to
+   publish its own uninitialised buffer into the black box. 34 `cap` values in
+   [32, 73] were affected. The fix is one deleted clamp: `bput()` is
+   all-or-nothing, so `b.n` already IS the write offset — terminate there,
+   return that, and an over-tight buffer simply stops at the last field that
+   fitted whole. Decision 5 is what made this findable at all: the bug lived in
+   the pure half. **No device impact today** — the only caller,
+   `term_lp_panic_note()`, passes a full `TERM_LP_PANIC_MAX` buffer that the
+   fields are bounded to fit — so this was a contract violation waiting for the
+   second caller, which is the kind of thing a suite is for. The header now also
+   states the truncation rule and that `cap < 32` is the "hopeless" threshold.
+
+### Off-device verification
+
+In the phase-3 harness below, section [8]: the exact line for a fault and for
+an all-NULL info, clipping (a 299-byte kind/reason/task still yields a line
+under `TERM_LP_PANIC_MAX` **with `pc=` and `cause=` intact**), a hopeless
+buffer writing nothing rather than half a line, NULL guards, the append
+landing in the SYS partition and reading back as `sys/panic: panic: abort
+assert failed …` through `term_lp_dump_json`, and the one-shot refusal.
+
+**Not host-reachable, and honestly so:** the `lp_geom_ok` refusal path. `s_live`
+is static, so a host test cannot corrupt the shadow between two appends. The
+guard reuses the exact predicate `term_lp_ring_open()` applies (covered by
+`test_lp_format`'s geometry cases), so what is untested here is the two-line
+call, not the check.
+
+**Device-side to confirm when the orchestrator runs it:** trigger a panic
+(`sys.panic()` from the dev slot — §3 decision 12), reboot, pull `lastboot`, and expect
+one `sys/panic:` record of kind `fault` whose `pc=` matches the address in the
+serial Guru Meditation block. That cross-check is the whole point: the same
+fact from two independent paths. `task=` will read `esp_timer`, because that is
+where `sys.panic()`'s armed fault fires; a real crash inside a JS callback is
+what names the JS worker.
+
+---
+
+## 3. MQTT responder + signature gate (§7.2) — implemented, off-device verified
+
+Status: **implementation complete, host verification done (266-check throwaway
+harness + 31 host suites + 5 run_pc suites), device build / flash / device run
+are the orchestrator's steps (deliberately not run here).**
+
+### Contract surface (test author reads these)
+
+| File | Role | Read by tests | Status |
+|---|---|---|---|
+| `term_bb_pull.h` | The whole responder: the five properties (Q1-Q5), the request and reply wire formats, the error enum, `term_bb_req_parse` / `term_bb_req_gate` / `term_bb_serve`, and the four-callback environment | yes | done |
+| `term_lp_ring.h` | `term_lp_dump_json_ex` + `term_lp_dump_info_t` (new, see "The one header change"), and `term_lp_panic_*` (§2a) | yes | done |
+| `PHASE3_MANIFEST.md` | This ledger | yes | done |
+| `docs/term-design.md` §7 | Ground truth (annotated with what implementation decided) | yes | — |
+
+### Implementation (test author must NOT read)
+
+| File | Role | Read by tests | Status |
+|---|---|---|---|
+| `term_bb_pull.c` | Parse, gate, chunk loop, JSON framing. Pure C99: no printf, no allocation, no ESP-IDF, nothing to guard | NO | done |
+| `term_lp_ring.c` | `term_lp_dump_json_ex` (the old entry point is now a one-line wrapper) | NO | done |
+| `main/task_source.c` | The device half: the `<base>/bb` subscription and route, `crypto_sign_open` with `MQJS_TASK_PUBKEY`, the NVS high-water mark, the QoS 0 reply publish, the `/status` refusal line | NO | done |
+| `CMakeLists.txt` | `term_bb_pull.c` in `SRCS` (no new `PRIV_REQUIRES` — see decision 1) | NO | done |
+| `components/mqjs/mqjs_runtime.c` | `js_sys_panic` — the drill button of decision 12 (dev-slot gated, 500 ms armed fault) | NO | done |
+| `components/mqjs/device_stdlib.c` | `sys.panic` in the `js_sys[]` prop table | NO | done |
+| `components/mqjs/gen/device_stdlib.h` | ROM stdlib regen (-m32); `gen/mquickjs_atom.h` regenerated content-identical, restored with `git checkout --` (CRLF trap) | NO | done |
+| `tools/bb_pull.py` | The reader: signs, publishes, reassembles, prints | orchestrator | done |
+
+### Wire format
+
+**Request** — topic `<CONFIG_MQJS_TASK_TOPIC>/bb`, payload
+`Ed25519 signature(64) || message`, message ASCII ≤ 512 B:
+
+```
+bbpull1
+ctr=1753900000123
+top=esp32p4-mqjs/task/u7q3x9f2
+what=lastboot
+from=0
+```
+
+| key | req | meaning |
+|---|---|---|
+| `ctr` | yes | replay counter, 1 .. 2^63-1, must be **strictly greater** than the device's stored high-water mark |
+| `top` | yes | the device's own task topic, compared byte for byte |
+| `what` | yes | `stats` (term_lp_report, one chunk) / `lastboot` / `live` |
+| `from` | no | record cursor, default 0 — resumes a pull |
+
+Line 1 must be exactly `bbpull1`. A CR per line is tolerated and blank lines
+are ignored; **an unknown key, a duplicate key, a missing required key, a
+non-decimal number, an embedded NUL or an overlong message is refused**, never
+partially honoured (Q4).
+
+**Reply** — topic `<CONFIG_MQJS_TASK_TOPIC>/bb/reply`, QoS 0, one JSON object
+per chunk, `body` being exactly what `sys.blackbox()` returns:
+
+```json
+{"bb":1,"ctr":1753900000123,"what":"lastboot","seq":0,"from":0,
+ "body":{"src":"lastboot","ok":1,"from":0,"lines":["[142] sys/system: boot 7 …"],
+         "records":12,"next":12,"more":1},
+ "last":0}
+```
+
+`seq` counts chunks from 0 (a gap = a lost QoS 0 chunk, visible to the reader);
+`last:1` ends the reply; `body.next` is the cursor to resume from. Two flags
+appear only when they apply and both force `last:1`: `"stall":1` (the buffer
+cannot hold even one rendered line — advance on `records > 0`, not on `more`)
+and `"cut":1` (`TERM_BB_CHUNKS_MAX` = 64 chunks reached with records left).
+
+**Refusal** — one line on `<CONFIG_MQJS_TASK_TOPIC>/status`, the convention
+`task_source.c` already uses: `bb: rejected (replay)`. The names come from
+`term_bb_err_str`: `bad-length`, `bad-signature`, `bad-magic`, `bad-request`,
+`unknown-field`, `duplicate-field`, `missing-field`, `out-of-range`,
+`wrong-topic`, `replay`, `counter-store`, `misconfigured`, `publish-failed` —
+those thirteen and nothing else (`ok` for success, `bad-code` for a value
+outside the enum). An accepted pull answers `bb: sent 13 chunks, 172 records` there
+too, and raises a status-bar event — an accepted pull means class-A content
+just left the device, which belongs on the screen and not only in a log.
+
+### Replay defence, and the threat it answers
+
+§7.2 pins the mechanism, so nothing was invented: "署名リクエストは単調カウンタ
+を含めて署名し、デバイスは最後に受理した値より大きいもののみ通す … 受理済み
+カウンタの高水準マークは NVS に保存する — LP SRAM には置かない … 受理は低頻度
+なので NVS commit を受理ごとに同期実行してよい". Implemented exactly:
+
+- the counter is **inside** the signed message, so it cannot be edited in
+  flight;
+- the high-water mark lives in NVS (`termbb`/`ctr`, `nvs_set_u64` +
+  `nvs_commit` **synchronously**, per accept), never in the LP region this
+  component otherwise owns — LP is lost on a power cut (§4.4), so a mark kept
+  there would let one power cycle reopen the whole replay window;
+- **strictly greater**, so a captured request cannot be replayed even once;
+- the mark is stored **before the first reply byte is published**. A reset
+  mid-reply therefore burns the counter instead of leaving the request
+  replayable. The operator's remedy costs nothing because the counter is
+  wall-clock milliseconds: `tools/bb_pull.py` uses `time_ns()//1e6`, which is
+  monotonic across tool runs and across machines with sane clocks and needs no
+  state on either side. (Consequence, documented in the tool: a second machine
+  with a slow clock is refused until its clock passes; `--ctr` overrides.)
+
+The threat this closes is concrete, and it is worth being explicit about what
+the gate does and does not protect:
+
+- **The reply is plaintext on the broker.** Confidentiality of class-A content
+  in flight is the broker's and the network's job (LAN-only broker today,
+  tailnet later) — the same single-trust-domain assumption §4.4 states and the
+  same one the unsigned catalog rows in `task_source.c` already rest on. What
+  the signature gate controls is **who can cause** the device to emit the log.
+- Therefore a passive subscriber sees the request as well. Without the
+  counter, that observer could re-publish the captured request next week and
+  pull a **future** boot's class-A log — exactly the exfiltration §7.2's gate
+  is supposed to make impossible for a non-key-holder. With it, a captured
+  request is inert.
+- **`top=` closes the cross-device variant** (Q3): a captured request
+  re-published on another device's task topic would meet an independent, and
+  probably lower, high-water mark there. Every device in this project already
+  has its own task topic with a random suffix, which is what makes the check
+  meaningful. **Known limit:** two devices deliberately sharing one task topic
+  share the weakness, because the counter is per-device state. That is a
+  deployment choice, not something the protocol can fix without a device
+  identity, and there is no device identity in this design yet.
+- A device that has never been pulled has mark 0, so any `ctr >= 1` is fresh.
+  `ctr = 0` is refused outright, so an "unset counter" cannot be spelled.
+- Failing closed is the rule: if the mark cannot be **read**, or cannot be
+  **stored**, the request is refused and nothing is published.
+
+Not attempted, deliberately: a challenge/nonce handshake (an unsigned status
+query returning a device nonce, then a signed request over it). It would be
+strictly stronger against a device with no clock and no NVS, and it costs a
+round trip, a second topic and per-request device state — while §7.2 already
+chose the counter and the counter needs neither. If the design ever grows
+multiple readers with multiple keys (§4.4 anticipates this), the counter
+becomes per-key and that is when this gets revisited.
+
+### The one header change
+
+`term_lp_dump_json_ex(src, from, out, out_size, info)` was added to
+`term_lp_ring.h`, with `term_lp_dump_json` becoming a one-line wrapper (the
+rendering has one implementation, not two, and no existing suite changes).
+
+§2 promised the responder would need "nothing new", and that was wrong on one
+point: `records`, `next` and `more` are inside the JSON document, so a C
+chunker could only learn whether to ask again by re-parsing its own output.
+The alternatives were worse — drive `term_lp_iter_*` and re-implement the line
+rendering and the JSON quoting (two serialisers to keep in step, and the wire
+format would drift from the one `sys.blackbox` emits), or scan the produced
+JSON for `"more":`. So the numbers come out of the side door and the format
+stays exactly the one the host suites already cover. `info` may be NULL, and
+on a 0 return it is zeroed so a caller that only reads `info->more`
+terminates.
+
+### Decisions
+
+1. **The responder is pure; the device glue lives in `main/task_source.c`.**
+   The brief allowed an `ESP_PLATFORM`-guarded half here, the
+   `term_port_freertos.c` pattern. Callbacks beat a guard in this one case:
+   with `verify` / `hwm_load` / `hwm_store` / `publish` injected, the **whole**
+   responder — verify order, replay gate, counter durability ordering, chunk
+   loop, framing — is host-drivable, there is nothing in `term_bb_pull.c` that
+   compiles to nothing off-device, and `term_core` gains no dependency on
+   `mqtt`, `nvs_flash` or `tweetnacl` (so §2's note about re-adding
+   `nvs_flash` is moot: it stays out). The glue lands where the MQTT
+   connection is owned, which is also the project's single-owner rule.
+
+2. **No second broker connection, and no second task.** `task_source.c`
+   subscribes `<base>/bb` on its existing client and routes it in
+   `MQTT_EVENT_DATA` next to the app-push path, so the work runs on the MQTT
+   event task — which already does Ed25519 verification, LittleFS writes and
+   QoS 0 publishes there, and which is not `tcpip_thread`. The work is
+   bounded: one verify, one NVS commit, ≤ 64 small publishes, for a
+   human-driven once-in-a-crash operation. A queue and an owned task would be
+   the right answer for an unbounded or periodic job; this is neither, and an
+   extra hop would add a second owner of the same socket.
+
+3. **The `/bb` subscription is an exact topic, not a wildcard.** Replies go to
+   `<base>/bb/reply` underneath it; a `<base>/bb/#` subscription would make
+   the device receive its own answers.
+
+4. **QoS 0 for the reply, with `seq` making loss visible.** esp-mqtt's publish
+   with QoS > 0 waits for an ack that only the MQTT event task can process —
+   the deadlock esp-mqtt's own documentation warns about, and the reason
+   `publish_status()` has always been QoS 0. So chunks are lossy in principle;
+   `seq` makes a gap detectable and `from` makes it recoverable, which on a LAN
+   broker is the right trade. A black box one re-pull away from complete beats
+   a responder that hangs the connection.
+
+5. **Chunk size 1600 B (`TERM_BB_SCRATCH_WANT`), from the configured buffers,
+   not from taste.** `task_source.c` sets `buffer.out_size = TX_BUF_SIZE =
+   2048` (deliberately small: without it, `out` inherits `buffer.size` and
+   costs a second ~66 KB block — the rx side was raised to
+   `MQJS_SCRIPT_MAX + 2048` for large pushes, aa4d7e6, and tx was capped for
+   exactly this reason). 1600 B of payload plus the fixed header and a ~30-byte
+   topic sits inside 2048 with slack. Raising it means raising `TX_BUF_SIZE`
+   first; the header says so at the constant. ~31 KB of `lastboot` therefore
+   arrives in ~20-25 chunks.
+
+6. **One scratch buffer serves the envelope and every chunk.** `crypto_sign_open`
+   needs a message buffer as wide as the payload, and the parsed request is
+   copied into `term_bb_req_t` before the buffer is reused — so the responder
+   allocates nothing, and the one `malloc` in the whole path is the glue's
+   1600-byte scratch (off the MQTT event task's 8 KB stack, freed before
+   return).
+
+7. **Numbers are formatted by hand, no `snprintf`.** The ROM's nano formatting
+   is a moving target for 64-bit conversions on this chip, and `term_lp_ring.c`
+   already builds its JSON with a bounded writer — two serialisers that behave
+   identically at a buffer edge are worth 30 lines.
+
+8. **`stats` is answered through the gate too**, although `sys.blackbox()`
+   gives the same counters to any app unprivileged. It carries no content, and
+   a reader that wants to know whether a `lastboot` exists before pulling 31 KB
+   should not have to guess. It costs one counter value, which is free.
+
+9. **Refusals are named, not generic.** One error code per reason, published
+   as a word on `/status`. An operator debugging a failed pull should not have
+   to guess whether the signature or the counter was the problem, and neither
+   name leaks anything a key holder does not already know. `term_bb_result_t`
+   reports what the responder reached, so `res->hwm` is **0** on any refusal
+   raised before `hwm_load` runs (`E_ENV`, `E_SIZE`, `E_SIG`, every parse
+   error) rather than the stored mark; the header says so and `test_bb_refuse`
+   pins the pair.
+
+10. **A failed parse leaves `term_bb_req_t` zeroed** — the header promised it
+    and the first implementation did it only for the "missing field" path. The
+    harness caught it: an unknown key returned an error with `ctr` and `topic`
+    still filled in, which is exactly the shape of thing a caller acts on by
+    mistake. Fixed with a wrapper that clears on every non-OK return.
+
+11. **`live` pulls are best-effort and that is by construction.** The ring is
+    being appended to while the responder reads it and `term_registry` exposes
+    no lock, so a live pull may render a torn tail line. It cannot fault
+    (`term_lp_iter_next` bounds every walk by the header's own `used`/`cap` and
+    stops on an implausible record), and it is why forensics pull `lastboot`,
+    whose snapshot is immutable and whose cursor is therefore exact.
+
+12. **`sys.panic()` is a permanent drill button, gated like the content
+    reads.** Step 4 above used to say "trigger a panic from the dev slot" with
+    nothing to trigger it: §1's probe owned the crash triggers and went away
+    with the region handover, so the black box's most important record — the
+    one written by the thing that killed the device — had no way to be
+    exercised except by waiting for a real bug. `sys.panic()` fixes that with
+    the *same* predicate as `sys.blackbox("live")`
+    (`s_cur_wk->idx == MQJS_WORKER_DEV || s_cur_wk->trusted_system`, §7.2's
+    owner-key gate), so it is not an app API and anything else gets a
+    `TypeError`. Three sub-choices: **a real fault** (a volatile NULL read →
+    LoadProhibited), not `abort()`, because although both reach
+    `__wrap_esp_panic_handler` only a fault carries an mepc/mcause and the
+    cross-check step 4 asks for is exactly `pc=` against the Guru Meditation
+    block — and it is the trigger §1 measured as fully retention-safe;
+    **armed 500 ms out on an `esp_timer`** with the binding returning 0
+    immediately, so the caller's "about to panic" publish leaves the device
+    before the chip dies (a second call inside the window is a no-op, not a
+    second fault); and **inert off-device**, returning `-1` under
+    `ESP_PLATFORM`'s `#else` so `run_pc` cannot take the test runner down —
+    the gate is still real there, only the fault is absent.
+    Files: `components/mqjs/mqjs_runtime.c` (`js_sys_panic`),
+    `components/mqjs/device_stdlib.c` (the `js_sys[]` row, where the delay is
+    documented), `components/mqjs/gen/device_stdlib.h` (ROM regen, -m32;
+    `gen/mquickjs_atom.h` regenerated content-identical and was restored with
+    `git checkout --`). Verified through `run_pc`: `sys.panic()` returns `-1`
+    twice with the process alive afterwards, and `pc_test/run_pc_tests.sh`
+    still reports **ALL PC SUITES PASSED**.
+
+### The reader: `tools/bb_pull.py`
+
+```
+python3 tools/bb_pull.py HOST BASE_TOPIC [lastboot|live|stats] \
+        [--port N] [--from N] [--ctr N] [--timeout S] [--json] [--raw] [--tamper]
+
+python3 tools/bb_pull.py 192.168.1.2 esp32p4-mqjs/task/u7q3x9f2
+python3 tools/bb_pull.py 192.168.1.2 esp32p4-mqjs/task/u7q3x9f2 stats
+```
+
+Signs with `tools/task_signing_key.pem` (the same key and the same envelope as
+`mqjs_push.py`), subscribes to `<base>/bb/reply` **and** `<base>/status` before
+publishing, reassembles `body.lines` in `seq` order until `last`, prints the
+log to stdout and everything else to stderr. It warns on a `seq` gap, exits 1
+on a `bb: rejected (...)` line, and follows a `"cut":1` reply automatically
+with a fresh counter and `from=body.next` (up to 8 rounds). `--raw` publishes
+the request unsigned and `--tamper` flips a byte after signing — both exist so
+the orchestrator can watch the device refuse them.
+
+### Off-device verification (done)
+
+- **Throwaway harness** (ASan+UBSan, `-std=c99 -Wall -Wextra`, not a repo
+  file), **266 checks, 0 failures**, with **real TweetNaCl verification over
+  real Ed25519 signatures** produced by a python generator, and the real LP
+  ring underneath:
+  - *29 signed cases, in order, through `term_bb_serve`*: three accepted
+    (`stats`, `live`, `lastboot`-with-no-snapshot); `replay` for a counter
+    equal to the mark and for an older one; `bad-signature` for a flipped
+    signature bit, for a message edited after signing, for an unsigned
+    payload and for a truncated envelope; `bad-length` for a payload shorter
+    than a signature, for a signature with no message and for a message over
+    `TERM_BB_REQ_MAX`; `bad-magic`, `unknown-field`, `duplicate-field`,
+    `missing-field` (both required keys), `wrong-topic`, `out-of-range`
+    (`ctr=0`, 2^63, 24 digits), `bad-request` (non-decimal counter, unknown
+    `what`, empty value, empty key, embedded NUL); and three tolerated shapes
+    (CRLF, blank lines, leading zeros). **Every refusal also asserts that
+    nothing was published and that the high-water mark did not move**, and
+    every acceptance asserts the mark equals the request's counter.
+  - *chunk loop*: 13 chunks for 172 records at 1600 B, `seq` dense from 0,
+    exactly one chunk claiming `last`, every chunk NUL-terminated, closed with
+    `}`, within the scratch, carrying the right preamble, and the sum of the
+    per-chunk `records` equal both to `res.records` and to the ring's own live
+    record count — i.e. **the reassembly is complete, not just plausible**.
+  - *the two honesty flags*: at the smallest legal scratch (704 B) a 512-byte
+    record under a 31-byte writer name cannot be rendered, and the reply ends
+    `"stall":1,"last":1` (40 chunks, 171 of 172 records); with a denser ring
+    (700 and 1200 records) the 64-chunk bound is hit instead and the reply ends
+    `"cut":1,"last":1`. In every configuration the loop terminates with
+    `last:1`, never exceeds `TERM_BB_CHUNKS_MAX`, and never stops with records
+    pending without saying which of the two happened.
+  - *counter durability ordering*: a failing `hwm_store` yields
+    `counter-store` with **zero chunks published** and exactly one store
+    attempt; a failing `hwm_load` likewise; and a publish that fails on chunk 3
+    yields `publish-failed` with the mark **still burned** — the documented
+    direction (a request is never replayable twice).
+  - *environment refusals*: NULL env, an all-zero env, a scratch one byte
+    below `TERM_BB_SCRATCH_MIN`, a NULL payload, a zero length.
+  - *pure parse/gate, no crypto*: the minimal message, no trailing LF, `from`
+    at `UINT32_MAX` and one past it, magic-only, a duplicated optional key,
+    `len` (not a NUL) deciding where the message ends, a failed parse leaving
+    `out` zeroed, and the gate's ordering — topic mismatch outranks a stale
+    counter, a prefix or an extension of the topic is not a match, equal
+    counters are a replay.
+  - *stats reply*: one chunk, `what` echoed, the report body present, closed
+    with `"last":1}`, zero records counted.
+  - *the panic note* (§2a section [8]).
+- **The tool and the device agree, end to end**: a second harness feeds
+  `tools/bb_pull.py`'s own `request()`/`sign()` output into the C responder
+  verified against **`main/task_pubkey.h`'s real public key** — accepted first
+  time, `replay` the second, `bad-signature` for one flipped byte and for a
+  5-byte truncation. A python-side check confirms `bb_pull.py` signs with the
+  key the firmware embeds (one trust root), that the request bytes are exactly
+  the documented format, and that `collect()` reassembles chunks, ignores a
+  reply for another counter, ignores unrelated `/status` traffic, warns on a
+  `seq` gap and exits 1 on a rejection.
+- **Host suites**: `host_test/run_tests.sh` -> **31 suites, ALL SUITES
+  PASSED**, no new warnings (the runner globs the parent directory, so
+  `term_bb_pull.c` is compiled with `-Wall -Wextra` and ASan/UBSan into every
+  suite). Note that §2's line about `test_lp_writers` having one unsatisfiable
+  check is now stale: all 31 pass.
+- **run_pc**: builds with `term_bb_pull.c` in the glob; `pc_term_basic`,
+  `pc_term_errors`, `pc_term_name`, `pc_term_probe`, `pc_term_resize` all
+  **ALL PASS**, and `sys.blackbox()` / `("live")` / `("live", next)` still
+  answer correctly through the refactored `term_lp_dump_json` — the JS surface
+  is unchanged.
+- **Not run** (orchestrator's steps, deliberately): the device build, the
+  flash, any push to the device.
+
+### Device verification plan (for the orchestrator)
+
+1. Flash, then `python3 tools/bb_pull.py 192.168.1.2 <task topic> stats` —
+   expect one chunk and `retention`/`lastboot` in the body.
+2. `--raw` and `--tamper` — expect `bb: rejected (bad-signature)` on
+   `<base>/status` and no reply chunk.
+3. Re-run a normal pull twice with `--ctr 1` — the second must be
+   `bb: rejected (replay)`. Then a fresh (clock-derived) counter must work
+   again, and it must **still** be refused after a power cycle, which is the
+   NVS mark doing its job.
+4. Trigger a panic from the dev slot with **`sys.panic()`** (decision 12 —
+   publish first, the fault is armed 500 ms out), let it reboot, then
+   `bb_pull.py ... lastboot` — expect the previous boot's lines **and** the
+   `sys/panic:` note (§2a), and cross-check its `pc=` against the serial Guru
+   Meditation block. The drill's note reads `kind=fault … task=esp_timer`
+   (the fault fires on the timer task, not `js_task`) — §2a's "task= names the
+   JS worker" describes a real crash inside a JS callback, not this.
+5. Confirm the reply arrived in ~20-25 chunks with no `seq` gap, and that
+   `bb: sent N chunks` appeared on `/status` and in the status bar.
+
+### Device verification — RESULTS (2026-07-30, all steps run, all passed)
+
+Executed over MQTT with tools/bb_pull.py + a 210 s serial capture; raw
+outputs in the session transcript.
+
+1. `stats --ctr 1` accepted: 1 chunk, `retention=ok, prev=captured,
+   lastboot=1`, `/status`: `bb: sent 1 chunk, 0 records`.
+2. `--ctr 1` again → `bb: rejected (replay)`. `--raw` → `bb: rejected
+   (bad-length)` — the 63 B unsigned payload cannot even contain the 64 B
+   signature, so the length gate correctly fires *before* the signature
+   verdict the plan predicted; `--tamper` → `bb: rejected (bad-signature)`.
+   Every refusal: zero reply chunks.
+3. `--ctr 2` accepted; after an esptool reboot `--ctr 2` → `bb: rejected
+   (replay)` — the NVS high-water mark doing its job across a reset. A
+   fresh clock-derived counter then pulled `lastboot` clean (3 records,
+   `bb: sent 1 chunk, 3 records`; the short chunk count is the short boot,
+   the 13-chunk/172-record loop is covered by the §3 harness).
+4. `sys.panic()` drill (convergent dev-slot probe tools/probe_panic_drill.js:
+   arms on a non-panic boot, collects on the panic boot): `lastboot` after
+   the drill contains `sys/panic: panic: fault Load access fault
+   task=esp_timer core=0 pc=0x4002ebbc cause=5`, and the serial capture's
+   Guru Meditation block reads `Core 0 panic'ed (Load access fault)`,
+   `MEPC: 0x4002ebbc` — **cause, core and pc all match the note exactly.**
+   Partition-ordered dump confirmed (SYS lines, then APP).
+5. Dense `seq`, exactly one `last:1` per pull, tool rc=0 on accepts and
+   rc=1 on every refusal. dev_idle restored after the drill.

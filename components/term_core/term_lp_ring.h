@@ -640,6 +640,68 @@ bool term_lp_log(term_lp_class_t cls, const char *writer,
 const term_lp_ring_t *term_lp_source(term_lp_src_t src);
 
 /* ===================================================================== */
+/* The panic note (§4.4: "panic 理由" is SYS-partition content)            */
+/* ===================================================================== */
+
+/*
+ * What the panic handler knows, in terms this component can hold without
+ * including an ESP-IDF header. The caller (main/panic_note.c) translates
+ * panic_info_t into this; every string may be NULL.
+ */
+typedef struct {
+    const char *kind;   /* class: "fault"/"abort"/"iwdt"/"twdt"/"debug"    */
+    const char *reason; /* the architecture's reason string                */
+    const char *task;   /* the task that was running                       */
+    uint32_t    pc;     /* faulting instruction address (mepc on RISC-V)   */
+    uint32_t    cause;  /* architectural cause (mcause on RISC-V)          */
+    int         core;
+} term_lp_panic_t;
+
+/* Longest note this builds, NUL included. */
+#define TERM_LP_PANIC_MAX 160u
+
+/*
+ * Render the note. Pure, allocation-free, NUL-terminated, never longer than
+ * `cap - 1`; returns the length written (0 if `cap` is hopeless, i.e. under 32
+ * bytes). Strings are clipped field by field so a long task name cannot push
+ * the numbers out — the numbers are the part a human cannot reconstruct.
+ *
+ * The return value covers only bytes this function wrote, so it is safe to pass
+ * straight to term_lp_ring_append(): when `cap` is too small for the whole line
+ * the output stops at the last field that fitted whole (no half-written field,
+ * and no gap of the caller's own buffer contents inside the returned length).
+ *
+ *   "panic: fault Load access fault task=js_task core=0 pc=0x4800f2a4 cause=5"
+ */
+size_t term_lp_panic_fmt(char *out, size_t cap, const term_lp_panic_t *p);
+
+/*
+ * Write the note into the live ring's SYS partition as writer "panic".
+ *
+ * CALLABLE FROM THE PANIC HANDLER, which is the whole point and the reason it
+ * is not just term_lp_log():
+ *
+ *   - no allocation, no lock, no FreeRTOS call, no logging;
+ *   - the caller's serialisation (term_registry's table mutex) does NOT hold
+ *     in panic context — the interrupted writer may have been half way
+ *     through an append on another, now-stalled core. So this REVALIDATES the
+ *     DRAM shadow header's geometry first and REFUSES to append when it is
+ *     mid-update. That direction is deliberate: an append from an
+ *     inconsistent shadow would publish a header that describes a region
+ *     state which never existed, and the reader would then reject the WHOLE
+ *     black box — trading the last few hundred lines for one line about the
+ *     crash. Losing the note is the cheaper failure, and it is bounded to
+ *     crashes that land inside the few instructions of an append window.
+ *   - beyond that window, P5 already bounds the damage: the record in flight
+ *     is lost, everything published before it reads back.
+ *   - it is one-shot. A second call (a panic inside the panic handler) does
+ *     nothing, because at that point nothing about the ring can be trusted.
+ *
+ * Returns true when the note was appended.
+ */
+bool term_lp_panic_note(const term_lp_panic_t *p);
+
+/* ===================================================================== */
 /* Introspection                                                         */
 /* ===================================================================== */
 
@@ -727,6 +789,35 @@ size_t term_lp_report(char *out, size_t out_size);
  */
 size_t term_lp_dump_json(term_lp_src_t src, uint32_t from,
                          char *out, size_t out_size);
+
+/*
+ * The same dump, with the three chunking numbers ALSO returned in C.
+ *
+ * WHY THIS EXISTS (phase 3 §3, and the one header change the MQTT responder
+ * needed): `records`, `next` and `more` are inside the JSON document, so a C
+ * caller that chunks a 31 KB black box over MQTT could only learn whether to
+ * ask again by re-parsing its own output. That is the sort of round trip this
+ * project does not do, and the alternative — driving term_lp_iter_* and
+ * re-implementing the line rendering and the JSON quoting — would duplicate
+ * the serialiser the host suites already cover. So the numbers come out of the
+ * side door instead, and the wire format stays exactly the one the JS surface
+ * emits.
+ *
+ * `info` may be NULL, in which case this IS term_lp_dump_json (which is now a
+ * one-line wrapper: the rendering has one implementation, not two). On a 0
+ * return — `out` too small for even the framing — `*info` is zeroed, so a
+ * caller that only reads `info->more` still terminates.
+ */
+typedef struct {
+    bool     ok;       /* the source exists (mirrors "ok" in the JSON)      */
+    uint32_t records;  /* content records rendered into THIS chunk          */
+    uint32_t next;     /* pass as `from` for the next chunk (from+records)  */
+    bool     more;     /* the buffer filled before the records ran out      */
+} term_lp_dump_info_t;
+
+size_t term_lp_dump_json_ex(term_lp_src_t src, uint32_t from,
+                            char *out, size_t out_size,
+                            term_lp_dump_info_t *info);
 
 #ifdef __cplusplus
 }

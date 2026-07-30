@@ -6521,6 +6521,89 @@ JSValue js_sys_blackbox(JSContext *ctx, JSValue *this_val, int argc,
     return v;
 }
 
+/* sys.panic() -> 0 when the fault is armed, -1 off-device.
+
+   The black box's DRILL BUTTON, not an app API: it deliberately crashes the
+   device so that §2a's panic note and §3's `lastboot` pull can be exercised
+   on demand (PHASE3_MANIFEST.md §3's device plan, step 4). Before this
+   existed the only way to test the flight recorder's most important record
+   was to wait for a real bug.
+
+   Gated exactly like sys.blackbox's content reads — the dev slot or an
+   embedded system app (§7.2) — which is the device owner's Ed25519-signed
+   push. Anything else gets a TypeError, the same convention: a binding that
+   silently did nothing would look like a black box that failed to record.
+
+   WHY A REAL FAULT, NOT abort(). Both reach __wrap_esp_panic_handler
+   (main/panic_note.c handles `abort` explicitly, via g_panic_abort), so
+   either would produce a note. A fault is chosen because only it carries an
+   mepc and an mcause, and the device-side cross-check §2a asks for is
+   precisely "the note's pc= matches the address in the serial Guru
+   Meditation block" — the same fact from two independent paths. A volatile
+   NULL read is also the exact trigger §1's cause table measured (cause 0,
+   full retention), so the drill exercises a path with known-good results.
+
+   WHY IT IS DELAYED. The fault is armed on the esp_timer task 500 ms out and
+   this binding returns immediately, so the caller can finish the MQTT
+   publish that says the drill is about to fire and let it leave the device
+   before the chip dies. Not a tuning knob: shorten it and the acknowledging
+   publish is lost, which is the one thing that distinguishes a deliberate
+   drill from a real crash in the operator's log. A second call inside the
+   window is a no-op (the timer is already armed), not a second fault. */
+#ifdef ESP_PLATFORM
+/* Both `volatile`: the pointer so the compiler cannot fold a known-NULL
+   dereference into an unreachable trap, the pointee (and the sink) so the
+   load itself cannot be elided. What the CPU executes is a real 32-bit load
+   from address 0 -> LoadProhibited -> esp_panic_handler -> the note. */
+static volatile uint32_t *volatile s_drill_addr;
+static volatile uint32_t s_drill_sink;
+
+static void panic_drill_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "panic drill: faulting now (sys.panic)");
+    s_drill_sink = *s_drill_addr;
+}
+#endif
+
+JSValue js_sys_panic(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+
+    if (!s_cur_wk ||
+        !(s_cur_wk->idx == MQJS_WORKER_DEV || s_cur_wk->trusted_system)) {
+        JS_ThrowTypeError(ctx, "panic requires the dev slot or an embedded "
+                               "system app");
+        return JS_EXCEPTION;
+    }
+#ifdef ESP_PLATFORM
+    {
+        static esp_timer_handle_t s_panic_timer;
+        if (!s_panic_timer) {
+            const esp_timer_create_args_t a = {
+                .callback = panic_drill_cb,
+                .name = "panic_drill",
+            };
+            if (esp_timer_create(&a, &s_panic_timer) != ESP_OK) {
+                s_panic_timer = NULL;
+                return JS_NewInt32(ctx, -1);
+            }
+        }
+        if (!esp_timer_is_active(s_panic_timer))
+            esp_timer_start_once(s_panic_timer, 500 * 1000);
+        return JS_NewInt32(ctx, 0);
+    }
+#else
+    /* run_pc: the gate is real, the fault is not. A host binary that faulted
+       here would take the PC test runner down with it, and there is no panic
+       handler and no LP SRAM to record into anyway — so the honest answer is
+       "unsupported", -1, and the caller's own logic is still testable. */
+    return JS_NewInt32(ctx, -1);
+#endif
+}
+
 /* ------------------------------------------------------------------ */
 /* scheduler (design §3.7)                                             */
 /* ------------------------------------------------------------------ */

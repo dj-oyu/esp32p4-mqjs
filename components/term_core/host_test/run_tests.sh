@@ -45,7 +45,11 @@ else
     if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout 300"; fi
 fi
 
-CFLAGS="-std=c99 -O1 -g -Wall -Wextra -I$SRC_DIR -I."
+# -I../../tweetnacl is for test_bb_sig only: term_bb_pull.h leaves the Ed25519
+# verifier abstract (a callback with crypto_sign_open's contract), so ONE suite
+# links the vendored verify-only TweetNaCl and drives term_bb_serve over the
+# fixed vectors in bb_vectors.h. Nothing else includes it.
+CFLAGS="-std=c99 -O1 -g -Wall -Wextra -I$SRC_DIR -I. -I$SRC_DIR/../tweetnacl"
 LDFLAGS=""
 
 mkdir -p "$BUILD_DIR" || exit 1
@@ -104,8 +108,30 @@ for src in $TESTS; do
     bin="$BUILD_DIR/$name"
     printf '\n=== %s ===\n' "$name"
 
+    # Per-suite extra sources. Only test_bb_sig has one: the real Ed25519
+    # verifier it drives term_bb_serve's `verify` callback with. TweetNaCl is
+    # public-domain reference code that shifts negative values deliberately, so
+    # it is compiled UNSANITISED into an object and linked — UBSan is right about
+    # it and it is not this project's code to fix.
+    EXTRA=""
+    if [ "$name" = "test_bb_sig" ]; then
+        tn="$SRC_DIR/../tweetnacl/tweetnacl.c"
+        if [ ! -f "$tn" ]; then
+            echo "FAIL $name: $tn is missing (the real Ed25519 vectors need it)"
+            failed="$failed $name(no-tweetnacl)"
+            continue
+        fi
+        # shellcheck disable=SC2086
+        if ! $CC $CFLAGS -c "$tn" -o "$BUILD_DIR/tweetnacl.o"; then
+            echo "FAIL $name: tweetnacl.c did not compile"
+            failed="$failed $name(tweetnacl)"
+            continue
+        fi
+        EXTRA="$BUILD_DIR/tweetnacl.o"
+    fi
+
     # shellcheck disable=SC2086
-    if ! $CC $CFLAGS $SAN "$src" $CORE_SRCS -o "$bin" $LDFLAGS; then
+    if ! $CC $CFLAGS $SAN "$src" $CORE_SRCS $EXTRA -o "$bin" $LDFLAGS; then
         echo "FAIL $name: did not compile"
         failed="$failed $name(build)"
         continue

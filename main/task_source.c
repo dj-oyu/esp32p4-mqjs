@@ -16,11 +16,14 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "mqjs_runtime.h"
 #include "storage.h"
 #include "task_pubkey.h"
 #include "task_source.h"
+#include "term_bb_pull.h"
 #include "tweetnacl.h"
 #include "ui_status.h"
 
@@ -225,6 +228,125 @@ static void registry_rx(esp_mqtt_event_handle_t e)
     free(m);
 }
 
+/* ---- §7.2 black-box pull: the device half of term_bb_pull.h ----
+ *
+ * A signed request on <TASK_TOPIC>/bb is answered with black-box content on
+ * <TASK_TOPIC>/bb/reply; a refused one is named on <TASK_TOPIC>/status, the
+ * convention above. term_core owns the whole responder (verify order, replay
+ * gate, chunk loop) as pure logic over four callbacks; everything device-
+ * shaped is here, because this file owns the MQTT connection and the pull must
+ * not open a second one. It runs on the MQTT event task, like the app-push
+ * verification directly below — the same Ed25519 key, the same trust root
+ * (task_pubkey.h), no second one. */
+#define BB_TOPIC       CONFIG_MQJS_TASK_TOPIC "/bb"
+#define BB_REPLY_TOPIC BB_TOPIC "/reply"
+
+/* The replay high-water mark. NVS, never LP SRAM: §7.2 is explicit that LP is
+ * lost on a power cut, so a mark kept there would let one power cycle reopen
+ * the replay window for a captured request. */
+#define BB_NVS_NS  "termbb"
+#define BB_NVS_KEY "ctr"
+
+static nvs_handle_t s_bb_nvs;
+static bool s_bb_nvs_open;
+
+static bool bb_nvs(void)
+{
+    if (s_bb_nvs_open)
+        return true;
+    if (nvs_open(BB_NVS_NS, NVS_READWRITE, &s_bb_nvs) != ESP_OK) {
+        nvs_flash_init();
+        if (nvs_open(BB_NVS_NS, NVS_READWRITE, &s_bb_nvs) != ESP_OK)
+            return false;
+    }
+    s_bb_nvs_open = true;
+    return true;
+}
+
+static int bb_verify(void *ctx, unsigned char *m, unsigned long long *mlen,
+                     const unsigned char *sm, unsigned long long smlen)
+{
+    (void)ctx;
+    return crypto_sign_open(m, mlen, sm, smlen, MQJS_TASK_PUBKEY);
+}
+
+static bool bb_hwm_load(void *ctx, uint64_t *out)
+{
+    (void)ctx;
+    if (!bb_nvs())
+        return false;               /* fail closed: no mark, no answer */
+    esp_err_t err = nvs_get_u64(s_bb_nvs, BB_NVS_KEY, out);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        *out = 0;                   /* never pulled: any ctr >= 1 is fresh */
+        return true;
+    }
+    return err == ESP_OK;
+}
+
+static bool bb_hwm_store(void *ctx, uint64_t v)
+{
+    (void)ctx;
+    /* §7.2: "受理は低頻度なので NVS commit を受理ごとに同期実行してよい
+       (NVS の遅延 commit に期待値を置かない)" — so commit here, and report
+       failure so the request is refused rather than answered off the books. */
+    if (!bb_nvs())
+        return false;
+    if (nvs_set_u64(s_bb_nvs, BB_NVS_KEY, v) != ESP_OK)
+        return false;
+    return nvs_commit(s_bb_nvs) == ESP_OK;
+}
+
+static bool bb_publish(void *ctx, const char *json, size_t len)
+{
+    (void)ctx;
+    /* QoS 0 deliberately: a QoS > 0 publish issued from the MQTT event task
+       would wait for an ack that only this task can process. publish_status()
+       above is QoS 0 for the same reason. */
+    return esp_mqtt_client_publish(s_cli, BB_REPLY_TOPIC, json, (int)len,
+                                   0, 0) >= 0;
+}
+
+static void bb_rx(esp_mqtt_event_handle_t e)
+{
+    term_bb_result_t res;
+    term_bb_err_t err;
+    char msg[64];
+    /* Off the event task's stack (8 KB, shared with TweetNaCl): one scratch
+       buffer serves the envelope and every reply chunk (term_bb_pull.h). */
+    char *scratch = malloc(TERM_BB_SCRATCH_WANT);
+    if (!scratch) {
+        publish_status("bb: rejected (no-memory)");
+        return;
+    }
+    term_bb_env_t env = {
+        .verify = bb_verify,
+        .hwm_load = bb_hwm_load,
+        .hwm_store = bb_hwm_store,
+        .publish = bb_publish,
+        .ctx = NULL,
+        .topic = CONFIG_MQJS_TASK_TOPIC,
+        .scratch = scratch,
+        .scratch_size = TERM_BB_SCRATCH_WANT,
+    };
+    err = term_bb_serve(&env, e->data, (size_t)e->data_len, &res);
+    free(scratch);
+
+    if (err == TERM_BB_OK) {
+        snprintf(msg, sizeof msg, "bb: sent %u chunk%s, %u records",
+                 (unsigned)res.chunks, res.chunks == 1 ? "" : "s",
+                 (unsigned)res.records);
+        ESP_LOGI(TAG, "black-box pull ctr=%llu accepted, %s",
+                 (unsigned long long)res.req.ctr, msg);
+        /* An accepted pull means class-A content just left the device. That
+           belongs on the screen, not only in a log nobody is watching. */
+        ui_status_set_event(msg);
+    } else {
+        snprintf(msg, sizeof msg, "bb: rejected (%s)", term_bb_err_str(err));
+        ESP_LOGW(TAG, "black-box pull refused: %s", term_bb_err_str(err));
+    }
+    publish_status(msg);
+}
+
 static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     esp_mqtt_event_handle_t e = data;
@@ -236,6 +358,10 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         /* §11: catalog rows for everything on the shelf, payloads only
            for what this device has installed (selective install) */
         esp_mqtt_client_subscribe(s_cli, STORE_PREFIX "+", 1);
+        /* §7.2's signed pull. An EXACT topic, not a wildcard: the replies go
+           to BB_REPLY_TOPIC underneath it, and a wildcard here would make the
+           device subscribe to its own answers. */
+        esp_mqtt_client_subscribe(s_cli, BB_TOPIC, 1);
         subscribe_installed();
         publish_status("ready");
         ui_status_set_mqtt(true);
@@ -256,7 +382,14 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
             ui_status_set_event(ev0);
             break;
         }
-        /* route by topic: catalog vs registry shelf vs the dev topic */
+        /* route by topic: black-box pull vs catalog vs registry shelf vs the
+           dev topic (exact match first — /bb is not a prefix of anything the
+           device subscribes to, and the dev topic must not swallow it) */
+        if (e->topic_len == (int)(sizeof(BB_TOPIC) - 1) &&
+            memcmp(e->topic, BB_TOPIC, sizeof(BB_TOPIC) - 1) == 0) {
+            bb_rx(e);
+            break;
+        }
         if (e->topic_len > (int)(sizeof(STORE_PREFIX) - 1) &&
             memcmp(e->topic, STORE_PREFIX, sizeof(STORE_PREFIX) - 1) == 0) {
             store_rx(e);

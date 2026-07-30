@@ -22,7 +22,7 @@ configure_file(${MQJS_SCRIPT_PATH} ${CMAKE_CURRENT_BINARY_DIR}/task.js COPYONLY)
 
 idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                             "board_tab5.c" "ui_status.c" "ppa_bench.c"
-                            "jsmem_bench.c"
+                            "jsmem_bench.c" "panic_note.c"
                        PRIV_REQUIRES mqjs term_core nvs_flash esp_wifi esp_netif esp_event
                                      tweetnacl esp_driver_i2c ui_tab5 cam_tab5
                                      audio_tab5 audio_device kbd_tab5
@@ -32,3 +32,9 @@ idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                        EMBED_TXTFILES ${CMAKE_CURRENT_BINARY_DIR}/task.js
                                       ${CMAKE_CURRENT_BINARY_DIR}/launcher.js
                                       ${CMAKE_CURRENT_BINARY_DIR}/device_settings.js)
+
+# panic_note.c: IDF 6 offers no hook on the panic path, so the black box's
+# "panic 理由" line (§4.4) is written from a wrap of esp_panic_handler. Same
+# mechanism components/ui_tab5 uses for esp_hosted_init / lvgl_port_ppa_create.
+target_link_options(${COMPONENT_LIB} INTERFACE
+                    "-Wl,--wrap=esp_panic_handler")

@@ -1140,6 +1140,13 @@ size_t term_lp_report(char *out, size_t out_size)
 size_t term_lp_dump_json(term_lp_src_t src, uint32_t from,
                          char *out, size_t out_size)
 {
+    return term_lp_dump_json_ex(src, from, out, out_size, NULL);
+}
+
+size_t term_lp_dump_json_ex(term_lp_src_t src, uint32_t from,
+                            char *out, size_t out_size,
+                            term_lp_dump_info_t *info)
+{
     const term_lp_ring_t *r = term_lp_source(src);
     const char *sname = (src == TERM_LP_SRC_LASTBOOT) ? "lastboot" : "live";
     term_lp_iter_t it;
@@ -1148,6 +1155,8 @@ size_t term_lp_dump_json(term_lp_src_t src, uint32_t from,
     uint32_t skipped = 0, emitted = 0;
     bool more = false, first = true;
 
+    if (info)
+        memset(info, 0, sizeof *info);
     if (!out || out_size < 96u)
         return 0;
     b.p = out;
@@ -1208,5 +1217,102 @@ size_t term_lp_dump_json(term_lp_src_t src, uint32_t from,
     if (b.ovf)
         return 0;
     out[b.n] = '\0';
+    if (info) {
+        info->ok = (r != NULL);
+        info->records = emitted;
+        info->next = from + emitted;
+        info->more = more;
+    }
     return b.n;
+}
+
+/* ===================================================================== */
+/* The panic note                                                        */
+/* ===================================================================== */
+
+static void bputhex(lp_buf_t *b, uint32_t v)
+{
+    static const char hx[] = "0123456789abcdef";
+    char t[8];
+    int i;
+    for (i = 7; i >= 0; i--) {
+        t[i] = hx[v & 0xFu];
+        v >>= 4;
+    }
+    bput(b, t, 8);
+}
+
+/* One field, clipped. A panic string arrives from IDF or FreeRTOS, so it is
+   not hostile — but it can be long, and the numbers after it are the part a
+   human cannot reconstruct from the serial log. */
+static void bputclip(lp_buf_t *b, const char *s, size_t max)
+{
+    size_t n = 0;
+    if (!s)
+        return;
+    while (s[n] && n < max)
+        n++;
+    bput(b, s, n);
+}
+
+size_t term_lp_panic_fmt(char *out, size_t cap, const term_lp_panic_t *p)
+{
+    lp_buf_t b;
+
+    if (!out || !p || cap < 32u)
+        return 0;
+    b.p = out;
+    b.cap = (cap < TERM_LP_PANIC_MAX ? cap : TERM_LP_PANIC_MAX) - 1u;
+    b.n = 0;
+    b.ovf = false;
+
+    bputs(&b, "panic: ");
+    bputclip(&b, p->kind ? p->kind : "unknown", 12);
+    if (p->reason && p->reason[0]) {
+        bput(&b, " ", 1);
+        bputclip(&b, p->reason, 48);
+    }
+    bputs(&b, " task=");
+    bputclip(&b, (p->task && p->task[0]) ? p->task : "?", 20);
+    bputs(&b, " core=");
+    bputu(&b, (uint32_t)(p->core < 0 ? 0 : p->core));
+    bputs(&b, " pc=0x");
+    bputhex(&b, p->pc);
+    bputs(&b, " cause=");
+    bputu(&b, p->cause);
+    /* b.ovf here means `cap` was tiny (the fields are bounded above). bput() is
+       all-or-nothing, so b.n is exactly how many bytes were written: terminate
+       there and return that. Terminating at b.cap instead would hand the caller
+       a length covering bytes this function never wrote — its own uninitialised
+       buffer — and term_lp_ring_append() would then publish them. */
+    out[b.n] = '\0';
+    return b.n;
+}
+
+/* One-shot: set on the first call and never cleared. After a panic there is
+   no "later" to reset it for, and a panic inside the panic handler must not
+   walk this code again. */
+static bool s_panic_noted;
+
+bool term_lp_panic_note(const term_lp_panic_t *p)
+{
+    char line[TERM_LP_PANIC_MAX];
+    size_t n;
+
+    if (s_panic_noted || !p)
+        return false;
+    s_panic_noted = true;
+    if (!s_live.attached || s_live.read_only)
+        return false;
+    /* The interrupted writer may be stalled mid-append on another core, so
+       the shadow header is not known-good here the way it is everywhere else
+       in this file. Refuse rather than publish an inconsistent one — see
+       term_lp_ring.h on this function. */
+    if (!lp_geom_ok(&s_live.hdr))
+        return false;
+    n = term_lp_panic_fmt(line, sizeof line, p);
+    if (!n)
+        return false;
+    return term_lp_ring_append(&s_live, TERM_LP_CLASS_SYS, "panic", line, n,
+                               lp_now_ms());
 }
