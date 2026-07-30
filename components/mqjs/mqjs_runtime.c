@@ -6378,6 +6378,62 @@ static void ime_fold_now(void)
     ime_view_clear(&s_ime);
 }
 
+/* ---- 実測 (ui.imeStats) ---------------------------------------------
+ *
+ * 計測は IME と一緒に C へ来た。打鍵はもう JS を跨がないので、アプリ側で
+ * 時間を挟む手段が無い — skk_test.js が skk.key() を挟んで測っていた数字は、
+ * この移行で「誰も通らない道の値」になった。
+ *
+ * ここで測るのは**出荷する道**そのもの: 入力面が post してから所有タスクが
+ * 拾うまで (hop) と、ime_feed の中身 (辞書を引いた打鍵とそうでない打鍵で
+ * 別のバケツ)。hop はこの構造にしか存在せず、「打鍵が重いか」に答えるのは
+ * 実はこちら — エンジンが 77µs でも、キューで 30ms 待たされていれば遅い。
+ *
+ * 触ってよいのは所有タスクだけ (s_ime と同じ規律)。唯一の例外が
+ * s_ime_drops で、キューに入らなかった打鍵は poster 側でしか数えられない。 */
+typedef struct {
+    uint32_t key_calls, key_us, key_max_us;    /* 辞書を引かなかった打鍵 */
+    uint32_t conv_calls, conv_us, conv_max_us; /* 引いた打鍵 */
+    uint32_t hop_calls, hop_us, hop_max_us;    /* post → 所有タスクが拾う */
+    uint32_t last_lookups;   /* 上の振り分けに使う前回値 (js_skk_key と同じ) */
+} ImeMeter;
+static ImeMeter s_ime_m;
+/* 数えるのは打鍵を投げる側 (LVGL / ドックの kbd)。2 つのタスクの非アトミック
+   な ++ なので稀に 1 数え落とすが、意味があるのは「0 か 0 でないか」。 */
+static volatile uint32_t s_ime_drops;
+
+/* 所有タスクが撮るスナップショット。カウンタを外のタスクから直接読むと
+   「半分だけ新しい」姿が見えるうえ、skk_stats() は構造体まるごとの複製で、
+   所有タスクが書いている最中に重なりうる。 */
+typedef struct {
+    skk_stats_t eng;
+    ImeMeter    m;
+    uint32_t    drops;
+    uint32_t    img_len, img_load_us, nasi, ari, levels;
+    const char *dict;   /* s_skk_img[].path (静的配列) を指す */
+    bool        ready, on;
+} ImeSnap;
+static ImeSnap s_ime_snap;
+
+static bool ime_snap_now(void)
+{
+    if (!s_ime_init || s_ime_img < 0)
+        return false;      /* 一度も arm されていない = 語る数字が無い */
+    skk_stats(&s_ime.skk, &s_ime_snap.eng);
+    s_ime_snap.m = s_ime_m;
+    s_ime_snap.drops = s_ime_drops;
+    const SkkImage *im = &s_skk_img[s_ime_img];
+    s_ime_snap.img_len = (uint32_t)im->len;
+    s_ime_snap.img_load_us = im->load_us;
+    s_ime_snap.nasi = (uint32_t)im->dict.blk[SKK_BLK_NASI].count;
+    s_ime_snap.ari = (uint32_t)im->dict.blk[SKK_BLK_ARI].count;
+    s_ime_snap.levels = (uint32_t)im->dict.blk[SKK_BLK_NASI].levels;
+    s_ime_snap.dict = im->path[0] ? im->path : "builtin";
+    s_ime_snap.ready = ime_ready(&s_ime);
+    s_ime_snap.on = ime_on(&s_ime);
+    return true;
+}
+
 #ifdef ESP_PLATFORM
 /* ---- 変換中を見せる (docs/keyboard-ime-unification.md §6) ------------
  *
@@ -6544,17 +6600,52 @@ static void ime_face_update(void)
 /* 打鍵 1 つを IME に通し、残ったもの (素通し or 確定文字列) をアプリへ
    配達する。判定と配達が同じタスクの同じ関数に居るのが肝: 打鍵を渡した側は
    「食われたか」を聞かずに済み、キューが 1 本なので順序も勝手に保たれる。 */
-static void ime_owner_key(const char *key, size_t len)
+static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
 {
     ime_disp_t d = IME_PASS;
+
+    /* キューで待った時間。素通しの打鍵も数える — 待ちは打鍵の種類に関係なく
+       全部が払っており、消費された打鍵だけ数えると数字が実際より良く見える。
+       32bit の巻き戻り (71.6 分ごと) は引き算で消えるので下位だけで足りる。 */
+    uint32_t hop = (uint32_t)time_us() - t_post;
+    s_ime_m.hop_calls++;
+    s_ime_m.hop_us += hop;
+    if (hop > s_ime_m.hop_max_us)
+        s_ime_m.hop_max_us = hop;
 
     if (s_ime_img >= 0) {
         /* 学習は skk.* ハンドルと 1 つを共有しているので、エンジンを回す間だけ
            鍵を取る (s_skk_mru_lock)。ime_text() が指すのは skk_t の commit
-           バッファであって MRU ではないから、外に出してよい。 */
+           バッファであって MRU ではないから、外に出してよい。
+           t0 を鍵の内側に置くのは js_skk_key と同じ理由 — 測りたいのは
+           エンジンの仕事であって鍵の待ち時間ではない (待ちは hop が持つ)。 */
         mru_lock();
+        int64_t t0 = time_us();
         d = ime_feed(&s_ime, key, len);
         mru_unlock();
+        /* 素通しは計測の手前で抜ける (§4.2)。辞書を引いていない = 帰属先が
+           無いし、ASCII の 1 打鍵に 2 回目の時計読みと struct 複製を足すのは
+           bitmask 設計が消したはずのコストそのもの。 */
+        if (d != IME_PASS) {
+            uint32_t us = (uint32_t)(time_us() - t0);
+            /* 「この打鍵は変換か」はエンジンの lookups で決める。候補ゼロの
+               空振りはビットが 1 本も立たないので、状態ビットで振り分けると
+               いちばん高い打鍵が打鍵バケツに紛れる (js_skk_key と同じ判断)。 */
+            skk_stats_t es;
+            skk_stats(&s_ime.skk, &es);
+            if (es.lookups != s_ime_m.last_lookups) {
+                s_ime_m.last_lookups = es.lookups;
+                s_ime_m.conv_calls++;
+                s_ime_m.conv_us += us;
+                if (us > s_ime_m.conv_max_us)
+                    s_ime_m.conv_max_us = us;
+            } else {
+                s_ime_m.key_calls++;
+                s_ime_m.key_us += us;
+                if (us > s_ime_m.key_max_us)
+                    s_ime_m.key_max_us = us;
+            }
+        }
         if (d == IME_TEXT) {
             s_skk_mru_dirty = true; /* js_skk_key と同じ: 印だけ、書き戻しは後 */
             key = ime_text(&s_ime, &len);
@@ -6582,17 +6673,20 @@ static void ime_owner_key(const char *key, size_t len)
     key_to_app(key, len);
 }
 
-/* コマンドキュー。打鍵は投げっぱなし、ARM/FOLD だけ ack を待つ。
+/* コマンドキュー。打鍵は投げっぱなし、ARM/FOLD/STATS だけ ack を待つ。
    ImeCmd.key は KBD_SEQ_MAX(16) を包む — 入力面が作る打鍵はここに必ず収まる。 */
 #define MQJS_IME_KEY_MAX  24
-#define MQJS_IME_QUEUE_LEN 16   /* 26B×16 + キュー本体 ≒ 500B。連打 0.5 秒分:
+#define MQJS_IME_QUEUE_LEN 16   /* 32B×16 + キュー本体 ≒ 600B。連打 0.5 秒分:
                                    辞書引き 1 回の裏で溢れる深さではない。 */
-enum { IME_CMD_KEY, IME_CMD_ARM, IME_CMD_FOLD };
+enum { IME_CMD_KEY, IME_CMD_ARM, IME_CMD_FOLD, IME_CMD_STATS };
 
 typedef struct {
-    uint8_t kind;
-    uint8_t len;
-    char    key[MQJS_IME_KEY_MAX];
+    uint8_t  kind;
+    uint8_t  len;
+    /* post した時刻 (time_us の下位 32bit)。所有タスクが拾った時刻との差が
+       hop = 打鍵がキューで待った時間。詰めの都合で len の直後に置く。 */
+    uint32_t t_post;
+    char     key[MQJS_IME_KEY_MAX];
 } ImeCmd;
 
 static QueueHandle_t     s_ime_q;
@@ -6607,8 +6701,12 @@ static void ime_owner_task(void *arg)
         if (xQueueReceive(s_ime_q, &c, portMAX_DELAY) != pdTRUE)
             continue;
         switch (c.kind) {
-        case IME_CMD_KEY:    ime_owner_key(c.key, c.len);   break;
+        case IME_CMD_KEY:    ime_owner_key(c.key, c.len, c.t_post); break;
         case IME_CMD_ARM:    s_ime_cmd_ok = ime_arm_now();
+                             xSemaphoreGive(s_ime_ack);     break;
+        /* 計測も所有タスクの上で撮る。ack を待つのは mqjs タスク 1 人という
+           前提は変わらない (呼び手は JS 束縛だけ)。 */
+        case IME_CMD_STATS:  s_ime_cmd_ok = ime_snap_now();
                              xSemaphoreGive(s_ime_ack);     break;
         case IME_CMD_FOLD:   ime_fold_now();
                              /* 畳んだのに読みかけが画面に残ると、次のアプリの
@@ -6685,12 +6783,15 @@ static bool ime_route_key(const char *utf8, size_t len)
        迂回させる — 千切って渡すと変換の途中に嘘の打鍵を混ぜることになる。 */
     if (!want || !s_ime_q || len > MQJS_IME_KEY_MAX)
         return false;
-    ImeCmd c = { .kind = IME_CMD_KEY, .len = (uint8_t)len };
+    ImeCmd c = { .kind = IME_CMD_KEY, .len = (uint8_t)len,
+                 .t_post = (uint32_t)time_us() };
     memcpy(c.key, utf8, len);
     /* キューが溢れたら握り潰す。素通しにすると、変換中に飲まれるはずの打鍵が
        アプリへ抜けるうえ順序も崩れる — 落とす方がまし (s_event_queue が満杯の
-       ときと同じ方針)。 */
-    xQueueSend(s_ime_q, &c, 0);
+       ときと同じ方針)。ただし黙って消えると原因不明の「打鍵が抜ける」に
+       なるので、数だけは残す (ui.imeStats の drops)。 */
+    if (xQueueSend(s_ime_q, &c, 0) != pdTRUE)
+        s_ime_drops++;
     return true;
 }
 
@@ -6770,6 +6871,94 @@ JSValue js_ui_ime(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         ime_disarm();
     }
     return JS_NewBool(false);
+}
+
+/* ui.imeStats() -> object | null。プラットフォーム IME の実測値。
+ *
+ * ui.* に置いたのは、アプリから見える IME がもう ui.ime / ui.caret の 2 本
+ * しかないから — 計測もその隣に置く。文字列 (audio.stats / skk.stats の形)
+ * ではなくオブジェクトを返すのは、呼び手が必ずやることが JSON.stringify で
+ * MQTT へ流すことだから: 文字列で返すと JSON.parse して組み直すぶん、
+ * アプリのアリーナで無駄に往復する。
+ *
+ * null = 一度も arm されていない (辞書の無いファーム / 誰も ui.ime(1) を
+ * 呼んでいない)。0 を並べたオブジェクトを返すと「速い」と読めてしまう。 */
+JSValue js_ui_imeStats(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+#ifdef ESP_PLATFORM
+    /* 撮るのは所有タスク。s_ime_q が無い = まだ誰も opt-in していない。 */
+    if (!ime_cmd_sync(IME_CMD_STATS))
+        return JS_NULL;
+#else
+    if (!ime_snap_now())
+        return JS_NULL;
+#endif
+    const ImeSnap *s = &s_ime_snap;
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    /* エンジンが数えるもの (skk_stats_t) */
+    JS_SetPropertyStr(ctx, obj_ref.val, "keys", JS_NewInt32(ctx, (int)s->eng.keys));
+    JS_SetPropertyStr(ctx, obj_ref.val, "consumed",
+                      JS_NewInt32(ctx, (int)s->eng.consumed));
+    JS_SetPropertyStr(ctx, obj_ref.val, "lookups",
+                      JS_NewInt32(ctx, (int)s->eng.lookups));
+    JS_SetPropertyStr(ctx, obj_ref.val, "probes",
+                      JS_NewInt32(ctx, (int)s->eng.probes));
+    JS_SetPropertyStr(ctx, obj_ref.val, "fullcmp",
+                      JS_NewInt32(ctx, (int)s->eng.fullcmp));
+    JS_SetPropertyStr(ctx, obj_ref.val, "cands",
+                      JS_NewInt32(ctx, (int)s->eng.cands));
+    JS_SetPropertyStr(ctx, obj_ref.val, "dropped",
+                      JS_NewInt32(ctx, (int)s->eng.dropped));
+    JS_SetPropertyStr(ctx, obj_ref.val, "commits",
+                      JS_NewInt32(ctx, (int)s->eng.commits));
+    /* ime_feed の中身。辞書を引いた打鍵とそうでない打鍵は予算が 3 桁違う */
+    JS_SetPropertyStr(ctx, obj_ref.val, "keyCalls",
+                      JS_NewInt32(ctx, (int)s->m.key_calls));
+    JS_SetPropertyStr(ctx, obj_ref.val, "keyUs",
+                      JS_NewInt32(ctx, (int)s->m.key_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "keyMaxUs",
+                      JS_NewInt32(ctx, (int)s->m.key_max_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "convCalls",
+                      JS_NewInt32(ctx, (int)s->m.conv_calls));
+    JS_SetPropertyStr(ctx, obj_ref.val, "convUs",
+                      JS_NewInt32(ctx, (int)s->m.conv_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "convMaxUs",
+                      JS_NewInt32(ctx, (int)s->m.conv_max_us));
+    /* キューで待った時間。この構造にしか無い数字で、「打鍵が重い」の答えは
+       たいていこちら側に居る */
+    JS_SetPropertyStr(ctx, obj_ref.val, "hopCalls",
+                      JS_NewInt32(ctx, (int)s->m.hop_calls));
+    JS_SetPropertyStr(ctx, obj_ref.val, "hopUs",
+                      JS_NewInt32(ctx, (int)s->m.hop_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "hopMaxUs",
+                      JS_NewInt32(ctx, (int)s->m.hop_max_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "drops",
+                      JS_NewInt32(ctx, (int)s->drops));
+    /* どの辞書を引いているのか (梅/竹/松の区別は段数とバイト数で付く) */
+    JS_SetPropertyStr(ctx, obj_ref.val, "dictBytes",
+                      JS_NewInt32(ctx, (int)s->img_len));
+    JS_SetPropertyStr(ctx, obj_ref.val, "loadUs",
+                      JS_NewInt32(ctx, (int)s->img_load_us));
+    JS_SetPropertyStr(ctx, obj_ref.val, "nasi", JS_NewInt32(ctx, (int)s->nasi));
+    JS_SetPropertyStr(ctx, obj_ref.val, "ari", JS_NewInt32(ctx, (int)s->ari));
+    JS_SetPropertyStr(ctx, obj_ref.val, "levels",
+                      JS_NewInt32(ctx, (int)s->levels));
+    JS_SetPropertyStr(ctx, obj_ref.val, "on", JS_NewBool(s->on));
+    JS_SetPropertyStr(ctx, obj_ref.val, "ready", JS_NewBool(s->ready));
+    /* 文字列は必ず自分の文で作る: JS_SetPropertyStr の引数の中で作ると、
+       その中の GC が obj_ref.val を動かした後で古い値が読まれうる。 */
+    JSValue v_dict = JS_NewString(ctx, s->dict ? s->dict : "");
+    JS_SetPropertyStr(ctx, obj_ref.val, "dict", v_dict);
+    JS_POP_VALUE(ctx, obj);
+    return obj;
 }
 
 /* ------------------------------------------------------------------ */
