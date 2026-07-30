@@ -179,6 +179,17 @@
  *     TERM_LP_CLASS_TERM | TERM_LP_F_SCREEN and bounded by
  *     TERM_REC_SCREEN_MAX bytes.
  *
+ *     TRAILING blank rows are dropped (an empty bottom half of the screen is
+ *     the screen being taller than the output). An INTERIOR blank row is kept
+ *     and written as ONE SPACE: the ring refuses an empty payload, and
+ *     dropping the row would shift every row below it in a pulled transcript,
+ *     so a space is the only rendering under which "one record per row" and
+ *     "no empty record" both hold. A reader of a transcript may rely on it.
+ *
+ *     A BLANK SCREEN still captures: the marker lands with zero rows, because
+ *     "recording started here and the glass was empty" is a fact a transcript
+ *     needs and is not the same as no capture at all.
+ *
  * R4. WHAT THE OPERATOR ACCEPTED, and what an app must therefore tell the
  *     user: a recorded session is pullable IN PLAINTEXT by the holder of the
  *     signing key, and survives resets until the power is cut. With R3 that
@@ -683,6 +694,16 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
  *
  * DOES NOT PERSIST ANYTHING — R1. Every lifecycle transition listed in R1
  * clears it, and nothing restores it.
+ *
+ * ARMING A DETACHED TERM IS ACCEPTED (TERM_OK), and this is deliberate rather
+ * than an oversight the caller has to know about. It behaves like any other
+ * arming — the tee goes on and the immediate capture of the retained screen
+ * lands — and RE-ATTACHING CLEARS IT AGAIN (R1), so it cannot carry into the
+ * session the app picks up. What it cannot do is answer R4's question: there is
+ * no app showing the term, so there is no indicator, which is why nothing in
+ * the platform arms a detached term on its own. It is refused nowhere because
+ * the alternative — an error whose meaning is "this id is yours but not right
+ * now" — is a worse contract than a flag the next transition throws away.
  */
 term_err_t term_registry_record(term_id_t id, const char *owner, bool on);
 
@@ -840,6 +861,17 @@ term_err_t term_registry_producer_unbind(term_id_t id, const char *owner);
  * stale ack is dropped, counted, and is never mistaken for the ack of a
  * later term in the same slot (that is what the generation in the id is
  * for, I2).
+ *
+ * A DUPLICATE ACK on a term that is still alive is NOT stale and is not
+ * counted as such: "stale" means the slot moved on (FREE, or a different
+ * generation), and a second ack for the term that is still there is processed
+ * as a session end again — recording is cleared and a final capture taken
+ * (R1 + R3(c)), even though there is no longer a producer bound. That is the
+ * fail-safe direction and it is why the check is written this way: the cost of
+ * the duplicate is one more screen in the black box, while the cost of
+ * ignoring an ack that is real — because the caller acked twice, or acked after
+ * an unbind it did not observe — would be recording that outlived its session,
+ * the one thing R1 exists to prevent.
  */
 term_err_t term_registry_producer_ack(term_id_t id);
 
@@ -1123,6 +1155,16 @@ typedef struct {
     uint32_t caret_pushes;   /* caret events handed to the sink          */
 
     /* -- phase 5 (§4.4's recording exception; R1-R5) ------------------ */
+    /*
+     * WHAT A CAPTURE ADDS TO WHICH COUNTER, because a reader of these numbers
+     * has to be able to reconstruct the records: rec_screens counts MARKERS
+     * (one per landing) and rec_screen_rows counts ROWS, so a capture that
+     * landed appends rec_screen_rows + 1 records and a blank-screen capture is
+     * a landing with zero rows. The PANIC path is the exception and moves
+     * rec_panic_rows ONLY: its marker is not a rec_screens landing, because the
+     * counter is the one thing a post-mortem reader cannot re-derive and
+     * "screens the running system captured" is the fact worth keeping there.
+     */
     uint32_t rec_on;         /* recording turned on, per term per session */
     uint32_t rec_off;        /* turned off explicitly (not by lifecycle)  */
     uint32_t rec_cleared;    /* turned off BY a lifecycle transition, i.e.

@@ -261,6 +261,113 @@ Transitions are `print()`ed as well as toasted — the Defect C lesson: a toast
 is gone in five seconds, and a transcript without "recording started here" in
 it cannot tell a later reader where the recording began.
 
+### 11. The manual capture spends none of the debounce's state
+
+*(Defect the test author's `test_rec_screen`
+`case_manual_does_not_reset_the_rate_limit` caught — their D1. The header had
+said this since the first commit; the code did the opposite.)*
+
+`capture_screen_locked()` moved `rec_snap_ms` on **every** landing, and
+`record_settle_locked()` measures `TERM_REC_SNAP_MIN_MS` from that field. So
+pressing "record this screen now" closed the rate limit for the next 5 s: the
+following settle capture was turned away and counted `rec_snaps_deferred`. The
+button cost the operator the automatic snapshot of whatever the remote painted
+next — precisely the content the button-presser was about to want, and the exact
+opposite of what R3(a) is for.
+
+The fix is a split, not a special case: `capture_screen_locked()` takes a
+`charge_limit` flag, the three automatic triggers (arm, settle, stop/lifecycle)
+pass `true`, and `record_screen()` passes `false`. The **hash** still moves for a
+manual capture, because it answers a different question — "is this screen
+already in the box" — and the answer is yes however it got there. The two
+episode flags (`rec_settled`, `rec_deferred`) are still cleared by the manual
+path, so a screen that changes *after* the press is still picked up.
+
+The suite's A/B is the right shape for this and is why it was caught: identical
+timing with and without the press in the middle, asserting the same number of
+settle captures. A single-arm test would have passed.
+
+### 12. The panic ordering was right; the assertion that checked it could not fail
+
+*(The test author's D2, and the one report that was **not** a defect in the
+registry. Reported as "walks slots in index order"; it does not.)*
+
+`term_registry_panic_capture()` has walked the table twice since the first
+commit — pass 0 taking `view.visible` terms, pass 1 the rest — and an
+instrumented run of the suite's own fixture confirms it: the visible term in the
+**higher** slot is appended first (`pass=0 slot=1 w=app_alpha:pV`), the hidden
+one in slot 0 second.
+
+What failed was `rec_util.h`'s `p5_writer_of()`, which formatted into **one
+shared static buffer** and returned a pointer to it. The suite holds two of its
+results at once:
+
+```c
+w_shown  = p5_writer_of(OWNER_A, "pV");
+w_hidden = p5_writer_of(OWNER_A, "pH");   /* rewrote what w_shown points at */
+```
+
+so both pointers read `"app_alpha:pH"`, `first_visible` and `first_hidden`
+landed on the same record, and `first_visible < first_hidden` was unsatisfiable
+— the assertion could not pass whatever the ordering was, and could not fail if
+the ordering broke. **This is the only change made inside `host_test/`**: the
+helper now interns one stable buffer per distinct `owner:name`. The assertion is
+strengthened, not weakened — before the fix it tested nothing.
+
+The registry keeps the two-pass loop; its comment now says *why* the ordering
+rule exists (the budget is shared, so index order spends it on the tab nobody
+was looking at) rather than only that it is obeyed.
+
+### 13. `TERM_REC_PANIC_MAX` is a cap on what is written, not on what precedes the last record
+
+*(The test author's D3. Their diagnosis named the markers; the markers were in
+fact charged — `spent += n` — and the overrun was the row loop.)*
+
+Both loops tested `spent < TERM_REC_PANIC_MAX` **before** appending and added
+the cost **after**, so the last record of the walk always straddled the cap:
+4,126 payload bytes observed against a 4,096 budget. Every append now checks for
+fit first (`spent + need > MAX` → stop on a row boundary; a marker that does not
+fit means the term contributes nothing at all, because rows without their own
+marker read as a continuation of the previous term's frame). Measured after the
+fix: **4,087 bytes, 105 records, both markers present.** "4,096 plus however
+long the last row happened to be" is not a bound worth writing down, least of
+all for the one path that spends a shared LP region under a fault.
+
+### 14. Four behaviours the phase-5 suites pinned, now written into the header
+
+The suites documented these in their own comments and asked for a ruling. All
+four are **kept as-is** — no behaviour changed — and are now stated in
+`term_registry.h` so a later change to them is a change to a documented
+contract:
+
+1. **`record(id, owner, true)` on a DETACHED term returns `TERM_OK`.** Kept.
+   It behaves like any arming (tee on, immediate capture of the retained
+   screen) and **re-attach clears it** (R1), so it cannot carry into the session
+   the app picks up. What it cannot do is answer R4: no app is showing the term,
+   so there is no indicator — which is why nothing in the platform arms a
+   detached term on its own. Refusing it would mean an error whose meaning is
+   "this id is yours but not right now", a worse contract than a flag the next
+   transition throws away. The suites' re-attach case needs to be able to arm
+   it.
+2. **A duplicate `producer_ack()` on a live term with no producer bound is
+   processed as a real session end** — recording cleared, final capture taken,
+   *not* counted in `stale_acks` (which means "the slot moved on", and it has
+   not). Fail-safe direction: the cost is one extra screen in the box, while
+   ignoring an ack that is real would be recording that outlived its session,
+   the one thing R1 exists to prevent.
+3. **An interior blank row is written as one space.** The ring refuses an empty
+   payload and dropping the row would shift every row below it in a pulled
+   transcript, so this is the only rendering under which R3's "one record per
+   row" and the ring's "no empty record" both hold. Trailing blank rows are
+   still dropped. A transcript reader may rely on both halves.
+4. **Counter semantics.** `rec_screens` counts markers (one per landing),
+   `rec_screen_rows` counts rows, so a landed capture appends
+   `rec_screen_rows + 1` records and a blank-screen capture is a landing with
+   **0** rows. The panic path moves `rec_panic_rows` only and leaves
+   `rec_screens` at 0: its marker is not a "screen the running system
+   captured", and that counter is the one thing a post-mortem reader cannot
+   re-derive from the records.
+
 ## Verification (off-device)
 
 ### Host suite — the shipped one, unchanged
@@ -271,6 +378,12 @@ cd components/term_core/host_test && sh ./run_tests.sh
 
 **45 suites, ALL SUITES PASSED** — the same 45 as phase 4. No suite was added;
 the phase-5 suites are the test author's job.
+
+**After the test author's six phase-5 suites landed: 51 suites, ALL SUITES
+PASSED** (Decisions 11-13 are the three fixes that took it there; 49/51 on
+arrival). Re-run afterwards, both green: the 5 PC suites
+(`run_pc_tests.sh` → ALL PC SUITES PASSED) and `tools/smoke_examples.sh`
+(12/12 examples clean).
 
 ### PC suites — the shipped ones, unchanged
 

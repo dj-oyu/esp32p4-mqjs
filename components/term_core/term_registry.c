@@ -785,8 +785,18 @@ static void reg_record_cb(void *user, const char *text, size_t len)
  * TRAILING BLANK ROWS ARE DROPPED, interior ones are not: an empty line in
  * the middle of an error message is content, an empty bottom half of the
  * screen is just the screen being taller than the output.
+ *
+ * A BLANK ROW INSIDE the kept range is written as ONE SPACE. The ring refuses
+ * an empty payload, and dropping the row instead would shift every row below
+ * it in a pulled transcript, so a space is the only rendering under which R3's
+ * "one record per row" and the ring's "no empty record" both hold.
+ *
+ * `charge_limit` says whether this landing anchors R3(b)'s rate limit. Only
+ * the AUTOMATIC triggers do: see record_screen's own comment for why a human
+ * pressing a button must not spend the debounce's budget.
  */
-static void capture_screen_locked(term_slot_t *sl, const char *why)
+static void capture_screen_locked(term_slot_t *sl, const char *why,
+                                  bool charge_limit)
 {
     const char *writer;
     int rows, r, last = -1;
@@ -842,7 +852,11 @@ static void capture_screen_locked(term_slot_t *sl, const char *why)
     s_stats.rec_screens++;
     if (trunc)
         s_stats.rec_screen_trunc++;
-    sl->rec_snap_ms = s_p->now_ms();
+    /* The rate limit's anchor moves for an automatic landing only. The HASH
+     * moves for every landing, manual included: it answers "is this screen
+     * already in the box", and the answer is yes however it got there. */
+    if (charge_limit)
+        sl->rec_snap_ms = s_p->now_ms();
     sl->rec_hash = term_core_screen_hash(sl->core);
     sl->rec_hash_valid = true;
 }
@@ -875,11 +889,11 @@ static void record_set_locked(term_slot_t *sl, bool on, bool lifecycle,
         /* R3(a) at the moment of arming: the reason a human pressed the
          * button is on the glass now, and the settle timer would lose it to
          * the next redraw. */
-        capture_screen_locked(sl, why ? why : "start");
+        capture_screen_locked(sl, why ? why : "start", true);
         return;
     }
     if (sl->core)
-        capture_screen_locked(sl, why ? why : "stop");
+        capture_screen_locked(sl, why ? why : "stop", true);
     sl->record = false;
     sl->rec_hash_valid = false;
     sl->rec_settled = false;
@@ -950,7 +964,7 @@ static void record_settle_locked(term_slot_t *sl, bool moved, int64_t now)
                                    * change it until bytes arrive */
         return;
     }
-    capture_screen_locked(sl, "settled");
+    capture_screen_locked(sl, "settled", true);
     sl->rec_settled = true;
     sl->rec_deferred = false;
 }
@@ -1900,13 +1914,19 @@ term_err_t term_registry_record_screen(term_id_t id, const char *owner)
         unlock();
         return TERM_ERR_INVAL;
     }
-    capture_screen_locked(sl, "manual");
-    /* The manual capture deliberately does NOT arm the debounce's rate limit
-     * against the next settle — capture_screen_locked moved rec_snap_ms, and
-     * that is the honest accounting: a capture landed, so the next automatic
-     * one waits its turn. What it does clear is the "this episode has been
-     * evaluated" flag, so a screen that changes AFTER the button is still
-     * picked up by the debounce. */
+    /* charge_limit = false, and this is the header's promise ("It does NOT
+     * reset the debounce rate limit"), not an optimisation.
+     *
+     * THE LIMIT EXISTS TO STOP AN AUTOMATIC TRIGGER FROM STARVING THE RING,
+     * and a button press is bounded by the human pressing it. If a manual
+     * capture moved rec_snap_ms, pressing "save this screen" would turn the
+     * NEXT screen state away for up to TERM_REC_SNAP_MIN_MS and count it
+     * deferred — the button would cost the operator the automatic snapshot of
+     * whatever came after it, which is the opposite of what it is for. So the
+     * manual path shares none of the limiter's state: not the anchor here, and
+     * not the two episode flags below, which it clears so that a screen which
+     * changes AFTER the press is still picked up by the debounce. */
+    capture_screen_locked(sl, "manual", false);
     sl->rec_settled = false;
     sl->rec_deferred = false;
     unlock();
@@ -1926,8 +1946,18 @@ int term_registry_panic_capture(void)
         return 0;
 
     /* Visible terms first: with a shared budget, the tab the user was looking
-     * at is the one worth spending it on. No lock — see the header on why
-     * that is contained rather than safe. */
+     * at is the one worth spending it on. Two passes over the table, pass 0
+     * taking the visible terms and pass 1 the rest, because slot index and
+     * visibility are unrelated — the hidden tab is as likely as not to be the
+     * lower slot, and spending the budget on it is exactly the outcome this
+     * ordering rule exists to prevent. No lock — see the header on why that is
+     * contained rather than safe.
+     *
+     * TERM_REC_PANIC_MAX IS A CAP ON WHAT IS WRITTEN, not on what is written
+     * before the last record: every append is checked for fit FIRST (marker
+     * included), so the total payload cannot exceed the budget by a record.
+     * The panic path is spending a shared LP region under a fault; "4,096 plus
+     * however long the last row happened to be" is not a bound. */
     for (pass = 0; pass < 2 && spent < TERM_REC_PANIC_MAX; pass++) {
         for (i = 0; i < TERM_SLOT_COUNT && spent < TERM_REC_PANIC_MAX; i++) {
             term_slot_t *sl = &s_slots[i];
@@ -1954,6 +1984,11 @@ int term_registry_panic_capture(void)
                 n = rb_putu(s_panic_row, sizeof s_panic_row, n,
                             (unsigned)rows);
                 n = rb_put(s_panic_row, sizeof s_panic_row, n, " ---");
+                /* The marker is charged, and a marker that does not fit means
+                 * this term contributes NOTHING: rows without their own marker
+                 * would read as a continuation of the previous term's frame. */
+                if (spent + n > TERM_REC_PANIC_MAX)
+                    continue;
                 if (!term_lp_panic_append(REC_SCREEN_CLS, writer,
                                           s_panic_row, n))
                     return appended;
@@ -1967,6 +2002,8 @@ int term_registry_panic_capture(void)
                     continue;      /* blank rows are not worth a panic append */
                 if ((size_t)need >= sizeof s_panic_row)
                     need = (int)sizeof s_panic_row - 1;
+                if (spent + (size_t)need > TERM_REC_PANIC_MAX)
+                    break;         /* stop on a row boundary, inside the cap */
                 if (!term_lp_panic_append(REC_SCREEN_CLS, writer, s_panic_row,
                                           (size_t)need))
                     return appended;   /* the shadow header went bad: stop */
