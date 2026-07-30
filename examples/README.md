@@ -94,6 +94,12 @@ print("hello");
   ssh_vt のクロージャへ台本を注入して見張っていた「IME フックが TOKSEQ 展開
   より前にあること」は、`ime_core` では構造的に表現不可能になったので、
   この 2 つに引き継いで harness は廃止した
+- `skk_test.js`: 日本語入力の試験台。入力は ssh_vt と同じく `ui.ime(1)` +
+  `ui.caret()` で、**計測は `ui.imeStats()`** — 辞書の引き方 (lookups/probes)、
+  変換の µs、そして**打鍵がコマンドキューで待った時間 (hop)** を C 側が数えて
+  返す。私設セッションを開いて JS で時間を挟んでも、それは実際の打鍵が通る道
+  ではない (`docs/keyboard-ime-unification.md` §7.1)。桁のモデル (`ui.cellWidth`
+  と CONT セル) と `ui.cells` / `ui.text` の描き分けの見本でもある
 - `reading.js`: NVS 永続化、一覧 UI、ISBN 入力
 - `circuit.js`: キャンバス UI、式評価、永続化
 
