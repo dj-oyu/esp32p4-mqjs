@@ -393,9 +393,10 @@ W (12345) mqjs: IME: no dictionary (part:jisyo, err -104) — flash one into
 **静かに切り詰められ**、切れたイメージは開けるし引けるのに切れ目から先だけ
 誤答します。
 
-変換の学習 (どの候補を選んだか) は端末全体で共有され、`/littlefs/skk/mru.txt`
-へ書き戻されます。書くのは IME をオフにしたときとアプリ停止時で、打鍵ごとでは
-ありません (どちらも C 側。アプリは何も呼びません)。
+**変換の学習はありません。** 以前は選んだ候補を `/littlefs/skk/mru.txt` へ
+書き戻していましたが、2026-07-30 に削除しました
+([`docs/skk-ime-design.md`](docs/skk-ime-design.md) の S7 追記)。候補は常に
+辞書順で、同じ語を何度変換しても並びは変わりません。
 
 `--strip-annotations` で候補の注釈を落とすと L が 538 KB 縮みます。
 `python tools/skk_prep.py inspect jisyo.bin --lookup かんじ` で中身を確認できます。
