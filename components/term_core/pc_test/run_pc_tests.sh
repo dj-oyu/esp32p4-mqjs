@@ -104,9 +104,10 @@ fi
 MQJS_SRCS="tools/run_pc.c mqjs_runtime.c system_vault.c tailscale_adapter.c
            app/mqjs_app_manager.c
            ../skk_core/skk_kana.c ../skk_core/skk_dict.c ../skk_core/skk_builtin.c
+           ../ime_core/ime_core.c
            mquickjs/mquickjs.c mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c"
 
-INCS="-I. -Igen_pc -Imquickjs -I../skk_core/include -I../ui_tab5/include -I$TERM_REL"
+INCS="-I. -Igen_pc -Imquickjs -I../skk_core/include -I../ime_core/include -I../ui_tab5/include -I$TERM_REL"
 
 build_run_pc () {
     extra="$1"
