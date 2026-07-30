@@ -666,6 +666,19 @@ different things ("no such session" vs "not yet") will be collapsed into
 one error code by somebody, and the retry logic downstream then cannot
 work. Split the predicate at the source.
 
+**Fixed and device-confirmed the same day.** The flight recorder carries
+the proof, from the very `print()` this defect added:
+
+```
+[117238] app/ssh_vt2: ssh_vt2: piped tab t0 after 6 tries
+```
+
+Six retries ≈ 1.8 s of handshake — comfortably inside the new 6 s budget
+and utterly out of reach of the old one, which never retried this code at
+all. Note what the two runs cost to diagnose: the first (toast only) took
+a static read of three C layers; the second answered itself in one
+`bb_pull`. The `print()` rule earns its keep immediately.
+
 ## Device checklist — automated half DONE 2026-07-30
 
 Firmware flashed (build `C:\esp-build\term-native-m`, 3 hashes verified) and
