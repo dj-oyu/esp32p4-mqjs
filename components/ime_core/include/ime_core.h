@@ -7,8 +7,8 @@
  * mean", "which accessor do I re-read for which status bit", "when does
  * the candidate bar fold away" — and, most importantly, "in what ORDER
  * are keys offered to the engine". That last one is not a style
- * question: tools/ssh_vt_imetest.sh exists solely to watch it, and it
- * only watches one of the three apps.
+ * question: a whole test harness (tools/ssh_vt_imetest.sh, deleted when
+ * ssh_vt migrated) existed solely to watch it, in one of the three apps.
  *
  * This component is to skk_core what kbd_core is to the key surfaces.
  *

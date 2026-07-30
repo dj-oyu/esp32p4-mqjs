@@ -2,7 +2,7 @@
 // @title SSHターミナル
 // @icon 
 // @desc VT100 端末エミュレータ (マルチセッション・選択コピー対応)。
-// @perm ssh,clipboard,store,vault,skk
+// @perm ssh,clipboard,store,vault
 /* Tab5 SSH ターミナルエミュレータ (Phase T3 + W3): mquickjs 製 VT100、
  * マルチセッション対応。
  *
@@ -19,22 +19,21 @@
  * ホストは store("ssh_hosts") にローカル永続 (W2)。切断するとそのタブが
  * 消え、最後のセッションが終わるとホスト一覧に戻る。
  *
- * S6: SKK 日本語入力 (docs/skk-ime-design.md)。制御バーの「あ」ボタン
- * (= "\x00ime" トークン) かタブバー右端のモードセルのタップでトグルし、
- * 変換中の preedit と候補は ui.overlay のフロート窓が描く。確定文字列だけ
- * が ssh.write() でリモートへ行く。端末グリッドには 1 セルも書かない。
- *
- * ⚠️ 端末フォント font_term_mono には かな/カナ/漢字 が 1 グリフも無い
- * (実測 2026-07-29)。「変換中はフロート窓で読めるが、確定した日本語は
- * 端末グリッド上では空白」が今の正しい状態で、直るのは S4 (フォント
- * 再生成) から。フロートが読めるのは ui.overlay が UI フォント
- * (漢字 3,517 字) で描くため = S6 が S3/S4 を待たない理由 (§7.7)。
+ * I2: 日本語入力はプラットフォームの持ち物 (docs/keyboard-ime-unification.md)。
+ * このアプリがするのは ui.ime(1) の opt-in と、カーソルが動いたときの
+ * ui.caret(x,y,h) だけ。「あ」のトグルも preedit も候補もモード表示も C が
+ * 持ち、確定した日本語は ui.onKey に**普通の文字列として**届くので、他の
+ * 打鍵と同じく ssh.write() へ流すだけでよい。端末グリッドには 1 セルも
+ * 書かない (端末行はリモートの持ち物で、そこへ描くとリモートの再描画で
+ * 消え、選択コピーの座標もずれる)。
  *
  * 検証モード (いずれも committed 版は false):
  *   SELFTEST=true … PC/実機でパーサを走らせ grid を print ダンプ
  *   REPORT=true   … 実機で色付きデモを画面に流し続ける (SSH 不要・目視用)
- * IME のキー順序は tools/ssh_vt_imetest.sh が見る (末尾のマーカー行へ台本を
- * 注入して run_pc で走らせる)。 */
+ * ⚠️ 日本語入力は**実機でしか試せない**。IME のフックは mqjs_post_key() の
+ * #ifdef ESP_PLATFORM の中にあり、run_pc では ui.onKey がそもそも発火しない。
+ * エンジンとセッション方針のほうは tools/tests/ime_diff.sh と
+ * tools/tests/test_ime_core.c がホストで見ている。 */
 "use strict";
 sys.setAppName("ssh_vt");
 
@@ -47,7 +46,6 @@ var PASS = "";
    push するため、複数行コメントだと注入で構文が壊れる)。 */
 var SELFTEST = false; /* PC: DEMO_SCRIPT を流して grid を print ダンプ */
 var REPORT = false;   /* 実機: DEMO_SCRIPT を画面描画し続ける SSH 無しデモ (目視確認用) */
-var IME_DICT = "";    /* skk.open() に渡す辞書パス。"" = 埋め込みイメージ (実機の既定) */
 
 var DEMO_SCRIPT =
     "\x1b[2J\x1b[H" +
@@ -844,189 +842,32 @@ if (SELFTEST) {
        1 キーだけ効く。再タップで解除。武装中はタブバー右端に表示。 */
     var pendCtrl = false, pendAlt = false;
 
-    /* ================= SKK 日本語入力 (設計 §8/§9, S6) =================
-       (1) 端末グリッドには一切書かず、preedit も候補も ui.overlay に
-           丸投げする。端末行はリモートの持ち物で、そこへ描くとリモートの
-           再描画で消え選択コピーの座標もずれる (§9.1)。オーバーレイは
-           LVGL が合成するので差分描画 (dirty[]/markRow) に干渉しない。
-       (2) IME オフの打鍵経路には呼び出しを 1 つも足さない (§4.2)。
-       (3) 状態は status bitmask だけで更新する (§8.1)。 */
-    var HAVE_OVERLAY = (typeof ui.overlay === "function");
-    var OVL_IME = 0;        /* ssh_vt は overlay を他に使っていない (0-3 全部空き) */
-    var ime = 0;
-    var imeReady = false;   /* skk.open() 済み */
-    var imeOn = false;      /* かな入力中 (= skk.enable(true)) */
-    var imeMode = 0;        /* skk.mode() のキャッシュ。SKK_ST_MODE でだけ更新 */
-    var imePre = "";        /* preedit のキャッシュ。SKK_ST_PREEDIT/COMMIT でだけ更新 */
-    var imeErr = "";
-    var cands = [];         /* ▼ の候補。SKK_ST_CANDS でだけ作り直す */
-    var candSel = 0;        /* 選択 index。NB: `sel` は選択コピーが使っている */
-    var ovlOn = false;      /* フロートを出しているか (無駄な post を出さないため) */
+    /* ============ 日本語入力 (docs/keyboard-ime-unification.md §7) =======
+       アプリがするのはこの 2 つだけ。「あ」のトグルも、preedit も候補も、
+       モード表示 (制御バーの「あ」キーの面) も C 側の ime_core が持ち、
+       確定した日本語は ui.onKey に**普通の文字列として**届く — つまり
+       下の onKey の末尾の ssh.write() がそのまま宛先になる。
+       戻り値 false = 辞書の無いファーム。ここでは何も告げない: ユーザーが
+       「あ」を押しても C がキーの面を変えないので、そこで分かる。 */
+    ui.ime(1);
 
-    /* 辞書は遅延ロード。未定義グローバルの直接参照は ReferenceError に
-       なるので typeof で避け、open は try で囲む — skk バインディングの
-       無いファーム / 辞書の無い実機 / run_pc のどれでも例外なくロードでき
-       ること (これが無いと smoke_examples.sh が ssh_vt で落ちる)。 */
-    var IME_NO_BINDING = "skk バインディング無し (ROM 未再生成)";
-    var openIme = function () {
-        /* 恒久ラッチはバインディングが無い場合だけ。辞書の open 失敗で
-           ラッチすると、辞書を置いた後も「あ」が二度と skk.open を呼ばず
-           アプリ再起動まで直らない (skk_dict.bin は .gitignore なので
-           クリーンビルドのファームには埋め込みが無い = 実際に起きる)。 */
-        if (imeReady || imeErr === IME_NO_BINDING)
+    /* 変換中のフロートを出す位置。C が唯一知り得ない値なので JS が渡す
+       (フロートは「目線を動かさない」ために在るので、固定位置に出したら
+       本末転倒)。
+       ⚠️ 打鍵ごとに呼んではいけない。端末のカーソルを動かすのは打鍵では
+       なくリモートからの応答で、打った直後の位置はまだ 1 往復ぶん古い。
+       実際に動いたかを知っているのは受信を描き終えた下の flush ティック
+       なので、そこから前回と違うときだけ投げる (毎フレームの整数比較 2 回)。 */
+    var caretC = -1, caretR = -1;
+    var reportCaret = function () {
+        if (actIdx < 0 || actIdx >= sessions.length)
             return;
-        if (typeof skk === "undefined") {
-            imeErr = IME_NO_BINDING;
-            return;
-        }
-        try {
-            ime = skk.open(IME_DICT);
-        } catch (eOpen) {
-            imeErr = "" + eOpen;
-            return;
-        }
-        imeErr = "";
-        imeReady = true;
-        imeMode = skk.mode(ime);
-    };
-
-    /* 変換中のフロート窓。渡すのはカーソル位置と中身だけで、クランプも
-       上下反転もキーボード回避も候補のウィンドウ送りも C 側 (ovl_window)。
-       ⚠️ ここで中央寄せを書いてはいけない — C 側は edge-triggered で、
-       中央固定はハイライトが動かず手応えが消えるのが実機で確認済み。 */
-    var imeFloat = function () {
-        if (!HAVE_OVERLAY)
-            return;
-        var show = imeOn && imeReady && !inForm &&
-                   actIdx >= 0 && actIdx < sessions.length &&
-                   (imePre !== "" || cands.length > 0);
-        if (!show) {
-            if (ovlOn) {
-                ui.overlay(OVL_IME, null);
-                ovlOn = false;
-            }
-            return;
-        }
         var xy = sessions[actIdx].term.cursor();
-        ui.overlay(OVL_IME, {
-            col: xy[0], row: xy[1] + TAB_ROWS, h: LH,
-            lines: imePre ? [imePre] : [],
-            items: cands,
-            sel: candSel
-        });
-        ovlOn = true;
-    };
-
-    /* ---- モード表示 (設計 §9.3): タブバー右端の MODE_W セル ----
-       ⚠️ ui.cells = font_term_mono なので ASCII しか出せない。かな も カナ
-       も ▽(U+25BD) も ▼(U+25BC) も 0 グリフで、blit_glyph() は記述子が
-       引けないと豆腐ではなく無描画 = 空白になる (壊れても画面で分からない)。
-       なので代用字: > が ▽、v が ▼、* が送り仮名。かなのまま `ls -la` を
-       打つと全部かなになる (§4.2) ので、この表示は飾りではない。 */
-    var MODE_W = 4;
-    var MODE_LBL = ["  AA", "  JA", "  KA", " >JA", " *JA", " vJA"];
-    var MODE_BG = [0x394452, 0x2E6BD6, 0x256B45, 0xB07A1E, 0xB07A1E, 0xC0392B];
-    var drawMode = function () {
-        if (COLS <= MODE_W)
+        if (xy[0] === caretC && xy[1] === caretR)
             return;
-        var lbl = "  EN", fg = TAB_FG, bg = TAB_BG;
-        if (imeErr) {
-            lbl = "  ??";
-            fg = 0xE05A4E;
-        } else if (imeOn && imeReady &&
-                   imeMode >= 0 && imeMode < MODE_LBL.length) {
-            lbl = MODE_LBL[imeMode];
-            bg = MODE_BG[imeMode];
-            fg = 0xFFFFFF;
-        }
-        ui.cells(COLS - MODE_W, 0, lbl, fg, bg);
-    };
-
-    var toggleIme = function () {
-        openIme();
-        if (!imeReady) {
-            sys.notify("日本語入力を開けない: " + imeErr);
-            drawMode();
-            return;
-        }
-        /* オフに落とすと skk.reset で ▽/▼ の読みが消える。モードセルは
-           誤タップしやすい位置なので、黙って捨てると「読みが消えた」だけが
-           残る — だから破棄 + 告知にしてある。
-           **確定に化けさせる案は却下 (2026-07-29 決定)。** 誤タップで消える
-           のは打ち直せる数文字だが、誤タップでリモートのシェルへ文字列が
-           飛ぶのは打ち消せない。非対称なので迷う必要がない。 */
-        var hadPend = imePre !== "" || cands.length > 0;
-        imeOn = !imeOn;
-        skk.enable(ime, imeOn);
-        if (imeOn) {
-            skk.setMode(ime, skk.KANA); /* C-j が届かないので明示的に戻す */
-        } else {
-            skk.reset(ime);
-            /* 学習の書き戻しはここでやる。close() でも走るが、電源が落ちる
-               ほうが先に来る端末なので、IME を切る = 打鍵が止まる瞬間に
-               確定させておく。何も学んでいなければ何も書かない。 */
-            skk.save(ime);
-        }
-        imeMode = skk.mode(ime);
-        imePre = "";
-        cands = [];
-        candSel = 0;
-        sys.notify(imeOn ? "日本語入力 オン — 大文字で変換開始 / Space 変換"
-                         : (hadPend ? "日本語入力 オフ — 変換中の入力は破棄されました"
-                                    : "日本語入力 オフ"));
-        imeFloat();
-        drawMode();
-    };
-
-    /* 未確定を捨てて畳む。タブ切替・セッション消滅で使う。ハンドルは
-       セッション毎ではなく 1 本共有 — per-session にするなら imeOn も
-       タブ毎に持たないとモード表示が嘘になる。 */
-    var imeReset = function () {
-        if (imeReady) {
-            skk.reset(ime);
-            imeMode = skk.mode(ime);
-        }
-        imePre = "";
-        cands = [];
-        candSel = 0;
-        imeFloat();
-    };
-
-    /* 確定文字列の宛先。台本テストが差し替えるのでここだけ間接呼び出し
-       (IME オフの経路 = 末尾の ssh.write(id, k) は素のまま)。
-       ⚠️ bracketed paste では囲まない。(1) SKK の確定は「いま打った数文字」
-       で貼り付けではなく、\x1b[200~ で囲むと vim の insert 中に 'paste' が
-       入り切りされて逆に壊れる。(2) 確定文字列に制御文字は入らない
-       (Enter は ▼ の確定に消費される) ので守るべき危険がそもそも無い。 */
-    var imeSend = function (id, s) {
-        ssh.write(id, s);
-    };
-
-    /* IME が消費した打鍵。何を引き直すかは bitmask だけで決める。候補配列は
-       ▼ に入った 1 回 (CANDS) だけ作り、▼ 内の Space/x 連打は SEL しか
-       立たないので整数 1 つ読むだけ (設計 §4.4)。 */
-    var imeConsumed = function (id, st) {
-        if (st & skk.COMMIT) {
-            var out = skk.commit(ime);
-            if (out)
-                imeSend(id, out);
-        }
-        if (st & skk.MODE)
-            imeMode = skk.mode(ime);
-        if (st & (skk.PREEDIT | skk.COMMIT))
-            imePre = skk.preedit(ime);
-        if (st & skk.CANDS) {
-            cands = skk.candidates(ime);
-            candSel = skk.sel(ime);
-        } else if (st & skk.SEL) {
-            candSel = skk.sel(ime);
-        } else if (imeMode !== skk.SELECT && cands.length) {
-            cands = [];   /* ▼ を抜けた: 候補バーを畳む */
-            candSel = 0;
-        }
-        imeFloat();
-        if (st & skk.MODE)
-            drawMode();
+        caretC = xy[0];
+        caretR = xy[1];
+        ui.caret(caretC * CW, (caretR + TAB_ROWS) * LH, LH);
     };
 
     /* ---- タブバー (キャンバス最上段、ui.cells 直描き) ---- */
@@ -1039,7 +880,10 @@ if (SELFTEST) {
             var label = " " + (i + 1) + ":" + sessions[i].label + " ";
             if (label.length > 22)
                 label = label.slice(0, 21) + "… ";
-            if (c + label.length >= COLS - 4 - MODE_W)
+            /* -4 は [+] (3 セル) の取り置き。以前はここからさらにモード
+               セルぶん 4 セル引いていたが、モード表示は制御バーの「あ」
+               キーの面へ移ったので、その 4 桁はタブ名に戻っている。 */
+            if (c + label.length >= COLS - 4)
                 break;
             var act = (i === actIdx);
             ui.cells(c, 0, label, act ? TAB_ACT_FG : TAB_FG,
@@ -1052,15 +896,10 @@ if (SELFTEST) {
             ui.cells(c, 0, plus, TAB_ACT_FG, 0x256B45);
             tabHit.push({ x0: c * CW, x1: (c + plus.length) * CW, idx: -1 });
         }
+        /* 武装中の修飾キーは右端いっぱいまで寄せる (モードセルが居た場所)。 */
         var mods = (pendCtrl ? " CTRL " : "") + (pendAlt ? " ALT " : "");
-        if (mods)
-            ui.cells(COLS - MODE_W - mods.length, 0, mods, 0x000000, 0xFFD479);
-        /* モードセルはタップでも切り替えられる (idx -2)。設計 §9.3 の
-           「画面左上のタップ」は ssh_vt では採れない — 行 0 の左端は
-           タブ 1 のヒット領域そのもので、正面から衝突する。 */
-        drawMode();
-        if (COLS > MODE_W)
-            tabHit.push({ x0: (COLS - MODE_W) * CW, x1: W, idx: -2 });
+        if (mods && COLS > mods.length)
+            ui.cells(COLS - mods.length, 0, mods, 0x000000, 0xFFD479);
     };
 
     var switchTo = function (i) {
@@ -1073,7 +912,7 @@ if (SELFTEST) {
         var t = sessions[i].term;
         t.act = true;
         t.markAll();   /* 切替: 全行を flush 対象に */
-        imeReset();    /* 変換途中は別タブのカーソル位置に残さない */
+        reportCaret(); /* 変換中のフロートを新しいタブのカーソルへ連れて行く */
         drawTabs();
     };
 
@@ -1128,9 +967,6 @@ if (SELFTEST) {
             /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
             ssh.resize(sessions[i].id, COLS, ROWS);
         }
-        /* オーバーレイのアンカーは古い桁/行のまま陳腐化しているので
-           張り直す (フォーム中なら imeFloat が畳む) */
-        imeFloat();
         /* フォーム表示中は端末を描き戻さない — メトリクスだけ直して
            おき、returnTerminal() が戻ってきたときに描く */
         if (inForm)
@@ -1142,9 +978,13 @@ if (SELFTEST) {
         }
     };
 
-    /* ハンドラは無名関数にせず名前を付ける — run_pc では ui.onKey が絶対に
-       発火しないので、台本 (tools/ssh_vt_imetest.sh) がここを直接叩けないと
-       「キーを渡す順序」のバグが実機まで残る。 */
+    /* ここへ来る打鍵は既に IME を通り抜けたもの (素通しのキーか、確定した
+       日本語の文字列) — 変換中に飲まれるキーはそもそも届かない。「あ」の
+       "\x00ime" も C が食うので出てこない (辞書の無いファームだけは素通し
+       で届くが、TOKSEQ に無いので下で黙って捨てられる = 正しい)。
+       ⚠️ 確定した日本語を bracketed paste で囲んではいけない。あれは貼り付け
+       ではなく「いま打った数文字」で、\x1b[200~ で囲むと vim の insert 中に
+       'paste' が入り切りされて逆に壊れる。囲むのは paste トークンの側だけ。 */
     var onKey = function (k) {
         /* レイアウト変更はセッションが無くても処理する (下の actIdx
            ガードより前に置くこと) */
@@ -1152,40 +992,9 @@ if (SELFTEST) {
             relayout();
             return;
         }
-        /* 日本語入力のトグル。実際に届くと裏取りできた経路だけ:
-           "\x00ime" (制御バーの「あ」= KBD_K_IME、リピート対象外) と、
-           タブバー右端モードセルのタップ (onTouch の idx -2)。
-           不採用: F1 は A164 のキーマップに無く TOKSEQ.f1 を潰す。
-           Ctrl+O / Ctrl+\ は届くが 0x0F=nano WriteOut、0x1C=SIGQUIT で
-           リモートに渡すべき。左上タップはタブ 1 のヒット領域と衝突。
-           ⚠️ actIdx ガードより **前** に置くこと ("\x00rotate" と同じ)。
-           セッションが 0 本の起動直後はもう一方の経路も inForm で死んで
-           いるので、下に置くと「あ」が完全に無反応になる。 */
-        if (k.charCodeAt(0) === 0 && k.slice(1) === "ime") {
-            toggleIme();
-            return;
-        }
         if (actIdx < 0)
             return;
         var id = sessions[actIdx].id;
-        /* ---- IME フック ----
-           位置が肝で、**TOKSEQ 展開より前**。skk_core は "\0left" のような
-           生のトークンを期待していて、▽ が開いている間の矢印を
-           TOK_SWALLOW で飲む (preedit はアプリのカーソル位置に描かれるので、
-           カーソルだけ動くと取り残される)。展開後に渡すと "\x1b[D" になって
-           認識されず、リモートへ漏れる。
-           NB: "\n"->"\r" / "\b"->"\x7f" の書き換えとの前後は実は無害 —
-           skk は K_BS と K_DEL を両方受け、SELECT 中は候補キー以外なら何でも
-           確定する。守るべきはトークンのほうだけ。
-           imeOn が false なら && の短絡で skk.key() すら呼ばれない (§4.2)。
-           消費されたか (st !== 0) だけで足り、キーの白黒リストは要らない。 */
-        if (imeOn && imeReady) {
-            var st = skk.key(ime, k);
-            if (st !== 0) {
-                imeConsumed(id, st);
-                return;
-            }
-        }
         if (k.charCodeAt(0) === 0) {
             var name = k.slice(1);
             if (name === "ctrl") { pendCtrl = !pendCtrl; drawTabs(); return; }
@@ -1323,10 +1132,8 @@ if (SELFTEST) {
             if (y < TAB_ROWS * LH + 8) {
                 for (var i = 0; i < tabHit.length; i++) {
                     if (x >= tabHit[i].x0 && x < tabHit[i].x1) {
-                        if (tabHit[i].idx === -2)
-                            toggleIme();   /* 右端のモードセル */
-                        else if (tabHit[i].idx < 0)
-                            hostsPage(null);
+                        if (tabHit[i].idx < 0)
+                            hostsPage(null);   /* [+] */
                         else
                             switchTo(tabHit[i].idx);
                         return;
@@ -1403,6 +1210,7 @@ if (SELFTEST) {
         if (actIdx >= 0 && actIdx < sessions.length) {
             sessions[actIdx].term.flush();
             drawSel(); /* 受信出力に上書きされたハイライトの自己修復 */
+            reportCaret(); /* 描き終えた = カーソルが本当に居る場所が確定 */
         }
     }, 25); /* ~40fps でアクティブ端末のダーティ行を消化 */
 
@@ -1415,15 +1223,10 @@ if (SELFTEST) {
             drawTabs();
             ui.keyboard(2);
         }
-        imeFloat();
     };
 
-    /* ui.screen() は別スクリーンなのでフロートはその裏に隠れるが、
-       ui.back() で戻ると復活する。inForm を立てる場所では必ず畳むこと
-       (imeFloat は inForm を見て隠す)。 */
     var confirmPaste = function (id, data) {
         inForm = true;
-        imeFloat();
         ui.keyboard(0);
         var s = ui.screen("危険な貼り付け");
         s.label("改行または制御文字を含みます (" + data.length + " 文字)");
@@ -1440,7 +1243,6 @@ if (SELFTEST) {
 
     var trustHostPage = function (e, fingerprint, changed) {
         inForm = true;
-        imeFloat();
         ui.keyboard(0);
         var s = ui.screen(changed ? "ホスト鍵が変更されました" : "ホスト鍵を確認");
         s.label(e.host + ":" + e.port);
@@ -1535,7 +1337,6 @@ if (SELFTEST) {
     /* ---- W2: ホストページ / フォーム (store 永続) ---- */
     var connectForm = function (preset, editIdx) {
         inForm = true;
-        imeFloat();
         var s = ui.screen(editIdx >= 0 ? "ホストを編集" : "新規接続");
         var fh = s.field("Host");
         fh.setText(preset.host);
@@ -1619,7 +1420,6 @@ if (SELFTEST) {
 
     var hostsPage = function (note) {
         inForm = true;
-        imeFloat();
         var s = ui.screen("SSH ホスト");
         if (note)
             s.label(note);
@@ -1649,7 +1449,6 @@ if (SELFTEST) {
                     sessions[actIdx].term.markAll();
                 drawTabs();
                 ui.keyboard(2);
-                imeFloat();
             });
         }
     };
@@ -1660,40 +1459,21 @@ if (SELFTEST) {
        再描画 + flush で追い付き、ページは一覧から再入する (フォーム
        入力中の内容だけは戻らない — モデルではないので)。 */
     sys.onForeground(function () {
-        /* C 側は UI_CMD_RESET で ovl_hide_all() する (死んだアプリの
-           フロートを残さないため) ので、こちらの「出している」記憶も
-           落としてから描き直す。 */
-        ovlOn = false;
         if (!inForm && actIdx >= 0 && actIdx < sessions.length) {
             ui.clear(BG);
             sessions[actIdx].term.markAll(); /* flush 間隔が描き直す */
             drawTabs();
             ui.keyboard(2);
-            imeFloat();   /* 変換中だったら窓を戻す */
         } else {
             inForm = true;
             hostsPage(sessions.length ? "接続は維持されています" : null);
         }
     });
 
-    /* ハンドルは open が 1 回、close も 1 回。アプリ停止時は C 側
-       (mqjs_runtime.c の skkslot_free) が worker 一致で自動解放するので
-       これは保険だが、「開けたら閉じる」を JS 側にも書いておく。 */
-    sys.onStop(function () {
-        if (imeReady) {
-            imeReady = false;
-            imeOn = false;
-            skk.close(ime);
-        }
-    });
-
-    /* @imetest-inject — tools/ssh_vt_imetest.sh がこの行を tools/
-       ssh_vt_imetest.js.inc の中身に差し替えて run_pc に食わせる。台本は
-       ssh_vt のクロージャ (onKey / imeSend / imePre / cands …) に届く必要が
-       あるのでこの位置でしか成立しないが、出荷アプリには 1 バイトも乗せない。
-       守っているのは上の IME フックが **TOKSEQ 展開より前**にあること。
-       ui.onKey は run_pc で発火しないので、この網が無いと順序バグは実機まで
-       誰にも見えない。 */
+    /* 学習の書き戻しに sys.onStop は要らない。ui.ime(1) で立てた印は
+       アプリ停止で C 側が落とし (mqjs_runtime.c の ime_used)、そのとき
+       読みかけを畳んで skk_mru_flush() まで同期でやる。JS から二重に
+       閉じる相手はもう無い。 */
 
     hostsPage(null);
 }

@@ -6,8 +6,8 @@
  * the layer's contract, and above all THE ORDERING GUARANTEE: a caller
  * that feeds every key here first cannot expand "\0left" into "\x1b[D"
  * behind the engine's back. In the JS era that rule lived in a comment
- * and was watched by tools/ssh_vt_imetest.sh for exactly one of the
- * three apps that needed it.
+ * and was watched by tools/ssh_vt_imetest.sh (since deleted) for exactly
+ * one of the three apps that needed it.
  *
  * The dictionary half (skk_dict.c) is deliberately NOT linked: the
  * lookup is a tiny in-memory fake, so a failure here is a policy

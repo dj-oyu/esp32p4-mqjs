@@ -73,23 +73,27 @@ print("hello");
 
 - `p4_bg_app.js`: foreground / background と通知
 - `clip_mirror.js`: クリップボードを MQTT へ日和見同期する常駐サービス
-- `ssh_vt.js`: 複数セッション対応の SSH ターミナル。SKK 日本語入力つき —
-  制御バーの「あ」ボタン (`"\x00ime"` トークン) かタブバー右端のモードセルの
-  タップでトグルし、変換中の preedit と候補は `ui.overlay` のフロート窓が描く
-  (端末グリッドには書かない)。確定文字列だけが `ssh.write()` へ行く。
-  端末フォントは JIS 第1水準まで入っている (S4) ので、確定した日本語は
-  そのままグリッドに出る。
+- `ssh_vt.js`: 複数セッション対応の SSH ターミナル。日本語入力は
+  プラットフォームの持ち物で、アプリが書くのは `ui.ime(1)` の opt-in と
+  カーソルが動いたときの `ui.caret(x, y, h)` だけ
+  (`docs/keyboard-ime-unification.md` §7)。制御バーの「あ」ボタンのトグルも、
+  変換中の preedit と候補のフロートも、モード表示 (「あ」キーの面) も C 側が
+  持ち、**確定した日本語は `ui.onKey` に普通の文字列として届く** ので、
+  アプリは他の打鍵と同じく `ssh.write()` へ流すだけ。端末フォントは
+  JIS 第1水準まで入っている (S4) ので、確定した日本語はそのままグリッドに出る。
   辞書は既定でファーム埋め込みの SKK-JISYO.M だが、`jisyo` パーティションへ
   大きいものを焼けば**アプリを変えずに**そちらが使われる (ルート README 3.5)。
-  変換の学習は端末全体で共有され、IME をオフにしたとき (`skk.save()`) と
-  アプリ停止時に littlefs へ書き戻される。
-  IME のキー経路は `tools/ssh_vt_imetest.sh` が見る — `@imetest-inject`
-  マーカーへ `tools/ssh_vt_imetest.js.inc` を注入したものを run_pc で走らせ、
-  `PASS` / `FAIL x<n>` を出す (**出荷アプリにテストのバイトは乗らない**)。
-  検出しているのは変換の正しさではなく **IME フックが TOKSEQ 展開より前に
-  あること** で、効いているのは `arrow-swallow` の項目。辞書は
-  `tools/skk_prep.py` が生成する gitignore 対象なので、無ければ `FAIL dict`
-  が出る (静かなスキップにはならない)
+  変換の学習は端末全体で共有され、IME をオフにしたときとアプリ停止時に
+  littlefs へ書き戻される (どちらも C 側)。
+  ⚠️ **日本語入力は実機でしか試せない**。IME のフックは `mqjs_post_key()` の
+  `#ifdef ESP_PLATFORM` の中にあり、run_pc では `ui.onKey` がそもそも発火
+  しないので、ホストでは 1 打鍵も IME を通らない。ホストで見られるのは
+  エンジンとセッション方針のほうで、`tools/tests/ime_diff.sh` (golden との
+  回帰) と `tools/tests/test_ime_core.c` (▽ 中の矢印/ESC の飲み込み、
+  トークンの順序) がそれを見る。かつて `tools/ssh_vt_imetest.sh` が
+  ssh_vt のクロージャへ台本を注入して見張っていた「IME フックが TOKSEQ 展開
+  より前にあること」は、`ime_core` では構造的に表現不可能になったので、
+  この 2 つに引き継いで harness は廃止した
 - `reading.js`: NVS 永続化、一覧 UI、ISBN 入力
 - `circuit.js`: キャンバス UI、式評価、永続化
 
