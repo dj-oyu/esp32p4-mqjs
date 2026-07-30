@@ -31,7 +31,7 @@
 #include "opus_player.h"
 #include "wifi.h"
 #include "tailscale_adapter.h"
-#include "term_lp_probe.h"
+#include "term_lp_ring.h"
 
 static const char *TAG = "app";
 
@@ -147,13 +147,14 @@ static void tab5_ui_ready(void *arg)
 
 void app_main(void)
 {
-    /* LP SRAM retention probe (docs/term-design.md §11.3, the prerequisite of
-       the §4.4 black box). First thing in app_main so the RTC_NOINIT region is
-       judged before anything else in the boot could touch LP RAM, and so a
-       verdict is logged even if a later stage of boot fails. Does nothing at
-       all unless sys.lpProbe("arm") armed a sequence: no state key, no task,
-       no crash. See components/term_core/PHASE3_MANIFEST.md. */
-    term_lp_probe_boot();
+    /* The LP SRAM black box (docs/term-design.md §4.4). FIRST STATEMENT ON
+       PURPOSE: it validates the retained region, freezes the previous
+       session's log tail as `lastboot` and re-arms the ring, and all of that
+       has to happen before anything in this boot can log — and before any
+       later boot stage can fail. Cheap (~31 KB memcpy only when there is
+       something to freeze) and never fatal.
+       See components/term_core/PHASE3_MANIFEST.md §2. */
+    term_lp_ring_boot();
 
     /* boot-time micro-benches (2026-06-12): ppa_bench_run() /
        ppa_bench_crossover() / jsmem_bench_run() — call here to

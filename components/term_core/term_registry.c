@@ -34,6 +34,12 @@
 
 #include <string.h>
 
+/* §4.4's black box. The dependency is one-way and shallow: the registry
+ * tees into the ring, the ring knows nothing about terms. Lock order is
+ * registry -> ring, and since the ring takes no lock of its own there is no
+ * second order to get wrong (term_lp_ring.h, SERIALISATION). */
+#include "term_lp_ring.h"
+
 /* ===================================================================== */
 /* Tunables that are implementation detail, not contract                 */
 /* ===================================================================== */
@@ -402,6 +408,12 @@ term_err_t term_registry_init(const term_registry_config_t *cfg)
     s_p = term_port_get();
     if (!s_p)
         return TERM_ERR_NOT_READY;
+
+    /* §4.4's black box comes up before the first line can be logged.
+     * Idempotent, and on the device app_main has already called it as its
+     * first statement — this call is what gives the host suites and run_pc a
+     * real ring instead of a stub. */
+    term_lp_ring_boot();
 
     memset(s_slots, 0, sizeof s_slots);
     memset(s_jobs, 0, sizeof s_jobs);
@@ -914,12 +926,30 @@ term_err_t term_registry_feed(term_id_t id, const char *owner,
     return took == len ? TERM_OK : TERM_ERR_TIMEOUT;
 }
 
+/* The byte-ring half of a line append. Lock held; slot already validated. */
+static term_err_t log_locked(term_slot_t *sl, const char *text, size_t len)
+{
+    static const uint8_t crlf[2] = { '\r', '\n' };
+
+    /* Line-atomic: taken whole or dropped whole, so two writers never
+     * interleave halves of two messages (§3.2). The lock is what makes
+     * multiple writers safe here — this path is not the SPSC ring
+     * fast-path, and does not care whether a producer is bound. */
+    if (ring_space(sl) < len + sizeof crlf) {
+        sl->bytes_dropped += len + sizeof crlf;
+        s_stats.drops_full++;
+        return TERM_ERR_TIMEOUT;
+    }
+    ring_write(sl, (const uint8_t *)text, len);
+    ring_write(sl, crlf, sizeof crlf);
+    return TERM_OK;
+}
+
 term_err_t term_registry_log(term_id_t id, const char *owner,
                              const char *text, size_t len)
 {
     term_slot_t *sl;
     term_err_t e;
-    static const uint8_t crlf[2] = { '\r', '\n' };
 
     if (!s_ready)
         return TERM_ERR_NOT_READY;
@@ -935,20 +965,20 @@ term_err_t term_registry_log(term_id_t id, const char *owner,
         unlock();
         return e;
     }
-    /* Line-atomic: taken whole or dropped whole, so two writers never
-     * interleave halves of two messages (§3.2). The lock is what makes
-     * multiple writers safe here — this path is not the SPSC ring
-     * fast-path, and does not care whether a producer is bound. */
-    if (ring_space(sl) < len + sizeof crlf) {
-        sl->bytes_dropped += len + sizeof crlf;
-        s_stats.drops_full++;
-        unlock();
-        return TERM_ERR_TIMEOUT;
-    }
-    ring_write(sl, (const uint8_t *)text, len);
-    ring_write(sl, crlf, sizeof crlf);
+    /*
+     * §4.4's tee, at the line-oriented ingest and under the table lock (the
+     * ring's serialisation, term_lp_ring.h). TERM_LOG only: a VT term is
+     * class B by §3.2 and its mode cannot change, so SSH session content has
+     * no path here at all — structure, not a filter. `owner` is the tag's
+     * writer_id; a NULL owner means a platform caller reached us through
+     * term_registry_platform_log, which has already teed with its own writer
+     * and class, so this path must not tee again.
+     */
+    if (sl->mode == TERM_LOG && owner)
+        term_lp_log(TERM_LP_CLASS_APP, owner, text, len);
+    e = log_locked(sl, text, len);
     unlock();
-    return TERM_OK;
+    return e;
 }
 
 static void resize_job(void *arg)
@@ -1547,21 +1577,47 @@ term_id_t term_registry_console_id(void)
     return s_console_id;
 }
 
+term_err_t term_registry_platform_log(const char *writer, term_wclass_t wc,
+                                      const char *text, size_t len)
+{
+    term_lp_class_t cls = (wc == TERM_WCLASS_SYSTEM) ? TERM_LP_CLASS_SYS
+                                                     : TERM_LP_CLASS_APP;
+    term_slot_t *sl;
+    term_err_t e;
+
+    if (!text && len)
+        return TERM_ERR_INVAL;
+    if (!s_ready) {
+        /* No table means no mutex to serialise on. This is the pre-bring-up
+         * window, where app_main and js_task are the only callers and the
+         * ring's single-writer requirement holds anyway — and a line from a
+         * boot that never got as far as a console is exactly the kind the
+         * black box exists for. */
+        term_lp_log(cls, writer, text, len);
+        return TERM_ERR_NOT_READY;
+    }
+    if (!lock_for(s_ingest_ms)) {
+        s_stats.drops_lock++;
+        return TERM_ERR_TIMEOUT;   /* §5's bounded wait; the tee shares it */
+    }
+    term_lp_log(cls, writer, text, len);
+    if (s_console_id == TERM_ID_INVALID) {
+        unlock();
+        return TERM_ERR_NOT_READY;
+    }
+    /* No owner gate: the console belongs to the platform, and this is the
+     * platform writing to it. */
+    e = slot_lookup(s_console_id, NULL, false, &sl);
+    if (e == TERM_OK)
+        e = log_locked(sl, text, len);
+    unlock();
+    return e;
+}
+
 term_err_t term_registry_system_log(const char *writer,
                                     const char *text, size_t len)
 {
-    /*
-     * writer is the {writer_id} half of §4.4's record tag. The black box
-     * that consumes it is phase 3; this is the seam it tees from, and
-     * naming the parameter now is what keeps the print sink's call site
-     * from having to change then.
-     */
-    (void)writer;
-    if (s_console_id == TERM_ID_INVALID)
-        return TERM_ERR_NOT_READY;
-    /* No owner gate: the console belongs to the platform, and this is
-     * the platform writing to it. */
-    return term_registry_log(s_console_id, NULL, text, len);
+    return term_registry_platform_log(writer, TERM_WCLASS_APP, text, len);
 }
 
 /* ===================================================================== */

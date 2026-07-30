@@ -357,4 +357,7 @@ term.close(id);
   the canvas, not a layer above it — an app that draws over the term's
   rectangle wins until the term's next damage. Revisit with the CanvasApp
   dirty handling when the VT screen ships.
-- SGR stripping for the black box: not reached this phase (phase 3).
+- SGR stripping for the black box: not reached this phase. **Settled in phase
+  3** — it happens inside `term_lp_ring_append()`, i.e. in the tee at this
+  phase's own line-oriented ingest, and it drops every escape sequence rather
+  than only SGR. See `PHASE3_MANIFEST.md` §2 decision 1.

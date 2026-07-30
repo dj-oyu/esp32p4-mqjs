@@ -688,10 +688,11 @@ static const JSPropDef js_sys[] = {
     /* §11 store catalog: browse the shelf, install on demand */
     JS_CFUNC_DEF("store", 0, js_sys_store),
     JS_CFUNC_DEF("install", 1, js_sys_install),
-    /* term phase-3 prerequisite (docs/term-design.md §11.3): the LP SRAM
-       retention probe. Dev-facing, read-mostly; "arm" is one-shot and
-       "clear" is the abort. Returns a JSON string. */
-    JS_CFUNC_DEF("lpProbe", 1, js_sys_lpProbe),
+    /* term phase 3 (docs/term-design.md §4.4): the LP SRAM black box.
+       No argument = stats (any app). "live"/"lastboot" = the log tail, and
+       that read is gated on the dev slot or an embedded system app (§7.2).
+       Returns a JSON string. */
+    JS_CFUNC_DEF("blackbox", 2, js_sys_blackbox),
     JS_PROP_END,
 };
 

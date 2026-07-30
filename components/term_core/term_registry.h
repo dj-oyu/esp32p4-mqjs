@@ -426,6 +426,10 @@ term_err_t term_registry_feed(term_id_t id, const char *owner,
 
 /*
  * term.log (§8): the line-oriented convenience. Appends a newline,
+ * AND IS THE TEE POINT FOR THE LP BLACK BOX (§4.4) — see the note above
+ * term_registry_platform_log below for what that means and why it is here
+ * rather than in the parser.
+ *
  * accepts no escape interpretation beyond what the core already does, and
  * is ATOMIC PER LINE — a line is taken whole or dropped whole, so
  * concurrent writers never interleave halves of two messages (§3.2's
@@ -434,7 +438,10 @@ term_err_t term_registry_feed(term_id_t id, const char *owner,
  * into the ring.
  *
  * Legal on both modes. On a VT term it is equivalent to feeding the text
- * plus CRLF.
+ * plus CRLF — and a VT term is NOT teed to the black box (§3.2's table:
+ * "LP 黒箱 tee — TERM_VT: しない"), which the mode makes structural since a
+ * term's mode is fixed at create and a re-attach with a different one is
+ * TERM_ERR_MODE.
  */
 term_err_t term_registry_log(term_id_t id, const char *owner,
                              const char *text, size_t len);
@@ -609,14 +616,52 @@ int term_registry_ui_visit(term_ui_visit_fn fn, void *user);
 term_id_t term_registry_console_id(void);
 
 /*
- * The print sink (§3.1: print sink -> registry). Platform path, no owner
- * gate, routed to the console term; `writer` is the app name that
- * produced the line and is recorded for later per-writer filtering
- * (§4.4's {writer_id, class} record tag — the black box itself is phase
- * 3, and this is the seam it will tee from). Class A data by definition;
- * §4.4's contract with app developers is that anything printed may be
- * retained across a reset and pulled off the device by the owner's key.
- * Line-atomic and lossy, like term_registry_log.
+ * Which black-box partition a platform-side line belongs in (§4.4's static
+ * 8KB/23KB split, and the `class` half of its {writer_id, class} record
+ * tag). Both are class A data (§7.1); the split exists so that a chatty or
+ * hostile app cannot flush the platform's last words, which is why the
+ * caller — the only party that knows whether the writer is a trusted system
+ * app — decides, and the registry does not guess from the name.
+ */
+typedef enum {
+    TERM_WCLASS_APP    = 0,  /* user app print()/term.log -> 23KB partition */
+    TERM_WCLASS_SYSTEM = 1,  /* platform events, system apps -> 8KB         */
+} term_wclass_t;
+
+/*
+ * The platform log stream (§3.1: print sink -> registry). Two things happen,
+ * in this order:
+ *
+ *   1. THE LINE IS TEED TO THE LP BLACK BOX (§4.4) — always, whether or not
+ *      a console term exists and even before term_registry_init() has run.
+ *      The flight recorder is deliberately more reliable than the console:
+ *      if it needed the registry to be up, the lines from a boot that failed
+ *      before bring-up — the ones worth having — would be the ones missing.
+ *   2. the line is mirrored into the console term, if there is one, exactly
+ *      as term_registry_log would.
+ *
+ * `writer` is the app name that produced the line (§4.4's writer_id; it
+ * comes from a signed push, so it is a trustworthy identifier) and `wc`
+ * chooses the partition. No owner gate: the console belongs to the platform
+ * and this is the platform writing to it. Line-atomic and lossy.
+ *
+ * The return value describes step 2 only — TERM_ERR_NOT_READY when there is
+ * no console, TERM_ERR_TIMEOUT when the console dropped the line. Step 1 has
+ * no error a caller could act on; its counters are in term_lp_stats().
+ *
+ * SGR/escape stripping happens inside the black box (term_lp_ring.h, P4),
+ * not here: the console wants the escapes, the recorder must never keep
+ * them.
+ */
+term_err_t term_registry_platform_log(const char *writer, term_wclass_t wc,
+                                      const char *text, size_t len);
+
+/*
+ * The phase-2 spelling, kept because it is what the existing callers and
+ * suites use: exactly term_registry_platform_log(writer, TERM_WCLASS_APP,
+ * text, len). §4.4's contract with app developers is attached to this call —
+ * anything printed may be retained across a reset and pulled off the device
+ * by the owner's key, so an app must not print secrets.
  */
 term_err_t term_registry_system_log(const char *writer,
                                     const char *text, size_t len);

@@ -11,10 +11,14 @@ proceeds — a running contract, not a plan written once. Same reading rule as
 phase 2: the test author works from headers and `docs/term-design.md`, never
 from an implementation `.c`.
 
-Status: **§1 (the retention probe) implemented, off-device verification done,
-device run pending.** Nothing else in the phase has started, and by §11.3's own
-rule nothing else may: the ring is not implemented until the probe has run
-("未検証のまま実装しない").
+Status: **§1 (the retention probe) done and device-verified 2026-07-30; §2 (the
+ring, the boot-time `lastboot` capture and the JS introspection) implemented and
+verified off-device, device run pending. §3 (the MQTT responder) not started.**
+
+The probe of §1 has been **removed from the firmware** now that it has answered
+its question — it claimed the same LP region the ring needs, and the device must
+never have two owners of that memory. Its results below stand as the record, and
+the ring's boot marker is its permanent successor (§2, "Probe reconciliation").
 
 | Column | Meaning |
 |---|---|
@@ -23,7 +27,15 @@ rule nothing else may: the ring is not implemented until the probe has run
 
 ---
 
-## 1. LP SRAM retention probe (§11.3 prerequisite)
+## 1. LP SRAM retention probe (§11.3 prerequisite) — DONE, THEN REMOVED
+
+**The files described in this section no longer exist.** `term_lp_probe.{c,h}`,
+`tools/probe_lp.js`, the `sys.lpProbe` binding and the `app_main` hook were
+removed when the ring took the region (§2). Everything below is kept as the
+record of what was measured and how, because the ring's whole licence to exist
+is the "Results" table; to re-run a dedicated crash sequencer, restore the files
+from commit **77b1c99** — but read §2's "Probe reconciliation" first, because the
+ring measures the same thing continuously and on real data.
 
 ### What it tests, and why it exists at all
 
@@ -331,24 +343,383 @@ What the answers decide:
 
 ---
 
-## 2. LP SRAM black box ring (§4.4)
+## 2. LP SRAM black box ring (§4.4) — implemented, off-device verified
 
-**Blocked on §1's device run.** Not started, deliberately — §11.3 forbids
-implementing it on an unverified assumption. The seam it will tee from already
-exists: `term_registry_system_log(writer, …)` carries the `writer_id` of
-§4.4's record tag (accepted and not stored today).
+Status: **implementation complete, host + run_pc verification done, device build
+/ flash / device run are the orchestrator's steps (deliberately not run here).**
 
-Open questions that §1's results will settle, plus the ones §12 already lists:
+### Contract surface (test author reads these)
 
-- per-record CRC or region-level only (depends on whether any cause corrupts
-  rather than wipes)
-- where SGR stripping happens (§12: "ingest 時に属性ラン化した後なら素のテキス
-  トは手元にあるはず — 実装時に確認")
-- the 8 KB system / 23 KB app static split of §4.4 against the 31 KiB the probe
-  proves is placeable
+| File | Role | Read by tests | Status |
+|---|---|---|---|
+| `term_lp_ring.h` | The whole black box: region layout, record/header/partition structs, the strip rule, format/open/append, the iterator, the singleton, stats and the two JSON shapes. Six numbered properties (P1-P6) at the top are the invariants to test against | yes | done |
+| `term_registry.h` | `term_wclass_t` + `term_registry_platform_log` (new), and the tee note on `term_registry_log` | yes | done |
+| `PHASE3_MANIFEST.md` | This ledger | yes | done |
+| `docs/term-design.md` §4.4/§5/§7/§12 | Ground truth | yes | — |
+
+### Implementation (test author must NOT read)
+
+| File | Role | Read by tests | Status |
+|---|---|---|---|
+| `term_lp_ring.c` | Pure ring logic (CRC32, strip, validate, format, append, iterator, JSON) unguarded; the `RTC_NOINIT` region, `esp_reset_reason`, the clock and the PSRAM snapshot allocator `ESP_PLATFORM`-guarded, with inert host equivalents | NO | done |
+| `term_registry.c` | `log_locked` split out; the tee in `term_registry_log` (TERM_LOG only) and in `term_registry_platform_log`; `term_lp_ring_boot()` from `term_registry_init` | NO | done |
+| `components/mqjs/mqjs_runtime.c` | `js_sys_blackbox`; the print sink now passes a `term_wclass_t` and no longer needs a status-bar sink to tee | NO | done |
+| `components/mqjs/device_stdlib.c` | `sys.blackbox` replaces `sys.lpProbe` in the `js_sys[]` table | NO | done |
+| `components/mqjs/gen/device_stdlib.h` | ROM stdlib regen (-m32). `gen/mquickjs_atom.h` regenerates content-identical and was restored with `git checkout --` (CRLF trap) | NO | done |
+| `main/app_main.c` | `term_lp_ring_boot()` as the first statement, replacing the probe's hook | NO | done |
+| `CMakeLists.txt` | `term_lp_ring.c` in, `term_lp_probe.c` out, `nvs_flash` dropped from `PRIV_REQUIRES` (the probe was its only user) | NO | done |
+
+### The region, and where the numbers come from
+
+```
+offset   size    contents
+0        128     term_lp_hdr_t slot A      double-buffered (P5)
+128      128     term_lp_hdr_t slot B
+256      256     writer table: 8 x 32-byte names
+512      8192    SYS partition   §4.4 "システム区画 8KB"
+8704     23552   APP partition   §4.4 "アプリ区画 23KB"
+------------------
+32256            TERM_LP_REGION_BYTES
+```
+
+LP RAM is 32,744 B usable and IDF's own `.rtc.*` sections plus the 12 B of
+pre-existing `.rtc_noinit` take ~152 B, so this leaves **~336 B of slack**
+(§1 measured the probe's 31,744 B fitting with 848 B to spare). The linker
+ASSERTs the fit, so an over-large region fails the build rather than
+relocating; if the device link ever objects, `TERM_LP_APP_BYTES` is the one
+number to reduce. **To re-check on the device build:** `.rtc_noinit` at
+0x50108080 with size 0x7E0C (32,268 = 0xc + 32,256), still inside
+`lp_ram_seg`.
+
+Sizes worth knowing: record header 8 B, records 8-byte aligned and sized,
+payload cap 512 B, so ~68 B for a typical 60-byte log line (12% framing) and
+~120 live records in the SYS partition, ~340 in the APP partition at that
+size. `.bss` cost: one 512-byte staging buffer plus two 184-byte handles.
+
+### Decisions
+
+1. **SGR stripping happens in `term_lp_ring_append()`, not in the parser
+   (§12's open question, resolved).** §12 guessed the plain text would be at
+   hand "after attribute run-splitting at ingest". It is not: ingest copies
+   raw bytes into the per-term byte ring and the parser runs later, on the UI
+   frame task, producing attributed *cells* — there is no run-of-text stage
+   anywhere. Three reasons the tee therefore sits at the line-oriented ingest
+   instead: (a) re-serialising cells back to text would undo the parser's work
+   and lose line grouping; (b) the parser runs a frame or more after the
+   writer spoke, so a device that dies before the next frame would lose
+   exactly the last words the black box exists for; (c) the parser sees class
+   B (SSH) bytes, so class separation would become a filter instead of a
+   structure. The strip is *inside* append rather than at the call site, so no
+   caller can write raw bytes even by mistake.
+
+   **It strips every escape sequence, not only SGR.** That is a security
+   property: the black box is pulled off the device and printed on the
+   operator's terminal, so a retained escape would let any app that can call
+   `print()` inject terminal control into the reader's session. Also dropped:
+   the C0 controls except `\n`/`\t`, and DEL. Everything >= 0x20 passes
+   through byte for byte, so UTF-8 survives; a truncation at 512 B backs off
+   to a codepoint boundary so a pulled log is always valid UTF-8.
+
+2. **`lastboot` is frozen by copying the region image to PSRAM at boot, not
+   by sealing in place.** LP SRAM is the irreplaceable resource — 32 KiB,
+   no second source — and sealing would permanently halve the live ring to
+   protect the abundant kind of memory. §4.1's budget is 1.3 MB of PSRAM for
+   eight terminals; 31.5 KB more is 2.4% of that and 0.1% of the chip's PSRAM.
+   The copy is allocated **only when there is something to freeze**, so a cold
+   power-on pays nothing, and it is a flat byte copy, which means the frozen
+   image has the same layout as the live one and **one iterator serves both
+   sources** — the reason the MQTT responder of §3 needs no second decoder.
+   Allocation failure is `TERM_LP_PREV_NOMEM`: no lastboot, everything else
+   still works. PSRAM only (`MALLOC_CAP_SPIRAM`), never the internal SRAM the
+   size diet won back.
+
+3. **Probe reconciliation: the probe module is deleted, not repointed.** The
+   brief allowed either. Deleting wins because (a) a crash sequencer that can
+   still reboot the device four times while measuring a `.bss` buffer is a
+   hazard with no remaining benefit, and (b) the ring is a strictly better
+   instrument for the same question: the boot marker records this boot's
+   `esp_reset_reason()` next to the verdict on the previous image, so
+   `retention: ok | cold | lost | corrupt` is computed on **real log data,
+   every boot, forever** — including the two causes the probe could not reach
+   (brownout, and a task WDT if `CONFIG_ESP_TASK_WDT_PANIC` is ever enabled).
+   `retention: "lost"` means a reset that should have preserved LP SRAM found
+   the region wiped, and it is also `ESP_LOGW`n at boot with an explicit
+   marker. §1's results stay in this file; the code is one `git show 77b1c99`
+   away.
+
+   **Orchestrator note:** the dev slot may still hold `tools/probe_lp.js` from
+   the §1 run. `sys.lpProbe` no longer exists, so that script would now throw
+   on the dev slot after a flash — re-push `tools/dev_idle.js` (or the
+   blackbox probe) as §1's step 4 already said.
+
+4. **Region-level integrity only, as §1's results license — but two-level.**
+   `hdr.crc` covers the 124-byte header (recomputed per append over a DRAM
+   shadow, not over 31 KB of LP SRAM), and the content is validated
+   *structurally*: both record chains must walk from `tail` to `head`
+   consuming exactly `used` bytes, with every `len` in range, every class
+   valid, no record straddling a partition end, and a record count that
+   matches the header. Payload bytes are not checksummed — §1 measured
+   retention as bit-perfect or absent, never subtly rotten, so a per-record
+   CRC would only buy what the chain walk already catches. The writer table
+   has its own CRC over just the interned entries, and a failure there loses
+   **names only** (records still read, writer shows `?`).
+
+5. **The header is double-buffered and content is only ever written into
+   published free space (P5).** Without this, a crash during the append that
+   evicts the oldest record would overwrite the record the live header still
+   calls `tail`, and the chain walk would then reject the *whole* region —
+   losing the entire black box at the one moment it matters. So: evict, then
+   publish the advanced tail to the other header slot, then write the record,
+   then publish head. A reader takes the valid slot with the greatest `hseq`.
+   Cost: 128-256 B of header writes per record on a slow bus (§4.4 budgets
+   "a few KB/s"); benefit: a torn append costs the record in flight and
+   nothing else, which the host harness verifies directly by corrupting the
+   final header slot and the in-flight payload of a real append.
+
+6. **No lock in the ring; the registry's table mutex is the serialisation.**
+   The tee already runs under it, the lock order is registry -> ring, and the
+   ring never calls back — so there is no second order to get wrong. Adding a
+   mutex here would recreate the nested-lock question this project has already
+   paid for. `term_lp_ring_boot()` runs before any other task can reach the
+   ring, and the one path that can reach it with no registry (a `print()`
+   before bring-up) is js_task-only.
+
+7. **`term_registry_system_log`'s signature is unchanged; the class arrives
+   through a new sibling.** The phase-2 host suites call it with three
+   arguments and `host_test/` is off limits, so the class channel is
+   `term_registry_platform_log(writer, wc, text, len)` and `system_log` is
+   now `platform_log(writer, TERM_WCLASS_APP, …)`. The caller decides the
+   class because only the runtime knows whether a writer is a trusted system
+   app (`MqjsWorker::trusted_system`); the registry does not guess it from the
+   name. Platform code with no app on the stack also counts as system class.
+
+8. **The tee is more reliable than the console, on purpose.**
+   `term_registry_platform_log` records to the black box **before** it looks
+   for a console term and **even when the registry is not initialised** — the
+   lines from a boot that failed before bring-up are the ones worth having. It
+   also cost one change in `mqjs_runtime.c`: `out_write` no longer skips line
+   assembly when no status-bar sink is installed, because the flight recorder
+   must not depend on whether the host wired up a UI sink (and run_pc, the one
+   build without that sink, is where the tee is testable). The return value of
+   `platform_log` still describes the console write only, so the existing
+   suites' expectations (`NOT_READY` with no console, `OK` with one) hold.
+
+9. **The ring is self-starting.** Every singleton entry point calls
+   `term_lp_ring_boot()` first, so a build that forgets the `app_main` hook
+   still records — it only gets a later timestamp on the boot marker. Nothing
+   can overwrite the retained image before boot runs, because this module is
+   the region's only writer. This is also what makes `term_registry_init`'s
+   call (and therefore the 22 host suites and run_pc) exercise a real ring.
+
+10. **Class B is unreachable, not filtered (P3).** The only entry into the
+    ring is the line-oriented log path. `term.feed`, the byte ring, the
+    parser and the (phase-4) ssh pipe never call append. `term.log` on a
+    **TERM_VT** term does not tee either, per §3.2's table row — and a term's
+    mode is fixed at create (a re-attach with a different mode is
+    `TERM_ERR_MODE`), so that gate cannot drift. Preedit never enters term
+    state at all (§10.2).
+
+11. **A record is one ingest call, newlines included; `\r` is dropped.** The
+    tee sees the text before `term_registry_log` adds CRLF, so a record is
+    normally exactly one line. An app that hands `term.log` an embedded `\n`
+    gets it back inside one record (rendered as `\n` in the JSON dump). The
+    alternative — splitting into several records — would multiply the 8-byte
+    framing and attribute the halves as separate lines.
+
+12. **The writer table interns 8 names of 32 bytes, and overflows to
+    `WRITER_UNKNOWN` rather than truncating.** §4.4 wants a structural
+    `{writer_id, class}` tag with no prefix parsing; a 32-byte name in every
+    record would cost more than half the payload of a typical line, and
+    truncating names would let two distinct apps present the same identity
+    (the same argument that made `TERM_OWNER_MAX` 32). Interning also survives
+    the eviction of the record that introduced the name. A ninth writer's
+    records read `?` — never somebody else's identity — and `unnamed` counts
+    it. Names are sanitised (controls, `"` and `\` become `_`), which is what
+    lets `TERM_OWNER_SYSTEM` ("\1system") appear as `_system` and keeps the
+    JSON dump well-formed.
+
+13. **A name too long to store whole takes the table-full path, not a
+    truncation** (fix; the contract suite found it). Decision 12 said the
+    table "overflows to `WRITER_UNKNOWN` rather than truncating" and
+    `term_lp_ring.h` says it twice — "Names are stored whole, never truncated:
+    two distinct apps must not be able to present the same writer_id" and "a
+    record gets TERM_LP_WRITER_UNKNOWN rather than somebody else's identity".
+    The first implementation honoured that for the *ninth* writer and broke it
+    for a *long* one: the sanitiser silently cut at 31 bytes, so two 40-byte
+    names differing only after byte 33 interned to one entry and shared a
+    writer_id (`writers=1`, `unnamed=0` — the collision was not even counted).
+    Found by the phase-3 contract suite (`test_lp_writers`,
+    "a name that cannot be stored whole never becomes another identity"), which
+    asserted the header's claim without the reachability qualifier the
+    implementation had quietly assumed.
+
+    Fixed by making the sanitiser *fail* instead of truncating: a name that
+    does not fit whole into a 32-byte NUL-padded entry gets
+    `TERM_LP_WRITER_UNKNOWN` and `unnamed++`, exactly as a ninth writer does.
+    Not reachable from an app today — `TERM_LP_WRITER_MAX == MQJS_APP_NAME_MAX`
+    bounds every real writer at 31 bytes — so this is defence in depth, but the
+    header states the property with no qualifier and a header that overstates
+    is worse than one that is silent. It is also phase 2's decision #1
+    restated: **reject, never truncate**, because a truncated identifier is
+    indistinguishable from somebody else's.
+
+14. **`t_ms` is milliseconds since boot, not wall time.** After a reset the
+    only honest statement about a record is how long after boot it was
+    written; it wraps at 49 days of uptime. Records are emitted SYS-partition
+    first, then APP, so the dump is per-partition chronological, not globally
+    sorted — merging the two into one timeline is a reader-side choice the
+    responder can make.
+
+### JS surface
+
+```js
+sys.blackbox()               // stats JSON: any app (telemetry, like sys.heap)
+sys.blackbox("live")         // this session's tail   \ dev slot or embedded
+sys.blackbox("lastboot")     // the frozen previous  / system app ONLY
+sys.blackbox(what, from)     // skip `from` records; reply carries "next"
+```
+
+- Both content reads throw a `TypeError` for any other app rather than
+  returning an empty answer, because an empty answer looks like an empty
+  black box. The gate is the dev slot **or** `trusted_system`: a dev-slot push
+  arrives by the same Ed25519 signature as the MQTT responder's requests, i.e.
+  the device owner's key, which is exactly §7.2's gate for this data.
+- Stats carry no content and **no writer names** — counters only.
+- Both return a JSON *string* (the §1 decision #4 precedent): the shape lives
+  in C next to the data, a probe script forwards the parsed object wholesale,
+  and there is exactly one allocation with nothing live to move.
+- The shapes are documented in `term_lp_ring.h`. `retention` is the field to
+  read for "did LP SRAM survive this reset".
+
+### What the MQTT responder (§3) will consume
+
+Nothing new: `term_lp_report()`, `term_lp_dump_json(src, from, …)` or, for a
+custom wire format, `term_lp_iter_begin/next` over
+`term_lp_source(TERM_LP_SRC_LASTBOOT)`. The frozen source is immutable, so the
+responder needs no lock and its chunk cursor is exact; against LIVE the cursor
+is best-effort by construction, which is why forensics pull `lastboot`. The
+responder adds the signature gate and the NVS replay counter (§3) and no state
+here.
+
+### Off-device verification (done)
+
+- **Throwaway host harness** (ASan+UBSan, `-std=c99 -Wall -Wextra`, not a repo
+  file), 10 groups, **ALL RING CHECKS PASSED**:
+  - *layout*: `sizeof(term_lp_hdr_t) == 128`, `term_lp_rec_t == 8`,
+    `term_lp_part_t == 32`, region 32,256, SYS@512, APP@8704, handle 184 B.
+  - *strip*: SGR, OSC (BEL- and ST-terminated), DCS, nF (`ESC ( B` vanishes
+    whole — an early version left a stray `B`, which this test caught), an
+    unterminated CSI eating the rest, `\r`/BEL/DEL dropped, `\n`/`\t` kept,
+    UTF-8 byte-exact, truncation backing off to a codepoint boundary,
+    measure-only mode.
+  - *format/open*: a virgin region reports `zeroed`, one stray byte makes it
+    `garbage` instead, a formatted region validates on all six bits, an
+    unaligned or short region is refused rather than coerced, a read-only
+    handle refuses appends.
+  - *append/partitions*: SYS and APP routed by class, escapes stripped on the
+    way in, an all-escape line refused and counted, `TERM_LP_CLASS_PAD`
+    refused from a caller, iteration oldest-first over one or both partitions,
+    a fresh `open` of the same bytes seeing the same records.
+  - *writers*: 8 interned then 3 unnamed with `?` (never a wrong identity),
+    NULL writer, control/quote sanitisation, the same writer twice interning
+    once.
+  - *truncation*: a 1,024-byte line stored as 512 with `TERM_LP_F_TRUNC`.
+  - *wrap/evict*: 300 x 96-byte records through an 8,192-byte partition
+    (~3.8 laps, PAD exercised every lap) — 78 survivors, 222 evicted, chain
+    still valid, **the survivors are the newest records in order** (checked by
+    decoding the sequence number in each payload), and the APP partition
+    untouched at 0 bytes, which is P1's static split demonstrated.
+  - *corruption*: both header slots wrecked -> no open; the **stale** slot
+    wrecked -> the live one still wins and all 20 records read; a smashed
+    record header mid-chain -> `chain_ok` false while `crc_ok`/`geometry_ok`
+    stay true, and the iterator stops instead of running away; a corrupt
+    writer table -> `ok` true, `wt_crc_ok` false, records intact with `?`.
+
+    **Correction to an earlier line here** (it read "one flipped bit in the
+    live header -> `crc_ok` false with `magic_ok` true"): that is only the
+    outcome when **both** slots are damaged. Flip a bit in the *newer* slot
+    alone and `open()` still SUCCEEDS with `crc_ok` **true**, because the
+    double buffer hands the reader the older slot — which describes the same
+    region one record earlier. That is not a degraded result, it is P5 working
+    exactly as designed: the cost of a torn header write is the record in
+    flight and nothing else. `crc_ok` therefore means "*a* slot validated",
+    not "the newest slot validated"; the only way to make it false is to leave
+    no valid slot at all. The suites cover both shapes (`test_lp_torn`).
+
+    Where the other two integrity bits divide, for the same reason: a `used`
+    that contradicts head/tail arithmetic ((tail+used)%cap != head) is a
+    **geometry** failure, caught from the header alone before any record byte
+    is read; `chain_ok` covers only what the record walk can see (classes,
+    lengths, no straddling, landing on `head`, the record count). `chain_ok` is
+    not computed at all unless `geometry_ok` holds. Now stated in
+    `term_lp_ring.h` on `term_lp_check_t` itself.
+  - *reformat + freeze*: 40 records, copy out, re-format in place with
+    `boot_seq+1`; the frozen copy keeps all 40 while the new session logs, and
+    a reader of the re-formatted region is **not** fooled by the stale slot's
+    much higher `hseq`.
+  - *torn append (P5)*: after the partition is full, one more append, then
+    (a) the final header store corrupted -> the region still validates and
+    reads one record fewer, (b) the in-flight record's bytes smashed as well
+    -> still validates, still reads the same set, (c) the untouched region
+    shows the completed record. This is the property the whole double-buffer
+    exists for.
+  - *singleton*: idempotent boot, `retained` false off-device, boot marker
+    present, `retention: cold` on a zeroed region, JSON round-trips through
+    `JSON.parse`, `"` and `\` escaped, a small buffer stops with `more: 1` and
+    still closes its braces, a hopeless buffer yields
+    `{"ready":1,"error":"truncated"}` rather than half a document.
+- **Host suites**: `host_test/run_tests.sh` -> at the time of writing **22
+  suites, ALL SUITES PASSED** (the runner globs the parent directory, so
+  `term_lp_ring.c` is compiled into every suite and `term_registry_init` boots
+  a real ring in all of them).
+
+  **Superseded by the phase-3 contract suites.** The test author's nine
+  `test_lp_*` suites bring the runner to **31 suites / ~28.4k checks**; after
+  decision 13's fix, **30 pass and `test_lp_writers` has one red check left**,
+  at `test_lp_writers.c:222`. That check is not a defect report — it is
+  unsatisfiable alongside the block directly above it in the same case, which
+  requires **both** over-long names to resolve to `"?"` (the header's rule, and
+  what the implementation now does) while line 222 requires the two resolved
+  names to **differ**. Two C strings cannot both equal `"?"` and differ, so no
+  implementation can turn that case green. Flagged to the orchestrator; the
+  suite is the test author's file and was deliberately not edited here.
+- **run_pc**: builds clean with `../term_core/term_lp_ring.c` added to the
+  phase-2 recipe; `pc_term_basic`, `pc_term_errors`, `pc_term_name`,
+  `pc_term_resize` all **ALL PASS**, `pc_term_probe` reports ready, and
+  `tools/smoke_examples.sh` (11 shipped examples) passes — no regression from
+  the `out_write` change.
+- **`sys.blackbox` through run_pc**: stats report `ready=1 retained=0
+  region=32256 boot_seq=1 reset=unknown retention=cold`, `sys.blackbox("live")`
+  returns the boot marker plus the app's own `print()` lines tagged
+  `app/<appname>`, a `term.log` line arrives SGR-stripped, **a `term.log` on a
+  TERM_VT term does not appear at all** (P3 observed from JS), `from` advances
+  the cursor, `sys.blackbox("nope")` throws.
+- **Not run** (orchestrator's steps, deliberately): the device build, the
+  flash, and any push to the device.
+
+### Open on the device
+
+- **Is the LP region write-buffered from the HP core?** Everything here
+  assumes a store to LP SRAM is visible to the next boot immediately, which
+  §1's probe cannot distinguish (it crashed 15 s after writing). If P4's LP
+  RAM were behind a write-back cache, the *last* record before a panic could
+  be lost. The observable: whether the record immediately preceding a crash is
+  present in `lastboot`. Expected present (LP RAM is outside the cached
+  address ranges).
+- **`.rtc_noinit` placement and size** in the device `.map` (expected 0x7E0C
+  at 0x50108080), and that the ~336 B remainder does not upset
+  `heap_caps_init` — §1 established that a region too small for
+  `multi_heap_register` is logged and skipped, not fatal.
+- The first real `retention` verdict after a panic: expected `ok` with
+  `prev: captured`, which is §1's result restated on live data.
 
 ## 3. MQTT responder + signature gate (§7.3)
 
-Not started. Depends on §2 for `lastboot`; the accepted-counter high-water mark
-goes in **NVS, not LP SRAM** (§7.3 is explicit: LP is lost on power cut, so a
-replay window would reopen after one power cycle).
+Not started. Depends on §2 for `lastboot` — and only on its **read** API:
+`term_lp_report` / `term_lp_dump_json` / the iterator over
+`term_lp_source(TERM_LP_SRC_LASTBOOT)`, all of which exist and are verified.
+The accepted-counter high-water mark goes in **NVS, not LP SRAM** (§7.3 is
+explicit: LP is lost on a power cut, so a replay window would reopen after one
+power cycle). Note that `nvs_flash` was dropped from this component's
+`PRIV_REQUIRES` when the probe went; the responder will need it back (or,
+better, will live where the MQTT client already does).

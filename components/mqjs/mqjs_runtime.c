@@ -62,7 +62,7 @@
    unconditionally and term.* works in run_pc exactly as ui.* does. The
    device glue behind term_ui_tab5.h is the only ESP-only part. */
 #include "term_registry.h"
-#include "term_lp_probe.h"
+#include "term_lp_ring.h"
 #include "app/mqjs_app_manager_internal.h"
 /* mkdir()/fsync() for the personal dictionary (S7). Outside the
    ESP_PLATFORM block on purpose: the same code runs in run_pc, and
@@ -535,7 +535,8 @@ void mqjs_set_uninstall_hook(void (*fn)(const char *name))
 
 /* Flush one assembled line to the sink. Non-dev apps get a "[name] "
    prefix so the shared console stays attributable (§3.5). */
-static void term_sink_line(const char *writer, const char *line, size_t len);
+static void term_sink_line(const char *writer, term_wclass_t wc,
+                           const char *line, size_t len);
 
 static void sink_flush(void)
 {
@@ -543,12 +544,19 @@ static void sink_flush(void)
     char *line = app ? app->sink_line : s_orphan_line;
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
     /* §3.1's second sink: the same assembled line also goes to the term
-       registry's console, tagged with the app that wrote it (§4.4's
-       {writer_id, class} — the LP black box tees from here in phase 3).
-       Independent of s_print_sink: the console screen must work whether
-       or not the host wired a status-bar sink. */
+       registry's console AND to the §4.4 LP black box, tagged with the app
+       that wrote it ({writer_id, class}). Independent of s_print_sink: the
+       console screen must work whether or not the host wired a status-bar
+       sink. The class is decided HERE because this is where the writer's
+       trust level is known: platform code with no app on the stack and
+       embedded system apps go to §4.4's 8KB system partition, every other
+       app to the 23KB app partition, so a chatty app cannot flush the
+       platform's last words. */
     if (*plen)
-        term_sink_line(app && app->name[0] ? app->name : "system", line, *plen);
+        term_sink_line(app && app->name[0] ? app->name : "system",
+                       (!app || app->trusted_system) ? TERM_WCLASS_SYSTEM
+                                                     : TERM_WCLASS_APP,
+                       line, *plen);
     if (s_print_sink && *plen) {
         if (app && app->idx != MQJS_WORKER_DEV && app->name[0]) {
             char buf[sizeof(app->sink_line) + sizeof(app->name) + 4];
@@ -565,8 +573,12 @@ static void sink_flush(void)
 static void out_write(const void *buf, size_t len)
 {
     fwrite(buf, 1, len, stdout);
-    if (!s_print_sink)
-        return;
+    /* Line assembly runs whether or not a status-bar sink was installed:
+       sink_flush() has three consumers now (the status bar, the term console
+       and §4.4's LP black box), and making the flight recorder depend on
+       whether the host wired up a UI sink would be an accidental coupling —
+       the one build without that sink (run_pc) is also the one where the
+       tee most needs to be testable. */
     MqjsWorker *app = s_cur_wk;
     char *line = app ? app->sink_line : s_orphan_line;
     size_t *plen = app ? &app->sink_len : &s_orphan_len;
@@ -6160,13 +6172,15 @@ static void mqjs_term_pump(void)
 #endif
 }
 
-/* The print sink's tee (§3.1 "print sink -> registry"). Silent until an
-   app has brought the subsystem up; never allocates, never blocks. */
-static void term_sink_line(const char *writer, const char *line, size_t len)
+/* The print sink's tee (§3.1 "print sink -> registry", §4.4's black box).
+   Never allocates, never blocks. No readiness check on purpose: the black
+   box half of term_registry_platform_log works before the registry is up,
+   and a line from a boot that never reached the console is exactly the kind
+   the flight recorder exists to keep. */
+static void term_sink_line(const char *writer, term_wclass_t wc,
+                           const char *line, size_t len)
 {
-    if (!term_registry_ready())
-        return;
-    term_registry_system_log(writer, line, len);
+    term_registry_platform_log(writer, wc, line, len);
 }
 
 /* The calling app's identity, or NULL when there is no app on the
@@ -6429,36 +6443,80 @@ JSValue js_term_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     return term_err_value(ctx, term_registry_close((term_id_t)id, owner));
 }
 
-/* sys.lpProbe([action]) -> the LP SRAM retention probe's state and verdicts
-   as a JSON string (see term_lp_probe.h for the shape).
-     sys.lpProbe()        read only
-     sys.lpProbe("arm")   arm the sequence — ONE-SHOT: a no-op when one is
-                          already running or when results are present, so the
-                          dev-slot script that arms it can re-run on every
-                          boot (which it does) without re-arming
-     sys.lpProbe("clear") erase state + results; also stands down a sequence
-                          still inside its pre-crash delay window
-   Always returns the report, whatever the action, so a caller never has to
-   make a second call to see what it did. Dev-facing: this is the §11.3
-   prerequisite probe, not part of the term contract of §8. */
-JSValue js_sys_lpProbe(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+/* sys.blackbox([what[, from]]) -> the LP SRAM black box (docs/term-design.md
+   §4.4), as a JSON string. See term_lp_ring.h for both shapes.
+
+     sys.blackbox()               stats: presence, boot_seq, this boot's reset
+                                  cause, the retention verdict, per-partition
+                                  byte/record counters. NO content and no
+                                  writer names, so any app may ask — it is
+                                  telemetry of the same kind as sys.heap().
+     sys.blackbox("lastboot")     the frozen previous session's log tail
+     sys.blackbox("live")         this session's tail so far
+     sys.blackbox(what, from)     skip `from` records; the reply's "next" is
+                                  the cursor for the following chunk
+
+   The two content reads are PRIVILEGED (§7.2: the black box is platform data
+   and mixes every app's lines, so no ordinary app may read it). The gate is
+   the dev slot or an embedded system app — the dev slot arrives by the same
+   Ed25519-signed push as the MQTT responder's requests, i.e. the device
+   owner's key, which is precisely §7.2's gate for this data. Everyone else
+   gets a TypeError rather than a value, because a silent empty answer would
+   look like an empty black box.
+
+   The MQTT responder of §7.2 is the other consumer of the same C read API;
+   it does not go through this binding. */
+JSValue js_sys_blackbox(JSContext *ctx, JSValue *this_val, int argc,
+                        JSValue *argv)
 {
     (void)this_val;
-    char act[16];
-    act[0] = '\0';
-    if (argc >= 1 && uiw_copy_str(ctx, argv[0], act, sizeof act))
+    char what[16];
+    int from = 0;
+    size_t cap, len;
+    char *buf;
+    JSValue v;
+
+    what[0] = '\0';
+    if (argc >= 1 && uiw_copy_str(ctx, argv[0], what, sizeof what))
         return JS_EXCEPTION;
-    if (!strcmp(act, "arm"))
-        term_lp_probe_arm();
-    else if (!strcmp(act, "clear"))
-        term_lp_probe_clear();
-    /* Off the JS heap: a kilobyte of report should not move an app's arena,
-       and the buffer is gone before JS_NewStringLen can trigger a GC. */
-    char *buf = malloc(TERM_LP_PROBE_REPORT_MAX);
-    if (!buf)
+    if (argc >= 2 && JS_ToInt32(ctx, &from, argv[1]))
+        return JS_EXCEPTION;
+    if (from < 0)
+        from = 0;
+
+    if (what[0]) {
+        bool last = !strcmp(what, "lastboot");
+        if (!last && strcmp(what, "live")) {
+            JS_ThrowTypeError(ctx, "blackbox: expected \"live\" or \"lastboot\"");
+            return JS_EXCEPTION;
+        }
+        if (!s_cur_wk ||
+            !(s_cur_wk->idx == MQJS_WORKER_DEV || s_cur_wk->trusted_system)) {
+            JS_ThrowTypeError(ctx, "blackbox content requires the dev slot "
+                                   "or an embedded system app");
+            return JS_EXCEPTION;
+        }
+        cap = TERM_LP_DUMP_MAX;
+        /* Off the JS heap: kilobytes of report should not move an app's
+           arena, and the buffer is gone before JS_NewStringLen can GC. */
+        buf = malloc(cap);
+        if (!buf)
+            return JS_NULL;
+        len = term_lp_dump_json(last ? TERM_LP_SRC_LASTBOOT
+                                     : TERM_LP_SRC_LIVE,
+                               (uint32_t)from, buf, cap);
+    } else {
+        cap = TERM_LP_REPORT_MAX;
+        buf = malloc(cap);
+        if (!buf)
+            return JS_NULL;
+        len = term_lp_report(buf, cap);
+    }
+    if (!len) {
+        free(buf);
         return JS_NULL;
-    size_t len = term_lp_probe_report(buf, TERM_LP_PROBE_REPORT_MAX);
-    JSValue v = JS_NewStringLen(ctx, buf, len);
+    }
+    v = JS_NewStringLen(ctx, buf, len);
     free(buf);
     return v;
 }
