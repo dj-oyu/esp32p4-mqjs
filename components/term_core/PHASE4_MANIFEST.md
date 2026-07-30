@@ -627,7 +627,38 @@ device checklist:
 - pixels: tab bar, selection highlight colours, the term's own cursor cell,
   underline position, and whether hide→show actually repaints on glass.
 
-## Device checklist (the orchestrator runs this)
+## Device checklist — automated half DONE 2026-07-30
+
+Firmware flashed (build `C:\esp-build\term-native-m`, 3 hashes verified) and
+`ssh_vt2` shelved (body 40,507 B). Two things ran without a human:
+
+**Black box across the flash** — `bb_pull stats` on the new firmware:
+`retention=ok, prev=captured, lastboot=1, dropped=0 trunc=0 refused=0`.
+The phase-3 responder is unaffected by the phase-4 plumbing.
+
+**tools/probe_term_vt.js — 16/16 checks, 0 failures.** This is everything
+phase 4 added *except* a live ssh session (the app takes credentials
+interactively, so a real pipe needs a human):
+
+- vt-mode create, `show`, and escape parsing through the real UI-task
+  drain: plain text, `\x1b[4m`/`\x1b[9m` runs and a `\x1b[5;3H` cursor
+  move all land where the snapshot says they should; **no escape byte
+  survives into the snapshot**.
+- **`onReply` delivered a DSR answer** (`\x1b[6n` → 1 reply) — the
+  feed-driven reply route works on hardware.
+- **`term.pipe(id, <bogus handle>)` returns a negative error, does not
+  throw and does not crash**; `unpipe` on an unpiped term likewise.
+- hide → re-show → `resize(60,20)` all return 0 and the content survives
+  (Defect A's repaint path exercised end to end, minus the pixels).
+- Heap after the run: 25.0 MB PSRAM / 116 KB internal free.
+
+**Still needs a human at the device** (unchanged from "Device-only"):
+a real ssh session through `term.pipe` (backpressure under a `top`
+redraw storm, wolfSSH stalling on a full ring rather than dying),
+the *pixels* of underline/strike at 9×24, the IME float anchoring under
+the terminal cursor, rotation/pty-resize, tab switching, selection →
+clipboard, background non-painting, persist re-attach, and Defect B's
+severity. Numbered walkthrough below.
 
 Push both apps; `ssh_vt` stays installed as the fallback. Note that
 `vault` is namespaced by app name, so **the password and host key must be
