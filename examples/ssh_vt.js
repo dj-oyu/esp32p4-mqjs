@@ -967,6 +967,12 @@ if (SELFTEST) {
             /* 切断済みでも投げてよい (C 側が id を見て捨てる) */
             ssh.resize(sessions[i].id, COLS, ROWS);
         }
+        /* 選択はセル座標で持っている。ROWS が縮むと drawSel が t.rows[r] の
+           外を触って TypeError — ドックを挿した指がまだ画面に乗っている間
+           (長押し選択中の回転) に実際に起きる。
+           (フロートの張り直しはここには要らない。preedit と候補は C の
+           持ち物になり、アンカーは ui.caret() が下のティックから報告する) */
+        sel = null;
         /* フォーム表示中は端末を描き戻さない — メトリクスだけ直して
            おき、returnTerminal() が戻ってきたときに描く */
         if (inForm)

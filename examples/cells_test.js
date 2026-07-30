@@ -12,19 +12,42 @@ sys.setAppName("cells_test");
 var cs = ui.cellSize();
 print("cellSize = " + cs[0] + " x " + cs[1]);
 
-ui.clear(0x0B0E11);
-ui.cells(0, 0, "ABCDEFGHIJ abcdefghij 0123456789 !@#$%^&*()", 0xC9D1D9, 0x0B0E11);
-ui.cells(0, 1, "red", 0xE05A4E, 0x0B0E11);
-ui.cells(4, 1, "green", 0x2ECC71, 0x0B0E11);
-ui.cells(10, 1, "blue", 0x4FC3F7, 0x0B0E11);
-ui.cells(0, 2, "inverse-bar (fg/bg swap)", 0x0B0E11, 0xFFD479);
-ui.cells(0, 3, "box: ┌──┐ │xx│ └──┘",
-         0xC9D1D9, 0x0B0E11);
-ui.cells(0, 4, "col79 ->", 0x8B98A5, 0x0B0E11);
-ui.cells(72, 4, "END", 0xFF6B5E, 0x0B0E11);     /* 80 桁目付近 */
-ui.cells(0, 6, "scroll test: this row should move up by 1", 0xC678DD, 0x0B0E11);
-ui.scroll(0, 6, 1, 0x0B0E11);                    /* 0..6 を 1 行上へ */
-ui.cells(0, 6, "row6 after scroll (was blank)", 0x56B6C2, 0x0B0E11);
+var W = 0;
+
+/* 回転すると C がキャンバスを張り直して隠すので、描き直さない限り画面はコンソールのまま
+ * ＝「グリフが正しく出たか」を見るテストが偽陰性になる。桁数も 720<->1280 で変わるため
+ * END マーカーの位置は毎回 ui.size() から出し直す。[0,0] は画面なし板なので前の値を保つ。 */
+function draw() {
+    W = ui.size()[0] || W;
+    var endCol = (W / cs[0] | 0) - 3;
+    if (endCol < 1) endCol = 1;
+    ui.clear(0x0B0E11);
+    ui.cells(0, 0, "ABCDEFGHIJ abcdefghij 0123456789 !@#$%^&*()", 0xC9D1D9, 0x0B0E11);
+    ui.cells(0, 1, "red", 0xE05A4E, 0x0B0E11);
+    ui.cells(4, 1, "green", 0x2ECC71, 0x0B0E11);
+    ui.cells(10, 1, "blue", 0x4FC3F7, 0x0B0E11);
+    ui.cells(0, 2, "inverse-bar (fg/bg swap)", 0x0B0E11, 0xFFD479);
+    ui.cells(0, 3, "box: ┌──┐ │xx│ └──┘",
+             0xC9D1D9, 0x0B0E11);
+    ui.cells(0, 4, "last col ->", 0x8B98A5, 0x0B0E11);
+    ui.cells(endCol, 4, "END", 0xFF6B5E, 0x0B0E11); /* 右端付近 */
+    ui.cells(0, 6, "scroll test: this row should move up by 1", 0xC678DD, 0x0B0E11);
+    ui.scroll(0, 6, 1, 0x0B0E11);                    /* 0..6 を 1 行上へ */
+    ui.cells(0, 6, "row6 after scroll (was blank)", 0x56B6C2, 0x0B0E11);
+}
+draw();
+
+ui.onKey(function (k) {
+    if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate") { draw(); }
+});
 
 print("cells_test drew without crashing");
-setInterval(function () {}, 2000); /* 画面を保持 */
+setInterval(function () {
+    /* "\x00rotate" はフォアグラウンドのアプリにしか届かない。取りこぼした一回で
+     * ズレっぱなしになるので、副作用の無い ui.size() と突き合わせて拾い直す。 */
+    if (ui.size()[0] !== W) { draw(); }
+}, 2000); /* 画面を保持 */
+
+/* 背面では描画コマンドが捨てられる — 裏で回転を拾うと W だけ新しくなり、
+ * 前面に戻っても上の突き合わせが一致してしまうので描き直しの機会が消える */
+sys.onForeground(draw);

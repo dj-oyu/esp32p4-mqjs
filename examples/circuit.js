@@ -23,14 +23,18 @@ sys.setAppName("circuit");
 var SELFTEST = false; /* true にすると PC でソルバ検証だけ走る */
 var HAS_UI = !SELFTEST && ui.size()[0] !== 0;
 
-/* ===== レイアウト定数 (720x1192 キャンバス) ===== */
-var W = 720;
+/* ===== レイアウト (実寸は relayout() が ui.size() から導出する) ===== */
 var SP = 80;                 /* 格子間隔 */
-var GC = 9, GR = 7;          /* 格子ノード数 (列 x 行) */
 var GX0 = 40, GY0 = 96;      /* 格子原点 */
-var FML_Y = 584;             /* 導出式エリアの先頭 y */
-var SHEET_ROW0 = 29;         /* 表のヘッダ行 (ui.cells 行番号, 1行=24px) */
-var SHEET_MAX = 19;          /* 表に出せる部品行数 */
+var CELL_W = 9, CELL_H = 24; /* ui.cells の 1 セル */
+var TOOL_H = 72;             /* ツールバー帯の高さ */
+var W = 720, H = 1192;       /* キャンバス実寸 */
+var BTN_PITCH, BTN_W;        /* ツールバーのボタン間隔・幅 */
+var GC, GR;                  /* 格子ノード数 (列 x 行) */
+var GRID_X1, GRID_Y1;        /* 格子帯の右端・下端 */
+var FML_Y, FML_COLS;         /* 導出式エリアの先頭 y と桁数 */
+var SHEET_X0, SHEET_ROW0;    /* 表の原点 (ui.cells 座標) */
+var SHEET_MAX, SHEET_COLS;   /* 表に出せる部品行数・桁数 */
 
 var BG = 0x101820;
 var COL_WIRE = 0xC9D1D9, COL_R = 0x4FC3F7, COL_V = 0xFFD479;
@@ -49,7 +53,6 @@ var editIdx = -1;            /* 編集中の部品 index (-1 = なし) */
 var editBuf = "";
 var editFresh = false;       /* 編集開始直後 = 最初の文字で全置換 (表計算流) */
 var kbH = 0;                 /* キーボードの予約高さ (編集中のみ > 0) */
-var H = HAS_UI ? ui.size()[1] : 1192;
 var ana = null;              /* 直近の解析結果 */
 
 function nx(n) { return GX0 + (n % 16) * SP; }
@@ -490,11 +493,11 @@ var TOOLS = [
 
 function drawToolbar() {
     for (var i = 0; i < TOOLS.length; i++) {
-        var bx = 8 + i * 142;
+        var bx = 8 + i * BTN_PITCH;
         var active = TOOLS[i].m === mode;
-        ui.rect(bx, 8, 134, 56, active ? 0x2E6BD6 : 0x222C36);
+        ui.rect(bx, 8, BTN_W, 56, active ? 0x2E6BD6 : 0x222C36);
         var tw = ui.textSize(TOOLS[i].lbl)[0];
-        ui.text(bx + ((134 - tw) >> 1), 26, TOOLS[i].lbl,
+        ui.text(bx + ((BTN_W - tw) >> 1), 26, TOOLS[i].lbl,
                 active ? 0xFFFFFF : COL_TXT);
     }
 }
@@ -590,10 +593,10 @@ function drawFormula() {
             l3 = "部品をタップすると V・I の導出式をここに表示";
         }
     }
-    ui.text(8, FML_Y, cap(l1, 56), COL_TXT);
-    ui.text(8, FML_Y + 24, cap(l2, 56), 0x9FB3C8);
-    ui.text(8, FML_Y + 48, cap(l3, 56), COL_SEL);
-    ui.text(8, FML_Y + 72, cap(l4, 56), COL_SEL);
+    ui.text(8, FML_Y, cap(l1, FML_COLS), COL_TXT);
+    ui.text(8, FML_Y + 24, cap(l2, FML_COLS), 0x9FB3C8);
+    ui.text(8, FML_Y + 48, cap(l3, FML_COLS), COL_SEL);
+    ui.text(8, FML_Y + 72, cap(l4, FML_COLS), COL_SEL);
 }
 
 function sheetComps() {
@@ -606,7 +609,7 @@ function sheetComps() {
 function drawSheet() {
     var hdr = pad(" ID", 5) + pad("value", 14) + pad("V", 10) +
               pad("I", 10) + pad("P", 10) + "(行タップで編集)";
-    ui.cells(0, SHEET_ROW0, pad(hdr, 80), COL_DIM, 0x1A232C);
+    ui.cells(SHEET_X0, SHEET_ROW0, pad(hdr, SHEET_COLS), COL_DIM, 0x1A232C);
     var list = sheetComps();
     var n = list.length < SHEET_MAX ? list.length : SHEET_MAX;
     for (var k = 0; k < n; k++) {
@@ -620,11 +623,11 @@ function drawSheet() {
         var sel = selComp >= 0 && selComp < comps.length && comps[selComp] === c;
         var bg = sel ? 0x24435E : (k & 1) ? 0x10161C : 0x0B0E11;
         var fg = c.kind === "V" ? COL_V : COL_TXT;
-        ui.cells(0, SHEET_ROW0 + 1 + k, pad(line, 80), fg, bg);
+        ui.cells(SHEET_X0, SHEET_ROW0 + 1 + k, pad(line, SHEET_COLS), fg, bg);
     }
     /* 余り行を掃除 (部品削除後のゴミ消し) */
     for (var e = n; e < SHEET_MAX; e++)
-        ui.cells(0, SHEET_ROW0 + 1 + e, pad("", 80), COL_DIM, BG);
+        ui.cells(SHEET_X0, SHEET_ROW0 + 1 + e, pad("", SHEET_COLS), COL_DIM, BG);
 }
 
 function scene() {
@@ -635,6 +638,51 @@ function scene() {
         drawComp(comps[i], i === selComp);
     drawFormula();
     drawSheet();
+}
+
+/* 負数 = 純クエリ (表示を変えない)。0 は「まだ答えられない」(キャンバス未生成)
+ * であって「キーボードが無い」ではないので直前の値を保つ。逆に dock 装着時は
+ * 0 が正しい答え — ここを `|| 400` で埋めると 632px のキャンバスに 400px の
+ * 死に領域ができ、編集中のタップがすべてそこに吸われる。 */
+function curKb() {
+    var v = ui.keyboard(-1);
+    return ui.size()[0] ? v : kbH;
+}
+
+/* dock の着脱で C 側がキャンバスの縦横を入れ替える。C がやるのは寸法の差し替えと
+ * 「描き直すまで隠す」ところまでで、桁数・行数・当たり判定を引き直すのはアプリの
+ * 仕事 — 起動時の縦向きの値のまま描くと表が画面の外に落ちて二度と戻らない。 */
+function relayout() {
+    var s = ui.size();
+    W = s[0] || W;               /* [0,0] = 画面なし: 前の値を保つ */
+    H = s[1] || H;
+    kbH = editIdx >= 0 ? curKb() : 0;
+    BTN_PITCH = ((W - 8) / TOOLS.length) | 0;
+    BTN_W = BTN_PITCH - 8;
+    var cols = (W / CELL_W) | 0, rows = (H / CELL_H) | 0;
+    if (W > H) {
+        /* 横向きは表 20 行を下に積む高さが無い (積むと格子が 3 行に潰れて、
+           r*16+c で保存済みの部品が格子の外に出る) ので右の帯へ移す */
+        SHEET_X0 = cols - 54;    /* 表 1 行 = 49 桁 + 余白 */
+        SHEET_ROW0 = (TOOL_H / CELL_H) | 0;
+        FML_Y = H - 4 * CELL_H - 8;
+        SHEET_MAX = ((FML_Y / CELL_H) | 0) - SHEET_ROW0 - 1;
+    } else {
+        SHEET_X0 = 0;
+        SHEET_MAX = 19;
+        SHEET_ROW0 = rows - SHEET_MAX - 1;
+        FML_Y = (SHEET_ROW0 - 4) * CELL_H - 16;
+    }
+    SHEET_COLS = cols - SHEET_X0;
+    GRID_X1 = SHEET_X0 ? SHEET_X0 * CELL_W : W;
+    GRID_Y1 = FML_Y - 4;
+    FML_COLS = ((W - 16) / 12.5) | 0;   /* ui.text の半角 1 字 ≈ 12.5px */
+    GC = (((GRID_X1 - 2 * GX0) / SP) | 0) + 1;
+    if (GC > 16) GC = 16;        /* ノードは r*16+c で詰めている */
+    if (GC < 2) GC = 2;
+    GR = (((GRID_Y1 - GY0) / SP) | 0) + 1;
+    if (GR < 2) GR = 2;
+    scene();                     /* C が隠したキャンバスは描くまで戻らない */
 }
 
 /* ===== 操作 ===== */
@@ -708,7 +756,7 @@ function startEdit(i) {
     editBuf = comps[i].expr;
     editFresh = true;
     selComp = i;
-    kbH = ui.keyboard(1) || 400;
+    kbH = ui.keyboard(1);
     scene();
 }
 
@@ -731,10 +779,10 @@ function handleTouch(x, y, kind) {
     if (editIdx >= 0 && y >= H - kbH) return;
     if (editIdx >= 0) commitEdit(true); /* 表計算ライク: 他をタップで確定 */
 
-    if (y < 72) {
-        var bi = ((x - 8) / 142) | 0;
+    if (y < TOOL_H) {
+        var bi = ((x - 8) / BTN_PITCH) | 0;
         if (bi < 0 || bi >= TOOLS.length) return;
-        if (x < 8 + bi * 142 || x > 8 + bi * 142 + 134) return;
+        if (x < 8 + bi * BTN_PITCH || x > 8 + bi * BTN_PITCH + BTN_W) return;
         if (TOOLS[bi].m === "CLR") {
             comps = [];
             seq = { R: 0, V: 0 };
@@ -750,7 +798,7 @@ function handleTouch(x, y, kind) {
         return;
     }
 
-    if (y < 580) {
+    if (y < GRID_Y1 && x < GRID_X1) {
         var nn = mode === "DEL" ? -1 : nearestNode(x, y);
         if (nn >= 0) { nodeTap(nn); return; }
         var ci = nearestComp(x, y);
@@ -773,9 +821,11 @@ function handleTouch(x, y, kind) {
         return;
     }
 
-    var idx = ((y / 24) | 0) - SHEET_ROW0 - 1;
+    var idx = ((y / CELL_H) | 0) - SHEET_ROW0 - 1;
     var list = sheetComps();
-    if (idx >= 0 && idx < list.length && idx < SHEET_MAX) {
+    /* 横向きの表は右の帯: 左半分の同じ行 (= 導出式) を行タップと誤らない */
+    if (x >= SHEET_X0 * CELL_W && idx >= 0 && idx < list.length &&
+        idx < SHEET_MAX) {
         for (var i = 0; i < comps.length; i++) {
             if (comps[i] === list[idx]) { startEdit(i); return; }
         }
@@ -783,6 +833,8 @@ function handleTouch(x, y, kind) {
 }
 
 function handleKey(k) {
+    /* レイアウト変更は編集中でなくても処理する (下の editIdx ガードより前に) */
+    if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate") { relayout(); return; }
     if (editIdx < 0) return;
     if (k === "\n") { commitEdit(true); return; }
     if (k === "\b") {
@@ -945,7 +997,7 @@ function selftest() {
 if (HAS_UI) {
     load();
     recompute();
-    scene();
+    relayout();
     ui.onTouch(handleTouch);
     ui.onKey(handleKey);
     sys.onForeground(function () {
@@ -955,8 +1007,16 @@ if (HAS_UI) {
         kbH = 0;
         ui.keyboard(0);
         recompute();
-        scene();
+        relayout();
     });
+    /* "\x00rotate" だけに頼らない。トークンはフォアグラウンドのアプリにしか
+       届かず、取りこぼした一回がそのままズレっぱなしになる。ui.size() と
+       ui.keyboard(-n) は副作用の無いクエリなので突き合わせてよい。 */
+    setInterval(function () {
+        var s = ui.size();
+        if (s[0] !== W || s[1] !== H || (editIdx >= 0 && curKb() !== kbH))
+            relayout();
+    }, 500);
 } else {
     selftest();
 }

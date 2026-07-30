@@ -63,7 +63,35 @@ function openSettings() {
     });
 }
 
+/* 回転すると C 側がキャンバスを swap した寸法で貼り直して隠すので、描き直すまで画面は空。
+ * W を取り直さないと設定ボタンもその当たり判定も 720 幅の位置に取り残される。
+ * 描きかけのストロークは回転前の座標なので切る (次の move で古い点から線が伸びる)。 */
+function relayout() {
+    var s = ui.size();
+    W = s[0] || W;
+    H = s[1] || H;
+    px = -1;
+    py = -1;
+    scene();
+}
+
 scene();
+
+ui.onKey(function (k) {
+    if (k.charCodeAt(0) === 0 && k.slice(1) === "rotate")
+        relayout(); /* 設定画面が前面でも処理する (無視すると戻ったときズレたまま) */
+});
+
+/* トークンはフォアグラウンドのアプリにしか届かない。取りこぼした一回がズレっぱなしになる */
+setInterval(function () {
+    var s = ui.size();
+    if (s[0] !== W || s[1] !== H)
+        relayout();
+}, 500);
+
+/* 背面では描画コマンドが捨てられる — 上のポーリングだけだと、裏で回転を
+ * 拾って W だけ新しくなり、前面に戻っても寸法が一致するので二度と描き直さない */
+sys.onForeground(relayout);
 
 ui.onTouch(function (x, y, kind) {
     if (inSettings)

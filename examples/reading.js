@@ -16,6 +16,10 @@
 //    する。どちらも不在でも手入力で全機能が使える (ローカルファースト)
 //  - ISBN はカメラのバーコード読取 (camera.scan、978/979 のみ受理) でも
 //    入れられる。読めたらそのまま NDL 検索まで自動で進む
+//  - タイトルと著者は日本語入力できる。アプリが書くのは `s.field(名前, "ja")`
+//    の 3 文字だけで、変換も候補もモード表示もプラットフォームの持ち物
+//    (docs/keyboard-ime-unification.md)。ISBN やページ数の欄は既定のまま
+//    = ASCII のみで、そこにかなが入らないのは C 側が保証する
 //  - データは NVS (rd_books / rd_game)。microSD 不要、最大 25 冊
 //
 // 検索機能・書影は意図的に無し (目的は読書支援であって蔵書管理ではない)。
@@ -281,7 +285,7 @@ function buildHome() {
                                off: 0, hold: HOLD_HEAD });
         })(i);
     }
-    s.button("本を追加", buildAdd);
+    s.button("本を追加", function () { buildAdd(null); });
     s.button("実績とバッジ", buildStats);
     s.button("コンソールへ戻る", ui.back);
 }
@@ -337,8 +341,11 @@ function buildAdd() {
     var s = ui.screen("本を追加");
     var status = s.label("ISBN から自動入力するか、手で入れてください");
     var fIsbn = s.field("ISBN");
-    var fTitle = s.field("タイトル (必須)");
-    var fAuthor = s.field("著者");
+    /* "ja" = この欄だけ日本語入力を許す。既定は ASCII のみで、ISBN や
+       ページ数にかなが混ざらないのは C 側が保証する (アプリ側の書き忘れで
+       破れない)。制御バーの「あ」も非 ja の欄では押せない。 */
+    var fTitle = s.field("タイトル (必須)", "ja");
+    var fAuthor = s.field("著者", "ja");
     var fPages = s.field("総ページ数 (必須)");
     /* 解析済みレコードでフィールドを埋める (HTTP/MQTT 両経路で共通) */
     function fillBook(rec) {
