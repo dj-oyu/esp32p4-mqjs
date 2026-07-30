@@ -137,8 +137,12 @@ term_err_t term_pipe_bind(term_id_t id, const char *owner, int handle)
     term_pipe_t *p;
     term_err_t e;
 
+    /* "Not up yet" is not the same answer as "no such session": the first
+     * is the handshake still running and a retry fixes it, the second is a
+     * caller bug. Returning BAD_ID for both left the app with nothing to
+     * retry on. */
     if (!mqjs_ssh_up(handle))
-        return TERM_ERR_BAD_ID;
+        return mqjs_ssh_known(handle) ? TERM_ERR_NOT_READY : TERM_ERR_BAD_ID;
     p = pipe_alloc(id, handle);
     if (!p)
         return TERM_ERR_NO_SLOT;

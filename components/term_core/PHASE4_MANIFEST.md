@@ -627,6 +627,45 @@ device checklist:
 - pixels: tab bar, selection highlight colours, the term's own cursor cell,
   underline position, and whether hide→show actually repaints on glass.
 
+## Defect C — the first real device run: ssh_vt2 could not connect
+
+Reported 2026-07-30: `ssh_vt` connects, `ssh_vt2` shows
+`端末に繋げない (term.pipe -3)`. Root cause, from that one error code:
+
+`mqjs_ssh_up(id)` is `slot >= 0 && s_sess[slot].up`, and
+`term_pipe_bind` mapped **both** of its false cases onto
+`TERM_ERR_BAD_ID` (-3). But they are opposites: an unknown handle is a
+caller bug, while a known-but-not-yet-up session is the handshake still
+running on the session task — which is the **normal** state right after
+`ssh.connect`, because connect returns an id immediately and auth plus
+the shell request happen afterwards. So every first pipe attempt was
+early, reported as BAD_ID, and `pipeWithRetry` only retried on
+`TERM_ERR_BUSY` — so it gave up on attempt one, every time. The native
+app could never connect; nothing was wrong with ssh, the ring, or the
+pipe itself.
+
+Fix, three parts:
+
+1. `mqjs_ssh_known(id)` added (sshc.h/.c) — slot exists, up or not.
+2. `term_pipe_bind` now returns **`TERM_ERR_NOT_READY` when the session
+   is known but not up**, keeping `BAD_ID` for a handle that names no
+   session. Documented in `term_pipe.h` as retryable and as the common
+   case.
+3. `ssh_vt2` retries on `NOT_READY` and `BUSY` with a budget that covers
+   a real login (20 × 300 ms = 6 s, was 8 × 150 ms = 1.2 s and only on
+   BUSY), and **`print()`s the failure as well as toasting it**.
+
+The observability half is a finding in its own right: the black box had
+**not one line** from `ssh_vt2` about the failure, because the app only
+toasted. A five-second toast is not a diagnosis; the flight recorder
+built in phase 3 is, and app failure paths have to write to it. That is
+now a rule for native-term apps, not a nicety.
+
+Lesson for the contract: a status predicate whose false case means two
+different things ("no such session" vs "not yet") will be collapsed into
+one error code by somebody, and the retry logic downstream then cannot
+work. Split the predicate at the source.
+
 ## Device checklist — automated half DONE 2026-07-30
 
 Firmware flashed (build `C:\esp-build\term-native-m`, 3 hashes verified) and

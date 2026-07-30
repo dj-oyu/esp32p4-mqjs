@@ -46,8 +46,19 @@ extern "C" {
  * succeeds; §5, and term_registry.h's term_registry_pipe).
  *
  * Additional failures of this layer:
- *   TERM_ERR_NO_SLOT  no free pipe context (one per term slot)
- *   TERM_ERR_BAD_ID   the handle names no live session
+ *   TERM_ERR_NO_SLOT    no free pipe context (one per term slot)
+ *   TERM_ERR_BAD_ID     the handle names no session at all
+ *   TERM_ERR_NOT_READY  the session exists but is not up yet — the
+ *                       handshake is still running on its own task.
+ *                       **Retryable, and the common case**: ssh.connect()
+ *                       returns an id the moment the session is created,
+ *                       so a pipe issued straight afterwards always
+ *                       arrives early. A caller must retry this (and
+ *                       TERM_ERR_BUSY) with a budget that covers a real
+ *                       handshake — seconds, not milliseconds — and must
+ *                       not treat it as a failure. Conflating it with
+ *                       BAD_ID is what made the first native app
+ *                       unable to connect at all (device, 2026-07-30).
  *
  * A pipe outlives neither side: when the ssh session ends, the producer
  * acks and the term becomes unpiped (feed/log work again). The app learns

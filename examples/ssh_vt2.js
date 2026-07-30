@@ -277,6 +277,11 @@ if (SELFTEST) {
        なく固定の 3 つを使い回す — アプリを停止しても persist term は
        DETACHED で残り、同じ名前の create が拾い直す (tmux モデル)。 */
     var TAB_NAMES = ["t0", "t1", "t2"];
+    /* term.pipe の再試行予算。ssh.connect は id を即返し、認証と shell
+       要求はセッションタスクで進むので最初の pipe は必ず早すぎる
+       (term_pipe.h: TERM_ERR_NOT_READY)。WiFi + tailnet 越しのログインは
+       秒単位なので 20 × 300ms = 6 秒みておく。 */
+    var PIPE_TRIES = 20, PIPE_WAIT_MS = 300;
 
     /* sessions[i] = {name, tid, sshId, live, label} — 並びがタブ順 */
     var sessions = [];
@@ -670,12 +675,25 @@ if (SELFTEST) {
         if (!entry.sshId || idxOf(entry) < 0)
             return;
         var rc = term.pipe(entry.tid, entry.sshId);
-        if (rc === term.OK)
-            return;
-        if (rc === term.BUSY && tries > 0) {
-            setTimeout(function () { pipeWithRetry(entry, tries - 1); }, 150);
+        if (rc === term.OK) {
+            print("ssh_vt2: piped tab " + entry.name + " after " +
+                  (PIPE_TRIES - tries) + " tr" + (PIPE_TRIES - tries === 1 ? "y" : "ies"));
             return;
         }
+        /* NOT_READY = the handshake is still running (ssh.connect hands back
+           an id immediately, so the first attempt is always early); BUSY =
+           the old producer has just been asked to detach. Both are "ask
+           again", and the budget has to cover a real login over WiFi, not
+           a few hundred ms. Anything else is final. */
+        if ((rc === term.NOT_READY || rc === term.BUSY) && tries > 0) {
+            setTimeout(function () { pipeWithRetry(entry, tries - 1); },
+                       PIPE_WAIT_MS);
+            return;
+        }
+        /* print() as well as notify(): the toast is gone in five seconds,
+           the LP black box keeps the line across a reboot and a pull. */
+        print("ssh_vt2: term.pipe failed rc=" + rc + " tab=" + entry.name +
+              " sshId=" + entry.sshId + " triesLeft=" + tries);
         sys.notify("端末に繋げない (term.pipe " + rc + ")");
     };
 
@@ -763,7 +781,7 @@ if (SELFTEST) {
             sessions.push(entry);
         }
         term.resize(entry.tid, COLS, ROWS);
-        pipeWithRetry(entry, 8);
+        pipeWithRetry(entry, PIPE_TRIES);
         saveTabs();
 
         var forgetTimer = null;

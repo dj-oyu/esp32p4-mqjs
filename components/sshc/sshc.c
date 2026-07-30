@@ -581,6 +581,11 @@ bool mqjs_ssh_up(int id)
     return slot >= 0 && s_sess[slot].up;
 }
 
+bool mqjs_ssh_known(int id)
+{
+    return sess_lookup(id) >= 0;
+}
+
 bool mqjs_ssh_set_sink(int id, const sshc_sink_t *sink)
 {
     int slot = sess_lookup(id);

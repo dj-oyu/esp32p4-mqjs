@@ -84,6 +84,10 @@ void mqjs_ssh_close_all(void);
 bool mqjs_ssh_active(void);
 /* Shell channel established (auth done) for this id. */
 bool mqjs_ssh_up(int id);
+/* The id names a session slot, whether or not it is up yet. Together with
+   mqjs_ssh_up() this separates "still handshaking" (retry) from "no such
+   session" (caller bug) — term_pipe_bind needs that distinction. */
+bool mqjs_ssh_known(int id);
 
 /* Install the rx sink (see sshc_sink_t). Callable from any task; false
  * for a stale id, a session that is on its way out, or when a sink is
