@@ -246,47 +246,6 @@ const char *skk_cand_text(const skk_dict_t *d, const skk_cand_t *c, size_t *len)
     return (const char *)d->image.base + c->off;
 }
 
-/* The personal dictionary, stubbed for the same reason as the rest of
- * skk_dict.c. What belongs HERE is the state machine's half of the
- * contract — that it learns on a commit out of SELECT and not on any
- * other commit, and that the key it learns under is the one the lookup
- * used, okurigana stem included. Whether the MRU then reorders anything
- * is skk_dict.c's business and is tested against a real dictionary in
- * test_skk_e2e.c. So the note stub RECORDS instead of doing nothing:
- * a stub that always returned SKK_OK would let the wiring rot. */
-static struct { int calls; int blk; char rd[64]; size_t rdlen;
-                char cand[96]; size_t clen; } g_mru;
-
-int skk_mru_note(skk_mru_t *m, skk_blk_t blk, const char *reading, size_t rlen,
-                 const char *cand, size_t clen)
-{
-    (void)m;
-    g_mru.calls++;
-    g_mru.blk    = (int)blk;
-    g_mru.rdlen  = rlen < sizeof g_mru.rd ? rlen : sizeof g_mru.rd;
-    g_mru.clen   = clen < sizeof g_mru.cand ? clen : sizeof g_mru.cand;
-    memcpy(g_mru.rd, reading, g_mru.rdlen);
-    memcpy(g_mru.cand, cand, g_mru.clen);
-    return SKK_OK;
-}
-
-int skk_mru_apply(const skk_mru_t *m, const skk_dict_t *d, skk_blk_t blk,
-                  const char *reading, size_t rlen, skk_cand_t *cands,
-                  size_t n, size_t cap, size_t *out_n)
-{
-    (void)m; (void)d; (void)blk; (void)reading; (void)rlen; (void)cands;
-    (void)cap;
-    if (out_n) *out_n = n;
-    return SKK_OK;
-}
-
-const char *skk_mru_text(const skk_mru_t *m, const skk_cand_t *c, size_t *len)
-{
-    (void)m; (void)c;
-    if (len) *len = 0;
-    return NULL;
-}
-
 /* ------------------------------------------------------------------ */
 /* Driving the engine                                                   */
 
@@ -305,7 +264,6 @@ static void begin(const char *name)
     g_q_calls    = 0;
     g_q_len      = 0;
     g_q_blk      = -1;
-    memset(&g_mru, 0, sizeof g_mru);
 }
 
 /* One key. Enforces the two invariants the header states for EVERY
@@ -900,71 +858,6 @@ static void t_okuri(void)
 
 /* ------------------------------------------------------------------ */
 /* 7. Candidate selection                                               */
-
-/* Learning: WHEN the state machine records a choice, and under WHICH
-   key. Not whether the MRU then reorders — that needs a real dictionary
-   and lives in test_skk_e2e.c. */
-static void t_learn(void)
-{
-    static skk_mru_t mru;   /* the stub ignores it; the pointer arms the path */
-
-    begin("learn/no-mru");
-    feed("Kanji \n");
-    CHECK(g_mru.calls == 0, "no MRU attached must mean no learning (%d calls)",
-          g_mru.calls);
-
-    begin("learn/select-commit");
-    skk_attach_mru(&g_s, &mru);
-    feed("Kanji ");          /* convert, v mode, sel 0 = 漢字 */
-    feed(" ");               /* next candidate: 感じ */
-    feed("\n");              /* commit the selection */
-    CHECK(g_mru.calls == 1, "a commit out of v must learn exactly once (%d)",
-          g_mru.calls);
-    CHECK(g_mru.blk == SKK_BLK_NASI, "blk %d, want okuri-nasi", g_mru.blk);
-    CHECK(g_mru.rdlen == strlen("かんじ") &&
-          memcmp(g_mru.rd, "かんじ", g_mru.rdlen) == 0,
-          "learned reading \"%.*s\"", (int)g_mru.rdlen, g_mru.rd);
-    CHECK(g_mru.clen == strlen("感じ") &&
-          memcmp(g_mru.cand, "感じ", g_mru.clen) == 0,
-          "learned candidate \"%.*s\", want the SELECTED one",
-          (int)g_mru.clen, g_mru.cand);
-
-    /* The okuri-ari key carries the stem. Learn it without and the entry
-       is filed under a reading no lookup will ever ask for. */
-    begin("learn/okuri-stem");
-    skk_attach_mru(&g_s, &mru);
-    feed("OkuRu\n");
-    CHECK(g_mru.calls == 1, "okuri commit must learn (%d)", g_mru.calls);
-    CHECK(g_mru.blk == SKK_BLK_ARI, "blk %d, want okuri-ari", g_mru.blk);
-    CHECK(g_mru.rdlen == strlen("おくr") &&
-          memcmp(g_mru.rd, "おくr", g_mru.rdlen) == 0,
-          "learned reading \"%.*s\", want the stem included",
-          (int)g_mru.rdlen, g_mru.rd);
-    CHECK(g_mru.rdlen == g_q_len && memcmp(g_mru.rd, g_q, g_q_len) == 0,
-          "the learned key must be the key that was looked up");
-
-    /* Commits that express no preference between candidates. Recording
-       these would fill the 48 slots with things nobody chose. */
-    begin("learn/kana-commit");
-    skk_attach_mru(&g_s, &mru);
-    feed("Kanji\n");         /* Enter in ~ : take the kana as typed */
-    CHECK(g_mru.calls == 0, "committing raw kana must not learn (%d)",
-          g_mru.calls);
-
-    begin("learn/katakana-commit");
-    skk_attach_mru(&g_s, &mru);
-    feed("Kanjiq");          /* 'q' in ~ : commit as katakana */
-    CHECK(g_mru.calls == 0, "committing katakana must not learn (%d)",
-          g_mru.calls);
-
-    begin("learn/cancelled");
-    skk_attach_mru(&g_s, &mru);
-    feed("Kanji ");
-    feed("\x07");            /* C-g back to ~ */
-    feed("\x07");            /* C-g again: discard */
-    CHECK(g_mru.calls == 0, "a cancelled conversion must not learn (%d)",
-          g_mru.calls);
-}
 
 static void t_select(void)
 {
@@ -1600,7 +1493,6 @@ int main(void)
     t_complete();
     t_okuri();
     t_select();
-    t_learn();
     t_backspace();
     t_limits();
     t_badutf8();

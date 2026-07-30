@@ -11,8 +11,12 @@
  *   - the SKK state machine (kana / katakana / MIDASHI (~) / OKURI /
  *     SELECT (v)), including where the okurigana starts,
  *   - the dictionary: packed-key index, binary search, zero-copy
- *     candidates,
- *   - later, the personal dictionary's MRU ordering.
+ *     candidates.
+ *
+ * There is no personal dictionary. One existed (an MRU that reordered
+ * candidates by recency) and was removed on 2026-07-30 — see
+ * docs/skk-ime-design.md §S7 for why, and for the shape a user
+ * dictionary would take if one comes back. It would not be this one.
  *
  * WHO CALLS THIS. Not an app — ime_core does, on the one task that owns
  * the device's IME session, and mqjs hands the result to whichever sink
@@ -412,14 +416,18 @@ skk_blob_t skk_builtin_image(void);
  * JS_NewStringLen, once, on entering v mode.
  *
  * `src` says which base `off` counts from. It costs nothing (the struct
- * is 8 bytes either way once aligned) and keeps the personal dictionary
- * (S7) and katakana conversion from forcing a format change later.
+ * is 8 bytes either way once aligned) and keeps katakana conversion —
+ * which is not in the image — from forcing a format change.
  * Resolve it with skk_cand() rather than by hand. */
 typedef enum {
     SKK_SRC_DICT    = 0, /* off is from skk_dict_t.image.base */
     SKK_SRC_SCRATCH = 1, /* off is into skk_t.scratch (e.g. the reading
                             rendered as katakana) */
-    SKK_SRC_USER    = 2, /* reserved for the personal dictionary (S7) */
+    /* 2 was SKK_SRC_USER, the personal dictionary's own storage
+       (removed 2026-07-30). Left unassigned rather than reused: a
+       skk_cand_t never leaves the process, so nothing forces the
+       number to be recycled, and a `2` appearing anywhere is a bug
+       worth being able to recognise. */
 } skk_src_t;
 
 typedef struct {
@@ -482,7 +490,6 @@ typedef struct {
  * waiting to happen. Defining the guards below turns those in-file
  * blocks into no-ops. */
 #define SKK_DICT_EXTRAS_DECLARED 1
-#define SKK_MRU_DECLARED         1
 
 /* skk_lookup() plus the counters, so the state machine fills
  * skk_stats_t.probes/fullcmp/cands/dropped without a second search.
@@ -515,40 +522,6 @@ int skk_index_check(skk_blob_t text, const uint64_t *keys, const uint32_t *offs,
 int skk_complete(const skk_dict_t *d, skk_blk_t blk,
                  const char *prefix, size_t plen, size_t nth,
                  const char **out, size_t *out_len, uint32_t *probes);
-
-/* ---- personal dictionary (MRU) ----------------------------------- */
-#define SKK_MRU_ENTRIES     48
-#define SKK_MRU_READING_MAX 48
-#define SKK_MRU_CAND_MAX    48
-/* Worst case of skk_mru_save(): header + per record "N " + reading +
-   " /" + candidate + "/\n". */
-#define SKK_MRU_SAVE_MAX    (32 + SKK_MRU_ENTRIES * \
-                             (SKK_MRU_READING_MAX + SKK_MRU_CAND_MAX + 6))
-
-typedef struct {
-    uint8_t blk;             /* skk_blk_t */
-    uint8_t reading_len;
-    uint8_t cand_len;
-    uint8_t pad;
-    char    reading[SKK_MRU_READING_MAX];
-    char    cand[SKK_MRU_CAND_MAX];
-} skk_mru_rec_t;
-
-typedef struct {
-    uint32_t      n;
-    skk_mru_rec_t rec[SKK_MRU_ENTRIES];   /* newest first */
-} skk_mru_t;
-
-void skk_mru_init(skk_mru_t *m);
-int  skk_mru_note(skk_mru_t *m, skk_blk_t blk,
-                  const char *reading, size_t rlen,
-                  const char *cand, size_t clen);
-int  skk_mru_apply(const skk_mru_t *m, const skk_dict_t *d, skk_blk_t blk,
-                   const char *reading, size_t rlen,
-                   skk_cand_t *cands, size_t n, size_t cap, size_t *out_n);
-const char *skk_mru_text(const skk_mru_t *m, const skk_cand_t *c, size_t *len);
-int  skk_mru_save(const skk_mru_t *m, char *buf, size_t cap, size_t *out_len);
-int  skk_mru_load(skk_mru_t *m, const char *buf, size_t len);
 
 /* ------------------------------------------------------------------ */
 /* How the preedit is composed.
@@ -597,14 +570,6 @@ typedef struct {
 typedef struct {
     /* ---- private ---- */
     const skk_dict_t *dict;
-    /* The personal dictionary, or NULL for an IME that does not learn.
-       A POINTER, like the dictionary, for the same two reasons: a
-       skk_mru_t is 4.7 KB and would quadruple this struct, and learning
-       belongs to the user rather than to one IME instance, so several
-       skk_t may share one. Unlike the dictionary it is written through,
-       so the sharers must be on one task — which they are: every mqjs
-       worker runs on the single `mqjs` task. */
-    skk_mru_t *mru;
     uint8_t  enabled;
     uint8_t  mode;        /* skk_mode_t */
     uint8_t  base_mode;   /* KANA or KATA: where ~/v return to */
@@ -656,20 +621,6 @@ void skk_init(skk_t *s);
    is shared read-only, so several skk_t may use one. Conversion without
    a dictionary returns SKK_ERR_NODICT rather than misbehaving. */
 void skk_attach(skk_t *s, const skk_dict_t *d);
-
-/* Point at a personal dictionary (or NULL to stop learning). `m` must
- * outlive `s` and is WRITTEN THROUGH on every commit from SELECT, so
- * every skk_t sharing one must run on the same task.
- *
- * With one attached, a conversion pulls previously chosen candidates to
- * the front, and a candidate the dictionary no longer offers is still
- * presented (sourced from `m`, SKK_SRC_USER). Only a commit out of
- * SELECT is recorded: taking the raw kana with Enter, or katakana with
- * 'q', expresses no preference between candidates.
- *
- * skk_core does no I/O, so persistence is the caller's: skk_mru_save()
- * renders `m` to a buffer and skk_mru_load() parses one back. */
-void skk_attach_mru(skk_t *s, skk_mru_t *m);
 
 /* Abandon any preedit/candidates and return to base_mode. Whatever was
    being typed is discarded, NOT committed — call it when an app loses

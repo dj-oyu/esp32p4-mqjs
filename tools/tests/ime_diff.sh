@@ -22,12 +22,13 @@
 # the golden in the same commit and say why. Do not bend the engine back
 # to it, and do not "fix" the golden separately from the change.
 #
-# ⚠️ LEARNING IS STATE. skk learns on every commit out of v, so the
-# candidate order on a second run is not the order on the first. The C
-# driver attaches a learning dictionary of its own because the JS binding
-# does (mqjs_runtime.c skk_attach_mru) and leaving it off reorders
-# candidates — but it is a fresh in-process one, never persisted, so this
-# script is repeatable where the old two-sided version was not.
+# THIS RUN CARRIES NO STATE. The engine used to learn on every commit
+# out of v, so candidate order on a second run was not the order on the
+# first, and the driver had to attach a learning dictionary of its own to
+# match the JS binding. Learning was removed on 2026-07-30; the driver
+# attaches nothing but the dictionary now, and the golden did not move —
+# this script converts each reading exactly once, so recency never had
+# anything to reorder here.
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd)

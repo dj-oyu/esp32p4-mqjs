@@ -604,9 +604,7 @@ static void commit_katakana(skk_t *s, uint32_t *st)
 }
 
 /* The reading as the dictionary indexes it: the kana span, plus the
-   ASCII stem for an okuri-ari entry ("うご" + 'k'). Both the lookup and
-   the learning have to agree on this exactly, or the entry is learned
-   under a key nothing will ever look up. `buf` must hold
+   ASCII stem for an okuri-ari entry ("うご" + 'k'). `buf` must hold
    SKK_READING_MAX + 1. */
 static size_t span_key(const skk_t *s, char *buf, skk_blk_t *blk)
 {
@@ -622,30 +620,15 @@ static size_t span_key(const skk_t *s, char *buf, skk_blk_t *blk)
 }
 
 /* Commit the selected candidate plus the okurigana (Enter in v, or any
-   key that is not a selection command).
- *
- * This is also the ONLY place that learns. Committing raw kana from ~
- * with Enter, or as katakana with 'q', is not a dictionary choice and
- * says nothing about which candidate the user prefers — recording those
- * would fill the 48 slots with noise. */
+   key that is not a selection command). */
 static void commit_selection(skk_t *s, uint32_t *st)
 {
     size_t before = s->commit_len;
     size_t n = 0;
     const char *c = skk_cand(s, s->sel, &n);
 
-    if (c && add_commit(s, c, n)) {
+    if (c && add_commit(s, c, n))
         (void)add_commit(s, s->okuri, s->okuri_len);
-        if (s->mru) {
-            char key[SKK_READING_MAX + 1];
-            skk_blk_t blk;
-            size_t klen = span_key(s, key, &blk);
-            /* Returns SKK_ERR_NOSPACE for a reading or candidate past
-               the record size; not learning it is the correct outcome
-               and not an error worth propagating to the app. */
-            (void)skk_mru_note(s->mru, blk, key, klen, c, n);
-        }
-    }
     span_commit(s, st, before);
 }
 
@@ -677,14 +660,6 @@ static void convert(skk_t *s, uint32_t *st)
     if (skk_lookup_stats(s->dict, blk, key, klen, s->cand, SKK_CAND_MAX,
                          &n, &s->stats) < 0)
         n = 0;
-    /* Learning goes on top of the dictionary result, not instead of it:
-       previously chosen candidates move to the front, and one that the
-       dictionary no longer offers is re-inserted from the MRU store. So
-       this can turn an empty result into a non-empty one — hence it runs
-       before the `n == 0` bail-out, not after. */
-    if (s->mru)
-        (void)skk_mru_apply(s->mru, s->dict, blk, key, klen,
-                            s->cand, n, SKK_CAND_MAX, &n);
     if (n == 0) return;
 
     s->cand_n = (uint16_t)n;
@@ -1111,12 +1086,6 @@ void skk_attach(skk_t *s, const skk_dict_t *d)
     s->dict = d;
 }
 
-void skk_attach_mru(skk_t *s, skk_mru_t *m)
-{
-    if (!s) return;
-    s->mru = m;
-}
-
 void skk_reset(skk_t *s)
 {
     if (!s) return;
@@ -1235,9 +1204,6 @@ const char *skk_cand(const skk_t *s, int i, size_t *len)
         if (len) *len = c->len;
         return s->scratch + c->off;
     }
-    /* A learned candidate the dictionary no longer has (or never had):
-       skk_mru_apply() keeps offering it, sourced from the MRU store. */
-    if (c->src == SKK_SRC_USER) return skk_mru_text(s->mru, c, len);
     if (!s->dict) return NULL;
     return skk_cand_text(s->dict, c, len);
 }

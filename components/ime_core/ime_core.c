@@ -38,11 +38,6 @@ void ime_attach(ime_t *im, const skk_dict_t *d)
     }
 }
 
-void ime_attach_mru(ime_t *im, skk_mru_t *m)
-{
-    skk_attach_mru(&im->skk, m);
-}
-
 bool ime_ready(const ime_t *im) { return im->ready; }
 bool ime_on(const ime_t *im) { return im->on; }
 

@@ -136,30 +136,6 @@ const char *skk_cand_text(const skk_dict_t *d, const skk_cand_t *c, size_t *len)
     return (const char *)d->image.base + c->off;
 }
 
-int skk_mru_note(skk_mru_t *m, skk_blk_t blk, const char *reading, size_t len,
-                 const char *text, size_t tlen)
-{
-    (void)m; (void)blk; (void)reading; (void)len; (void)text; (void)tlen;
-    return SKK_OK;
-}
-
-int skk_mru_apply(const skk_mru_t *m, const skk_dict_t *d, skk_blk_t blk,
-                  const char *reading, size_t len, skk_cand_t *cands,
-                  size_t n, size_t cap, size_t *out_n)
-{
-    (void)m; (void)d; (void)blk; (void)reading; (void)len; (void)cands;
-    (void)cap;
-    if (out_n) *out_n = n;
-    return SKK_OK;
-}
-
-const char *skk_mru_text(const skk_mru_t *m, const skk_cand_t *c, size_t *len)
-{
-    (void)m;
-    if (len) *len = c->len;
-    return NULL;
-}
-
 /* ---- helpers ------------------------------------------------------- */
 
 static ime_disp_t feed1(ime_t *im, const char *k)

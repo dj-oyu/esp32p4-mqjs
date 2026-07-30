@@ -6370,7 +6370,7 @@ static void app_reset_bindings(MqjsWorker *app)
     /* No skk handles to release any more. NB the dictionary image no
        longer comes back when an app stops: the platform session holds it
        for the rest of the boot (one ime_t per device), and the app-stop
-       path below only folds the reading and flushes learning. That is a
+       path below only folds the reading. That is a
        property of the shared session, not something lost with the
        handles — it has been true since the first ui.ime(1) landed. */
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {

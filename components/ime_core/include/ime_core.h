@@ -88,7 +88,6 @@ void ime_init(ime_t *im);
  * with no dictionary, and a permanent latch would keep the IME dead
  * until an app restart even after one is flashed. */
 void ime_attach(ime_t *im, const skk_dict_t *d);
-void ime_attach_mru(ime_t *im, skk_mru_t *m);
 
 bool ime_ready(const ime_t *im);   /* has a dictionary */
 bool ime_on(const ime_t *im);      /* kana input armed */
@@ -101,8 +100,9 @@ bool ime_on(const ime_t *im);      /* kana input armed */
  * a string into a remote shell. Callers should say so — IME_V_ENABLE is
  * raised so the surface can show a toast.
  *
- * Learning is NOT written back here: ime_core does no I/O. The caller
- * persists on the same edge (that is where the user stops typing). */
+ * Nothing is persisted on this edge, or on any other: an IME session is
+ * entirely in memory (the learning store that used to be written back
+ * here was removed 2026-07-30, docs/skk-ime-design.md §S7). */
 void ime_set_on(ime_t *im, bool on);
 
 /* Feed one key, exactly as the surface produced it — the same bytes

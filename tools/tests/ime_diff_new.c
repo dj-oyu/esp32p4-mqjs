@@ -1,8 +1,11 @@
 /* The driver behind tools/tests/ime_diff.sh: a fixed key script through
-   ime_core with the real dictionary and a learning dictionary attached (the
-   JS binding attaches one at mqjs_runtime.c skk_attach_mru, so leaving it off
-   here would change candidate order). One line per key, diffed against
+   ime_core with the real dictionary. One line per key, diffed against
    tools/tests/ime_golden.trace.
+
+   It used to attach a learning dictionary too, because the JS binding of
+   the day did. Learning was removed on 2026-07-30 and the trace did not
+   move a byte — the script converts each reading exactly once, and an
+   empty MRU reorders nothing.
 
    The line format is not free to change: it is the format the golden was
    recorded in, back when the other side of the diff was the JS glue inside
@@ -41,7 +44,6 @@ static const key_t_ KEYS[] = {
 #define NKEYS ((int)(sizeof KEYS / sizeof KEYS[0]))
 
 static skk_dict_t D;
-static skk_mru_t  MRU;
 
 int main(int argc, char **argv)
 {
@@ -73,9 +75,7 @@ int main(int argc, char **argv)
     }
 
     ime_init(&im);
-    skk_mru_init(&MRU);
     ime_attach(&im, &D);
-    ime_attach_mru(&im, &MRU);
 
     printf("DICT ?\n");
     for (i = 0; i < NKEYS; i++) {
