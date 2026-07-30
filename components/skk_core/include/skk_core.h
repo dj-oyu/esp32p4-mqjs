@@ -14,18 +14,26 @@
  *     candidates,
  *   - later, the personal dictionary's MRU ordering.
  *
- * What deliberately stays in JS: drawing the preedit and the candidate
- * bar, and — the reason the boundary is here at all — deciding where a
- * committed string goes. ssh_vt writes it to an ssh session (bracketed
- * paste and all), an editor would insert it into a buffer; if C owned
- * that it would have to know each app's business.
+ * WHO CALLS THIS. Not an app — ime_core does, on the one task that owns
+ * the device's IME session, and mqjs hands the result to whichever sink
+ * has focus (see docs/keyboard-ime-unification.md). Nothing above this
+ * file has to know the status bitmask, the accessor lifetimes, or the
+ * order keys must be offered in.
  *
- * The call is synchronous by necessity, not by taste: mqjs key events
- * are a fixed `char text[8]`, so a committed string cannot travel back
- * out through the key path. An app calls skk_key() from inside its own
- * ui.onKey and pulls the results. The good property that falls out is
- * that nothing happens unless an app asks — a user who never types
- * Japanese pays nothing, not even a call.
+ * It was not always so. Until 2026-07-30 the `skk.*` JS bindings let an
+ * app drive this engine directly, and three of them did — each with its
+ * own copy of when to arm, what the 「あ」 button means and when the
+ * candidate bar folds. The bindings are gone; that history is kept here
+ * only because the shape of this API still reflects it. In particular
+ * skk_key() returns an integer and allocates nothing, which mattered
+ * when a JS binding sat on the per-keystroke path and matters less now,
+ * but is still the right shape for a hot path.
+ *
+ * The one thing that genuinely stays above: WHERE a committed string
+ * goes. ssh_vt writes it to an ssh session, a widget field inserts it
+ * into a textarea. Committed text now travels back out through the key
+ * path as an ordinary key event (it no longer has to fit `char text[8]`
+ * — that limit is why an app used to have to pull the string itself).
  *
  * Pure logic: no I/O, no LVGL, no allocation, no clock, no ESP-IDF
  * headers. Dictionary bytes arrive as a skk_blob_t (embedded rodata, an
