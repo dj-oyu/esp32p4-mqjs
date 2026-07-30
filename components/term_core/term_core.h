@@ -248,6 +248,49 @@ typedef void (*term_reply_fn)(void *user, const char *bytes, size_t len);
  * that term exists. May be NULL. */
 typedef void (*term_caret_fn)(void *user, int col, int row, bool visible);
 
+/*
+ * RECORDING TEE (§4.4's 2026-07-30 exception, phase 5).
+ *
+ * Fires once for every grid row this core archives to scrollback, with that
+ * row's text — no attributes, no escapes, CONT halves already resolved,
+ * exactly the bytes term_core_line_utf8 would give back. `text` points into
+ * the scrollback arena and is valid ONLY for the duration of the call.
+ *
+ * WHY HERE AND NOWHERE ELSE. This is the seam at which display content
+ * exists as text and nothing else does:
+ *
+ *   - the raw byte stream is escape-dense, and the black box strips every
+ *     escape (a pulled record gets printed on the operator's terminal, so a
+ *     retained escape is control injection). A full-screen TUI redraw with
+ *     all its cursor addressing stripped is unreadable soup, i.e. not
+ *     "display content" in any useful sense;
+ *   - a row that goes to scrollback IS display content, already resolved
+ *     from escapes into ordered text;
+ *   - during the case that motivated the cost question — `top`, an alt-screen
+ *     TUI, any in-place repaint — this fires ZERO times, because in-place
+ *     painting archives nothing and the alt screen never reaches scrollback
+ *     at all. A raw-byte tee would have burnt the whole 23 KiB partition in
+ *     seconds there.
+ *
+ * The corollary is the hole this cannot cover, and the reason the registry
+ * also captures whole screens: content that is displayed and never scrolls
+ * off — an nvim error in the message area of an alt screen — passes no row
+ * to scrollback and therefore never reaches this callback. See
+ * term_registry.h "RECORDING".
+ *
+ * ONE ROW PER CALL, so a soft-wrapped logical line arrives as consecutive
+ * calls rather than as one long one. That keeps the callee's work bounded by
+ * `cols` and matches what was on the glass line by line.
+ *
+ * Runs inside term_core_feed()/term_core_resize(), i.e. on the UI task with
+ * the registry's table lock held: it must not allocate, block, take a lock or
+ * re-enter the core. NULL — the default, and the state a term is always in
+ * until a human turns recording on — means the row is archived and nothing
+ * else happens, which is what makes "recording off" structurally inert
+ * rather than filtered.
+ */
+typedef void (*term_record_fn)(void *user, const char *text, size_t len);
+
 typedef struct {
     term_mode_t mode;
 
@@ -301,6 +344,24 @@ void term_core_reset(term_core_t *c);
  * NULL to detach. */
 void term_core_set_reply_cb(term_core_t *c, term_reply_fn fn, void *user);
 void term_core_set_caret_cb(term_core_t *c, term_caret_fn fn, void *user);
+
+/*
+ * Install or remove the recording tee. There is NO config-time field for
+ * this and there never will be: a config field is a thing a caller can
+ * persist and restore, and §4.4's exception is per-session only. NULL is the
+ * only state a term can be born in.
+ *
+ * term_core_reset() (RIS) does NOT clear it, for the same reason it does not
+ * clear reply_cb or caret_cb: these are the owner's wiring, not terminal
+ * state, and a REMOTE that can emit `ESC c` must not be able to silently
+ * desynchronise the recording indicator from what is actually being
+ * recorded. The "a reused tab starts a new session with recording off" rule
+ * lives one layer up, where the session lifecycle is (term_registry.h).
+ */
+void term_core_set_record_cb(term_core_t *c, term_record_fn fn, void *user);
+
+/* True while a recording tee is installed. */
+bool term_core_recording(const term_core_t *c);
 
 /* There is no term_core_free(): the core owns nothing. The caller
  * releases the block whenever it has established that no one is feeding
@@ -399,6 +460,25 @@ void term_core_scroll_region(const term_core_t *c, int *top, int *bot);
  * output was truncated. Never mutates the core: a probe must not perturb
  * what it measures. */
 int term_core_row_utf8(const term_core_t *c, int row, char *out, size_t out_size);
+
+/*
+ * A cheap hash of everything the active screen DISPLAYS: every cell's
+ * codepoint, colours and attribute flags, plus the geometry. Used by the
+ * registry's settle-debounced screen capture to answer "has the screen
+ * changed since the last snapshot?" without serialising it — serialising to
+ * compare would cost the same as capturing, which would defeat the point.
+ *
+ * NOT included: the cursor position and visibility, the dirty set, the
+ * scrollback, and the inactive screen. A cursor that moves without changing a
+ * cell has not changed what a human reads, and treating it as a change would
+ * make an idle shell with a blinking-ish caret snapshot forever.
+ *
+ * One pass over cols*rows cells (51 KiB of PSRAM at the worst geometry). Not
+ * a cryptographic hash and not stable across builds — the only thing anybody
+ * may rely on is that two calls with no intervening grid mutation agree.
+ * Never mutates.
+ */
+uint32_t term_core_screen_hash(const term_core_t *c);
 
 /* ===================================================================== */
 /* Dirty rows (§5, §9: blit only what changed)                           */

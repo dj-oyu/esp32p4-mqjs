@@ -35,12 +35,19 @@
  *     introduced it. NOTHING is recovered by parsing a prefix string out of
  *     the text.
  *
- * P3. CLASS B IS UNREACHABLE, NOT FILTERED (§3.2, §7.1). The only way into
- *     this ring is term_registry's LINE-ORIENTED log path. `term.feed`, the
- *     byte ring, the VT parser and the ssh pipe never call append — there is
- *     no code path from SSH session content to this memory, so no filter can
- *     be wrong about it. Preedit is likewise absent because it never enters
- *     term state at all (§10.2).
+ * P3. CLASS B IS UNREACHABLE BY DEFAULT, AND REACHABLE ONLY THROUGH ONE
+ *     PER-SESSION HUMAN SWITCH (§3.2, §7.1, §4.4's 2026-07-30 exception).
+ *     The default is still structural, not a filter: with recording off no
+ *     code path exists from SSH session content to this memory. `term.feed`,
+ *     the byte ring, the VT parser and the ssh pipe never call append at all;
+ *     the ONLY session-content route is term_registry's recording hook, and
+ *     that hook's function pointer is NULL until a human turns recording on
+ *     for one live session (term_registry_record). Turning it on is what §4.4
+ *     calls the explicit opt-out of class B's exclusion; it tags what it
+ *     writes TERM_LP_CLASS_TERM so a reader can always separate a recorded
+ *     session from an app log, and it cannot survive the session — see
+ *     "RECORDING MODE" below. Preedit remains absent unconditionally,
+ *     because it never enters term state at all (§10.2).
  *
  * P4. THE REGION ONLY EVER HOLDS STRIPPED TEXT. term_lp_ring_append() runs
  *     term_lp_strip() on every byte it accepts; there is no API that writes
@@ -112,6 +119,44 @@
  * property, not tidiness: the black box is pulled off the device and printed
  * on the operator's terminal, so a retained escape sequence would let any app
  * that can call print() inject terminal control into the reader's session.
+ *
+ * =====================================================================
+ * RECORDING MODE (TERM_LP_CLASS_TERM) — the §4.4 exception of 2026-07-30
+ * =====================================================================
+ *
+ * §4.4 used to say SSH session content NEVER enters this region. The device
+ * owner reversed that on 2026-07-30 for one reason: a remote host's output —
+ * an nvim Lua traceback, a build error — could not be got off the device at
+ * all. §7.2 gives no cross-app read API, so what the glass showed was
+ * unquotable. Recording mode makes it pullable over the existing signed
+ * black-box pull, which is the whole point of the feature and not a side
+ * effect.
+ *
+ * WHAT THIS MODULE CONTRIBUTES to that, and nothing more:
+ *
+ *   - TERM_LP_CLASS_TERM, which lands in the APP partition. The SYS
+ *     partition's 8 KiB stays structurally out of reach of session content,
+ *     so a recorded session can never flush the platform's last words or a
+ *     panic note (P1 was about a chatty app; recording is a chattier one).
+ *   - TERM_LP_F_SCREEN on the records that came from a screen capture rather
+ *     than from a scrolled line, because a reader rebuilding a transcript
+ *     needs to know which is which.
+ *   - term_lp_panic_append(), the panic-context door that lets the last
+ *     screen follow the panic note.
+ *
+ * EVERYTHING ELSE IS term_registry's: what is recorded, when, and the rule
+ * that recording is per live session and is never remembered anywhere. Read
+ * term_registry.h "RECORDING" for that contract. This module deliberately
+ * does not know whether recording is on; it is handed text like any other
+ * writer.
+ *
+ * COMPATIBILITY. The region layout does not change and TERM_LP_VERSION is
+ * NOT bumped: a build with this change reads an image written before it
+ * exactly as before. The other direction does not hold — a build WITHOUT
+ * TERM_LP_CLASS_TERM walks a class it does not know, so lp_chain_ok() fails
+ * and it reports the whole retained image as BAD rather than as `lastboot`.
+ * That is a downgrade-only cost, it loses one boot's log tail, and bumping
+ * the version instead would have lost the same tail on the UPGRADE as well.
  *
  * =====================================================================
  * LASTBOOT: HOW THE PREVIOUS SESSION IS FROZEN
@@ -263,20 +308,45 @@ extern "C" {
 /* ===================================================================== */
 
 /*
- * The `class` half of §4.4's record tag, and the partition selector. Both
- * SYS and APP are class A data (§7.1) — the distinction here is the
- * anti-eviction-DoS split of P1, not a confidentiality boundary. §4.4 is
- * explicit that system and user logs mix on purpose ("クラッシュ調査で一番
- * 読みたいのはハングしたユーザーアプリの直前ログ").
+ * The `class` half of §4.4's record tag, and the partition selector.
+ *
+ * APP and SYS are both class A data (§7.1) — the distinction between THOSE
+ * two is the anti-eviction-DoS split of P1, not a confidentiality boundary.
+ * §4.4 is explicit that system and user logs mix on purpose ("クラッシュ調査
+ * で一番読みたいのはハングしたユーザーアプリの直前ログ").
+ *
+ * TERM_LP_CLASS_TERM is different in kind, and that is exactly why it has its
+ * own value instead of being written as APP: it is class B — the content of an
+ * interactive session — admitted by the per-session opt-in of §4.4's
+ * 2026-07-30 exception. The tag is what makes the difference legible to every
+ * reader: `tools/bb_pull.py --session` rebuilds a transcript from it, and any
+ * future redaction or filter policy has something to name. Writing session
+ * content as APP would have made that permanently impossible.
+ *
+ * It lands in the APP partition (see "RECORDING MODE" above): SYS's 8 KiB is
+ * for the platform's last words, and a recorded session must not be able to
+ * evict them.
+ *
+ * A value here is on-memory format. 2..14 were free; TERM=2 is now taken and
+ * 3..14 remain. A decoder must treat an unknown class as corruption (that is
+ * what lp_chain_ok does), so adding one is a downgrade-breaking change — see
+ * COMPATIBILITY above.
  */
 typedef enum {
-    TERM_LP_CLASS_APP = 0,  /* user app print()/term.log -> APP partition  */
-    TERM_LP_CLASS_SYS = 1,  /* platform + system apps     -> SYS partition */
-    TERM_LP_CLASS_PAD = 15, /* filler to a partition end; never content    */
+    TERM_LP_CLASS_APP  = 0,  /* user app print()/term.log -> APP partition  */
+    TERM_LP_CLASS_SYS  = 1,  /* platform + system apps     -> SYS partition */
+    TERM_LP_CLASS_TERM = 2,  /* RECORDED session content   -> APP partition */
+    TERM_LP_CLASS_PAD  = 15, /* filler to a partition end; never content    */
 } term_lp_class_t;
 
 /* Record flags, carried in the high nibble of term_lp_rec_t::cls. */
 #define TERM_LP_F_TRUNC 0x10u   /* payload was cut at TERM_LP_REC_MAX */
+
+/* This record is one row of a SCREEN CAPTURE, not a line that scrolled off.
+ * Only ever set together with TERM_LP_CLASS_TERM. A capture is a marker
+ * record followed by the rows, all flagged, so a reader can tell "this is
+ * what was on the glass at 12.4 s" from "these lines went past". */
+#define TERM_LP_F_SCREEN 0x20u
 
 #define TERM_LP_CLASS_OF(c) ((term_lp_class_t)((unsigned)(c) & 0x0Fu))
 #define TERM_LP_FLAGS_OF(c) ((unsigned)(c) & 0xF0u)
@@ -495,15 +565,20 @@ bool term_lp_ring_open(term_lp_ring_t *r, void *region, size_t bytes,
                        bool read_only, term_lp_check_t *out);
 
 /*
- * Append one record. `cls` selects the partition (P1), `writer` is interned
- * into the table (P2; NULL or empty means WRITER_UNKNOWN), `text`/`len` is
- * the payload BEFORE stripping (P4) and `t_ms` the monotonic timestamp.
+ * Append one record. `cls` selects the partition (P1) and may carry
+ * TERM_LP_F_SCREEN in its high nibble, `writer` is interned into the table
+ * (P2; NULL or empty means WRITER_UNKNOWN), `text`/`len` is the payload
+ * BEFORE stripping (P4) and `t_ms` the monotonic timestamp.
  *
  * Lossy at the tail, never at the head: records are evicted from the oldest
  * end until the new one fits, which is what a flight recorder is. Returns
  * false without changing anything when the ring is not attached, is
- * read-only, `cls` is neither APP nor SYS, or the text is empty after
+ * read-only, `cls` is not one of APP/SYS/TERM, or the text is empty after
  * stripping.
+ *
+ * TERM_LP_F_TRUNC is set by this function; TERM_LP_F_SCREEN is the caller's
+ * and is passed through. Any other flag bit is silently dropped, so a caller
+ * cannot invent record metadata a reader would have to guess at.
  *
  * WHAT `refused` COUNTS is narrower than that list: only the refusals that
  * happen on a LIVE ATTACHED ring, i.e. an empty-after-stripping text or a
@@ -628,9 +703,11 @@ bool term_lp_ring_ready(void);
 
 /*
  * The tee (§4.4: "ingest がスクロールバックに書くついでに同じバイト列を
- * tee"). Appends to the live ring with the port's clock; the only writer
- * inside this component is term_registry's line-oriented log path (P3).
- * Returns false when there is no ring or the text was empty after
+ * tee"). Appends to the live ring with the port's clock; the writers inside
+ * this component are term_registry's line-oriented log path (P3) and, since
+ * 2026-07-30, its recording hook (TERM_LP_CLASS_TERM, optionally with
+ * TERM_LP_F_SCREEN — `cls` carries the flag exactly as term_lp_ring_append
+ * takes it). Returns false when there is no ring or the text was empty after
  * stripping. Serialisation: the caller's, as above.
  */
 bool term_lp_log(term_lp_class_t cls, const char *writer,
@@ -700,6 +777,33 @@ size_t term_lp_panic_fmt(char *out, size_t cap, const term_lp_panic_t *p);
  * Returns true when the note was appended.
  */
 bool term_lp_panic_note(const term_lp_panic_t *p);
+
+/*
+ * The panic-context door for everything that follows the note — today, the
+ * last screen of a recorded session (term_registry_panic_capture).
+ *
+ * Same contract as term_lp_panic_note's second bullet: it revalidates the
+ * DRAM shadow header on EVERY call and refuses when it is mid-update, so a
+ * caller looping over rows either publishes a consistent header each time or
+ * writes nothing. It is NOT one-shot — the loop is the caller's — and it
+ * takes no lock, allocates nothing and calls no FreeRTOS.
+ *
+ * `cls` is checked like any other append's, so the panic path cannot write
+ * outside the partition its class names.
+ *
+ * ORDERING RULE FOR CALLERS: append the panic note FIRST. P5 publishes a
+ * header per record, so anything that has already returned true is readable
+ * even if the next call — or the caller's own row serialiser — faults and
+ * turns the panic into a double panic. Put the cheap certain line in before
+ * the expensive uncertain ones.
+ */
+bool term_lp_panic_append(term_lp_class_t cls, const char *writer,
+                          const char *text, size_t len);
+
+/* True when a panic-context append has somewhere consistent to go: a live
+ * attached ring with a self-consistent shadow header. Lets a caller skip
+ * building a payload it could not store. */
+bool term_lp_panic_ready(void);
 
 /* ===================================================================== */
 /* Introspection                                                         */

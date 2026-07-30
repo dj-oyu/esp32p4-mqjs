@@ -247,7 +247,7 @@ static bool lp_chain_ok(const uint8_t *base, const term_lp_part_t *p)
         cap_len = (cls == TERM_LP_CLASS_PAD) ? p->cap - TERM_LP_REC_HDR
                                              : TERM_LP_REC_MAX;
         if (cls != TERM_LP_CLASS_APP && cls != TERM_LP_CLASS_SYS &&
-            cls != TERM_LP_CLASS_PAD)
+            cls != TERM_LP_CLASS_TERM && cls != TERM_LP_CLASS_PAD)
             return false;
         if (rec.len > cap_len)
             return false;
@@ -549,11 +549,19 @@ bool term_lp_ring_append(term_lp_ring_t *r, term_lp_class_t cls,
 
     if (!r || !r->attached || r->read_only)
         return false;
+    /* The caller may pass TERM_LP_F_SCREEN alongside the class; every other
+       flag bit is ours (TRUNC) or unassigned, and an unassigned bit must not
+       reach the region — a reader would have to guess what it meant. */
+    flags = (uint8_t)(TERM_LP_FLAGS_OF(cls) & TERM_LP_F_SCREEN);
     cls = TERM_LP_CLASS_OF(cls);
-    if (cls != TERM_LP_CLASS_APP && cls != TERM_LP_CLASS_SYS) {
+    if (cls != TERM_LP_CLASS_APP && cls != TERM_LP_CLASS_SYS &&
+        cls != TERM_LP_CLASS_TERM) {
         r->hdr.refused++;
         return false;                         /* PAD is not for callers */
     }
+    /* §4.4's 2026-07-30 exception: recorded session content shares the APP
+       partition, so SYS's 8 KiB of platform last words stays out of its
+       reach (term_lp_ring.h, RECORDING MODE). */
     part = (cls == TERM_LP_CLASS_SYS) ? TERM_LP_PART_SYS : TERM_LP_PART_APP;
     p = &r->hdr.part[part];
 
@@ -708,6 +716,28 @@ const char *term_lp_prev_str(term_lp_prev_t p)
     case TERM_LP_PREV_BAD:      return "bad";
     case TERM_LP_PREV_GARBAGE:  return "garbage";
     default:                    return "?";
+    }
+}
+
+/* The four-character record tag the JSON dump prints, and the token
+   tools/bb_pull.py splits a transcript on. One token per (class, screen)
+   pair so a reader needs no second field:
+
+     sys/  platform + system apps      (class A, SYS partition)
+     app/  user app print()/term.log   (class A, APP partition)
+     ses/  a RECORDED session line that scrolled off (class B, APP)
+     scr/  a row of a RECORDED screen capture         (class B, APP)
+
+   Anything unrecognised is "?"/ rather than a guess: an unknown class means
+   the image was written by a decoder this build does not know, and saying
+   "app" about it would be a lie. */
+static const char *lp_class_tag(term_lp_class_t cls, unsigned flags)
+{
+    switch (cls) {
+    case TERM_LP_CLASS_SYS:  return "sys/";
+    case TERM_LP_CLASS_APP:  return "app/";
+    case TERM_LP_CLASS_TERM: return (flags & TERM_LP_F_SCREEN) ? "scr/" : "ses/";
+    default:                 return "?/";
     }
 }
 
@@ -1186,7 +1216,12 @@ size_t term_lp_dump_json_ex(term_lp_src_t src, uint32_t from,
             bputs(&b, "\"[");
             bputu(&b, rec.t_ms);
             bputs(&b, "] ");
-            bputs(&b, rec.cls == TERM_LP_CLASS_SYS ? "sys/" : "app/");
+            /* The class tag. rec.cls is already masked by the iterator, so
+               this is a class comparison and not a whole-byte one — the
+               phase-3 spelling (`rec.cls == TERM_LP_CLASS_SYS`) would have
+               mislabelled a TRUNCated SYS record as "app/" the day a
+               platform line went over 512 bytes. */
+            bputs(&b, lp_class_tag(rec.cls, rec.flags));
             bputq(&b, rec.writer, strlen(rec.writer));
             bputs(&b, ": ");
             if (rec.flags & TERM_LP_F_TRUNC)
@@ -1315,4 +1350,22 @@ bool term_lp_panic_note(const term_lp_panic_t *p)
         return false;
     return term_lp_ring_append(&s_live, TERM_LP_CLASS_SYS, "panic", line, n,
                                lp_now_ms());
+}
+
+bool term_lp_panic_ready(void)
+{
+    return s_live.attached && !s_live.read_only && lp_geom_ok(&s_live.hdr);
+}
+
+bool term_lp_panic_append(term_lp_class_t cls, const char *writer,
+                          const char *text, size_t len)
+{
+    /* Revalidated on EVERY call, not once for the loop: the shadow header is
+       ours between calls, but the state we are refusing to trust is the one
+       the stalled core left behind, and one successful append does not prove
+       the next one starts from a consistent header (a first append that hit
+       eviction rewrites tail/used itself). Cheap — 128 bytes of DRAM. */
+    if (!term_lp_panic_ready())
+        return false;
+    return term_lp_ring_append(&s_live, cls, writer, text, len, lp_now_ms());
 }

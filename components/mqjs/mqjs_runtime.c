@@ -6947,6 +6947,57 @@ static void dispatch_term_reply(MqjsWorker *app, const MqjsEvent *ev)
         dump_error(ctx);
 }
 
+/* ---- term.record / term.recordScreen (§4.4's 2026-07-30 exception) -----
+ *
+ * term.record(id)        -> 1 recording, 0 not, or a negative term_err_t
+ * term.record(id, on)    -> 0 or a negative term_err_t
+ * term.recordScreen(id)  -> 0 or a negative term_err_t
+ *
+ * THE ONE-ARGUMENT FORM IS A QUERY, and it is the only introspection point
+ * for recording state (term_registry.h, R1). A UI that draws a "REC" badge
+ * must read it from here every time it repaints rather than caching a
+ * boolean of its own: the platform clears recording at half a dozen
+ * lifecycle transitions (re-attach, detach, pipe bind, session end, close),
+ * and a cached copy is how a badge ends up claiming a session is being
+ * recorded when it is not.
+ *
+ * THERE IS NO CREATE-TIME OPTION on purpose, and adding one would break the
+ * user's decision of 2026-07-30, not just its spirit: a field on
+ * term.create's config object is a field an app puts in its saved-tab record
+ * in `store` and replays after a reboot. The only way recording is ever on is
+ * a human turning it on during that live session.
+ */
+JSValue js_term_record(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    if (argc < 2 || JS_IsUndefined(argv[1]))
+        return JS_NewInt32(ctx, term_registry_recording((term_id_t)id, owner));
+    return term_err_value(ctx,
+                          term_registry_record((term_id_t)id, owner,
+                                               uiw_truthy(ctx, argv[1])));
+}
+
+JSValue js_term_recordScreen(JSContext *ctx, JSValue *this_val, int argc,
+                             JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx,
+                          term_registry_record_screen((term_id_t)id, owner));
+}
+
 /* term.close(id) -> 0 or a negative term_err_t. Stage 1 only: the id is
    dead to the caller the moment this returns, and nothing is joined
    (§3.1) — the reaper frees the memory once the acks are in. */

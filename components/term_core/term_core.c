@@ -176,6 +176,10 @@ struct term_core {
     void         *reply_user;
     term_caret_fn caret_cb;
     void         *caret_user;
+    /* §4.4's recording tee. NULL unless a human turned recording on for this
+     * live session; term_core.h explains why there is no config field. */
+    term_record_fn record_cb;
+    void          *record_user;
 
     term_stats_t stats;
 };
@@ -798,6 +802,21 @@ static void sb_archive_row(term_core_t *c, const term_cell_t *row,
     }
     c->sb_w = off + need;
     c->sb_open = softwrap;
+
+    /*
+     * §4.4's recording tee, at the one point where display content exists as
+     * text (term_core.h, term_record_fn). Deliberately AFTER the arena write
+     * and the index update: the callback is somebody else's code, and if it
+     * ever misbehaves the scrollback it was told about is already consistent.
+     * The bytes handed over are the ones just written, so there is no second
+     * serialisation and no buffer of our own — allocation-free, bounded by
+     * `cols`, and exactly zero work when no tee is installed.
+     */
+    if (c->record_cb && text_len)
+        c->record_cb(c->record_user,
+                     (const char *)(c->sb_arena + off + SB_CHUNK_HDR +
+                                    (size_t)nruns * sizeof(term_attr_run_t)),
+                     text_len);
 }
 
 /* ---- reading back -------------------------------------------------- */
@@ -2036,6 +2055,19 @@ void term_core_set_caret_cb(term_core_t *c, term_caret_fn fn, void *user)
     c->caret_user = user;
 }
 
+void term_core_set_record_cb(term_core_t *c, term_record_fn fn, void *user)
+{
+    if (!c)
+        return;
+    c->record_cb = fn;
+    c->record_user = user;
+}
+
+bool term_core_recording(const term_core_t *c)
+{
+    return c && c->record_cb != NULL;
+}
+
 /* ===================================================================== */
 /* Geometry                                                              */
 /* ===================================================================== */
@@ -2278,6 +2310,40 @@ int term_core_row_utf8(const term_core_t *c, int row, char *out, size_t out_size
     if (out && out_size > 0)
         out[pos < out_size ? pos : out_size - 1] = '\0';
     return (int)pos;
+}
+
+uint32_t term_core_screen_hash(const term_core_t *c)
+{
+    /* FNV-1a over the display-bearing fields of every active cell. Chosen
+       for being one multiply and one xor per word with no table: the caller
+       runs this at most once per settle interval, but it walks up to 51 KiB
+       of PSRAM and the point is to be cheaper than serialising. */
+    uint32_t h = 2166136261u;
+    const term_cell_t *cells;
+    size_t i, n;
+
+    if (!c)
+        return 0;
+    /* Geometry first, so a resize that happens to leave the same cells in
+       place still reads as a different screen. */
+    h = (h ^ (uint32_t)c->cols) * 16777619u;
+    h = (h ^ (uint32_t)c->rows) * 16777619u;
+    h = (h ^ (uint32_t)c->active) * 16777619u;
+
+    cells = c->screen[c->active];
+    if (!cells)
+        return h;
+    n = (size_t)c->cols * (size_t)c->rows;
+    for (i = 0; i < n; i++) {
+        /* cp, fg, bg and flags — everything a human can see. `flags` holds
+           only attributes and WIDE/CONT geometry (the damage set is a
+           separate bitmap), so all of it belongs in the hash. */
+        h = (h ^ cells[i].cp) * 16777619u;
+        h = (h ^ (uint32_t)cells[i].fg) * 16777619u;
+        h = (h ^ (uint32_t)cells[i].bg) * 16777619u;
+        h = (h ^ (uint32_t)cells[i].flags) * 16777619u;
+    }
+    return h;
 }
 
 /* ===================================================================== */

@@ -111,6 +111,87 @@
  * that is why term_registry_resize posts instead of writing cols/rows in
  * place: a torn dimension read inside the parser is not a bug this design
  * is willing to have.
+ *
+ * =====================================================================
+ * RECORDING (§4.4's exception of 2026-07-30) — READ THIS WHOLE BLOCK
+ * =====================================================================
+ *
+ * WHAT IT IS FOR. §7.2 gives no cross-app read API, so what a remote host
+ * printed on an operator's terminal could not be got off the device at all —
+ * an nvim Lua traceback on the glass was unquotable. Recording mode puts a
+ * recorded session's DISPLAY CONTENT into the LP black box, where the
+ * existing signed pull already reaches it: `tools/bb_pull.py --session`
+ * prints it back as a transcript on the PC. Making a session readable from
+ * the PC is the GOAL of the feature, not a side effect of where the bytes
+ * happened to land.
+ *
+ * R1. OFF BY DEFAULT, PER TERM, AND NEVER REMEMBERED ANYWHERE. This is the
+ *     user's decision of 2026-07-30 and it is a GUARANTEE a test may assert,
+ *     not a default a caller may change:
+ *
+ *       - there is no recording field on term_create_opts_t, and there will
+ *         not be one. A create-time flag is a thing an app stores in its
+ *         saved-tab record and replays months later;
+ *       - nothing here writes the flag to NVS, `store`, or any other
+ *         persistence, and nothing reads it from any;
+ *       - RE-ATTACHING a persist term clears it, even though the term's
+ *         scrollback survived. Picking a tmux session back up is a new
+ *         session for this purpose;
+ *       - DETACHING (the owner app stopping) clears it;
+ *       - BINDING A PRODUCER clears it, which is what makes "a tab reused
+ *         for a new ssh login after a disconnect" start off — including the
+ *         app-level RIS path, which always re-pipes;
+ *       - a producer's detach ack clears it (the session ended);
+ *       - a reboot obviously clears it: the flag lives in .bss, not in the
+ *         LP region.
+ *
+ *     The failure this forecloses is a forgotten opt-in: a flag set once,
+ *     persisted, and still quietly recording sessions months later into a
+ *     region that a pull returns in plaintext. Because it cannot outlive the
+ *     session, "am I being recorded?" is answerable from the current screen
+ *     and nothing else — which is why ssh_vt2's tab bar must show it.
+ *
+ * R2. THE TEE IS AT THE LINE LEVEL, NOT THE BYTE STREAM. term_core's
+ *     term_record_fn fires once per grid row archived to scrollback; see the
+ *     long comment there for why the raw ssh stream is the wrong seam (the
+ *     black box strips every escape, so a stripped TUI redraw is soup) and
+ *     why a redraw storm therefore costs nothing (in-place painting archives
+ *     no rows, and the alt screen never reaches scrollback).
+ *
+ * R3. AND BECAUSE OF R2, WHOLE SCREENS ARE CAPTURED TOO. A line tee cannot
+ *     see content that is displayed and never scrolls off — precisely the
+ *     motivating case, an error in nvim's message area on the alt screen,
+ *     read and then discarded. Three capture triggers close that hole:
+ *
+ *       (a) MANUAL: term_registry_record_screen(), the "I am looking at an
+ *           error, save it" button. Cheapest and most predictable.
+ *       (b) SETTLE-DEBOUNCED: while recording, when nothing has been fed for
+ *           TERM_REC_SETTLE_MS and term_core_screen_hash() differs from the
+ *           last captured screen, capture it. This records the screen states
+ *           a human actually reads, and still costs nothing during a `top`
+ *           storm — a storm never settles. Rate-limited to one landing per
+ *           TERM_REC_SNAP_MIN_MS so the debounce cannot starve the ring;
+ *           skipped evaluations are counted (rec_snaps_deferred).
+ *       (c) END OF SESSION and THE PANIC PATH, so a hang during `top` still
+ *           leaves the last screen.
+ *
+ *     A capture is a marker record plus one record per row, all tagged
+ *     TERM_LP_CLASS_TERM | TERM_LP_F_SCREEN and bounded by
+ *     TERM_REC_SCREEN_MAX bytes.
+ *
+ * R4. WHAT THE OPERATOR ACCEPTED, and what an app must therefore tell the
+ *     user: a recorded session is pullable IN PLAINTEXT by the holder of the
+ *     signing key, and survives resets until the power is cut. With R3 that
+ *     covers a secret merely DISPLAYED, not only one that scrolled. "Do not
+ *     record a session that will display secrets" is a user-level rule; the
+ *     platform's part of the bargain is R1 plus an indicator that cannot be
+ *     missed.
+ *
+ * R5. IT COSTS NOTHING WHEN OFF. Recording on/off IS the installation and
+ *     removal of term_core's record callback, not a boolean the hook tests:
+ *     with recording off there is no route from a term to the ring, in the
+ *     same sense that class B was unreachable before this feature existed
+ *     (term_lp_ring.h, P3).
  */
 #pragma once
 
@@ -161,6 +242,34 @@ extern "C" {
  * TERM_OWNER_MAX >= MQJS_APP_NAME_MAX in the IDF build.
  */
 #define TERM_OWNER_MAX 32
+
+/* ---- recording (R1-R5 above) --------------------------------------------
+ *
+ * All three are tuning, not contract; the contract is that they exist and
+ * that the ledger says what they were when the feature was verified.
+ *
+ * SETTLE 1,200 ms: long enough that a human has stopped reading a frame
+ * mid-redraw, short enough to catch an error message before it is dismissed.
+ * A `top` refreshing every second never reaches it, which is the point.
+ *
+ * SNAP_MIN 5,000 ms: the rate cap of R3(b). A pathological screen that
+ * alternates every 1.2 s therefore lands ~3 KB every 5 s rather than every
+ * 1.2 s — the APP partition turns over in ~40 s instead of ~10 s. Recording
+ * IS eviction pressure; this bounds it without pretending to remove it.
+ *
+ * SCREEN_MAX 8,192 B: about a third of the APP partition, which a worst-case
+ * 53x142 screen of 4-byte codepoints would otherwise exceed. A capture that
+ * hits the cap stops on a row boundary and counts itself truncated; it must
+ * not be able to evict the scrolled lines it is supposed to complement.
+ */
+#define TERM_REC_SETTLE_MS    1200u
+#define TERM_REC_SNAP_MIN_MS  5000u
+#define TERM_REC_SCREEN_MAX   8192u
+
+/* The panic path's share, smaller because that capture is the least certain
+ * code in the feature (it reads PSRAM with no lock, in panic context) and
+ * because the note and the already-recorded lines matter more than it does. */
+#define TERM_REC_PANIC_MAX    4096u
 
 /* A term id: (generation << TERM_SLOT_BITS) | slot. Generations start at
  * 1, so a valid id is always >= TERM_SLOT_COUNT and 0 is free to mean
@@ -544,6 +653,92 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
                               term_read_result_t *res);
 
 /* ===================================================================== */
+/* Recording (§4.4's 2026-07-30 exception; R1-R5 at the top of this file)  */
+/* ===================================================================== */
+
+/*
+ * Turn recording on or off for ONE term. Owner-gated and generation-checked
+ * like every other write (I3): an app can only record its own terminal, and
+ * there is no cross-app entry point, so this widens no read path that §7.2
+ * closed.
+ *
+ * `on` = true installs the line tee and arms the settle-debounced screen
+ * capture, and takes an IMMEDIATE screen capture: the human pressed the
+ * button because of what is on the glass right now, and waiting for the
+ * settle timer would lose it if the remote redraws first.
+ *
+ * `on` = false takes a final capture and then removes the tee, so stopping
+ * recording keeps the frame the user was looking at when they stopped.
+ *
+ * Idempotent: setting the state it already has does nothing at all (no
+ * capture, no counter).
+ *
+ * TERM_ERR_MODE ON A LOG TERM. Recording is the class-B exception and nothing
+ * else: a TERM_LOG term's content is ALREADY in the black box as class A,
+ * because term.log and the print sink tee there unconditionally (§4.4). Arming
+ * a log term would write every archived row a SECOND time as
+ * TERM_LP_CLASS_TERM, halving the retained history to say nothing new. So the
+ * feature is refused where it has no work to do, rather than allowed and
+ * documented as pointless.
+ *
+ * DOES NOT PERSIST ANYTHING — R1. Every lifecycle transition listed in R1
+ * clears it, and nothing restores it.
+ */
+term_err_t term_registry_record(term_id_t id, const char *owner, bool on);
+
+/*
+ * THE introspection point for recording state (there is deliberately only
+ * one, so a UI cannot read a stale second copy): 1 when this term is
+ * recording, 0 when it is not, or a negative term_err_t. Owner-gated.
+ *
+ * The aggregate counters are in term_registry_stats_t (rec_* fields), which
+ * is platform-only like the rest of that struct.
+ */
+int term_registry_recording(term_id_t id, const char *owner);
+
+/*
+ * Capture the visible screen NOW into the black box — R3(a), the "I am
+ * looking at an error, save it" action. TERM_ERR_INVAL when the term is not
+ * recording: this is not a second, unannounced way to put session content in
+ * the ring, it is a button that only exists while the indicator is lit.
+ *
+ * Runs inline under the table lock (the lock covers every core, so the grid
+ * is not being parsed while this reads it) and appends up to
+ * TERM_REC_SCREEN_MAX bytes. It does NOT reset the debounce rate limit — a
+ * human pressing a button is not the case that limit exists for.
+ */
+term_err_t term_registry_record_screen(term_id_t id, const char *owner);
+
+/*
+ * The panic path's half of R3(c). Call from the panic handler AFTER
+ * term_lp_panic_note(), never from anywhere else.
+ *
+ * WHAT IT DOES: for each recording term, visible ones first, appends the
+ * screen through term_lp_panic_append() until TERM_REC_PANIC_MAX bytes are
+ * spent. Takes no lock, allocates nothing, calls no FreeRTOS, and is
+ * one-shot.
+ *
+ * WHY IT IS THE RISKIEST CODE HERE, stated plainly so a reviewer can weigh
+ * it: it reads a grid in PSRAM with no lock, from panic context. The table
+ * itself is .bss and safe to walk, but the core it points at is not ours
+ * alone at that moment, and a cache-disabled panic could fault the read. The
+ * design contains the damage rather than claiming it cannot happen:
+ *
+ *   - the panic NOTE is already published before this runs, and P5 publishes
+ *     a header per record, so everything appended before a fault reads back;
+ *   - therefore the worst case is that a panic becomes a double panic — the
+ *     UART dump is cut short and the reset reason changes — WITHOUT losing
+ *     black box content;
+ *   - and the debounced capture (R3(b)) has usually already stored the last
+ *     screen a human could read, so this path only adds the case where the
+ *     screen was still changing when the device died.
+ *
+ * That is a device-checklist item, not a proof. Returns the number of
+ * records appended.
+ */
+int term_registry_panic_capture(void);
+
+/* ===================================================================== */
 /* Producers and the SPSC rule (§5)                                      */
 /* ===================================================================== */
 
@@ -879,6 +1074,7 @@ typedef struct {
     term_mode_t       mode;
     bool              persist;
     bool              piped;             /* a producer is bound (§5)     */
+    bool              recording;         /* R1; never persisted anywhere */
     int               cols, rows;
     size_t            mem_bytes;         /* the single block, I4         */
     int64_t           detached_since_ms; /* LRU key, 0 when attached     */
@@ -925,6 +1121,20 @@ typedef struct {
     uint32_t replies_js;     /* replies handed to a term.onReply sink    */
     uint32_t replies_dropped;/* replies nobody was listening for         */
     uint32_t caret_pushes;   /* caret events handed to the sink          */
+
+    /* -- phase 5 (§4.4's recording exception; R1-R5) ------------------ */
+    uint32_t rec_on;         /* recording turned on, per term per session */
+    uint32_t rec_off;        /* turned off explicitly (not by lifecycle)  */
+    uint32_t rec_cleared;    /* turned off BY a lifecycle transition, i.e.
+                              * the R1 guarantee doing its work: re-attach,
+                              * detach, pipe bind, detach ack, close       */
+    uint32_t rec_lines;      /* archived rows teed into the black box     */
+    uint32_t rec_screens;    /* screen captures that landed               */
+    uint32_t rec_screen_rows;/* rows those captures wrote                 */
+    uint32_t rec_snaps_deferred; /* settle evaluations the SNAP_MIN rate
+                              * limit turned away, once per settle episode */
+    uint32_t rec_screen_trunc;/* captures cut at TERM_REC_SCREEN_MAX      */
+    uint32_t rec_panic_rows; /* rows the panic path managed to append     */
 } term_registry_stats_t;
 
 void term_registry_stats(term_registry_stats_t *out);

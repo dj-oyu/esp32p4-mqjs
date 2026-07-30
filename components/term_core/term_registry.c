@@ -134,6 +134,20 @@ typedef struct {
 
     term_resize_job_t rz;
 
+    /* §4.4's recording, R1-R5. `record` is the ONE copy of the state — the
+     * core's callback pointer is derived from it and term_registry_recording
+     * reports it — and it lives here, in .bss, so that R1's "never
+     * remembered" is a property of where it is stored and not of a promise
+     * anybody has to keep. Everything else is the debounce (R3(b)). */
+    bool     record;
+    bool     rec_settled;      /* this quiet episode has been evaluated   */
+    bool     rec_deferred;     /* ...and the rate limit turned it away,
+                                * counted once per episode                */
+    bool     rec_hash_valid;
+    uint32_t rec_hash;         /* screen hash of the last capture         */
+    int64_t  rec_fed_ms;       /* last drain pass that moved bytes        */
+    int64_t  rec_snap_ms;      /* last capture that landed                */
+
     uint64_t bytes_in;
     uint64_t bytes_dropped;
 } term_slot_t;
@@ -199,6 +213,20 @@ static term_registry_stats_t s_stats;
 
 /* UI-task-only staging buffer for a drain slice. */
 static uint8_t s_drain_buf[TERM_DRAIN_CHUNK];
+
+/* One row of a screen capture, and the writer name it is attributed to.
+ * Static rather than on the stack because the UI task's stack is not the
+ * place for another 512 bytes, and safe to share because every caller holds
+ * the table lock — the same serialisation term_lp_ring_append already
+ * requires of its own staging buffer. The panic path has its own copies
+ * below, for the obvious reason. */
+static char s_rec_row[TERM_LP_REC_MAX];
+static char s_rec_writer[TERM_LP_WRITER_MAX];
+
+/* Recording lives in its own section further down (it needs term_core's
+ * callback type and the slot layout), but the lifecycle transitions of R1 are
+ * spread across this whole file and every one of them has to reach it. */
+static void record_clear_locked(term_slot_t *sl, const char *why);
 
 /* ===================================================================== */
 /* Small helpers                                                         */
@@ -368,6 +396,11 @@ static void stage1_locked(term_slot_t *sl,
 
     if (sl->state == TERM_SLOT_DYING || sl->state == TERM_SLOT_ZOMBIE)
         return; /* idempotent */
+
+    /* R1 + R3(c): the term is going away, so this is the last chance to keep
+     * the screen, and recording must not survive into the next occupant of
+     * this slot. Before the state change, while the core is still ours. */
+    record_clear_locked(sl, "close");
 
     sl->state = TERM_SLOT_DYING;
     sl->dying_since_ms = s_p->now_ms();
@@ -635,6 +668,293 @@ static void reg_caret_cb(void *user, int col, int row, bool visible)
     sl->caret_pending = true;
 }
 
+/* ===================================================================== */
+/* Recording (§4.4's 2026-07-30 exception; R1-R5 in term_registry.h)      */
+/* ===================================================================== */
+
+/* The class+flag every screen-capture record carries (term_lp_ring.h). Named
+ * once so the two append sites and the panic twin cannot drift apart. */
+#define REC_SCREEN_CLS \
+    ((term_lp_class_t)((unsigned)TERM_LP_CLASS_TERM | TERM_LP_F_SCREEN))
+
+/* Bounded appenders for the one line this feature formats (the capture
+ * marker). No snprintf: this code is one caller away from panic context and
+ * the file is allocation- and libc-format-free by I4. Both return the new
+ * length and never write past `cap - 1`. */
+static size_t rb_put(char *dst, size_t cap, size_t at, const char *s)
+{
+    while (*s && at + 1u < cap)
+        dst[at++] = *s++;
+    dst[at] = '\0';
+    return at;
+}
+
+static size_t rb_putu(char *dst, size_t cap, size_t at, unsigned v)
+{
+    char tmp[12];
+    int n = 0;
+
+    do { tmp[n++] = (char)('0' + v % 10u); v /= 10u; } while (v && n < 12);
+    while (n-- > 0 && at + 1u < cap)
+        dst[at++] = tmp[n];
+    dst[at] = '\0';
+    return at;
+}
+
+/*
+ * The writer_id a recorded record carries: "<owner>:<name>", e.g.
+ * "ssh_vt2:t0".
+ *
+ * WHY THE TERM NAME IS IN IT. A transcript of three simultaneously recorded
+ * tabs is useless if every line says "ssh_vt2": the writer field is the only
+ * per-record provenance the format has (term_lp_ring.h, P2), so it is where
+ * the tab has to go. Both halves are as trustworthy as the owner alone —
+ * `owner` came from the signed push and `name` is inside that owner's own
+ * namespace (I3) — so this does not weaken what a writer_id means.
+ *
+ * WHAT IT COSTS. The writer table holds 8 interned names, shared with every
+ * app's print(). Three recorded tabs are three of them. When the table fills,
+ * or when owner+':'+name will not fit in 31 bytes, the honest fallback is the
+ * bare owner, and after that lp_intern's own WRITER_UNKNOWN. Both degrade
+ * ATTRIBUTION only; content is never affected.
+ */
+static const char *rec_writer(const term_slot_t *sl)
+{
+    size_t o = strlen(sl->owner), n = strlen(sl->name);
+
+    if (!o)
+        return NULL;
+    if (n && o + 1u + n < sizeof s_rec_writer) {
+        memcpy(s_rec_writer, sl->owner, o);
+        s_rec_writer[o] = ':';
+        memcpy(s_rec_writer + o + 1u, sl->name, n);
+        s_rec_writer[o + 1u + n] = '\0';
+        return s_rec_writer;
+    }
+    return sl->owner;
+}
+
+/*
+ * The panic path's own copies of the two buffers. Separate rather than shared
+ * because the panic handler cannot take the lock, and the lock is what makes
+ * the shared pair safe: reusing s_rec_row would mean a crash landing in the
+ * middle of a capture publishes half of one row and half of another as one
+ * record. 288 bytes of .bss buys "the note is either right or absent".
+ */
+static char s_panic_row[TERM_LP_REC_MAX];
+static char s_panic_writer[TERM_LP_WRITER_MAX];
+
+static const char *rec_writer_panic(const term_slot_t *sl)
+{
+    size_t o = strlen(sl->owner), n = strlen(sl->name);
+
+    if (!o)
+        return NULL;
+    if (n && o + 1u + n < sizeof s_panic_writer) {
+        memcpy(s_panic_writer, sl->owner, o);
+        s_panic_writer[o] = ':';
+        memcpy(s_panic_writer + o + 1u, sl->name, n);
+        s_panic_writer[o + 1u + n] = '\0';
+        return s_panic_writer;
+    }
+    return sl->owner;
+}
+
+/*
+ * R2's tee. Runs inside term_core_feed() — UI task, table lock held — which
+ * is exactly the context term_lp_ring_append wants (it takes no lock of its
+ * own and requires the caller's serialisation, and the registry's mutex is
+ * the serialisation every other writer uses). So this appends INLINE and
+ * needs none of the caret sink's park-and-flush: unlike the caret, the black
+ * box is not another subsystem's state, it is one level DOWN from here, and
+ * the lock order registry -> ring is the one term_lp_ring.h already names.
+ */
+static void reg_record_cb(void *user, const char *text, size_t len)
+{
+    term_slot_t *sl = (term_slot_t *)user;
+
+    if (term_lp_log(TERM_LP_CLASS_TERM, rec_writer(sl), text, len))
+        s_stats.rec_lines++;
+}
+
+/*
+ * Capture the active screen. Lock held; `why` names the trigger and goes into
+ * the marker record, which is what lets a reader see frame boundaries in a
+ * transcript instead of one undifferentiated wall of rows.
+ *
+ * TRAILING BLANK ROWS ARE DROPPED, interior ones are not: an empty line in
+ * the middle of an error message is content, an empty bottom half of the
+ * screen is just the screen being taller than the output.
+ */
+static void capture_screen_locked(term_slot_t *sl, const char *why)
+{
+    const char *writer;
+    int rows, r, last = -1;
+    size_t spent = 0, n;
+    bool trunc = false;
+
+    if (!sl->core)
+        return;
+    rows = term_core_rows(sl->core);
+    for (r = 0; r < rows; r++)
+        if (term_core_row_utf8(sl->core, r, NULL, 0) > 0)
+            last = r;
+
+    writer = rec_writer(sl);
+    n = rb_put(s_rec_row, sizeof s_rec_row, 0, "--- screen ");
+    n = rb_put(s_rec_row, sizeof s_rec_row, n, why ? why : "?");
+    n = rb_put(s_rec_row, sizeof s_rec_row, n, " ");
+    n = rb_putu(s_rec_row, sizeof s_rec_row, n,
+                (unsigned)term_core_cols(sl->core));
+    n = rb_put(s_rec_row, sizeof s_rec_row, n, "x");
+    n = rb_putu(s_rec_row, sizeof s_rec_row, n, (unsigned)rows);
+    n = rb_put(s_rec_row, sizeof s_rec_row, n, " rows=");
+    n = rb_putu(s_rec_row, sizeof s_rec_row, n, (unsigned)(last + 1));
+    n = rb_put(s_rec_row, sizeof s_rec_row, n, " ---");
+    if (!term_lp_log(REC_SCREEN_CLS, writer, s_rec_row, n))
+        return;                 /* no ring: do not walk 51KB for nothing */
+    spent += n;
+
+    for (r = 0; r <= last; r++) {
+        int need = term_core_row_utf8(sl->core, r, s_rec_row,
+                                      sizeof s_rec_row);
+        size_t take;
+        if (need < 0)
+            need = 0;
+        if ((size_t)need >= sizeof s_rec_row)
+            need = (int)sizeof s_rec_row - 1;   /* row_utf8 NUL-terminates */
+        take = (size_t)need;
+        if (spent + take > TERM_REC_SCREEN_MAX) {
+            trunc = true;
+            break;
+        }
+        /* An empty row still gets a record so the transcript keeps the
+         * screen's line structure — the ring refuses an empty payload, so
+         * one space is what an empty line has to be. */
+        if (!take) {
+            s_rec_row[0] = ' ';
+            take = 1;
+        }
+        if (term_lp_log(REC_SCREEN_CLS, writer, s_rec_row, take))
+            s_stats.rec_screen_rows++;
+        spent += take;
+    }
+    s_stats.rec_screens++;
+    if (trunc)
+        s_stats.rec_screen_trunc++;
+    sl->rec_snap_ms = s_p->now_ms();
+    sl->rec_hash = term_core_screen_hash(sl->core);
+    sl->rec_hash_valid = true;
+}
+
+/*
+ * Arm or disarm. THE function that implements R1 and R5: recording on/off is
+ * the presence or absence of the core's callback, so "off" leaves no route
+ * from this term to the ring at all.
+ *
+ * `lifecycle` distinguishes "the user turned it off" from "a transition in R1
+ * turned it off", because those are different facts about the device and the
+ * second one is the guarantee doing its job. A lifecycle clear still takes
+ * the final capture (that is the end-of-session snapshot of R3(c)) unless the
+ * core is already gone.
+ */
+static void record_set_locked(term_slot_t *sl, bool on, bool lifecycle,
+                              const char *why)
+{
+    if (on == sl->record)
+        return;
+    if (on) {
+        sl->record = true;
+        sl->rec_hash_valid = false;
+        sl->rec_settled = false;
+        sl->rec_deferred = false;
+        sl->rec_fed_ms = s_p->now_ms();
+        sl->rec_snap_ms = 0;
+        term_core_set_record_cb(sl->core, reg_record_cb, sl);
+        s_stats.rec_on++;
+        /* R3(a) at the moment of arming: the reason a human pressed the
+         * button is on the glass now, and the settle timer would lose it to
+         * the next redraw. */
+        capture_screen_locked(sl, why ? why : "start");
+        return;
+    }
+    if (sl->core)
+        capture_screen_locked(sl, why ? why : "stop");
+    sl->record = false;
+    sl->rec_hash_valid = false;
+    sl->rec_settled = false;
+    sl->rec_deferred = false;
+    term_core_set_record_cb(sl->core, NULL, NULL);
+    if (lifecycle)
+        s_stats.rec_cleared++;
+    else
+        s_stats.rec_off++;
+}
+
+/* R1's guarantee at a lifecycle transition. Cheap enough to call
+ * unconditionally: it returns immediately unless recording was on. */
+static void record_clear_locked(term_slot_t *sl, const char *why)
+{
+    record_set_locked(sl, false, true, why);
+}
+
+/*
+ * R3(b), once per drain pass per term. `moved` says whether this pass took
+ * bytes out of the ring.
+ *
+ * THE COST DISCIPLINE, in the order the conditions are written, because the
+ * order IS the design:
+ *
+ *   1. not recording -> zero work. Not even a clock read.
+ *   2. bytes moved -> the screen is changing: reset the quiet timer and
+ *      return. This is the `top` storm, and it costs two stores.
+ *   3. already evaluated this quiet episode -> return. An unchanged screen
+ *      with no new bytes cannot become a different screen, so one hash per
+ *      episode is all the information there is.
+ *   4. not quiet long enough -> return, still no hash.
+ *   5. rate limit still closed -> count once and return, still no hash. The
+ *      episode stays unevaluated so the capture happens when it opens.
+ *   6. only now: hash the screen (51 KiB of PSRAM), and capture only if it
+ *      differs from the last one captured.
+ *
+ * So the hash runs at most once per settle interval per recording term, and
+ * never at all for a term nobody is recording or a screen nobody stopped
+ * writing to.
+ */
+static void record_settle_locked(term_slot_t *sl, bool moved, int64_t now)
+{
+    uint32_t h;
+
+    if (!sl->record)
+        return;
+    if (moved) {
+        sl->rec_fed_ms = now;
+        sl->rec_settled = false;
+        sl->rec_deferred = false;
+        return;
+    }
+    if (sl->rec_settled)
+        return;
+    if (now - sl->rec_fed_ms < (int64_t)TERM_REC_SETTLE_MS)
+        return;
+    if (now - sl->rec_snap_ms < (int64_t)TERM_REC_SNAP_MIN_MS) {
+        if (!sl->rec_deferred) {
+            sl->rec_deferred = true;
+            s_stats.rec_snaps_deferred++;
+        }
+        return;
+    }
+    h = term_core_screen_hash(sl->core);
+    if (sl->rec_hash_valid && h == sl->rec_hash) {
+        sl->rec_settled = true;   /* nothing new to keep, and nothing can
+                                   * change it until bytes arrive */
+        return;
+    }
+    capture_screen_locked(sl, "settled");
+    sl->rec_settled = true;
+    sl->rec_deferred = false;
+}
+
 /* Carve the one block: core first (term_core_init wants 8-byte
  * alignment and term_core_mem_size is already a multiple of 8), byte
  * ring after it. One allocation, one free — I4. */
@@ -760,6 +1080,12 @@ term_err_t term_registry_create(const term_create_opts_t *opts,
         }
         sl->state = TERM_SLOT_LIVE;
         sl->detached_since_ms = 0;
+        /* R1: a re-attach is a NEW session even though the scrollback
+         * survived. Belt and braces — the DETACHED transition already
+         * cleared it — because this is the path a restarted app takes to
+         * pick a tab back up, and it is precisely where a persisted flag
+         * would have come back to life. */
+        record_clear_locked(sl, "reattach");
         if (opts->cols != sl->cols || opts->rows != sl->rows)
             need_post = queue_resize_locked(sl, opts->cols, opts->rows);
         *out_id = slot_id(sl);
@@ -838,6 +1164,16 @@ term_err_t term_registry_create(const term_create_opts_t *opts,
     sl->caret_col = sl->caret_row = 0;
     sl->caret_vis = true;
     sl->rz.queued = false;
+    /* R1 in its simplest form: a brand new term is never recording. Written
+     * out rather than left to the slot's previous contents, because a slot is
+     * reused and "whatever the last tenant left" is not a guarantee. */
+    sl->record = false;
+    sl->rec_settled = false;
+    sl->rec_deferred = false;
+    sl->rec_hash_valid = false;
+    sl->rec_hash = 0;
+    sl->rec_fed_ms = 0;
+    sl->rec_snap_ms = 0;
     sl->bytes_in = 0;
     sl->bytes_dropped = 0;
     sl->state = TERM_SLOT_LIVE;
@@ -917,7 +1253,10 @@ int term_registry_owner_stopped(const char *owner)
         n++;
         if (sl->persist) {
             /* §3.1: kept alive, waiting for a same-owner+same-name
-             * create to pick it back up, or for the LRU to evict it. */
+             * create to pick it back up, or for the LRU to evict it.
+             * R1 + R3(c): the app that was showing this session is gone, so
+             * take the last screen and disarm. */
+            record_clear_locked(sl, "detach");
             sl->state = TERM_SLOT_DETACHED;
             sl->detached_since_ms = s_p->now_ms();
             sl->view.visible = false;
@@ -1477,6 +1816,170 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
 }
 
 /* ===================================================================== */
+/* Recording, the public half (§4.4's exception; R1-R5)                   */
+/* ===================================================================== */
+
+term_err_t term_registry_record(term_id_t id, const char *owner, bool on)
+{
+    term_slot_t *sl;
+    term_err_t e;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    if (sl->mode != TERM_VT) {
+        /* Recording is the class-B exception and nothing else — a LOG term is
+         * already teed as class A, so arming it would only duplicate. See the
+         * header. */
+        unlock();
+        return TERM_ERR_MODE;
+    }
+    /*
+     * NOT posted to the UI task, unlike snapshot/read, even though arming
+     * takes a screen capture and therefore reads the grid. The table lock is
+     * what protects a core from the parser (this file's opening comment: one
+     * mutex covers the whole table AND every term's core), so reading here is
+     * as consistent as reading in the drain. The read pair posts because it
+     * wants a FRAME boundary for the caller's benefit and because it copies
+     * into the caller's buffer; neither applies to an append into the ring.
+     */
+    record_set_locked(sl, on, false, on ? "start" : "stop");
+    unlock();
+    return TERM_OK;
+}
+
+int term_registry_recording(term_id_t id, const char *owner)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    bool on;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    on = sl->record;
+    unlock();
+    return on ? 1 : 0;
+}
+
+term_err_t term_registry_record_screen(term_id_t id, const char *owner)
+{
+    term_slot_t *sl;
+    term_err_t e;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    if (!sl->record) {
+        /* Not a second, unannounced door into the ring: this exists only
+         * while the indicator is lit. */
+        unlock();
+        return TERM_ERR_INVAL;
+    }
+    capture_screen_locked(sl, "manual");
+    /* The manual capture deliberately does NOT arm the debounce's rate limit
+     * against the next settle — capture_screen_locked moved rec_snap_ms, and
+     * that is the honest accounting: a capture landed, so the next automatic
+     * one waits its turn. What it does clear is the "this episode has been
+     * evaluated" flag, so a screen that changes AFTER the button is still
+     * picked up by the debounce. */
+    sl->rec_settled = false;
+    sl->rec_deferred = false;
+    unlock();
+    return TERM_OK;
+}
+
+int term_registry_panic_capture(void)
+{
+    static bool done;
+    int pass, i, appended = 0;
+    size_t spent = 0;
+
+    if (done || !s_ready)
+        return 0;
+    done = true;
+    if (!term_lp_panic_ready())
+        return 0;
+
+    /* Visible terms first: with a shared budget, the tab the user was looking
+     * at is the one worth spending it on. No lock — see the header on why
+     * that is contained rather than safe. */
+    for (pass = 0; pass < 2 && spent < TERM_REC_PANIC_MAX; pass++) {
+        for (i = 0; i < TERM_SLOT_COUNT && spent < TERM_REC_PANIC_MAX; i++) {
+            term_slot_t *sl = &s_slots[i];
+            const char *writer;
+            int rows, r;
+
+            if (!sl->record || !sl->core)
+                continue;
+            if (sl->state != TERM_SLOT_LIVE && sl->state != TERM_SLOT_DETACHED)
+                continue;
+            if ((pass == 0) != (sl->view.visible ? true : false))
+                continue;
+
+            writer = rec_writer_panic(sl);
+            rows = term_core_rows(sl->core);
+            /* One marker, so a reader can tell a panic screen from the
+             * debounced one that may already be a few records back. */
+            {
+                size_t n = rb_put(s_panic_row, sizeof s_panic_row, 0,
+                                  "--- screen panic ");
+                n = rb_putu(s_panic_row, sizeof s_panic_row, n,
+                            (unsigned)term_core_cols(sl->core));
+                n = rb_put(s_panic_row, sizeof s_panic_row, n, "x");
+                n = rb_putu(s_panic_row, sizeof s_panic_row, n,
+                            (unsigned)rows);
+                n = rb_put(s_panic_row, sizeof s_panic_row, n, " ---");
+                if (!term_lp_panic_append(REC_SCREEN_CLS, writer,
+                                          s_panic_row, n))
+                    return appended;
+                spent += n;
+                appended++;
+            }
+            for (r = 0; r < rows && spent < TERM_REC_PANIC_MAX; r++) {
+                int need = term_core_row_utf8(sl->core, r, s_panic_row,
+                                              sizeof s_panic_row);
+                if (need <= 0)
+                    continue;      /* blank rows are not worth a panic append */
+                if ((size_t)need >= sizeof s_panic_row)
+                    need = (int)sizeof s_panic_row - 1;
+                if (!term_lp_panic_append(REC_SCREEN_CLS, writer, s_panic_row,
+                                          (size_t)need))
+                    return appended;   /* the shadow header went bad: stop */
+                spent += (size_t)need;
+                appended++;
+                s_stats.rec_panic_rows++;
+            }
+        }
+    }
+    return appended;
+}
+
+/* ===================================================================== */
 /* Producers (§5)                                                        */
 /* ===================================================================== */
 
@@ -1501,6 +2004,7 @@ term_err_t term_registry_producer_bind_ex(term_id_t id, const char *owner,
         unlock();
         return TERM_ERR_BUSY;
     }
+    record_clear_locked(sl, "bind");   /* R1: a new producer = a new session */
     sl->piped = true;
     sl->prod = *prod;
     s_stats.pipes++;
@@ -1564,6 +2068,15 @@ term_err_t term_registry_pipe(term_id_t id, const char *owner,
         fn(user, id); /* outside the lock: it may shutdown() a socket */
         return TERM_ERR_BUSY;
     }
+    /*
+     * R1's structural half of "a reused tab starts recording off". Binding a
+     * producer is the one event every new session passes through: a fresh
+     * connect, a reconnect into a tab that was cleared with RIS, a re-pipe
+     * onto a different channel. Clearing here means an app that FORGOT to
+     * disarm cannot carry one session's opt-in into the next one, so the
+     * guarantee does not depend on app code being careful.
+     */
+    record_clear_locked(sl, "bind");
     sl->piped = true;
     sl->prod = *prod;
     s_stats.pipes++;
@@ -1622,6 +2135,10 @@ term_err_t term_registry_producer_ack(term_id_t id)
         unlock();
         return TERM_OK;
     }
+    /* R1 + R3(c): the producer is gone, i.e. the ssh session ended. Keep the
+     * last screen (a session that died in `top` scrolled nothing, so this is
+     * the only record of what it was showing) and disarm. */
+    record_clear_locked(sl, "session-end");
     sl->prod_ack_pending = false;
     sl->piped = false;
     memset(&sl->prod, 0, sizeof sl->prod);
@@ -1813,6 +2330,7 @@ bool term_registry_ui_drain(void)
     int ncarets = 0;
     term_caret_sink_fn sink;
     void *sink_user;
+    int64_t now;
 
     if (!s_ready)
         return false;
@@ -1823,9 +2341,13 @@ bool term_registry_ui_drain(void)
      * is anybody to deliver to. */
     sink = s_caret_sink;
     sink_user = s_caret_sink_user;
+    /* One clock read for the whole pass, like the sink: the debounce of R3(b)
+     * compares terms against the same instant, and now_ms() is a port call. */
+    now = s_p->now_ms();
     for (i = 0; i < TERM_SLOT_COUNT; i++) {
         term_slot_t *sl = &s_slots[i];
         int budget;
+        bool moved = false;
 
         if (sl->state == TERM_SLOT_DYING || sl->state == TERM_SLOT_ZOMBIE) {
             /* This is the UI half of the stage-2 ack: past this point
@@ -1849,7 +2371,12 @@ bool term_registry_ui_drain(void)
                 break;
             term_core_feed(sl->core, s_drain_buf, got);
             budget -= (int)got;
+            moved = true;
         }
+        /* R3(b). After the parse, so a screen judged "settled" is the screen
+         * this pass produced and not the one before it. The recording tee
+         * itself already fired inside term_core_feed, from sb_archive_row. */
+        record_settle_locked(sl, moved, now);
         /* Leftovers stay in the ring for the next frame — §5's carry. */
         if (sl->view.visible &&
             (term_core_full_repaint(sl->core) ||
@@ -1963,6 +2490,7 @@ static void fill_info(const term_slot_t *sl, term_slot_info_t *out)
     out->mode = sl->mode;
     out->persist = sl->persist;
     out->piped = sl->piped;
+    out->recording = sl->record;
     out->cols = sl->cols;
     out->rows = sl->rows;
     out->mem_bytes = sl->block_size;

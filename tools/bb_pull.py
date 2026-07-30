@@ -9,11 +9,36 @@
       --ctr N       use this replay counter instead of the wall clock
       --timeout S   seconds to wait for a reply chunk (default 10)
       --json        print the raw reply chunks instead of the log text
+      --session     print ONLY recorded terminal content, as a transcript
+      --writer W    keep only records written by W (e.g. ssh_vt2:t0)
       --raw         publish the request UNSIGNED (expect a rejection)
       --tamper      sign, then flip one message byte (expect a rejection)
 
     python3 tools/bb_pull.py 192.168.1.2 esp32p4-mqjs/task/u7q3x9f2
     python3 tools/bb_pull.py 192.168.1.2 esp32p4-mqjs/task/u7q3x9f2 stats
+    python3 tools/bb_pull.py 192.168.1.2 esp32p4-mqjs/task/u7q3x9f2 --session
+
+RECORD CLASSES. Every record carries a {writer_id, class} tag structurally
+(docs/term-design.md §4.4), and the device prints the class as a four-
+character token in front of the writer:
+
+  sys/   the platform and system apps: boot markers, panic reasons
+  app/   a user app's print() / term.log()
+  ses/   a line of a RECORDED terminal session that scrolled off screen
+  scr/   one row of a RECORDED screen capture, or its "--- screen ... ---"
+         marker; a capture is the marker plus its rows, consecutively
+  ?/     a class this script does not know — a newer firmware wrote it
+
+ses/ and scr/ exist only for a session a human explicitly recorded, for that
+one session (term_registry.h "RECORDING"). They are why --session can print a
+readable transcript at all: without the class tag the session's lines and the
+device's own log lines would be one interleaved stream with no way to separate
+them. --session strips the timestamps and writer prefixes and puts a blank
+line at each screen-capture boundary, which is the form to paste somewhere.
+
+If several tabs were recorded at once their lines interleave — use --writer
+with the "<app>:<term>" name from a normal (non---session) listing to pull one
+tab out.
 
 Wire format (components/term_core/term_bb_pull.h is the contract):
 
@@ -34,6 +59,7 @@ request cannot be re-published later to pull a future boot's log.
 """
 import json
 import os
+import re
 import select
 import socket
 import sys
@@ -182,6 +208,51 @@ def collect(m: Mqtt, base: str, ctr: int, timeout: float, want_json: bool):
     return lines, tail
 
 
+#  "[12345] ses/ssh_vt2:t0: some text"  ->  (12345, "ses/", writer, text)
+#  The device builds this in term_lp_dump_json_ex; a truncated payload is
+#  marked with a leading "~" on the text, which is kept as-is.
+RECORD_RE = re.compile(r"^\[(\d+)\] ([a-z?]+/)([^:]*(?::[^:]*)?): (.*)$",
+                       re.DOTALL)
+
+SCREEN_MARKER = re.compile(r"^~?--- screen \S+ ")
+
+
+def split_record(line: str):
+    """(t_ms, tag, writer, text) or None when the line is not in that form."""
+    m = RECORD_RE.match(line)
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2), m.group(3), m.group(4)
+
+
+def transcript(lines: list[str], writer_filter: str | None) -> list[str]:
+    """Recorded session content only, as something a human can read.
+
+    Keeps ses/ and scr/ and nothing else, so the device's own log lines do not
+    interleave with the remote host's output. A screen capture's marker
+    becomes a blank line plus the marker, so the boundary between "these lines
+    scrolled past" and "this is what the glass showed" stays visible — that
+    distinction is the whole reason TERM_LP_F_SCREEN exists.
+    """
+    out: list[str] = []
+    for line in lines:
+        rec = split_record(line)
+        if not rec:
+            continue
+        _t, tag, writer, text = rec
+        if tag not in ("ses/", "scr/"):
+            continue
+        if writer_filter and writer != writer_filter:
+            continue
+        if tag == "scr/" and SCREEN_MARKER.match(text):
+            if out:
+                out.append("")
+            out.append(text.lstrip("~"))
+            continue
+        out.append(text)
+    return out
+
+
 def main() -> None:
     argv = sys.argv[1:]
     if len(argv) < 2:
@@ -192,8 +263,8 @@ def main() -> None:
             return cast(argv[argv.index(name) + 1])
         return default
 
-    flags = {"--json", "--raw", "--tamper"}
-    valued = {"--port", "--from", "--ctr", "--timeout"}
+    flags = {"--json", "--raw", "--tamper", "--session"}
+    valued = {"--port", "--from", "--ctr", "--timeout", "--writer"}
     pos = []
     skip = False
     for i, a in enumerate(argv):
@@ -218,6 +289,10 @@ def main() -> None:
     timeout = opt("--timeout", 10.0, float)
     ctr = opt("--ctr", None, int)
     want_json = "--json" in argv
+    want_session = "--session" in argv
+    writer_filter = opt("--writer")
+    if want_session and what == "stats":
+        raise SystemExit("--session needs a content read (lastboot or live)")
 
     m = Mqtt(host, port)
     m.subscribe(f"{base}/bb/reply", f"{base}/status")
@@ -265,8 +340,22 @@ def main() -> None:
     if what == "stats":
         if not want_json and tail:
             print(json.dumps(tail.get("body"), ensure_ascii=False, indent=1))
+    elif want_session and not want_json:
+        rows = transcript(total, writer_filter)
+        for line in rows:
+            print(line)
+        if not rows:
+            print("[info] no recorded session content in this image "
+                  "(recording is off unless somebody turned it on for a live "
+                  "session)", file=sys.stderr)
+        print(f"[done] {len(rows)} recorded lines of {len(total)} records",
+              file=sys.stderr)
+        return
     elif not want_json:
         for line in total:
+            rec = split_record(line)
+            if writer_filter and (not rec or rec[2] != writer_filter):
+                continue
             print(line)
     print(f"[done] {len(total)} records", file=sys.stderr)
 

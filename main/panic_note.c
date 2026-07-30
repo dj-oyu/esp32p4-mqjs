@@ -37,6 +37,7 @@
 #include "freertos/task.h"
 
 #include "term_lp_ring.h"
+#include "term_registry.h"
 
 void __real_esp_panic_handler(panic_info_t *info);
 
@@ -74,5 +75,19 @@ void __wrap_esp_panic_handler(panic_info_t *info)
 
         term_lp_panic_note(&p);
     }
+    /*
+     * The last screen of any RECORDED session, after the note and outside the
+     * `info` guard (a panic with no info is still a panic worth a screen).
+     *
+     * ORDER IS THE SAFETY ARGUMENT, not a preference. This is the least
+     * certain code on the panic path — it reads a grid in PSRAM with no lock —
+     * and every record term_lp_ring publishes its own header (P5), so with the
+     * note already in, a fault here costs a double panic and nothing else: the
+     * note and every line recorded before the crash still read back. Running
+     * it before the note would risk trading the certain line for the uncertain
+     * ones. It is also a no-op in the normal case, because nothing is
+     * recording unless a human turned it on for a live session.
+     */
+    term_registry_panic_capture();
     __real_esp_panic_handler(info);
 }

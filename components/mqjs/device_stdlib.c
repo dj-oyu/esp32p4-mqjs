@@ -476,6 +476,11 @@ static const JSPropDef js_term[] = {
     JS_CFUNC_DEF("resize", 3, js_term_resize),     /* (id, cols, rows) */
     JS_CFUNC_DEF("snapshot", 1, js_term_snapshot), /* (id) -> text | null */
     JS_CFUNC_DEF("read", 3, js_term_read),         /* (id, from, n) -> text */
+    /* Recording (§4.4's 2026-07-30 exception). (id) queries, (id, on) sets;
+       per session only, never persisted, off after every lifecycle
+       transition — term_registry.h R1. */
+    JS_CFUNC_DEF("record", 2, js_term_record),     /* (id[, on]) -> 1|0|-err */
+    JS_CFUNC_DEF("recordScreen", 1, js_term_recordScreen), /* (id) */
     JS_CFUNC_DEF("close", 1, js_term_close),
     /* term_err_t values, so apps need no magic numbers */
     JS_PROP_DOUBLE_DEF("OK", 0, 0),

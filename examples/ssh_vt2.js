@@ -86,6 +86,10 @@ var TAB_FG = 0x8B98A5;
 var TAB_ACT_BG = 0x2E6BD6;
 var TAB_ACT_FG = 0xFFFFFF;
 var SEL_FG = 0x000000, SEL_BG = 0x9CC4E4;
+/* 記録中のタブ。青系のタブ色から一番遠い赤で、非アクティブでも赤のまま
+   にする — 「録っているのはどのタブか」は選択中かどうかと無関係。 */
+var REC_BG = 0xB3261E, REC_ACT_BG = 0xE04A3F, REC_FG = 0xFFFFFF;
+var REC_DOT = "●";   /* ● */
 
 /* ---- snapshot の行を「列 → 文字」へ展開する ---------------------------
    term.snapshot は CONT セル (幅 2 文字の右半分) を落とした UTF-8 を
@@ -141,11 +145,21 @@ function rowText(row, c0, c1, copy) {
 }
 
 /* ---- タブバーの見た目 (純関数、セルフテストが検算する) ----------------
-   戻り: {runs:[{c,text,fg,bg}], hits:[{x0,x1,idx}]}  idx -1 = [+]。 */
-function tabLayout(labels, actIdx, cols, cw, canAdd, mods) {
+   戻り: {runs:[{c,text,fg,bg}], hits:[{x0,x1,idx}]}  idx -1 = [+]。
+
+   rec[i] が真のタブは「記録中」。§4.4 の記録モードはユーザーが「録って
+   いるかどうか」を画面だけで判断できることが前提の契約なので、見落と
+   しようのない出し方にする:
+     ・そのタブのラベル先頭に ● を付ける
+     ・そのタブの背景を赤にする (非アクティブでも赤)
+     ・アクティブタブが記録中なら右端に ●REC を出す (修飾キー表示の左)
+   3 つ重ねているのは冗長ではなく、ラベルが長くて切れた場合・タブが
+   はみ出して並ばない場合それぞれに一つずつ残るため。 */
+function tabLayout(labels, actIdx, cols, cw, canAdd, mods, rec) {
     var runs = [], hits = [], c = 0, i;
     for (i = 0; i < labels.length; i++) {
-        var label = " " + (i + 1) + ":" + labels[i] + " ";
+        var on = !!(rec && rec[i]);
+        var label = " " + (on ? REC_DOT : "") + (i + 1) + ":" + labels[i] + " ";
         if (label.length > 22)
             label = label.slice(0, 21) + "… ";
         /* -4 は [+] (3 セル) の取り置き。モード表示は制御バーの「あ」キー
@@ -154,8 +168,9 @@ function tabLayout(labels, actIdx, cols, cw, canAdd, mods) {
             break;
         var act = (i === actIdx);
         runs.push({ c: c, text: label,
-                    fg: act ? TAB_ACT_FG : TAB_FG,
-                    bg: act ? TAB_ACT_BG : TAB_BG });
+                    fg: on ? REC_FG : (act ? TAB_ACT_FG : TAB_FG),
+                    bg: on ? (act ? REC_ACT_BG : REC_BG)
+                           : (act ? TAB_ACT_BG : TAB_BG) });
         hits.push({ x0: c * cw, x1: (c + label.length) * cw, idx: i });
         c += label.length;
     }
@@ -163,9 +178,15 @@ function tabLayout(labels, actIdx, cols, cw, canAdd, mods) {
         runs.push({ c: c, text: " + ", fg: TAB_ACT_FG, bg: 0x256B45 });
         hits.push({ x0: c * cw, x1: (c + 3) * cw, idx: -1 });
     }
+    var modsAt = cols - (mods ? mods.length : 0);
     if (mods && cols > mods.length)
-        runs.push({ c: cols - mods.length, text: mods,
-                    fg: 0x000000, bg: 0xFFD479 });
+        runs.push({ c: modsAt, text: mods, fg: 0x000000, bg: 0xFFD479 });
+    if (rec && actIdx >= 0 && rec[actIdx]) {
+        var badge = " " + REC_DOT + "REC ";
+        if (modsAt - badge.length > c)
+            runs.push({ c: modsAt - badge.length, text: badge,
+                        fg: REC_FG, bg: REC_BG });
+    }
     return { runs: runs, hits: hits };
 }
 
@@ -252,6 +273,40 @@ if (SELFTEST) {
                    lay.hits.length === 3 && lay.hits[0].x1 === lay.hits[1].x0);
                 var lay2 = tabLayout([], -1, 80, 9, true, "");
                 ok("[+] only", lay2.hits.length === 1 && lay2.hits[0].idx === -1);
+                /* 記録中の見せ方: ● 付きラベル + 赤背景 + 右端 ●REC。
+                   非アクティブでも赤のままであること。 */
+                var lr = tabLayout(["a@h", "b@h"], 0, 80, 9, false, "",
+                                   [true, false]);
+                ok("recording tab is red", lr.runs[0].bg === REC_ACT_BG);
+                ok("recording tab has the dot",
+                   lr.runs[0].text.indexOf(REC_DOT) >= 0);
+                ok("the other tab is not red", lr.runs[1].bg === TAB_BG);
+                ok("REC badge present",
+                   lr.runs[lr.runs.length - 1].text.indexOf("REC") >= 0);
+                var lr2 = tabLayout(["a@h", "b@h"], 0, 80, 9, false, "",
+                                    [false, true]);
+                ok("an inactive recording tab stays red",
+                   lr2.runs[1].bg === REC_BG);
+                ok("no badge when the active tab is not recording",
+                   lr2.runs[lr2.runs.length - 1].text.indexOf("REC") < 0);
+                /* term.record の契約: 既定は切、1 引数は問い合わせ、
+                   記録していないタブへの recordScreen は拒否。 */
+                ok("recording is OFF by default", term.record(tid) === 0);
+                ok("recordScreen refused while off",
+                   term.recordScreen(tid) === term.INVAL);
+                ok("record on", term.record(tid, true) === term.OK);
+                ok("query says on", term.record(tid) === 1);
+                ok("recordScreen accepted", term.recordScreen(tid) === term.OK);
+                ok("record off", term.record(tid, false) === term.OK);
+                ok("query says off again", term.record(tid) === 0);
+                ok("a bad id does not throw", term.record(999999) < 0);
+                /* 記録はクラス B の例外 = VT 限定。LOG term は既に
+                   クラス A で黒箱に入っているので二重記録になる。 */
+                var lg = term.create({ name: "selflog", mode: "log",
+                                       cols: SC, rows: SR });
+                ok("record on a LOG term is MODE",
+                   term.record(lg, true) === term.MODE);
+                ok("close log", term.close(lg) === term.OK);
                 /* メトリクス */
                 var p = gridFor(720, 1192, 480, 9, 24);
                 var l = gridFor(1192, 720, 80, 9, 24);
@@ -345,12 +400,19 @@ if (SELFTEST) {
     };
 
     var drawTabs = function () {
-        var labels = [], i;
-        for (i = 0; i < sessions.length; i++)
+        var labels = [], rec = [], i;
+        for (i = 0; i < sessions.length; i++) {
             labels.push((sessions[i].live ? "" : "×") + sessions[i].label);
+            /* 記録状態は C に毎回聞く。キャッシュしないのは意図的で、
+               プラットフォームは再アタッチ・デタッチ・pipe・セッション
+               終了で勝手に (正しく) 記録を落とすから (term_registry.h
+               R1)。持っている bool を信じると「録っていないのに ● が
+               点いている」= 契約の逆を表示することになる。 */
+            rec.push(term.record(sessions[i].tid) === 1);
+        }
         var mods = (pendCtrl ? " CTRL " : "") + (pendAlt ? " ALT " : "");
         var lay = tabLayout(labels, actIdx, COLS, CW,
-                            sessions.length < MAX_SESS, mods);
+                            sessions.length < MAX_SESS, mods, rec);
         ui.cells(0, 0, SP, TAB_FG, TAB_BG); /* 行クリア */
         for (i = 0; i < lay.runs.length; i++)
             ui.cells(lay.runs[i].c, 0, lay.runs[i].text,
@@ -583,6 +645,8 @@ if (SELFTEST) {
                     if (x >= tabHit[i].x0 && x < tabHit[i].x1) {
                         if (tabHit[i].idx < 0)
                             hostsPage(null);   /* [+] */
+                        else if (tabHit[i].idx === actIdx)
+                            tabMenu(actIdx);   /* 現在のタブ = タブメニュー */
                         else
                             switchTo(tabHit[i].idx);
                         return;
@@ -862,6 +926,78 @@ if (SELFTEST) {
             drawTabs();
             ui.keyboard(2);
         }
+    };
+
+    /* ---- タブメニュー (記録の入/切) ------------------------------------
+       出し方はアクティブなタブをもう一度タップ。非アクティブのタップは
+       今まで通り切り替えなので、既にある操作を潰していない。
+
+       記録は §4.4 の 2026-07-30 例外。ここで説明しているのは「何が起きる
+       か」ではなく「何を受け入れることになるか」で、それがこのページの
+       主目的: セッションの表示内容が署名鍵の持ち主に平文で取り出せるよう
+       になり、電源を切るまでリセットを跨いで残る。 */
+    var tabMenu = function (i) {
+        if (i < 0 || i >= sessions.length)
+            return;
+        var e = sessions[i];
+        var on = term.record(e.tid) === 1;
+        inForm = true;
+        ui.keyboard(0);
+        var s = ui.screen("タブ " + (i + 1) + ": " + e.label);
+        s.label(on ? "● 記録中 — このセッションの表示内容を黒箱に残しています"
+                   : "記録: 切 (既定)");
+        if (on) {
+            s.label("PC から: tools/bb_pull.py <host> <topic> live --session");
+            s.button("今の画面を記録する", function () {
+                var rc = term.recordScreen(e.tid);
+                print("ssh_vt2: record screen tab=" + e.name + " rc=" + rc);
+                sys.notify(rc === term.OK ? "画面を記録しました"
+                                          : ("記録できない (" + rc + ")"));
+                returnTerminal();
+            });
+            s.button("記録を停止する", function () {
+                var rc = term.record(e.tid, false);
+                /* print も残す: トーストは 5 秒で消えるが、記録の入/切
+                   そのものが黒箱に残っていないと、後から transcript を
+                   読む人が「どこからどこまで録られていたか」を判断でき
+                   ない (Defect C の教訓の一般形)。 */
+                print("ssh_vt2: recording OFF tab=" + e.name + " rc=" + rc);
+                sys.notify("記録を停止しました");
+                returnTerminal();
+            });
+        } else {
+            s.label("入にすると、この画面に出る内容が LP 黒箱に残ります。");
+            /* 直感に反する方が危ない側なので明示する: 開始時に可視画面を
+               1 枚撮る (エラーを見てから入にして拾う用途がこれ)。つまり
+               「秘密を出した後で入にした」は安全ではない。 */
+            s.label("いま表示中の画面も、開始した時点で保存されます。");
+            s.label("署名鍵の持ち主は MQTT 経由で平文で取り出せます。");
+            s.label("電源を切るまでリセットを跨いで残ります。");
+            s.label("秘密を表示するセッションでは入にしないでください。");
+            s.label("次のセッションでは必ず切に戻ります (記憶しません)。");
+            s.button("記録を開始する (このセッションのみ)", function () {
+                var rc = term.record(e.tid, true);
+                print("ssh_vt2: recording ON tab=" + e.name + " rc=" + rc);
+                sys.notify(rc === term.OK ? "記録を開始しました"
+                                          : ("記録できない (" + rc + ")"));
+                returnTerminal();
+            });
+        }
+        s.button("このタブを閉じる", function () {
+            closeTab(i);
+            if (!sessions.length) {
+                inForm = false;
+                unwind();
+                ui.clear(BG);
+                hostsPage(null);
+                return;
+            }
+            if (actIdx < 0)
+                actIdx = 0;
+            returnTerminal();
+            switchTo(actIdx);
+        });
+        s.button("戻る", returnTerminal);
     };
 
     confirmPaste = function (id, data) {
