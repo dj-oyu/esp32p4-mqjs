@@ -53,7 +53,10 @@ screen.button("Save", function () {
 
 - `screen.label(text)`
 - `screen.button(text, onTap)`
-- `screen.field(label[, opts])`
+- `screen.field(label[, mode])`: `mode` は `"ja"` (日本語可)、`"password"` /
+  `true` / `{ secret: true }` (伏せ字)、省略で ASCII のみ。**既定は ASCII で、
+  日本語入力は明示しないと開かない** — SSID の欄に かな が入る事故の方が、
+  日本語が打てないことより高くつくため (docs/keyboard-ime-unification.md §8.4)。
 - `screen.list()`
 - `screen.toggle(label[, initial[, onChange]])`
 - `screen.slider(min, max[, initial[, onChange]])`

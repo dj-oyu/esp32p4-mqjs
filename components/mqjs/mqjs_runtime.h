@@ -219,6 +219,17 @@ void mqjs_post_touch(int x, int y, int kind);
 void mqjs_post_key(const char *utf8, size_t len);
 
 /*
+ * A widget FIELD took (mode = ui_field_mode_t) or lost (mode < 0) focus
+ * — ui_tab5's widget layer calls this from the LVGL task (I3,
+ * docs/keyboard-ime-unification.md §5). Never blocks and never opens a
+ * dictionary: it only decides whether the platform IME sees this field's
+ * keystrokes, and where the composition floats (x/y are canvas
+ * coordinates, h the field's height). A non-Japanese field forces the
+ * IME off here — an app cannot opt out of that. ESP build only.
+ */
+void mqjs_ime_field_focus(int mode, int x, int y, int h);
+
+/*
  * Feed SSH session bytes / termination into the JS event loop (callable
  * from an sshc session task, not from an ISR). `id` is the session
  * handle returned by mqjs_ssh_connect (W3: up to 3 concurrent sessions);

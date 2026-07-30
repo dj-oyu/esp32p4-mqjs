@@ -1260,7 +1260,8 @@ static void ui_send(uint8_t op, int x, int y, int w, int h,
 #else
     static const char *names[] =
         { "clear", "fill", "rect", "line", "text", "pixel", "keyboard",
-          "cells", "scroll", "overlay", "reset" }; /* order == ui_cmd_op_t */
+          "cells", "scroll", "overlay", "reset",
+          "fieldkey" }; /* order == ui_cmd_op_t */
     printf("[ui] %s(x=%d, y=%d, w=%d, h=%d, fg=0x%06x, bg=0x%06x%s%s) (stub)\n",
            names[op], x, y, w, h, (unsigned)color, (unsigned)bg,
            text ? ", " : "", text ? text : "");
@@ -1847,6 +1848,12 @@ static bool ime_route_key(const char *utf8, size_t len);
    s_event_queue だけなので、それで足りる。 */
 static void key_to_app(const char *utf8, size_t len)
 {
+    /* シンクの振り分け (§7): widget の field にフォーカスがあれば行き先は
+       その textarea、無ければ従来どおり JS アプリ。ここに置くのは、素通しの
+       打鍵も IME の確定文字列も必ずこの 1 か所を通るから — 分配の手前に
+       置くと「英字は field に入るが日本語は入らない」になる。 */
+    if (ui_tab5_field_key(utf8, len))
+        return;
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
     if (!s_event_queue || !fg->used || !fg->key_used)
         return;
@@ -2138,6 +2145,49 @@ static int uiw_truthy(JSContext *ctx, JSValue v)
     return 1; /* objects/strings: truthy enough for an options flag */
 }
 
+/* 実体は辞書解決を skk.open() と共有するため下の skk セクション。ja の
+   field は「作った時点で辞書が開けたか」で ascii へ落ちるので、ここで要る。 */
+static bool ime_arm(void);
+
+/* field(label, mode) の第 2 引数 -> UIW_FIELD_* (I3)。
+ *
+ *   s.field("SSID")                     ascii — 既定。IME は armable ですらない
+ *   s.field("タイトル", "ja")            日本語可
+ *   s.field("パスワード", true)          password (旧 {secret:true} も同じ)
+ *
+ * 既定を ascii にしてあるのは、間違いの重さが釣り合わないから: "ja" を
+ * 書き忘れた自由入力欄は「日本語が打てない」だけで目に見えるが、SSID の欄を
+ * 縛り忘れると SSID に かな が入って接続が理由の見えない失敗をする。
+ * 知らない文字列も ascii に倒す (綴り間違いが日本語入力を勝手に開かない)。 */
+static int uiw_field_mode(JSContext *ctx, JSValue v, int *out)
+{
+    *out = UIW_FIELD_ASCII;
+    if (JS_IsUndefined(v) || JS_IsNull(v))
+        return 0;
+    if (JS_IsString(ctx, v)) {
+        char s[16];
+        if (uiw_copy_str(ctx, v, s, sizeof s))
+            return -1;
+        if (!strcmp(s, "ja"))
+            *out = UIW_FIELD_JA;
+        else if (!strcmp(s, "password") || !strcmp(s, "secret"))
+            *out = UIW_FIELD_PASSWORD;
+        return 0;
+    }
+    if (JS_IsBool(v) || JS_IsNumber(ctx, v)) { /* field(label, true) */
+        if (uiw_truthy(ctx, v))
+            *out = UIW_FIELD_PASSWORD;
+        return 0;
+    }
+    /* 残りはオプション object — 旧 API の field(label, {secret:true}) */
+    JSValue sec = JS_GetPropertyStr(ctx, v, "secret");
+    if (JS_IsException(sec))
+        return -1;
+    if (uiw_truthy(ctx, sec))
+        *out = UIW_FIELD_PASSWORD;
+    return 0;
+}
+
 /* ui.screen(title) -> UiScreen (inert handle for background apps) */
 JSValue js_ui_screen(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
@@ -2217,12 +2267,17 @@ JSValue js_uiscreen_create(JSContext *ctx, JSValue *this_val, int argc,
     case UIW_K_FIELD:
         if (uiw_copy_str(ctx, argv[0], text, sizeof text))
             return JS_EXCEPTION;
-        if (!JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
-            JSValue sec = JS_GetPropertyStr(ctx, argv[1], "secret");
-            if (JS_IsException(sec))
-                return JS_EXCEPTION;
-            a = uiw_truthy(ctx, sec);
-        }
+        if (uiw_field_mode(ctx, argv[1], &a))
+            return JS_EXCEPTION;
+#ifdef ESP_PLATFORM
+        /* ja は辞書がある機体でだけ ja。開けなければ ascii へ落とす —
+           「あ」が押せるのに何も起きない状態を作らないため (§4-4 の
+           恒久ラッチ禁止と同じ理由で、ここでは毎回開き直す)。
+           開くのは field を作るこの瞬間 = mqjs タスク。フォーカスは
+           LVGL タスクで起きるので、そこでは辞書 open も ack 待ちもできない。 */
+        if (a == UIW_FIELD_JA && !ime_arm())
+            a = UIW_FIELD_ASCII;
+#endif
         break;
     case UIW_K_LIST:
         break;
@@ -6265,6 +6320,19 @@ static ime_t s_ime;
 static bool  s_ime_init;
 static int   s_ime_img = -1;
 
+#ifdef ESP_PLATFORM
+/* widget の field がフォーカスを持っている間の入力方針 (I3)。
+   -1 = field 非フォーカス (ui.ime() の opt-in がそのまま効く)、
+    0 = ascii / password の field — アプリが ui.ime(1) 済みでも IME は通さない、
+    1 = ja の field。
+   書くのは LVGL タスク (フォーカスのイベント)、読むのは打鍵の来たタスク。
+   int なので破れず、古い値を読んでも打鍵 1 つぶん行き先がずれるだけ。
+   アンカーは field の矩形: widget アプリは preedit の存在を知らないので
+   ui.caret を呼ばず、C が持たないとフロートが画面の隅に出る。 */
+static volatile int s_ime_field = -1;
+static volatile int16_t s_ime_field_x, s_ime_field_y, s_ime_field_h;
+#endif
+
 /* --- ここから 3 つは所有タスクの上でしか呼ばない (ESP では IME タスク、
    ホストには入力タスクが無いので mqjs タスクがそのまま所有者)。
    単一所有になるのは s_ime だけ、という点は正確に読むこと: 学習 (skk_mru_t)
@@ -6427,10 +6495,18 @@ static void ime_float_update(void)
     }
     mru_unlock();
 
-    /* アンカーはアプリのカーソル (ui.caret)。高さを貰っていなければ端末の
-       1 行ぶんで代用する — 0 だと preedit が行に重なる。 */
+    /* アンカーはアプリのカーソル (ui.caret)。ただし field にフォーカスが
+       あるときは、その矩形が正しい行き先 — アプリは preedit を知らないので
+       ui.caret を呼ばない (I3)。高さを貰っていなければ端末の 1 行ぶんで
+       代用する — 0 だと preedit が行に重なる。 */
     const MqjsWorker *fg = &s_workers[s_fg_worker];
+    int ax = fg->caret_x, ay = fg->caret_y;
     int h = fg->caret_h;
+    if (s_ime_field >= 0) {
+        ax = s_ime_field_x;
+        ay = s_ime_field_y;
+        h = s_ime_field_h;
+    }
     if (h <= 0) {
         int cw = 0, ch = 0;
         ui_tab5_cell_size(&cw, &ch);
@@ -6446,7 +6522,7 @@ static void ime_float_update(void)
         return;
     memcpy(copy, body, len + 1);
     /* flags: bit0-1 = 0 (auto 配置)、bit2 = 0 (候補は横並び)、bit3 = recolor */
-    ui_send(UI_CMD_OVERLAY, fg->caret_x, fg->caret_y, UI_OVERLAY_IME, h,
+    ui_send(UI_CMD_OVERLAY, ax, ay, UI_OVERLAY_IME, h,
             (uint32_t)sel, 0x8, copy);
     s_ime_ovl_on = true;
 }
@@ -6601,9 +6677,13 @@ static bool ime_cmd_sync(uint8_t kind)
 static bool ime_route_key(const char *utf8, size_t len)
 {
     MqjsWorker *fg = &s_workers[s_fg_worker];
+    /* field にフォーカスがある間は、その field のモードだけが判断材料。
+       ui.ime(1) 済みのアプリの都合を通すと、SSID の欄に かな が入る (I3)。 */
+    int fmode = s_ime_field;
+    bool want = fmode < 0 ? fg->ime_used : fmode > 0;
     /* len 超過は入力面には作れない (KBD_SEQ_MAX=16) が、通ってきたら IME を
        迂回させる — 千切って渡すと変換の途中に嘘の打鍵を混ぜることになる。 */
-    if (!fg->ime_used || !s_ime_q || len > MQJS_IME_KEY_MAX)
+    if (!want || !s_ime_q || len > MQJS_IME_KEY_MAX)
         return false;
     ImeCmd c = { .kind = IME_CMD_KEY, .len = (uint8_t)len };
     memcpy(c.key, utf8, len);
@@ -6612,6 +6692,32 @@ static bool ime_route_key(const char *utf8, size_t len)
        ときと同じ方針)。 */
     xQueueSend(s_ime_q, &c, 0);
     return true;
+}
+
+/* widget の field がフォーカスを取った/失った (I3)。呼ぶのは LVGL タスク
+   なので、ここでは何も待たないし、辞書も開かない:
+
+   - ack を待てない。s_ime_ack を待つのは mqjs タスク 1 人という前提で、
+     2 人目が入ると ime_cmd_sync の「取り残しを捨ててから投げる」が壊れる。
+     UI タスクを辞書引きの裏で 2 秒止める、という別の害もある。
+   - 辞書は field を作った時点 (js_uiscreen_create) で mqjs タスクが
+     開いている。ja の field は arm に成功したものだけなので、ここへ来た
+     時点で s_ime_q は必ず出来上がっている。
+
+   ja でないフォーカス (と、フォーカスを失ったとき) は FOLD を投げる:
+   IME を切り、読みかけを捨て (確定させない)、「あ」の面を A へ戻す。 */
+void mqjs_ime_field_focus(int mode, int x, int y, int h)
+{
+    s_ime_field_x = (int16_t)x;
+    s_ime_field_y = (int16_t)y;
+    s_ime_field_h = (int16_t)h;
+    /* 先に落とす: poster (このタスク自身とドックの kbd タスク) を止めてから
+       畳む。逆順だと、畳んだ直後の 1 打鍵が消えたセッションへ流れる。 */
+    s_ime_field = mode < 0 ? -1 : (mode == UIW_FIELD_JA ? 1 : 0);
+    if (s_ime_field == 1 || !s_ime_q)
+        return;
+    ImeCmd c = { .kind = IME_CMD_FOLD };
+    xQueueSend(s_ime_q, &c, 0);
 }
 
 /* --- ここから下は mqjs タスク側 (JS 束縛から呼ばれる) --- */
@@ -6772,6 +6878,17 @@ static void app_reset_bindings(MqjsWorker *app)
         app->ime_used = false;   /* ditto */
         ime_disarm();            /* 読みかけを次のアプリへ持ち越さない (§4-7) */
     }
+#ifdef ESP_PLATFORM
+    /* field 経由で IME を使ったアプリは ime_used が立たないので、上の枝では
+       拾えない (I3)。学習の書き戻しはこの境界が最後の機会で、mqjs タスクの
+       同期 I/O でやる決まり — LVGL タスクの blur では踏めない。 */
+    if (s_ime_field >= 0) {
+        s_ime_field = -1;      /* 先に落とす: poster を止めてから畳む */
+        ime_disarm();          /* 読みかけを次のアプリへ持ち越さない */
+    } else {
+        (void)skk_mru_flush(); /* 既に blur 済み。汚れていなければ即 return */
+    }
+#endif
     if (app->fg_used) {
         JS_DeleteGCRef(ctx, &app->fg_cb);
         app->fg_used = false;

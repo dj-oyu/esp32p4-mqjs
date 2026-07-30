@@ -73,6 +73,12 @@ typedef enum {
                                i.e. \1 separates, \2 starts the item list. */
     UI_CMD_RESET,     /* foreground-app switch: clear + hide the canvas and
                          hide the keyboard (same hygiene as a task switch) */
+    UI_CMD_FIELD_KEY, /* I3: one keystroke for the focused widget FIELD.
+                         text = heap copy, w = its LENGTH — the "\0name"
+                         tokens start with a NUL, so strlen would read
+                         them as empty. Posted from whichever task the
+                         key came in on; applied to the lv_textarea by
+                         the UI task (no lv_obj is touched off it). */
 } ui_cmd_op_t;
 
 typedef struct {
@@ -131,12 +137,31 @@ typedef enum {
 typedef enum {
     UI_WK_BUTTON = 0,
     UI_WK_LABEL  = 1,
-    UI_WK_FIELD  = 2, /* labelled one-line textarea; a!=0 -> password   */
+    UI_WK_FIELD  = 2, /* labelled one-line textarea; a = ui_field_mode_t */
     UI_WK_LIST   = 3,
     UI_WK_ITEM   = 4, /* list row; parent must be a UI_WK_LIST handle   */
     UI_WK_TOGGLE = 5, /* labelled switch; a!=0 -> initially on          */
     UI_WK_SLIDER = 6, /* a=min b=max c=initial value                    */
 } ui_widget_kind_t;
+
+/* What a UI_WK_FIELD accepts (I3). The platform, not the app, enforces
+ * it: on focus a non-JA field forces the IME off and the control bar's
+ * 「あ」 key goes DISABLED, so no app can forget to constrain a field.
+ *
+ * ASCII is the default deliberately. The two failure modes are not
+ * symmetric — forgetting "ja" on a free-text field only means the user
+ * cannot type Japanese there (obvious, harmless), while forgetting to
+ * constrain a Wi-Fi SSID field means kana in an SSID and a connection
+ * that fails for a reason nobody can see.
+ *
+ * PASSWORD == 1 on purpose: the old API was a truthy "secret" flag, so
+ * every existing {secret:true} caller keeps its exact behaviour. Values
+ * are mirrored in components/mqjs/mqjs_classes.h — keep both in sync. */
+typedef enum {
+    UI_FIELD_ASCII    = 0, /* ASCII only; the IME cannot be armed */
+    UI_FIELD_PASSWORD = 1, /* password mode; the IME is never allowed */
+    UI_FIELD_JA       = 2, /* Japanese allowed (「あ」 is live) */
+} ui_field_mode_t;
 
 typedef void (*ui_tab5_ready_cb_t)(void *arg);
 
@@ -225,6 +250,14 @@ bool ui_tab5_w_set_text(uint32_t handle, const char *text);
 bool ui_tab5_w_value_str(uint32_t handle, char *buf, size_t cap);
 /* ... or of a TOGGLE (0/1) / SLIDER (int). 0 for stale handles. */
 int ui_tab5_w_value_int(uint32_t handle);
+
+/* I3: deliver one keystroke to the focused FIELD, if any. Returns true
+ * when a field took it — i.e. "this key is not the JS app's". Callable
+ * from any task (the mqjs key funnel runs on the LVGL task, on the
+ * keyboard dock's task and on the IME's owner task): it only reads a
+ * focus flag and posts a UI command, never an lv_obj. `utf8` may be a
+ * "\0name" token, hence the explicit length. */
+bool ui_tab5_field_key(const char *utf8, size_t len);
 
 /* Destroy every widget screen and return to the console screen. Called
  * by the JS runtime when a task ends (same role as the canvas clear on
@@ -366,6 +399,12 @@ static inline int ui_tab5_w_value_int(uint32_t handle)
 {
     (void)handle;
     return 0;
+}
+static inline bool ui_tab5_field_key(const char *utf8, size_t len)
+{
+    (void)utf8;
+    (void)len;
+    return false;
 }
 static inline void ui_tab5_w_reset(void) {}
 static inline void ui_tab5_w_commit(void) {}
