@@ -1130,7 +1130,12 @@ public:
         lv_obj_t *bar = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(bar);
         lv_obj_set_pos(bar, 0, 0);
-        lv_obj_set_size(bar, UI_LCD_H_RES, UI_STATUSBAR_H);
+        /* ui_cur_hres(), not UI_LCD_H_RES: ui_tab5_set_landscape() only
+           resizes the handles that already exist, so a bar created after
+           the rotation (dock attached at boot, where the dock callback
+           beats this ability's onCreate) would keep the portrait width
+           for the rest of the session. Device-reported 2026-07-31. */
+        lv_obj_set_size(bar, ui_cur_hres(), UI_STATUSBAR_H);
         s_sb_bar = bar; /* resized on rotation */
         lv_obj_set_style_bg_color(bar, lv_color_hex(UI_COL_BAR), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
@@ -1142,7 +1147,7 @@ public:
         lv_obj_t *row = lv_obj_create(bar);
         lv_obj_remove_style_all(row);
         lv_obj_set_pos(row, 0, 0);
-        lv_obj_set_size(row, UI_LCD_H_RES, 44);
+        lv_obj_set_size(row, ui_cur_hres(), 44);
         s_sb_row = row; /* resized on rotation */
         /* hit-testing falls through to the bar's press state machine */
         lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
@@ -1197,7 +1202,7 @@ public:
 
         _event_lbl = make_label(bar, UI_COL_EVENT);
         lv_obj_set_pos(_event_lbl, UI_PAD, 48);
-        lv_obj_set_width(_event_lbl, UI_LCD_H_RES - 2 * UI_PAD);
+        lv_obj_set_width(_event_lbl, ui_cur_hres() - 2 * UI_PAD);
         s_sb_event = _event_lbl; /* resized on rotation */
         lv_obj_set_style_pad_hor(_event_lbl, 6, 0);
         lv_obj_set_style_radius(_event_lbl, 4, 0);
@@ -1447,7 +1452,11 @@ public:
         _panel = lv_obj_create(lv_screen_active());
         lv_obj_remove_style_all(_panel);
         lv_obj_set_pos(_panel, 0, UI_STATUSBAR_H);
-        lv_obj_set_size(_panel, UI_LCD_H_RES, UI_LCD_V_RES - UI_STATUSBAR_H);
+        /* same rule as the status bar: size to the orientation in force
+           now, because the rotation only fixes up handles that exist */
+        lv_obj_set_size(_panel, ui_cur_hres(),
+                        (s_landscape ? UI_LCD_H_RES : UI_LCD_V_RES)
+                            - UI_STATUSBAR_H);
         s_console_panel = _panel; /* resized on rotation */
         lv_obj_set_style_bg_color(_panel, lv_color_hex(UI_COL_BG), 0);
         lv_obj_set_style_bg_opa(_panel, LV_OPA_COVER, 0);
