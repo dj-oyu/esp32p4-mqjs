@@ -44,7 +44,10 @@ typedef enum {
                          bar (T3a: Esc/Tab/Ctrl/Alt/Fn/arrows/Copy/Paste
                          as "\0name" key tokens) */
     UI_CMD_CELLS,     /* monospace run: text at cell (x=col, y=row), color=fg,
-                         bg=bg. Drawn with the terminal grid font (ui.cells). */
+                         bg=bg. Drawn with the terminal grid font (ui.cells).
+                         w = attribute bits (UI_CELL_ATTR_*, 0 for none):
+                         one rule per run, drawn in fg after the glyphs
+                         (docs/term-design.md §6, "1 本線描画"). */
     UI_CMD_SCROLL,    /* scroll cell-rows [x=top, y=bot] by w lines
                          (w>0 up, w<0 down); vacated rows filled with color */
     UI_CMD_OVERLAY,   /* floating window anchored to a caller-supplied point
@@ -81,11 +84,22 @@ typedef enum {
                          the UI task (no lv_obj is touched off it). */
 } ui_cmd_op_t;
 
+/* Cell attributes a UI_CMD_CELLS run can carry (cmd.w). Everything else
+   an SGR sequence can say is already folded into fg/bg by the time cells
+   reach here — reverse swapped them, bold picked the bright twin — so the
+   renderer needs no attribute logic beyond drawing these two rules
+   (docs/term-design.md §6, term_core.h's cell contract). */
+enum {
+    UI_CELL_ATTR_UNDERLINE = 1u << 0, /* SGR 4 */
+    UI_CELL_ATTR_STRIKE    = 1u << 1, /* SGR 9 */
+};
+
 typedef struct {
     uint8_t op;     /* ui_cmd_op_t */
     int16_t x, y;
-    int16_t w, h;   /* RECT: size; LINE: end point; CELLS: unused;
-                       SCROLL: w=lines (signed); others: unused */
+    int16_t w, h;   /* RECT: size; LINE: end point; CELLS: w = UI_CELL_ATTR_*
+                       bits, h unused; SCROLL: w=lines (signed);
+                       others: unused */
     uint32_t color; /* 0xRRGGBB (CELLS: fg; SCROLL: fill) */
     uint32_t bg;    /* CELLS: background 0xRRGGBB; others: unused */
     char *text;     /* TEXT/CELLS only: heap copy. Consumed (freed) by the UI

@@ -415,6 +415,15 @@ int term_core_dirty_next(const term_core_t *c, int from_row);
  * describe those, so the caller must repaint everything. */
 bool term_core_full_repaint(const term_core_t *c);
 
+/* Raise that same flag without changing anything else, for when the PIXELS
+ * went away for a reason the core cannot see: the term was hidden and shown
+ * again (tab switching, §8), its view moved, or the app cleared the canvas
+ * underneath it. The damage set describes cell CHANGES, so on its own it
+ * would leave a re-shown terminal blank until the remote happened to write
+ * — which is most of a session for anything full-screen. Touches only the
+ * damage state; no cell, cursor or scrollback is affected. */
+void term_core_repaint_all(term_core_t *c);
+
 /* Clear the dirty set and the full-repaint flag. The renderer calls this
  * after it has blitted, and it is the ONLY reader-side call that mutates
  * the core — keep it out of probe paths. */

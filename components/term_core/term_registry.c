@@ -115,12 +115,22 @@ typedef struct {
     bool ui_ack_pending;
     bool prod_ack_pending;
 
-    /* The single producer (§5 SPSC). term.pipe is phase 4; the binding
-     * is here because the quiesce state machine is defined in terms of a
-     * producer's detach ack. */
-    bool                    piped;
-    term_producer_detach_fn detach;
-    void                   *detach_user;
+    /* The single producer (§5 SPSC): term.pipe's ssh channel, or a fake
+     * in the host suites. `prod.user` doubles as the producer's identity
+     * on term_registry_producer_space/_write. */
+    bool             piped;
+    term_producer_t  prod;
+
+    /* term.onReply (§6/§8). Only consulted when no producer claims the
+     * reply. */
+    term_reply_sink_fn reply_sink;
+    void              *reply_user;
+
+    /* §10.2's caret, accumulated during a drain pass and flushed once,
+     * after the lock is dropped — "変化時のみ通知", coalesced per frame. */
+    bool caret_pending;
+    int  caret_col, caret_row;
+    bool caret_vis;
 
     term_resize_job_t rz;
 
@@ -175,6 +185,13 @@ static uint32_t s_quiesce_ms;
 static uint32_t s_ingest_ms;
 static uint32_t s_read_ms;
 static int      s_drain_budget;
+static int      s_cell_w, s_cell_h;
+
+/* §10.2: one caret sink for the whole registry, installed by the platform.
+ * Not per term and not per app — a terminal does not opt into having a
+ * cursor. Read on the UI task after the lock is dropped. */
+static term_caret_sink_fn s_caret_sink;
+static void              *s_caret_sink_user;
 
 static term_id_t s_console_id;
 
@@ -359,8 +376,8 @@ static void stage1_locked(term_slot_t *sl,
     sl->ui_ack_pending = true;
     sl->prod_ack_pending = sl->piped;
     if (sl->piped) {
-        *out_fn = sl->detach;
-        *out_user = sl->detach_user;
+        *out_fn = sl->prod.detach;
+        *out_user = sl->prod.user;
     }
     s_stats.closes++;
 }
@@ -379,8 +396,10 @@ static void slot_release_locked(term_slot_t *sl)
     sl->ring = NULL;
     sl->ring_size = sl->ring_head = sl->ring_tail = sl->ring_used = 0;
     sl->piped = false;
-    sl->detach = NULL;
-    sl->detach_user = NULL;
+    memset(&sl->prod, 0, sizeof sl->prod);
+    sl->reply_sink = NULL;
+    sl->reply_user = NULL;
+    sl->caret_pending = false;
     sl->ui_ack_pending = false;
     sl->prod_ack_pending = false;
     sl->persist = false;
@@ -436,6 +455,8 @@ term_err_t term_registry_init(const term_registry_config_t *cfg)
                          ? cfg->read_timeout_ms : TERM_READ_TIMEOUT_MS_DEFAULT;
     s_drain_budget = (cfg && cfg->drain_budget_bytes > 0)
                          ? cfg->drain_budget_bytes : TERM_DRAIN_BUDGET_DEFAULT;
+    s_cell_w = (cfg && cfg->cell_w > 0) ? cfg->cell_w : TERM_CELL_W_DEFAULT;
+    s_cell_h = (cfg && cfg->cell_h > 0) ? cfg->cell_h : TERM_CELL_H_DEFAULT;
 
     s_mutex = s_p->mutex_create();
     if (!s_mutex)
@@ -522,6 +543,11 @@ int term_registry_deinit(void)
     s_console_id = TERM_ID_INVALID;
     for (i = 0; i < TERM_JOB_SLOTS; i++)
         memset(&s_jobs[i], 0, sizeof s_jobs[i]);
+    /* The caret sink goes with the table (§10.2): a host suite that builds
+     * and destroys a registry per case would otherwise keep pointing at
+     * the previous case's storage. */
+    s_caret_sink = NULL;
+    s_caret_sink_user = NULL;
     s_ready = false;
     unlock();
     s_p->mutex_destroy(s_mutex);
@@ -563,6 +589,52 @@ static term_slot_t *find_key_locked(const char *owner, const char *name)
     return NULL;
 }
 
+/* ===================================================================== */
+/* What the core calls back into (§6 replies, §10.2 caret)               */
+/* ===================================================================== */
+
+/*
+ * Both of these run INSIDE term_core_feed(), i.e. on the UI task with the
+ * table lock held. Neither may take the lock again or block; see
+ * term_reply_sink_fn in the header for the rule the reply route inherits.
+ */
+
+static void reg_reply_cb(void *user, const char *bytes, size_t len)
+{
+    term_slot_t *sl = (term_slot_t *)user;
+
+    /* §6: a piped term answers into its own channel, in C. The JS sink is
+     * for terms somebody feeds by hand — a reply belongs to the stream
+     * that asked the question. */
+    if (sl->piped && sl->prod.reply) {
+        s_stats.replies_piped++;
+        sl->prod.reply(sl->prod.user, slot_id(sl), bytes, len);
+        return;
+    }
+    if (sl->reply_sink) {
+        s_stats.replies_js++;
+        sl->reply_sink(sl->reply_user, slot_id(sl), bytes, len);
+        return;
+    }
+    s_stats.replies_dropped++;
+}
+
+/*
+ * §10.2's push. Nothing is delivered from here: the position is parked in
+ * the slot and the drain flushes it once, after the lock is dropped. The
+ * core already fires only on change, so "coalesced per frame" costs three
+ * ints and a flag rather than a comparison against a remembered value.
+ */
+static void reg_caret_cb(void *user, int col, int row, bool visible)
+{
+    term_slot_t *sl = (term_slot_t *)user;
+
+    sl->caret_col = col;
+    sl->caret_row = row;
+    sl->caret_vis = visible;
+    sl->caret_pending = true;
+}
+
 /* Carve the one block: core first (term_core_init wants 8-byte
  * alignment and term_core_mem_size is already a multiple of 8), byte
  * ring after it. One allocation, one free — I4. */
@@ -586,6 +658,14 @@ static term_err_t slot_alloc_locked(term_slot_t *sl,
                                                  : TERM_SB_BYTES_DEFAULT;
     cc.scrollback_lines = opts->scrollback_lines ? opts->scrollback_lines
                                                  : TERM_SB_LINES_DEFAULT;
+    /* Wired at construction, not later: a term that could emit a reply or
+     * move its caret before somebody remembered to attach the trampolines
+     * would lose exactly the first ones (the DA/DSR handshake a shell sends
+     * on connect is the first thing that happens). */
+    cc.reply_cb   = reg_reply_cb;
+    cc.reply_user = sl;
+    cc.caret_cb   = reg_caret_cb;
+    cc.caret_user = sl;
 
     core_size = term_core_mem_size(&cc);
     if (!core_size)
@@ -751,8 +831,12 @@ term_err_t term_registry_create(const term_create_opts_t *opts,
     sl->ui_ack_pending = false;
     sl->prod_ack_pending = false;
     sl->piped = false;
-    sl->detach = NULL;
-    sl->detach_user = NULL;
+    memset(&sl->prod, 0, sizeof sl->prod);
+    sl->reply_sink = NULL;
+    sl->reply_user = NULL;
+    sl->caret_pending = false;
+    sl->caret_col = sl->caret_row = 0;
+    sl->caret_vis = true;
     sl->rz.queued = false;
     sl->bytes_in = 0;
     sl->bytes_dropped = 0;
@@ -965,6 +1049,13 @@ term_err_t term_registry_log(term_id_t id, const char *owner,
         unlock();
         return e;
     }
+    if (sl->piped) {
+        /* §5 SPSC. Line-atomicity is what makes several LOG writers safe
+         * against each other; it does nothing about a producer that owns
+         * the ring's head, so the same gate feed has applies here. */
+        unlock();
+        return TERM_ERR_BUSY;
+    }
     /*
      * §4.4's tee, at the line-oriented ingest and under the table lock (the
      * ring's serialisation, term_lp_ring.h). TERM_LOG only: a VT term is
@@ -1055,6 +1146,24 @@ term_err_t term_registry_show(term_id_t id, const char *owner,
         return e;
     }
     if (view) {
+        /* The caret sink only speaks for a visible term (§10.2), so a
+         * term that becomes visible — or moves — owes the platform its
+         * anchor even though its cursor did not move. Tab switching is
+         * show/hide, and the IME float must not keep pointing at the tab
+         * that just went away.
+         *
+         * The same transition owes it a full repaint, and for the same
+         * kind of reason: the damage set describes cell changes, and
+         * nothing changed — what changed is which pixels are on the
+         * glass. Without this a switched-to tab stays blank until its
+         * remote writes something (term_core_repaint_all). */
+        if (view->visible &&
+            (!sl->view.visible || view->x != sl->view.x ||
+             view->y != sl->view.y || view->w != sl->view.w ||
+             view->h != sl->view.h)) {
+            sl->caret_pending = true;
+            term_core_repaint_all(sl->core);
+        }
         sl->view = *view;
     } else {
         sl->view.visible = false; /* hide without forgetting the rect */
@@ -1371,16 +1480,15 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
 /* Producers (§5)                                                        */
 /* ===================================================================== */
 
-term_err_t term_registry_producer_bind(term_id_t id, const char *owner,
-                                       term_producer_detach_fn detach,
-                                       void *user)
+term_err_t term_registry_producer_bind_ex(term_id_t id, const char *owner,
+                                          const term_producer_t *prod)
 {
     term_slot_t *sl;
     term_err_t e;
 
     if (!s_ready)
         return TERM_ERR_NOT_READY;
-    if (!owner || !detach)
+    if (!owner || !prod || !prod->detach)
         return TERM_ERR_INVAL;
     if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
         return TERM_ERR_TIMEOUT;
@@ -1394,8 +1502,71 @@ term_err_t term_registry_producer_bind(term_id_t id, const char *owner,
         return TERM_ERR_BUSY;
     }
     sl->piped = true;
-    sl->detach = detach;
-    sl->detach_user = user;
+    sl->prod = *prod;
+    s_stats.pipes++;
+    unlock();
+    return TERM_OK;
+}
+
+term_err_t term_registry_producer_bind(term_id_t id, const char *owner,
+                                       term_producer_detach_fn detach,
+                                       void *user)
+{
+    term_producer_t p;
+
+    p.detach = detach;
+    p.reply = NULL;
+    p.user = user;
+    return term_registry_producer_bind_ex(id, owner, &p);
+}
+
+/*
+ * term.pipe. The whole of §5's re-pipe rule, and no more than that: the
+ * old producer is asked to detach here, its ack collects it later, and
+ * this call never waits for either. CHOICE (PHASE4_MANIFEST #2): the
+ * "ack join" of §5 is the caller's retry rather than a bounded sleep on
+ * js_task, because js_task is shared by every worker and §3.1 already
+ * refuses to let a terminal's lifecycle stall all JS on the device.
+ */
+term_err_t term_registry_pipe(term_id_t id, const char *owner,
+                              const term_producer_t *prod)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    term_producer_detach_fn fn = NULL;
+    void *user = NULL;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner || !prod || !prod->detach)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    if (sl->mode != TERM_VT) {
+        /* A LOG term is multi-writer by construction (print sink,
+         * term.log). A producer that owns the ring's head cannot share it
+         * with them, and silently disabling the console's own writers to
+         * accommodate a pipe would be the wrong half to give up. */
+        unlock();
+        return TERM_ERR_MODE;
+    }
+    if (sl->piped) {
+        fn = sl->prod.detach;
+        user = sl->prod.user;
+        sl->prod_ack_pending = true; /* same ack discipline as stage 1 */
+        s_stats.pipe_busy++;
+        unlock();
+        fn(user, id); /* outside the lock: it may shutdown() a socket */
+        return TERM_ERR_BUSY;
+    }
+    sl->piped = true;
+    sl->prod = *prod;
+    s_stats.pipes++;
     unlock();
     return TERM_OK;
 }
@@ -1419,8 +1590,8 @@ term_err_t term_registry_producer_unbind(term_id_t id, const char *owner)
         return e;
     }
     if (sl->piped) {
-        fn = sl->detach;
-        user = sl->detach_user;
+        fn = sl->prod.detach;
+        user = sl->prod.user;
         sl->prod_ack_pending = true; /* same ack discipline as stage 1 */
     }
     unlock();
@@ -1453,11 +1624,137 @@ term_err_t term_registry_producer_ack(term_id_t id)
     }
     sl->prod_ack_pending = false;
     sl->piped = false;
-    sl->detach = NULL;
-    sl->detach_user = NULL;
+    memset(&sl->prod, 0, sizeof sl->prod);
     unlock();
     wake_reaper();
     return TERM_OK;
+}
+
+/* ===================================================================== */
+/* The ring, from the producer's side (§5: backpressure, never loss)     */
+/* ===================================================================== */
+
+/*
+ * Both entry points share the gate. No owner argument — the producer is
+ * platform C code — so the identity check is the cookie the bind was
+ * given. That matters for exactly one case: a producer that has been
+ * unbound but has not acked yet is still `piped` and still holds a valid
+ * id, and once it HAS acked and somebody else has taken the slot's pipe
+ * its writes must not land in the new producer's stream.
+ */
+static term_err_t producer_gate(term_id_t id, void *user, term_slot_t **out)
+{
+    term_slot_t *sl;
+    term_err_t e;
+
+    e = slot_lookup(id, NULL, false, &sl);
+    if (e != TERM_OK)
+        return e;
+    if (!sl->piped || sl->prod.user != user)
+        return TERM_ERR_BUSY;
+    *out = sl;
+    return TERM_OK;
+}
+
+term_err_t term_registry_producer_space(term_id_t id, void *user,
+                                        size_t *out_space)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    size_t space;
+
+    if (out_space)
+        *out_space = 0;
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!out_space)
+        return TERM_ERR_INVAL;
+    if (!lock_for(s_ingest_ms))
+        return TERM_ERR_TIMEOUT; /* nothing consumed: ask again */
+    e = producer_gate(id, user, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    space = ring_space(sl);
+    if (!space)
+        s_stats.prod_stalls++;
+    unlock();
+    *out_space = space;
+    return TERM_OK;
+}
+
+term_err_t term_registry_producer_write(term_id_t id, void *user,
+                                        const uint8_t *bytes, size_t len,
+                                        size_t *out_written)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    size_t took;
+
+    if (out_written)
+        *out_written = 0;
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!bytes && len)
+        return TERM_ERR_INVAL;
+    if (!len)
+        return TERM_OK;
+    if (!lock_for(s_ingest_ms))
+        return TERM_ERR_TIMEOUT; /* the producer still owns its bytes */
+    e = producer_gate(id, user, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    took = ring_write(sl, bytes, len);
+    s_stats.prod_bytes += took;
+    unlock();
+    if (out_written)
+        *out_written = took;
+    /*
+     * A short write means the producer wrote more than the space it asked
+     * for — a protocol error on its side, not a lost-bytes policy like
+     * feed's. It is reported, never silently absorbed, so the leftover is
+     * the caller's to re-offer.
+     */
+    return took == len ? TERM_OK : TERM_ERR_TIMEOUT;
+}
+
+/* ===================================================================== */
+/* Reply sink (§6/§8) and caret sink (§10.2)                             */
+/* ===================================================================== */
+
+term_err_t term_registry_set_reply(term_id_t id, const char *owner,
+                                   term_reply_sink_fn fn, void *user)
+{
+    term_slot_t *sl;
+    term_err_t e;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    sl->reply_sink = fn;
+    sl->reply_user = user;
+    unlock();
+    return TERM_OK;
+}
+
+void term_registry_set_caret_sink(term_caret_sink_fn fn, void *user)
+{
+    /* No lock: two words written once at bring-up, read on the UI task
+     * after the drain has released the lock. Taking the table mutex here
+     * would order this call behind a parse for no benefit. */
+    s_caret_sink = fn;
+    s_caret_sink_user = user;
 }
 
 /* ===================================================================== */
@@ -1507,11 +1804,25 @@ bool term_registry_ui_drain(void)
     int i;
     bool changed = false;
     bool acked = false;
+    /* §10.2's flush list. Built under the lock, delivered after it: the
+     * sink writes into another subsystem's state (the platform caret the
+     * IME reads) and must not do that from inside the registry's critical
+     * section. Bounded by the slot count, so it is a stack array and not
+     * an allocation — I4 holds on this path too. */
+    term_caret_ev_t carets[TERM_SLOT_COUNT];
+    int ncarets = 0;
+    term_caret_sink_fn sink;
+    void *sink_user;
 
     if (!s_ready)
         return false;
     if (!lock_for(TERM_WAIT_FOREVER))
         return false;
+    /* One read of the sink for the whole pass: deciding to collect an
+     * event and then delivering it must not disagree about whether there
+     * is anybody to deliver to. */
+    sink = s_caret_sink;
+    sink_user = s_caret_sink_user;
     for (i = 0; i < TERM_SLOT_COUNT; i++) {
         term_slot_t *sl = &s_slots[i];
         int budget;
@@ -1544,8 +1855,26 @@ bool term_registry_ui_drain(void)
             (term_core_full_repaint(sl->core) ||
              term_core_dirty_next(sl->core, 0) >= 0))
             changed = true;
+
+        /* §10.2: one caret event per term per frame, and only for a term
+         * the user can actually see. An invisible term's anchor keeps its
+         * pending flag until term_registry_show makes it visible again. */
+        if (sl->caret_pending && sl->view.visible && sink) {
+            term_caret_ev_t *ev = &carets[ncarets++];
+            sl->caret_pending = false;
+            ev->id = slot_id(sl);
+            memcpy(ev->owner, sl->owner, sizeof ev->owner);
+            ev->owner[sizeof ev->owner - 1] = '\0';
+            ev->x = sl->view.x + sl->caret_col * s_cell_w;
+            ev->y = sl->view.y + sl->caret_row * s_cell_h;
+            ev->h = s_cell_h;
+            ev->visible = sl->caret_vis;
+            s_stats.caret_pushes++;
+        }
     }
     unlock();
+    for (i = 0; i < ncarets; i++)
+        sink(sink_user, &carets[i]);
     if (acked)
         wake_reaper();
     return changed;

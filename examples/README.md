@@ -93,6 +93,20 @@ print("hello");
   ssh_vt のクロージャへ台本を注入して見張っていた「IME フックが TOKSEQ 展開
   より前にあること」は、`ime_core` では構造的に表現不可能になったので、
   この 2 つに引き継いで harness は廃止した
+- `ssh_vt2.js`: 同じ SSH ターミナルの**ネイティブ `term.*` 版**
+  (`docs/term-design.md` §11.4)。VT パーサ・grid・SGR・カーソル・
+  スクロールバックは C の `term_core` にあり、受信バイトは
+  `term.pipe(tid, sshId)` で **JS を一度も通らない**。アプリに残るのは
+  タブ (= `term.show` の付け替え)、接続 UX、長押し選択 →
+  `clipboard`(画面は `term.snapshot` で読む)、キー経路
+  `ui.onKey → ssh.write`、回転時の `term.resize` + `ssh.resize`。
+  `ui.caret` を呼ぶ場所も無い (§10.2: C の term が caret シンクへ直接
+  push する)。ネイティブ path が実機で通るまで `ssh_vt.js` が現役の
+  落とし所なので**両方入れておける** (アプリ名が別なので vault の
+  パスワード/ホスト鍵は入れ直し、`store` のホスト一覧は共有)。
+  `SELFTEST = true` に書き換えて run_pc で走らせると、`term.feed` した
+  画面に対する選択/幅 2 文字の列展開・タブの割り付け・桁行の丸めを
+  自己診断する
 - `skk_test.js`: 日本語入力の試験台。入力は ssh_vt と同じく `ui.ime(1)` +
   `ui.caret()` で、**計測は `ui.imeStats()`** — 辞書の引き方 (lookups/probes)、
   変換の µs、そして**打鍵がコマンドキューで待った時間 (hop)** を C 側が数えて

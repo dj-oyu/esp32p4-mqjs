@@ -3365,6 +3365,7 @@ private:
                 n++;
         fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W,
                   UI_CELL_H, bg);
+        const int run_col = col, run_cells = n;
 
         const int seg_max = (int)(sizeof(s_cells_a8) /
                                   ((size_t)UI_CELL_W * UI_CELL_H));
@@ -3395,6 +3396,33 @@ private:
             n -= take;
         }
         cells_run(col, row, s, nullptr, n, fg);
+        cells_rules(run_col, row, run_cells, fg, (unsigned)cmd.w);
+    }
+
+    /* §6's "1 本線描画": underline and strike-through, the only two SGR
+       attributes the cell contract does not fold into fg/bg. One
+       fill_rect per rule for the WHOLE run — not per cell — so a fully
+       underlined 142-column row costs two rect writes, and a run with no
+       attributes costs one compare. Drawn after the glyphs so the rule
+       sits on top of a descender rather than under it, which is what a
+       terminal looks like. */
+    void cells_rules(int col, int row, int n, uint16_t fg, unsigned attrs)
+    {
+        if (!(attrs & (UI_CELL_ATTR_UNDERLINE | UI_CELL_ATTR_STRIKE)) || n <= 0)
+            return;
+        int y0 = row * UI_CELL_H;
+        int x0 = col * UI_CELL_W, w = n * UI_CELL_W;
+        if (attrs & UI_CELL_ATTR_UNDERLINE) {
+            /* One pixel below the baseline (blit_glyph's own baseline
+               arithmetic), kept inside the cell so consecutive underlined
+               rows never touch. */
+            int y = y0 + (UI_CELL_H - (int)font_term_mono.base_line) + 1;
+            if (y > y0 + UI_CELL_H - 1)
+                y = y0 + UI_CELL_H - 1;
+            fill_rect(x0, y, w, 1, fg);
+        }
+        if (attrs & UI_CELL_ATTR_STRIKE)
+            fill_rect(x0, y0 + UI_CELL_H / 2, w, 1, fg);
     }
 
     /* One ≤80-cell segment: PPA compose+blend when it qualifies, else

@@ -13,6 +13,11 @@
 #                        unconditionally — it is the whole point of the file,
 #                        and the linker ASSERTs the LP RAM fit rather than
 #                        relocating it silently.
+#   term_pipe.c          phase 4 — term.pipe's producer (§5). The device half
+#                        installs an sshc rx sink; the host half is a stub
+#                        producer with a deferred detach ack, which is what
+#                        makes the SPSC and re-pipe rules testable without an
+#                        ssh server. Both halves build everywhere.
 #   term_bb_pull.c       phase 3 — the signed black-box pull (§7.2). Pure: the
 #                        whole responder runs over four callbacks, so there is
 #                        nothing to guard here and nothing device-specific to
@@ -37,8 +42,9 @@ idf_component_register(
          "term_ui_tab5.c"
          "term_lp_ring.c"
          "term_bb_pull.c"
+         "term_pipe.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES ui_tab5 esp_timer
+    PRIV_REQUIRES ui_tab5 esp_timer sshc
 )
 
 # §9.2: IDF appends -fno-jump-tables to every translation unit so that

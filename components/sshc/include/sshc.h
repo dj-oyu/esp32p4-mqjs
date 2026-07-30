@@ -28,6 +28,38 @@ extern "C" {
  * crypto buffers of internal RAM — design §7: 2-3, tunable here). */
 #define SSHC_MAX_SESSIONS 3
 
+/*
+ * A receive SINK: somewhere for this session's bytes to go that is not the
+ * JS heap (docs/term-design.md §5, term.pipe). While one is installed the
+ * session task hands received bytes straight to it and
+ * mqjs_post_ssh_data() is not called at all — no malloc per chunk, no
+ * event, no JS string. sshc knows nothing about terminals; the sink is
+ * three function pointers.
+ *
+ * ALL THREE RUN ON THE SESSION TASK and must not block.
+ *
+ *   space()  bytes the sink can take right now. The session task reads AT
+ *            MOST that many off the wire, so write() can never come up
+ *            short and an escape sequence is never cut in half (§5). When
+ *            it answers 0 the session STOPS READING for one recv timeout:
+ *            the socket buffer fills, the TCP window closes and the peer's
+ *            SSH window stops advancing — the backpressure §5 asks for,
+ *            produced by not consuming rather than by blocking anybody.
+ *   write()  take the bytes; returns how many were taken.
+ *   gone()   the sink has been released and this session will never touch
+ *            it again. Called exactly once per installed sink, from the
+ *            session task, either because mqjs_ssh_drop_sink() asked or
+ *            because the session ended. It is the detach ACK the term
+ *            registry's quiesce protocol waits for (§3.1), which is why
+ *            it is mandatory and why only the session task ever calls it.
+ */
+typedef struct {
+    size_t (*space)(void *user);
+    size_t (*write)(void *user, const void *data, size_t len);
+    void   (*gone)(void *user);
+    void   *user;
+} sshc_sink_t;
+
 #if CONFIG_MQJS_SSH
 
 /* Start a session task: TCP connect + handshake + password auth + shell
@@ -53,6 +85,17 @@ bool mqjs_ssh_active(void);
 /* Shell channel established (auth done) for this id. */
 bool mqjs_ssh_up(int id);
 
+/* Install the rx sink (see sshc_sink_t). Callable from any task; false
+ * for a stale id, a session that is on its way out, or when a sink is
+ * already installed — one sink per session, replacing needs a drop and
+ * its gone() first (the same single-producer rule the term ring has). */
+bool mqjs_ssh_set_sink(int id, const sshc_sink_t *sink);
+/* Ask the session task to release its sink. Returns immediately and
+ * joins nothing; gone() arrives on the session task within one recv
+ * timeout. A stale id is a no-op — a dead session has already called
+ * gone(). */
+void mqjs_ssh_drop_sink(int id);
+
 #else /* stubs: SSH disabled */
 
 static inline int mqjs_ssh_connect(const char *host, int port,
@@ -76,6 +119,12 @@ static inline void mqjs_ssh_close(int id) { (void)id; }
 static inline void mqjs_ssh_close_all(void) {}
 static inline bool mqjs_ssh_active(void) { return false; }
 static inline bool mqjs_ssh_up(int id) { (void)id; return false; }
+static inline bool mqjs_ssh_set_sink(int id, const sshc_sink_t *sink)
+{
+    (void)id; (void)sink;
+    return false;
+}
+static inline void mqjs_ssh_drop_sink(int id) { (void)id; }
 
 #endif /* CONFIG_MQJS_SSH */
 

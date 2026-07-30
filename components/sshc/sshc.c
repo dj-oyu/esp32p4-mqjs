@@ -81,9 +81,57 @@ typedef struct {
     uint16_t gen;          /* bumped per connect; part of the public id */
     int id;                /* public id while active */
     char close_reason[96];
+
+    /* rx sink (term.pipe, docs/term-design.md §5). Written by whichever
+       task installs it, read by the session task; both under s_sink_mux,
+       which is held for a struct copy and nothing else. `sink_drop` is the
+       detach request and `sink_closed` bars a late install from arriving
+       after the session task has already released (and so would never call
+       gone() for it). */
+    sshc_sink_t   sink;
+    bool          sink_on;
+    volatile bool sink_drop;
+    bool          sink_closed;
 } ssh_sess_t;
 
 static ssh_sess_t s_sess[SSHC_MAX_SESSIONS];
+
+/* Guards the sink fields only. Spinlock rather than a mutex: every hold is
+   a handful of instructions with no call inside it, and the session task
+   must not be able to block js_task here. */
+static portMUX_TYPE s_sink_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Take the sink away from the session, on the SESSION TASK, and hand the
+   caller the copy it must call gone() on (gone must not run under the
+   spinlock). Returns false when there was nothing installed. */
+static bool sink_release(ssh_sess_t *s, sshc_sink_t *out, bool final)
+{
+    bool had;
+    portENTER_CRITICAL(&s_sink_mux);
+    had = s->sink_on;
+    if (had)
+        *out = s->sink;
+    s->sink_on = false;
+    s->sink_drop = false;
+    if (final)
+        s->sink_closed = true;
+    portEXIT_CRITICAL(&s_sink_mux);
+    return had;
+}
+
+/* Session-task-side snapshot. Copying the three pointers under the lock is
+   what makes a concurrent set/drop safe without the read path ever
+   blocking. */
+static bool sink_get(ssh_sess_t *s, sshc_sink_t *out)
+{
+    bool on;
+    portENTER_CRITICAL(&s_sink_mux);
+    on = s->sink_on;
+    if (on)
+        *out = s->sink;
+    portEXIT_CRITICAL(&s_sink_mux);
+    return on;
+}
 
 static int sess_id(int slot)
 {
@@ -273,9 +321,49 @@ static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
             n = xStreamBufferReceive(s->tx, txbuf, sizeof txbuf, 0);
         }
 
+        /*
+         * rx sink (term.pipe, §5): the bytes go straight into the term's
+         * ring, never through the JS heap. Two things happen here and
+         * nowhere else — the detach ack, and the backpressure.
+         */
+        sshc_sink_t sk = { NULL, NULL, NULL, NULL };
+        bool piped = sink_get(s, &sk);
+        word32 want = (word32)sizeof rxbuf;
+        if (piped && s->sink_drop) {
+            sshc_sink_t rel = { NULL, NULL, NULL, NULL };
+            if (sink_release(s, &rel, false))
+                rel.gone(rel.user); /* the detach ack, from our own task */
+            piped = false;
+        }
+        if (piped) {
+            size_t space = sk.space(sk.user);
+            if (space == 0) {
+                /* §5: "満杯なら consume を止め SSH ウィンドウで背圧".
+                   Stop reading — do NOT read and drop, which would cut an
+                   escape sequence in half. One recv timeout is the same
+                   bounded wait this loop would have spent inside
+                   stream_read, and stop/tx/resize are serviced on the way
+                   round. */
+                vTaskDelay(pdMS_TO_TICKS(SSH_RECV_TMO_MS));
+                continue;
+            }
+            if (space < want)
+                want = (word32)space;
+        }
+
         /* read server output (blocks up to SSH_RECV_TMO_MS) */
-        int got = wolfSSH_stream_read(ssh, rxbuf, sizeof rxbuf);
-        if (got > 0) {
+        int got = wolfSSH_stream_read(ssh, rxbuf, want);
+        if (got > 0 && piped) {
+            /* Sized to the space we were promised, and SPSC means that
+               space cannot have shrunk since — a short take is a bug in
+               the sink, not a byte the wire is allowed to lose. */
+            size_t took = sk.write(sk.user, rxbuf, (size_t)got);
+            if (took < (size_t)got) {
+                ESP_LOGE(TAG, "pipe sink took %u of %d", (unsigned)took, got);
+                reason = "pipe overflow";
+                goto done;
+            }
+        } else if (got > 0) {
             char *copy = malloc(got);
             if (copy) {
                 memcpy(copy, rxbuf, got);
@@ -301,6 +389,16 @@ static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
         reason = "closed";
 
 done:
+    /* Release the pipe BEFORE anything else winds down: gone() is the
+       detach ack the term registry's reaper is waiting on, and a session
+       that dies without sending it turns a closed terminal into a zombie
+       (§3.1). `final` bars a late mqjs_ssh_set_sink() from installing a
+       sink nobody is left to release. */
+    {
+        sshc_sink_t rel = { NULL, NULL, NULL, NULL };
+        if (sink_release(s, &rel, true))
+            rel.gone(rel.user);
+    }
     if (ssh) {
         wolfSSH_stream_exit(ssh, 0);
         wolfSSH_free(ssh);
@@ -345,6 +443,15 @@ static void ssh_task(void *arg)
     ssh_session(s, ctx);
 
 cleanup:
+    /* Also here, for the paths that never reached ssh_session (lib/ctx
+       failure): a sink installed between mqjs_ssh_connect() returning and
+       this task giving up still gets its one gone(). sink_release is
+       idempotent, so the normal path's earlier call is not repeated. */
+    {
+        sshc_sink_t rel = { NULL, NULL, NULL, NULL };
+        if (sink_release(s, &rel, true))
+            rel.gone(rel.user);
+    }
     if (ctx)
         wolfSSH_CTX_free(ctx);
     secure_zero(s->params.pass, sizeof s->params.pass);
@@ -392,6 +499,11 @@ int mqjs_ssh_connect(const char *host, int port, const char *user,
     s->stop = false;
     s->up = false;
     s->resize_req = false;
+    portENTER_CRITICAL(&s_sink_mux);
+    s->sink_on = false;
+    s->sink_drop = false;
+    s->sink_closed = false; /* a fresh session can be piped again */
+    portEXIT_CRITICAL(&s_sink_mux);
     s->close_reason[0] = '\0';
     s->active = true;
     char name[8];
@@ -467,6 +579,37 @@ bool mqjs_ssh_up(int id)
 {
     int slot = sess_lookup(id);
     return slot >= 0 && s_sess[slot].up;
+}
+
+bool mqjs_ssh_set_sink(int id, const sshc_sink_t *sink)
+{
+    int slot = sess_lookup(id);
+    bool ok;
+    if (slot < 0 || !sink || !sink->space || !sink->write || !sink->gone)
+        return false;
+    portENTER_CRITICAL(&s_sink_mux);
+    /* Refused while one is installed (one producer per session, mirroring
+       the term ring's SPSC rule) and once the session task has passed the
+       point where it could ever call gone(). */
+    ok = !s_sess[slot].sink_on && !s_sess[slot].sink_closed;
+    if (ok) {
+        s_sess[slot].sink = *sink;
+        s_sess[slot].sink_drop = false;
+        s_sess[slot].sink_on = true;
+    }
+    portEXIT_CRITICAL(&s_sink_mux);
+    return ok;
+}
+
+void mqjs_ssh_drop_sink(int id)
+{
+    int slot = sess_lookup(id);
+    if (slot < 0)
+        return; /* dead session: it has already called gone() */
+    /* A request, not an action. The session task owns the release so that
+       gone() — the detach ack — can never race a read in progress, and so
+       that this call joins nothing (§3.1: no wait on js_task). */
+    s_sess[slot].sink_drop = true;
 }
 
 #endif /* CONFIG_MQJS_SSH */

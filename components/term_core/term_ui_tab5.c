@@ -78,6 +78,22 @@ static size_t utf8_put(char *p, uint32_t cp)
 }
 
 /*
+ * The two attributes the cell contract does not fold into fg/bg (§6):
+ * everything else — reverse, bold — is already in the colours by the time
+ * a cell exists, so this is the whole of the renderer's attribute logic.
+ * A run carries one value, which is why runs break on it below.
+ */
+static uint16_t run_attrs(const term_cell_t *c)
+{
+    uint16_t a = 0;
+    if (c->flags & TERM_CELL_UNDERLINE)
+        a |= UI_CELL_ATTR_UNDERLINE;
+    if (c->flags & TERM_CELL_STRIKE)
+        a |= UI_CELL_ATTR_STRIKE;
+    return a;
+}
+
+/*
  * Post cells [from, to) of `row` as one UI_CMD_CELLS run. Returns false
  * when the UI queue refused it, in which case the caller must NOT clear
  * the damage — the pixels never happened.
@@ -88,7 +104,8 @@ static size_t utf8_put(char *p, uint32_t cp)
  * space.
  */
 static bool post_run(const term_cell_t *cells, int from, int to,
-                     int cell_col, int cell_row, uint16_t fg, uint16_t bg)
+                     int cell_col, int cell_row, uint16_t fg, uint16_t bg,
+                     uint16_t attrs)
 {
     int n = to - from, i;
     size_t pos = 0;
@@ -114,6 +131,7 @@ static bool post_run(const term_cell_t *cells, int from, int to,
     cmd.op = UI_CMD_CELLS;
     cmd.x = (int16_t)(cell_col + from);
     cmd.y = (int16_t)cell_row;
+    cmd.w = (int16_t)attrs; /* §6's rules; see ui_tab5.h UI_CELL_ATTR_* */
     cmd.color = rgb565_to_888(fg);
     cmd.bg = rgb565_to_888(bg);
     cmd.text = text;
@@ -124,25 +142,32 @@ static bool post_run(const term_cell_t *cells, int from, int to,
     return true;
 }
 
-/* Split one grid row into same-colour runs and post them. */
+/* Split one grid row into runs of one fg/bg/attribute triple and post
+   them. Breaking on the attributes as well as the colours is what lets
+   the renderer draw one rule per run instead of one per cell. */
 static bool blit_row(const term_cell_t *cells, int ncols,
                      int cell_col, int cell_row)
 {
     int start = 0, c;
     bool ok = true;
+    uint16_t attrs;
 
     if (ncols <= 0)
         return true;
+    attrs = run_attrs(&cells[0]);
     for (c = 1; c <= ncols; c++) {
+        uint16_t a = (c < ncols) ? run_attrs(&cells[c]) : attrs;
         bool boundary = (c == ncols) ||
                         cells[c].fg != cells[start].fg ||
-                        cells[c].bg != cells[start].bg;
+                        cells[c].bg != cells[start].bg ||
+                        a != attrs;
         if (!boundary)
             continue;
         if (!post_run(cells, start, c, cell_col, cell_row,
-                      cells[start].fg, cells[start].bg))
+                      cells[start].fg, cells[start].bg, attrs))
             ok = false;
         start = c;
+        attrs = a;
     }
     return ok;
 }
@@ -173,10 +198,10 @@ static void repaint_cell(term_core_t *core, int col, int row,
         return;
     if (invert)
         post_run(cells, col, col + 1, cell_col, cell_row,
-                 cells[col].bg, cells[col].fg);
+                 cells[col].bg, cells[col].fg, run_attrs(&cells[col]));
     else
         post_run(cells, col, col + 1, cell_col, cell_row,
-                 cells[col].fg, cells[col].bg);
+                 cells[col].fg, cells[col].bg, run_attrs(&cells[col]));
 }
 
 /* ------------------------------------------------------------------ */

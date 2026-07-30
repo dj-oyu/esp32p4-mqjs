@@ -271,6 +271,16 @@ print sink ── ログ tee ───┘                → dirty 行集合 →
   新接続を張る。producer が常に 1 本なので head/tail 更新の競合が
   存在しない。TERM_LOG への `term.log`/print シンクは行単位アトミックの
   mutex 越し ingest なので複数書き手でも安全(こちらはリング直書きではない)。
+  → **実装時決着(フェーズ 4)**: (a) pipe 中は `feed` だけでなく
+  `term.log` もエラー — log もリングの head を進めるので、行単位
+  アトミックは「複数の log 書き手同士」しか守らない。(b) 再 pipe の
+  「ack join」は**呼び出し側の再試行**にした。§3.1 が js_task で join
+  しないと決めている以上、pipe だけが例外になる理由が無い — 旧
+  producer に detach を要求して `TERM_ERR_BUSY` を返し、ack が届いた
+  後の再呼び出しで張る。(c) パイプ側の背圧は「空きを聞く → その分だけ
+  wire から読む → 全部書く」の 3 段。SPSC なので聞いた空きは減らない、
+  つまり書き込みが途中で足りなくなる経路が存在しない。詳細は
+  components/term_core/PHASE4_MANIFEST.md の Decision 1〜5。
 - **`term.resize` も UI タスクへの post で実行する**: cols/rows は UI タスク
   だけが書く。パース中に別タスクが寸法を書き換えて境界判定が torn read に
   なる経路を持たない。
@@ -304,7 +314,7 @@ ssh_vt.js が既に持つ範囲を基準に、C 化で追加するものを含�
 | **カーソル表示/非表示 (25)** | 新規 | |
 | **端末応答 (DSR 6n / DA)** | **新規** | pipe 時は C 内でチャネルへ直接書き戻し。JS フィード時は `term.onReply` |
 | reverse / bold | 新規 | fg/bg スワップ / 明色パレットマップ(blitter 変更なし) |
-| underline | 新規 | セル flags + blitter に 1 本線描画(小規模) |
+| underline | 新規 | セル flags + blitter に 1 本線描画(小規模)。**実装(フェーズ 4)**: ラン単位で `fill_rect` 1 本(セル単位ではない)。ランは既に fg/bg で切れているので、そこに属性の対を足しただけ。strike も同じ経路で出る。位置は実機未確認(§11.4 の残り) |
 | マウスレポート (1000/1006) | **後回しフェーズ** | `ui.onTouch` からの変換。neovim マウス/ゲーム向け。要件の「ブロック崩し」をタッチ操作で満たすのはこのフェーズ完了時(それまではキー操作ゲームまで) |
 
 ## 7. プローブとアクセス制御
@@ -421,6 +431,15 @@ IME 設計の「preedit を確定前に外へ出さない」のターミナル�
   (`term_cursor_pos()` を ime がポーリング)は姉妹設計のイベント駆動方針と
   食い違うので**採らない**。現行 3 アプリが各自で書いている `imeFloat()` の
   アンカー計算はこの経路に一本化される。
+  → **実装時決着(フェーズ 4)**: 方針はそのまま。ただし**シンクの実体は
+  `ui_tab5` ではなく `MqjsWorker` の `caret_x/y/h`** — IME 統合が
+  `ui.caret` をそこに置いた(アンカーはアプリ単位で、IME 所有タスクは
+  フォアグラウンドのぶんだけ読む)。「term は `ui.caret` と同じシンクへ
+  push し、`ime_core` はそのシンクを読む」という肝はそのまま実装されて
+  おり、番地だけが本文と違う。push は**表示中の term に限り、drain 1 パス
+  あたり 1 回**(バイト毎でもチャンク毎でもない)。カーソル非表示は
+  「古い座標を残す」のではなく `visible=false` として通知し、シンク側が
+  無視する。詳細は PHASE4_MANIFEST.md の Decision 6〜10。
 - 依存方向: term → `ui_tab5`(blitter で既存)、`ime_core` → `ui_tab5`。
   層は `skk_core → ime_core → kbd_core → 入力面` に対し、term は出力側の
   兄弟であり循環しない。

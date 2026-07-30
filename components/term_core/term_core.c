@@ -2323,6 +2323,12 @@ bool term_core_full_repaint(const term_core_t *c)
     return c ? c->full_repaint : false;
 }
 
+void term_core_repaint_all(term_core_t *c)
+{
+    if (c)
+        c->full_repaint = true;
+}
+
 void term_core_dirty_clear(term_core_t *c)
 {
     int i;

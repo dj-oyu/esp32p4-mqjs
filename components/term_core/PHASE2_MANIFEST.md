@@ -327,6 +327,10 @@ term.close(id);
 
 ## Deliberately not done in this phase
 
+> The four items below are the phase-2 record. Three of them —
+> `term.pipe`/`term.onReply`, the §10.2 caret sink and underline/strike —
+> **were closed by phase 4**; see PHASE4_MANIFEST.md.
+
 - **`term.pipe` / `term.onReply`** — phase 4, excluded by the brief. The
   registry has the producer half (`producer_bind/_unbind/_ack`) because the
   quiesce state machine needs it; nothing is exposed to JS.

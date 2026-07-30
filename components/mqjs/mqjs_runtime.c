@@ -64,6 +64,7 @@
    device glue behind term_ui_tab5.h is the only ESP-only part. */
 #include "term_registry.h"
 #include "term_lp_ring.h"
+#include "term_pipe.h"
 #include "app/mqjs_app_manager_internal.h"
 /* usleep(). Outside the ESP_PLATFORM block on purpose: the same code
    runs in run_pc, and inside it the host build fell back to an implicit
@@ -174,6 +175,7 @@ typedef struct {
 typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
                EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
+               EV_TERM_REPLY, /* term.onReply: a DSR/DA answer, inline */
                EV_NET /* broadcast: release the net.onReady wait queue */
              } MqjsEventType;
 
@@ -199,6 +201,11 @@ typedef struct {
         struct { char *body; uint32_t len; int16_t status; } http; /* http.get
                        result: heap body owned by the event (dispatcher
                        frees it), status<=0 = request failed */
+        /* term.onReply (docs/term-design.md §6). Carried INLINE, not on the
+           heap: a terminal reply is at most TERM_REPLY_MAX bytes and this
+           event is posted from the UI task while the term registry's lock
+           is held, where a malloc is exactly the thing not to do. */
+        struct { char bytes[TERM_REPLY_MAX]; uint8_t len; int32_t id; } term;
     } u;
 } MqjsEvent;
 
@@ -241,6 +248,18 @@ typedef struct {
     JSGCRef data_fn, close_fn;
 } SshCb;
 
+/* term.onReply(id, cb) — per term, like ssh.onData is per session
+   (docs/term-design.md §8). Four is the same reasoning as the ssh table:
+   the shipped terminal keeps three sessions plus slack, and a term that is
+   PIPED needs no sink at all (§6 routes its replies into the channel). */
+#define MQJS_MAX_TERM_CB 4
+typedef struct {
+    bool used;
+    bool fn_used;
+    int32_t id;
+    JSGCRef fn;
+} TermCb;
+
 /* All binding state of one app, bundled (design §3.1). ~2KB of internal
    RAM per slot; the 256KB context arena lives in PSRAM. */
 typedef struct {
@@ -266,6 +285,7 @@ typedef struct {
     JSGCRef   mqtt_onconn;
     WidgetCb  widget_cbs[MQJS_MAX_WIDGET_CB]; /* only the fg app has live screens */
     SshCb     ssh_cbs[MQJS_MAX_SSH_CB];
+    TermCb    term_cbs[MQJS_MAX_TERM_CB];
     volatile bool touch_used; /* read by the UI task (poster) */
     JSGCRef   touch_cb;
     volatile bool key_used;   /* read by the UI task (poster) */
@@ -6401,6 +6421,43 @@ static void term_default_grid(int *cols, int *rows)
         (*rows)--;
 }
 
+/* ---- §10.2: the caret, pushed from C into the platform's caret state ----
+ *
+ * A JS app tells the platform where its cursor is by calling ui.caret();
+ * the value lands in its worker's caret_x/y/h and the IME's owner task
+ * reads the FOREGROUND worker's copy when it draws the preedit float. A
+ * native term is the same kind of writer, one layer down: the drain notices
+ * that the cursor cell moved and pushes the rectangle into the very same
+ * three fields (§10.2 — "JS アプリが ui.caret を呼ぶのと同じプラットフォーム
+ * 側 caret シンクへ C-to-C で更新を push する").
+ *
+ * That is the whole of the term<->IME relationship. term does not know
+ * ime_core exists, ime_core does not know term exists, and the polling
+ * alternative the design rejects by name (ime asking term for its cursor)
+ * has no entry point to call.
+ *
+ * Runs on the UI task, once per term per frame, after the registry has
+ * released its lock. Three int16 stores, so a reader that catches it
+ * mid-update is one keystroke stale in the float's position — the same
+ * tolerance ui.caret already documents. */
+static void term_caret_sink(void *user, const term_caret_ev_t *ev)
+{
+    (void)user;
+    if (!ev->visible)
+        return; /* cursor hidden: the anchor would be a lie, so say nothing
+                   and let the float fall back the way it does for an app
+                   that never called ui.caret */
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++) {
+        MqjsWorker *w = &s_workers[i];
+        if (!w->used || strcmp(w->name, ev->owner) != 0)
+            continue;
+        w->caret_x = (int16_t)ev->x;
+        w->caret_y = (int16_t)ev->y;
+        w->caret_h = (int16_t)ev->h;
+        return;
+    }
+}
+
 static bool term_ready(void)
 {
     if (term_registry_ready())
@@ -6423,14 +6480,26 @@ static bool term_ready(void)
     console.rows = rows;
     memset(&cfg, 0, sizeof cfg);
     cfg.console = &console;
-
+    /* §10.2's conversion needs the grid's pixel pitch, and this is the
+       only layer that knows both it and the registry. */
+    cfg.cell_w = 9;
+    cfg.cell_h = 24;
 #ifdef ESP_PLATFORM
-    return term_ui_tab5_start(&cfg) == TERM_OK;
+    ui_tab5_cell_size(&cfg.cell_w, &cfg.cell_h);
+    if (cfg.cell_w <= 0 || cfg.cell_h <= 0) {
+        cfg.cell_w = 9;
+        cfg.cell_h = 24;
+    }
+    if (term_ui_tab5_start(&cfg) != TERM_OK)
+        return false;
 #else
     if (!term_port_installed() && !term_port_install(&s_term_pc_port))
         return false;
-    return term_registry_init(&cfg) == TERM_OK;
+    if (term_registry_init(&cfg) != TERM_OK)
+        return false;
 #endif
+    term_registry_set_caret_sink(term_caret_sink, NULL);
+    return true;
 }
 
 /*
@@ -6445,6 +6514,11 @@ static void mqjs_term_pump(void)
     if (!term_registry_ready())
         return;
     term_registry_ui_drain();
+    /* The host pipe stub's "own task" moment: a requested detach becomes an
+       ack here, one pump after it was asked for, the way the ssh session
+       task does it on the device (term_pipe.h). Before the reap, so a close
+       that was waiting only on the producer completes in the same pass. */
+    term_pipe_pump();
     term_registry_reap();
 #endif
 }
@@ -6702,6 +6776,175 @@ JSValue js_term_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     JSValue v = JS_NewStringLen(ctx, buf, res.bytes);
     free(buf);
     return v;
+}
+
+/* ---- term.pipe / term.unpipe (§5, §8) ---------------------------------
+ *
+ * The point of the pipe is what does NOT happen in JS: after this call the
+ * ssh channel's bytes go into the term's ring in C, are parsed on the UI
+ * task and become pixels, without one of them entering the app's heap or
+ * costing an interpreted instruction (§9.1). The app orchestrates connect
+ * and tab switching; that is all.
+ *
+ * Off the device there is no ssh, and the handle binds the host stub
+ * producer instead (term_pipe.h) — real enough that feed/log answer BUSY
+ * and that the re-pipe rule is observable, which is what run_pc tests. */
+JSValue js_term_pipe(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0, handle = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) &&
+        JS_ToInt32(ctx, &handle, argv[1]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx, term_pipe_bind((term_id_t)id, owner, handle));
+}
+
+/* term.unpipe(id) -> 0 or a negative term_err_t. Asks the producer to
+   detach and returns; the term stops being piped when the ack lands
+   (§3.1 stage 1 — nothing is joined here). */
+JSValue js_term_unpipe(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    return term_err_value(ctx, term_pipe_unbind((term_id_t)id, owner));
+}
+
+/* ---- term.onReply (§6, §8) --------------------------------------------
+ *
+ * The sink runs on the UI task inside the drain, with the registry's table
+ * lock held, so it cannot call JS and cannot allocate. It posts the reply
+ * INLINE in an event instead — replies are at most TERM_REPLY_MAX bytes —
+ * and dispatch_term_reply() calls the app's function from js_task.
+ *
+ * `user` carries the worker's slot and generation, not a pointer: an app
+ * that stopped and restarted between the DSR and its answer must not have
+ * its successor's callback invoked (the same stale-event rule §3.2 applies
+ * to every worker-addressed event). */
+static void *term_reply_cookie(const MqjsWorker *w)
+{
+    return (void *)(uintptr_t)(((uint32_t)w->gen << 8) | w->idx);
+}
+
+static void term_reply_sink(void *user, term_id_t id, const char *bytes,
+                            size_t len)
+{
+    uint32_t cookie = (uint32_t)(uintptr_t)user;
+    MqjsEvent ev;
+
+    if (len > sizeof ev.u.term.bytes)
+        return; /* term_reply_sink_fn caps it at TERM_REPLY_MAX; a longer
+                   reply would be a core bug, and truncating a control
+                   sequence is worse than dropping it whole */
+    memset(&ev, 0, sizeof ev);
+    ev.type = EV_TERM_REPLY;
+    ev.worker = (uint8_t)(cookie & 0xFF);
+    ev.gen = (uint16_t)(cookie >> 8);
+    ev.u.term.id = (int32_t)id;
+    ev.u.term.len = (uint8_t)len;
+    memcpy(ev.u.term.bytes, bytes, len);
+    /* Zero wait: this is the UI task under a lock. A refused reply is one
+       the remote asks again for; a blocked frame is a frozen device. */
+    ev_post(&ev, 0);
+}
+
+static TermCb *termcb_get(MqjsWorker *app, int32_t id)
+{
+    int i;
+    for (i = 0; i < MQJS_MAX_TERM_CB; i++)
+        if (app->term_cbs[i].used && app->term_cbs[i].id == id)
+            return &app->term_cbs[i];
+    for (i = 0; i < MQJS_MAX_TERM_CB; i++) {
+        if (!app->term_cbs[i].used) {
+            memset(&app->term_cbs[i], 0, sizeof app->term_cbs[i]);
+            app->term_cbs[i].used = true;
+            app->term_cbs[i].id = id;
+            return &app->term_cbs[i];
+        }
+    }
+    return NULL;
+}
+
+static void termcb_release(JSContext *ctx, TermCb *c)
+{
+    if (c->fn_used)
+        JS_DeleteGCRef(ctx, &c->fn);
+    memset(c, 0, sizeof *c);
+}
+
+/* term.onReply(id, fn) -> 0 or a negative term_err_t. fn null/undefined
+   removes the sink. A PIPED term never calls it: its replies go back over
+   the channel in C (§6), which is the answer the remote asked for. */
+JSValue js_term_onReply(JSContext *ctx, JSValue *this_val, int argc,
+                        JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+
+    bool clear = argc < 2 || JS_IsUndefined(argv[1]) || JS_IsNull(argv[1]);
+    TermCb *c = termcb_get(s_cur_wk, (int32_t)id);
+    if (!c)
+        return term_err_value(ctx, TERM_ERR_NO_SLOT);
+    if (clear) {
+        term_err_t e = term_registry_set_reply((term_id_t)id, owner, NULL,
+                                               NULL);
+        termcb_release(ctx, c);
+        return term_err_value(ctx, e);
+    }
+    /* Install in the registry FIRST: if the id is not ours the callback is
+       never stored, so a rejected call leaves no rooted function behind. */
+    term_err_t e = term_registry_set_reply((term_id_t)id, owner,
+                                          term_reply_sink,
+                                          term_reply_cookie(s_cur_wk));
+    if (e != TERM_OK) {
+        termcb_release(ctx, c);
+        return term_err_value(ctx, e);
+    }
+    if (c->fn_used)
+        JS_DeleteGCRef(ctx, &c->fn);
+    JSValue *pf = JS_AddGCRef(ctx, &c->fn);
+    *pf = argv[1];
+    c->fn_used = true;
+    return term_err_value(ctx, TERM_OK);
+}
+
+static void dispatch_term_reply(MqjsWorker *app, const MqjsEvent *ev)
+{
+    JSContext *ctx = app->ctx;
+    TermCb *c = NULL;
+    for (int i = 0; i < MQJS_MAX_TERM_CB; i++)
+        if (app->term_cbs[i].used && app->term_cbs[i].id == ev->u.term.id)
+            c = &app->term_cbs[i];
+    if (!c || !c->fn_used)
+        return;
+    if (JS_StackCheck(ctx, 3)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, JS_NewStringLen(ctx, ev->u.term.bytes, ev->u.term.len));
+    JS_PushArg(ctx, c->fn.val);
+    JS_PushArg(ctx, JS_NULL);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 1);
+    if (JS_IsException(ret))
+        dump_error(ctx);
 }
 
 /* term.close(id) -> 0 or a negative term_err_t. Stage 1 only: the id is
@@ -7045,6 +7288,14 @@ static void app_reset_bindings(MqjsWorker *app)
         if (app->ssh_cbs[i].used)
             sshcb_release(ctx, &app->ssh_cbs[i]);
     }
+    /* term.onReply sinks. The registry side needs no unhooking: the
+       terms themselves have just gone DYING or DETACHED in the sweep
+       above, and a reply that races us in dies on the generation check
+       in event_owner (§3.2). */
+    for (int i = 0; i < MQJS_MAX_TERM_CB; i++) {
+        if (app->term_cbs[i].used)
+            termcb_release(ctx, &app->term_cbs[i]);
+    }
     wcb_release_all(app);
 
     /* flush a half-assembled console line so it is not attributed to
@@ -7351,7 +7602,8 @@ static MqjsWorker *event_owner(const MqjsEvent *ev)
     case EV_SIGNAL:
     case EV_CLIP:
     case EV_CAM:
-    case EV_HTTP: {
+    case EV_HTTP:
+    case EV_TERM_REPLY: {
         MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
     }
@@ -7391,6 +7643,7 @@ static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
+    case EV_TERM_REPLY:     dispatch_term_reply(app, ev);    break;
     }
     s_cur_wk = prev;
 }

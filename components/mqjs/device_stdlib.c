@@ -459,12 +459,20 @@ static const JSClassDef js_ui_obj =
 
    Errors are RETURN VALUES, never exceptions (§8): a closed, reused or
    foreign id gives a negative term_err_t (null from snapshot/read).
-   pipe/onReply are phase 4 and deliberately absent. ---- */
+
+   pipe/unpipe/onReply are phase 4 (§5, §6): pipe hands the term's byte
+   ring to an ssh channel in C, after which feed/log answer BUSY because a
+   VT term has exactly one producer, and terminal replies go back over that
+   channel without JS. onReply is the same replies for a term the app feeds
+   itself. ---- */
 static const JSPropDef js_term[] = {
     JS_CFUNC_DEF("create", 1, js_term_create),     /* (opts) -> id | -err */
     JS_CFUNC_DEF("show", 2, js_term_show),         /* (id, {x,y,w,h}) */
     JS_CFUNC_DEF("log", 2, js_term_log),           /* (id, str) line-atomic */
     JS_CFUNC_DEF("feed", 2, js_term_feed),         /* (id, bytes) VT input */
+    JS_CFUNC_DEF("pipe", 2, js_term_pipe),         /* (id, sshHandle) */
+    JS_CFUNC_DEF("unpipe", 1, js_term_unpipe),     /* (id) detach, async */
+    JS_CFUNC_DEF("onReply", 2, js_term_onReply),   /* (id, fn(bytes)) */
     JS_CFUNC_DEF("resize", 3, js_term_resize),     /* (id, cols, rows) */
     JS_CFUNC_DEF("snapshot", 1, js_term_snapshot), /* (id) -> text | null */
     JS_CFUNC_DEF("read", 3, js_term_read),         /* (id, from, n) -> text */

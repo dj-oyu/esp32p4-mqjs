@@ -93,13 +93,16 @@
  * WHO RUNS WHAT
  * =====================================================================
  *
- *   js_task        create, close, feed, log, resize, show, snapshot, read
+ *   js_task        create, close, feed, log, resize, show, snapshot, read,
+ *                  pipe/producer_bind/_unbind, set_reply
  *                  (the read pair posts to the UI task and joins with a
  *                  cap; everything else is non-blocking or bounded by the
  *                  ingest timeout)
  *   UI frame task  term_registry_ui_drain (parse, §5), term_registry_ui_visit
  *                  (blit, §9), and the serialisation half of snapshot/read
- *                  (§7.2 — always at a frame boundary, always consistent)
+ *                  (§7.2 — always at a frame boundary, always consistent).
+ *                  The reply and caret callbacks fire from here (§6, §10.2)
+ *   producer task  term_registry_producer_space / _write (the ssh pipe, §5)
  *   reaper task    term_registry_reap
  *   any task       term_registry_producer_ack, term_registry_system_log,
  *                  the introspection calls
@@ -135,6 +138,12 @@ extern "C" {
 /* Persist slots, initial value from §3.1. §12 lists the final number as
  * open pending on-device measurement, so it is a config field too. */
 #define TERM_PERSIST_MAX_DEFAULT 4
+
+/* The ui.cells grid (ui_tab5.cpp UI_CELL_W/UI_CELL_H, HackGen 9x24). Used
+ * only to turn a caret in cells into a caret in canvas pixels (§10.2);
+ * term_registry_config_t::cell_w/cell_h override them. */
+#define TERM_CELL_W_DEFAULT 9
+#define TERM_CELL_H_DEFAULT 24
 
 /* Name is the per-owner re-attach key (§3.1). 16 including the NUL, as in
  * the §3.1 struct sketch. */
@@ -292,6 +301,13 @@ typedef struct {
      * default. */
     int drain_budget_bytes;
 
+    /* Cell metrics of the display grid, in canvas pixels. The core
+     * reports caret movement in CELLS (§10.2) but the platform's caret
+     * state — the one ui.caret writes and ime_core reads — is in canvas
+     * pixels, and this is the only place that conversion has both
+     * numbers. 0 selects TERM_CELL_W_DEFAULT / TERM_CELL_H_DEFAULT. */
+    int cell_w, cell_h;
+
     /* Create the shared system console at init (TERM_LOG, owner
      * TERM_OWNER_SYSTEM) — the "汎用 console 画面" that motivates this
      * phase (§11.2). NULL creates none, and term_registry_console_id()
@@ -437,6 +453,11 @@ term_err_t term_registry_feed(term_id_t id, const char *owner,
  * precisely because this path goes through the lock rather than straight
  * into the ring.
  *
+ * SPSC (§5), same rule as feed: a piped term has exactly one producer, so
+ * log is TERM_ERR_BUSY while a pipe is bound. Line-atomicity is what makes
+ * several LOG writers safe; it does not make a second writer safe against
+ * a producer that owns the ring's head.
+ *
  * Legal on both modes. On a VT term it is equivalent to feeding the text
  * plus CRLF — and a VT term is NOT teed to the black box (§3.2's table:
  * "LP 黒箱 tee — TERM_VT: しない"), which the mode makes structural since a
@@ -529,15 +550,15 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
 /*
  * A producer is a C-side source that writes into the byte ring directly,
  * without the bytes ever entering the JS heap (§5: the ssh pipe). Binding
- * one makes it the term's single writer and turns term_registry_feed into
- * TERM_ERR_BUSY.
+ * one makes it the term's single writer and turns term_registry_feed AND
+ * term_registry_log into TERM_ERR_BUSY.
  *
- * term.pipe itself is phase 4. These three calls exist now because the
- * quiesce state machine is DEFINED in terms of a producer's detach ack
- * (§3.1 stage 1/2), and a state machine whose main timeout path cannot be
- * exercised is a state machine nobody has tested — the phase 2 host tests
- * bind a fake producer, ack it late, and check that DYING becomes ZOMBIE
- * at the deadline and that a late ack still collects it.
+ * The three phase-2 calls (bind/unbind/ack) exist because the quiesce state
+ * machine is DEFINED in terms of a producer's detach ack (§3.1 stage 1/2),
+ * and a state machine whose main timeout path cannot be exercised is a
+ * state machine nobody has tested. Phase 4 adds what an actual pipe needs:
+ * a reply route back to the channel (§6), and the two ring calls the
+ * producer's own task uses (space + write).
  */
 
 /*
@@ -549,14 +570,72 @@ term_err_t term_registry_read(term_id_t id, const char *owner,
  */
 typedef void (*term_producer_detach_fn)(void *user, term_id_t id);
 
+/*
+ * A terminal reply (DSR 5n/6n, primary DA — §6). One sink type serves both
+ * destinations of §6's "端末応答": the bound producer's channel (pipe: the
+ * answer goes back over ssh entirely in C) and the per-term JS sink
+ * (term.onReply, for a term somebody feeds by hand).
+ *
+ * CALLED FROM THE UI TASK, FROM INSIDE term_registry_ui_drain, WITH THE
+ * TABLE LOCK HELD. Therefore:
+ *   - it must not call any term_registry_* function (the mutex is not
+ *     recursive: that is a deadlock, not a warning),
+ *   - it must not block — post with a zero timeout and count the refusal,
+ *   - `bytes` is valid only for the duration of the call (a stack buffer
+ *     inside the parser); copy what you keep. len <= TERM_REPLY_MAX.
+ */
+#define TERM_REPLY_MAX 16   /* "\x1b[" + 5 + ';' + 5 + 'R' = 14 worst case */
+
+typedef void (*term_reply_sink_fn)(void *user, term_id_t id,
+                                   const char *bytes, size_t len);
+
+/* Everything a producer supplies. `reply` may be NULL (replies then fall
+ * through to the term's JS sink, if it has one, and are counted as dropped
+ * otherwise). `user` is the producer's own cookie and doubles as its
+ * identity on the ring calls below. */
+typedef struct {
+    term_producer_detach_fn detach;   /* required */
+    term_reply_sink_fn      reply;    /* optional */
+    void                   *user;
+} term_producer_t;
+
 /* Bind the single producer. TERM_ERR_BUSY if one is already bound;
  * re-piping requires unbinding first and waiting for its ack (§5). */
 term_err_t term_registry_producer_bind(term_id_t id, const char *owner,
                                        term_producer_detach_fn detach,
                                        void *user);
 
+/* Same, with a reply route. term_registry_producer_bind(id, o, d, u) is
+ * exactly this with {d, NULL, u}. */
+term_err_t term_registry_producer_bind_ex(term_id_t id, const char *owner,
+                                          const term_producer_t *prod);
+
+/*
+ * term.pipe (§8) — bind a producer to a VT term, asking whatever was bound
+ * before to detach first (§5: "再 pipe は旧接続の detach(ack join)を
+ * 済ませてから新接続を張る").
+ *
+ * TERM_ERR_MODE unless the term is TERM_VT: a LOG term is multi-writer by
+ * construction (the print sink, term.log) and a ring-owning producer cannot
+ * coexist with that.
+ *
+ * WHEN A PRODUCER IS ALREADY BOUND this call requests its detach — exactly
+ * as stage 1 does, outside the lock — and returns TERM_ERR_BUSY WITHOUT
+ * binding the new one. It does NOT wait for the ack. §3.1's rule is not
+ * negotiable here: the caller is js_task, shared by every worker, and a
+ * join would make "switch this terminal to a new session" an operation that
+ * can stall all JS on the device. The ack join is therefore the caller's
+ * retry — a second term_registry_pipe() succeeds once the old producer has
+ * acked from its own task, which for the ssh producer is one recv-timeout
+ * away. Callers that would rather not retry call
+ * term_registry_producer_unbind() when they close the old session and pipe
+ * the new one when it comes up.
+ */
+term_err_t term_registry_pipe(term_id_t id, const char *owner,
+                              const term_producer_t *prod);
+
 /* Voluntary unbind by the owner (not a close). Requests detach and marks
- * the ack outstanding, exactly as stage 1 does. */
+ * the ack outstanding, exactly as stage 1 does. This is term.unpipe. */
 term_err_t term_registry_producer_unbind(term_id_t id, const char *owner);
 
 /*
@@ -568,6 +647,128 @@ term_err_t term_registry_producer_unbind(term_id_t id, const char *owner);
  * for, I2).
  */
 term_err_t term_registry_producer_ack(term_id_t id);
+
+/*
+ * ---------------------------------------------------------------------
+ * THE RING, FROM THE PRODUCER'S SIDE (§5) — call these from the
+ * producer's own task, and identify yourself with the `user` cookie the
+ * bind was given. There is no owner argument: a producer is platform C
+ * code, not an app. A cookie mismatch is TERM_ERR_BUSY, which is what a
+ * producer that was unbound-but-has-not-acked-yet sees once someone else
+ * has taken its place.
+ * ---------------------------------------------------------------------
+ *
+ * BACKPRESSURE, NOT LOSS. §5 gives the pipe different rules from
+ * JS/print ingest: "ssh パイプは満杯なら consume を止め SSH ウィンドウで
+ * 背圧(エスケープ列を千切らない)". Truncating a run mid-escape would
+ * corrupt the screen with no way back, so the pipe never drops. The
+ * protocol is:
+ *
+ *   1. ask for space,
+ *   2. read at most that many bytes off the wire,
+ *   3. write them — all of them fit, guaranteed.
+ *
+ * Step 3 cannot come up short because the term has ONE producer (SPSC):
+ * only this task adds to the ring and only the UI drain removes from it,
+ * so the space observed in step 1 is a lower bound that can only grow.
+ * When space is 0 the producer must stop reading its socket; the TCP
+ * window closes, the peer's SSH window stops advancing, and the sender
+ * throttles itself. Do not spin: sleep for a bounded interval (the ssh
+ * session task uses its recv timeout) and ask again.
+ *
+ * Both calls take the table lock with the ingest bound (config
+ * ingest_timeout_ms). Missing it is TERM_ERR_TIMEOUT with *out_space /
+ * *out_written set to 0 and NOTHING CONSUMED — the producer still owns
+ * its bytes and simply tries again. That is the difference from
+ * term_registry_feed, which drops and counts on the same event.
+ *
+ * A SHORT WRITE — a producer that offered more than the space it asked
+ * for — is also TERM_ERR_TIMEOUT, with *out_written telling the truth
+ * about how much the ring took. Same code as feed's overflow because
+ * "the ring would not take all of it" is the same event; the difference
+ * is what happens to the remainder, and here it stays the caller's. The
+ * registry does not drop it and does not count it as a drop.
+ *
+ * A DYING/ZOMBIE term answers TERM_ERR_DYING to both (its detach is
+ * already on its way); the producer's job then is to stop and ack.
+ */
+term_err_t term_registry_producer_space(term_id_t id, void *user,
+                                        size_t *out_space);
+
+term_err_t term_registry_producer_write(term_id_t id, void *user,
+                                        const uint8_t *bytes, size_t len,
+                                        size_t *out_written);
+
+/* ===================================================================== */
+/* Terminal replies to JS (term.onReply, §6/§8)                          */
+/* ===================================================================== */
+
+/*
+ * term.onReply(id, cb) — where a fed term's DSR/DA answers go. Owner-gated
+ * like every other entry point; `fn` NULL removes the sink.
+ *
+ * ROUTING, in order (§6: "pipe 時は C 内でチャネルへ直接書き戻し。JS
+ * フィード時は term.onReply"):
+ *   1. a bound producer with a reply route gets it — the answer never
+ *      enters the JS heap, which is the entire point of the pipe;
+ *   2. otherwise this sink, if one is installed;
+ *   3. otherwise the reply is dropped and counted (stats.replies_dropped).
+ *
+ * So a piped term does not call its onReply sink. Registering one anyway is
+ * legal and useful — it becomes live the moment the pipe detaches — but
+ * while a producer holds the term the sink stays silent. That is not a
+ * degradation to work around: a terminal reply belongs to the stream that
+ * asked the question.
+ *
+ * The sink runs on the UI task under the table lock — see
+ * term_reply_sink_fn for what that forbids.
+ */
+term_err_t term_registry_set_reply(term_id_t id, const char *owner,
+                                   term_reply_sink_fn fn, void *user);
+
+/* ===================================================================== */
+/* The caret sink (§10.2)                                                */
+/* ===================================================================== */
+
+/*
+ * §10.2 settles this: when a VT term's cursor moves, the term PUSHES the
+ * new caret rectangle into the same platform-side caret state that a JS
+ * app fills by calling ui.caret(x, y, h). ime_core reads that state and
+ * never learns that term exists; term never learns that ime exists. The
+ * alternative the design rejects by name — ime polling a
+ * term_cursor_pos() — is not implemented and should not be added.
+ *
+ * ONE sink for the whole registry, installed by the platform at bring-up,
+ * not per term and not by an app: an app does not opt into having a
+ * cursor. `fn` NULL removes it, and term_registry_deinit() clears it —
+ * it belongs to the table's lifetime, so a suite that builds one registry
+ * per case installs its sink per case too.
+ *
+ * WHEN IT FIRES. Only on change (term_core only notifies when
+ * col/row/visible actually differ), only for a term whose view is
+ * visible, and AT MOST ONCE PER TERM PER term_registry_ui_drain() PASS —
+ * i.e. once per frame, not once per byte and not once per drain chunk.
+ * The drain accumulates the latest position per slot and flushes after it
+ * has released the table lock, so the sink runs UNLOCKED and may call
+ * back into the registry (it still should not block: it shares the frame
+ * with LVGL).
+ *
+ * Coordinates are canvas pixels: the term's view rect plus col/row times
+ * the configured cell size. `h` is the cell height, i.e. what ui.caret's
+ * third argument means. `visible` is false when the cursor is hidden
+ * (DECTCEM off) — the anchor is then stale and the IME float should fall
+ * back to whatever it uses for an app that never called ui.caret.
+ */
+typedef struct {
+    term_id_t id;
+    char      owner[TERM_OWNER_MAX]; /* who to attribute the caret to */
+    int       x, y, h;               /* canvas pixels */
+    bool      visible;
+} term_caret_ev_t;
+
+typedef void (*term_caret_sink_fn)(void *user, const term_caret_ev_t *ev);
+
+void term_registry_set_caret_sink(term_caret_sink_fn fn, void *user);
 
 /* ===================================================================== */
 /* Platform-side entry points                                            */
@@ -712,6 +913,18 @@ typedef struct {
     uint32_t drops_lock;     /* ingest calls that lost the bounded wait  */
     uint32_t drops_full;     /* ingest bytes refused by a full ring      */
     uint32_t post_fails;     /* UI queue refusals                        */
+
+    /* -- phase 4 (§5 pipe, §6 replies, §10.2 caret) ------------------- */
+    uint32_t pipes;          /* producers bound                          */
+    uint32_t pipe_busy;      /* pipes refused because one was bound; the
+                              * old producer was asked to detach         */
+    uint64_t prod_bytes;     /* bytes taken from producers (never lossy) */
+    uint32_t prod_stalls;    /* space queries answered 0 = the ring is
+                              * full and the ssh window is doing the work*/
+    uint32_t replies_piped;  /* replies routed into a producer's channel */
+    uint32_t replies_js;     /* replies handed to a term.onReply sink    */
+    uint32_t replies_dropped;/* replies nobody was listening for         */
+    uint32_t caret_pushes;   /* caret events handed to the sink          */
 } term_registry_stats_t;
 
 void term_registry_stats(term_registry_stats_t *out);
