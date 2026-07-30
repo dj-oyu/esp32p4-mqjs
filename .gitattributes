@@ -1,3 +1,6 @@
 # Shell scripts must stay LF even on Windows checkouts (core.autocrlf), or the
 # CRLF shebang breaks them under Git Bash ("env: 'sh\r': No such file").
 *.sh text eol=lf
+# Golden traces are compared byte-for-byte with output a host program just
+# produced (LF). A CRLF checkout would make every single line differ.
+*.trace text eol=lf
