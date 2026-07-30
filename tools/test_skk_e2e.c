@@ -261,7 +261,7 @@ int main(int argc, char **argv)
 
     /* The counters must actually fill in. convert() used to call
        skk_lookup() rather than skk_lookup_stats(), which left probes,
-       fullcmp and dropped at zero forever — skk.stats() reported a
+       fullcmp and dropped at zero forever — the stats reported a
        working IME with no measurable cost, and design §8.1's "measure
        the probes before reconsidering predictive conversion" had no
        instrument behind it. */

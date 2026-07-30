@@ -668,7 +668,7 @@ static void convert(skk_t *s, uint32_t *st)
     klen = span_key(s, key, &blk);
 
     /* The _stats variant, not skk_lookup(): it fills probes / fullcmp /
-       cands / dropped as it searches, so skk.stats() can answer "what did
+       cands / dropped as it searches, so ui.imeStats() can answer "what did
        that conversion cost" without running the search a second time.
        Calling the plain one here left those three counters at zero
        forever, which is the instrument design §8.1 says to read before

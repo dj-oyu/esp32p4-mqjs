@@ -6,6 +6,14 @@ Tab5 でローカル完結の日本語入力を実現します。変換エンジ
 この文書は実装前の設計です。数値には **実測** と **概算** を明示的に分けて
 書いてあります。概算は実装中に実測へ置き換えてください。
 
+> ⚠️ **2026-07-30: §8 の `skk.*` JavaScript API は削除されました。**
+> エンジン (`skk_core`)、辞書の段と image 形式 (§6)、性能の実測 (§4) は
+> そのまま生きていますが、**アプリがエンジンを直接叩く層はもうありません**。
+> IME はプラットフォームの持ち物になり、アプリから見えるのは `ui.ime(1)` /
+> `ui.caret()` / `ui.imeStats()` の 3 つだけです。§8 と §9 は「かつてこう
+> だった」の記録として読んでください。現行の設計は
+> [`docs/keyboard-ime-unification.md`](keyboard-ime-unification.md)。
+
 ## 1. 目的とスコープ
 
 SSH 越しに日本語を打てるようにするのが第一目的です。リモート側に IME を
@@ -938,7 +946,13 @@ S0 が効くのは、`font_term_mono` のコードポイント被覆が `font_nf
 を独立に進められます。
 
 
-## 8. JavaScript API
+## 8. JavaScript API (削除済み — 2026-07-30)
+
+**この節の API はもう存在しません。** 記録として残しますが、現行は
+`ui.ime(1)` + `ui.onKey` + `ui.imeStats()` です
+([`keyboard-ime-unification.md`](keyboard-ime-unification.md) §7)。
+`skk.stats()` が返していた実測カウンタは `ui.imeStats()` が引き継ぎ、
+**キューの待ち時間 (hop)** が加わりました。以下は当時の設計です。
 
 ハンドル方式は既存の ssh セッションや widget と揃えます。
 

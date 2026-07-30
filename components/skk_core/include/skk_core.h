@@ -450,8 +450,8 @@ typedef struct {
 
 /* Counters, no clock: skk_core must not depend on esp_timer and must
  * build on a host, so wall time is measured by the caller (the mqjs
- * binding brackets skk_key/skk_lookup with esp_timer_get_time and
- * exposes both through skk.stats()). What only the engine can know is
+ * binding brackets the engine call with esp_timer_get_time and exposes
+ * both through ui.imeStats()). What only the engine can know is
  * counted here. */
 typedef struct {
     uint32_t keys;       /* skk_key() calls */

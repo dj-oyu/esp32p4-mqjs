@@ -1838,9 +1838,9 @@ JSValue js_ui_onKey(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 #ifdef ESP_PLATFORM
-/* IME は打鍵の分配より手前で噛ませる。実体は辞書解決を skk.open() と
-   共有するため下の skk セクションにある。true = IME の所有タスクが
-   引き取った (確定文字列の配達もそちらがやる)。 */
+/* IME は打鍵の分配より手前で噛ませる。実体は辞書の解決と同じ場所に要るので
+   下の辞書セクションにある。true = IME の所有タスクが引き取った
+   (確定文字列の配達もそちらがやる)。 */
 static bool ime_route_key(const char *utf8, size_t len);
 
 /* 打鍵を fg アプリの ui.onKey へ流す、唯一の出口。IME を通した後の配達も
@@ -2145,8 +2145,8 @@ static int uiw_truthy(JSContext *ctx, JSValue v)
     return 1; /* objects/strings: truthy enough for an options flag */
 }
 
-/* 実体は辞書解決を skk.open() と共有するため下の skk セクション。ja の
-   field は「作った時点で辞書が開けたか」で ascii へ落ちるので、ここで要る。 */
+/* 実体は辞書を解決する場所と同じなので下の辞書セクション。ja の field は
+   「作った時点で辞書が開けたか」で ascii へ落ちるので、ここで要る。 */
 static bool ime_arm(void);
 
 /* field(label, mode) の第 2 引数 -> UIW_FIELD_* (I3)。
@@ -5296,24 +5296,22 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
-/* skk: local Japanese IME (docs/skk-ime-design.md §8)                  */
+/* Dictionary images + the personal dictionary (docs/skk-ime-design.md) */
 /*                                                                      */
-/* Handle-style like ssh, and for the same two reasons. The API in §8   */
-/* is flat (skk.key(h, k), not h.key(k)), so a JS class object would    */
-/* buy nothing but a malloc and a JS_GetOpaque on the hot path; and the */
-/* dictionary is ~290 KB of PSRAM whose release must happen when the    */
-/* app stops, not whenever the GC next runs a finalizer.                */
+/* THERE IS NO LONGER A JS-FACING skk.* API. Apps ask for Japanese      */
+/* input with ui.ime(1) and receive committed text through ui.onKey;    */
+/* everything between those two lives in ime_core behind the platform   */
+/* session (see "platform IME session" below). What survives here is    */
+/* what that session needs: loading and refcounting the dictionary      */
+/* image, and the one learning store the device shares.                 */
 /*                                                                      */
-/* skk.key() returns an int and nothing else — no object, no string, no */
-/* array — which is the whole point of the status bitmask (§4.2): a     */
-/* keystroke the IME passes through costs one C call and zero           */
-/* allocations, and the moving-GC nesting hazard never arises because   */
-/* nothing is built. Strings and the candidate array materialise only   */
-/* when the app asks, i.e. when the status bits say something moved.    */
+/* The handle API (skk.open/key/preedit/candidates/... , a 4-slot table */
+/* with generation-tagged ids) was deleted on 2026-07-30 once its last  */
+/* caller moved to the platform IME. Its whole reason for existing —    */
+/* letting an app drive the engine directly — is the thing that made    */
+/* the 「あ」 key's face lie (§6.2), so this is a removal, not a pause. */
 /* ------------------------------------------------------------------ */
 
-#define MQJS_MAX_SKK       4   /* IME handles. Low 2 bits of the id are the
-                                  slot, so this must stay <= 4. */
 #define MQJS_MAX_SKK_DICT  2   /* distinct dictionary images resident */
 #define MQJS_SKK_PATH_MAX  96
 #define MQJS_SKK_IMAGE_MAX (9u * 1024 * 1024) /* pine (L) is 8.3 MB */
@@ -5326,18 +5324,18 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 #define MQJS_SKK_DEFAULT_DICT MQJS_SKK_DIR "/skk_dict_M.bin"
 #define MQJS_SKK_MRU_PATH     MQJS_SKK_DIR "/mru.txt"
 
-/* Where a dictionary can come from. The string is both the selector an
- * app may pass to skk.open() and the cache key, so each source names
- * exactly one set of bytes:
+/* Where a dictionary can come from. The string is the cache key, so each
+ * source names exactly one set of bytes:
  *
  *   ""              the image linked into the firmware (plum, §6.6)
  *   "part:<name>"   a flash partition, mmap'd and read in place —
  *                   bamboo and pine (§6.7)
  *   anything else   a file, read into PSRAM
  *
- * skk.open() with no argument tries them in that order, best first, so
- * flashing a bigger dictionary into `jisyo` upgrades every app without
- * an app change and removing it falls back instead of failing. */
+ * They are tried in that order, best first, so flashing a bigger
+ * dictionary into `jisyo` upgrades every app without an app change and
+ * removing it falls back instead of failing. Nothing selects a source by
+ * hand any more — the argument existed for skk.open(), which is gone. */
 #define MQJS_SKK_PART_PREFIX "part:"
 #define MQJS_SKK_PARTITION   "jisyo"
 /* The custom data subtype partitions.csv gives `jisyo`. No built-in
@@ -5357,54 +5355,13 @@ typedef struct {
     const uint8_t *base;  /* 8-byte aligned image */
     size_t     len;
     skk_dict_t dict;
-    uint32_t   load_us;   /* read + open, for skk.stats() */
+    uint32_t   load_us;   /* read + open, for ui.imeStats() */
 #ifdef ESP_PLATFORM
     esp_partition_mmap_handle_t mmap_h;
     bool       mapped;    /* base is an mmap window, munmap it at zero */
 #endif
 } SkkImage;
 static SkkImage s_skk_img[MQJS_MAX_SKK_DICT];
-
-typedef struct {
-    bool     used;
-    uint16_t gen;      /* bumped per open; part of the public id */
-    int      id;       /* public id while used */
-    uint8_t  worker;   /* owning app slot (== s_cur_wk->idx) */
-    int8_t   img;      /* index into s_skk_img */
-    skk_t   *core;     /* ~1.2 KB of engine state, PSRAM */
-    /* µs accounting, split by what the key actually did. A key that
-       only stepped the romaji state machine and a key that ran a
-       dictionary search have budgets three orders of magnitude apart
-       (design §4.1: 55 ms per keystroke, tens of ms per conversion);
-       averaging them together hides both. */
-    uint32_t last_lookups; /* engine lookup counter at the last key */
-    uint32_t key_calls, key_us, key_max_us;
-    uint32_t conv_calls, conv_us, conv_max_us;
-} SkkSlot;
-static SkkSlot s_skk[MQJS_MAX_SKK];
-
-/* Same shape as sshc.c's sess_id/sess_lookup: slot in the low bits,
-   generation above, id 0 always invalid. A stale handle from a closed
-   IME resolves to NULL instead of hitting whoever reused the slot. */
-static int skkslot_id(int slot)
-{
-    return (int)(((unsigned)s_skk[slot].gen << 2) | (unsigned)slot) + 1;
-}
-
-static SkkSlot *skkslot_lookup(int id)
-{
-    if (id <= 0)
-        return NULL;
-    int slot = (id - 1) & 3;
-    if (slot >= MQJS_MAX_SKK)
-        return NULL;
-    SkkSlot *s = &s_skk[slot];
-    if (!s->used || s->id != id)
-        return NULL;                      /* closed, or an older generation */
-    if (s_cur_wk && s->worker != s_cur_wk->idx)
-        return NULL;                      /* another app's handle */
-    return s;
-}
 
 /* The image must be 8-byte aligned: skk_dict_open() reads the packed-key
    arrays as uint64 directly and returns SKK_ERR_ALIGN rather than risk
@@ -5509,8 +5466,7 @@ static int skkpart_open(const char *name, SkkImage *im)
 
 /* ---- the personal dictionary (design S7) ------------------------- */
 /*
- * ONE store for the device, shared by every IME handle, kept in PSRAM
- * and written back to littlefs.
+ * ONE store for the device, kept in PSRAM and written back to littlefs.
  *
  * Shared rather than per app, and that is a deliberate line: it matches
  * store.* (one NVS namespace, no per-app prefix) rather than vault.*
@@ -5520,26 +5476,19 @@ static int skkpart_open(const char *name, SkkImage *im)
  * to change, the change is here: key the file by app name and hand each
  * worker its own skk_mru_t.
  *
- * Sharing a MUTABLE structure between handles used to be safe because
- * every mqjs worker runs on the single `mqjs` task (app_main.c). The
- * platform IME broke that: see s_skk_mru_lock below.
- *
- * PERSISTENCE POLICY: written on close (which includes an app being
- * stopped or evicted) and on an explicit skk.save(). NOT on every
- * commit — the file is up to 4.9 KB and littlefs would stall the key
- * path. A power cut therefore loses learning since the last of those
- * two events; ssh_vt calls skk.save() when the IME is switched off,
- * which is the natural quiet moment.
+ * PERSISTENCE POLICY: written when an app stops or is evicted, when the
+ * IME is folded (the 「あ」 key going off, a field losing focus), and
+ * never on a commit — the file is up to 4.9 KB and littlefs would stall
+ * the key path. A power cut loses learning since the last of those.
  */
 static skk_mru_t *s_skk_mru;
 static bool       s_skk_mru_dirty;
 
 /* 学習を守る唯一の鍵。読み手も書き手も、例外なくこれを取る。
  *
- * js_skk_open() が配る skk.* ハンドルは全部この 1 つを指し、プラットフォーム
- * IME も同じものを attach する。skk_test.js が mqjs タスクで skk.key を叩く
- * 裏で IME 所有タスクが ime_feed を回す = 書き手 2 人と構造体まるごとの読み手
- * が、別タスクで同時に走る。
+ * skk.* ハンドルが消えて書き手は IME 所有タスク 1 つになったが、鍵は残す。
+ * 読み手が別タスクに居るからで、mqjs タスクの skk_mru_flush() (アプリ停止 /
+ * ime_disarm の後) は所有タスクが変換の最中に触っている構造体を丸ごと読む。
  *
  * 危ないのは昇格がバイトを物理的に動かすことで、mru_to_front()
  * (skk_dict.c:1200) は最大 47 record × ~100B ≒ 4.7KB の memmove。その最中に
@@ -5596,8 +5545,8 @@ static void mru_unlock(void)
 static skk_mru_t *skk_mru_get(void)
 {
     /* 生成と初回ロードは鍵の内側。下の flush と違ってファイル I/O を抱えた
-       まま持つ唯一の場所だが、これは 1 起動 1 回・skk.open() / IME の arm の
-       縁でしか走らず打鍵の経路には無い。外へ出すと「まだ load 途中の store」を
+       まま持つ唯一の場所だが、これは 1 起動 1 回・IME の arm の縁でしか
+       走らず打鍵の経路には無い。外へ出すと「まだ load 途中の store」を
        もう一方のタスクが引くか、両方が 4.7KB を malloc して片方を捨てる。 */
     mru_lock();
     if (s_skk_mru) {
@@ -5807,20 +5756,13 @@ static int skkimg_acquire(const char *path, int *out_err)
     return free_slot;
 }
 
-static void skkimg_release(int idx)
-{
-    if (idx < 0 || idx >= MQJS_MAX_SKK_DICT || !s_skk_img[idx].used)
-        return;
-    if (--s_skk_img[idx].refs)
-        return;
-#ifdef ESP_PLATFORM
-    if (s_skk_img[idx].mapped)   /* give the MMU window back */
-        esp_partition_munmap(s_skk_img[idx].mmap_h);
-#endif
-    if (s_skk_img[idx].owned) /* rodata and mmap windows are not owned */
-        skk_image_free((uint8_t *)s_skk_img[idx].base);
-    memset(&s_skk_img[idx], 0, sizeof s_skk_img[idx]);
-}
+/* 対になる skkimg_release() はもう居ません。手放す相手が消えたからです:
+   イメージを持つのはプラットフォームのセッション 1 つだけで、それは端末の
+   寿命そのもの (アプリが止まっても畳むだけ、辞書は載せたまま — 次に日本語を
+   打つアプリが 200 ms の CRC を払い直さずに済む)。skk.* のハンドルが有った
+   頃は close ごとに refs を落として munmap / free まで走らせていましたが、
+   その経路は 2026-07-30 に到達不能になったので、動かないコードとして
+   残さずに消しました (戻すときは git から。refs はここで 1 のまま増えます)。 */
 
 /* 辞書ソースの探索順を 1 か所に閉じ込める。`path` が空なら
    partition → 内蔵 (無ければファイル) の best-first。開けた s_skk_img の
@@ -5828,8 +5770,8 @@ static void skkimg_release(int idx)
    `*out_err` は最初の候補の失敗理由、`*out_first` はその名前 — 最後の
    候補で答えると、消えた `jisyo` パーティションの話なのに
    skk_dict_M.bin を指してしまい、探す場所を間違えさせる。
-   skk.open() とプラットフォーム IME が同じ順で開くのは必須で、ずれると
-   「大きい辞書を焼けば全アプリが賢くなる」(設計 §6.6) が崩れる。 */
+   順序そのものが「大きい辞書を焼けば全アプリが賢くなる」(設計 §6.6) の
+   実装なので、ここを触るときはそれを壊していないか見ること。 */
 static int skkimg_acquire_best(const char *path, int *out_err,
                                const char **out_first)
 {
@@ -5857,445 +5799,6 @@ static int skkimg_acquire_best(const char *path, int *out_err,
     return img;
 }
 
-static void skkslot_free(SkkSlot *s)
-{
-    if (!s->used)
-        return;
-    /* Closing is the one moment we are guaranteed to get — an app that
-       stops, is evicted, or just calls skk.close(). Learning that never
-       reached the file is lost otherwise. */
-    (void)skk_mru_flush();
-    skkimg_release(s->img);
-#ifdef ESP_PLATFORM
-    heap_caps_free(s->core);
-#else
-    free(s->core);
-#endif
-    s->core = NULL;
-    s->used = false;
-    s->id = 0;
-    s->img = -1;
-}
-
-/* skk.open([dictSource]) -> handle.
- *
- * No argument means "the best dictionary this device has", tried in
- * order: the `jisyo` partition (bamboo/pine — mmap'd, no allocation, no
- * load), then the image linked into the firmware (plum — flash rodata,
- * likewise free), then the conventional file. That order is why S8 needs
- * no app change: flashing SKK-JISYO.ML into `jisyo` upgrades every app's
- * vocabulary, and erasing it falls back instead of failing.
- *
- * An explicit argument pins one source: "part:<name>" for a partition,
- * anything else for a file (which does pay a copy into PSRAM plus a CRC
- * pass — that is the dev-loop path). Either way it happens here and not
- * at boot, so an app whose user never types Japanese never touches a
- * dictionary. */
-JSValue js_skk_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    char path[MQJS_SKK_PATH_MAX];
-
-    if (uiw_copy_str(ctx, argv[0], path, sizeof path))
-        return JS_EXCEPTION;
-
-    int slot = -1;
-    for (int i = 0; i < MQJS_MAX_SKK; i++) {
-        if (!s_skk[i].used) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0)
-        return JS_ThrowInternalError(ctx, "no free skk handle (max %d)",
-                                     MQJS_MAX_SKK);
-
-    int err = 0;
-    const char *first = "";
-    int img = skkimg_acquire_best(path, &err, &first);
-    if (img < 0) {
-        if (err == -102)
-            return JS_ThrowInternalError(
-                ctx, "skk: this firmware was built without a dictionary — "
-                     "flash one into the `jisyo` partition (README 3.5), "
-                     "select one in menuconfig, or pass a path to skk.open()");
-        /* -100 I/O, -101 out of memory, -103 no such partition,
-           -104 the partition is erased; anything else is an skk_err_t. */
-        return JS_ThrowInternalError(
-            ctx, "skk: cannot load %s (%s)",
-            first[0] ? first : "(built-in)",
-            err == -103 ? "no such partition — check partitions.csv"
-          : err == -104 ? "partition is erased — flash a dictionary into it "
-                          "(README 3.5)"
-          : err == SKK_ERR_VERSION ? "image built by a different format "
-                                     "version — rebuild it with "
-                                     "tools/skk_prep.py"
-          : err == SKK_ERR_CRC ? "CRC mismatch — the image is damaged"
-          : err == SKK_ERR_ALPHABET ? "collation table mismatch — rebuild "
-                                      "the image with this tree's "
-                                      "tools/skk_prep.py"
-          : "I/O or format error");
-    }
-
-    skk_t *core;
-#ifdef ESP_PLATFORM
-    core = heap_caps_malloc(sizeof *core, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-    core = malloc(sizeof *core);
-#endif
-    if (!core) {
-        skkimg_release(img);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    skk_init(core);
-    skk_attach(core, &s_skk_img[img].dict);
-    /* NULL is fine — skk_core simply stops learning, so a device with a
-       full or unwritable littlefs still has a working IME. */
-    skk_attach_mru(core, skk_mru_get());
-    skk_enable(core, true);
-
-    SkkSlot *s = &s_skk[slot];
-    uint16_t gen = (uint16_t)(s->gen + 1);
-    if (!gen)
-        gen = 1; /* gen 0 would let a fresh id collide with an old one */
-    memset(s, 0, sizeof *s);
-    s->used = true;
-    s->gen = gen;
-    s->id = skkslot_id(slot);
-    s->worker = s_cur_wk ? s_cur_wk->idx : 0;
-    s->img = (int8_t)img;
-    s->core = core;
-    return JS_NewInt32(ctx, s->id);
-}
-
-JSValue js_skk_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    int id;
-    if (JS_ToInt32(ctx, &id, argv[0]))
-        return JS_EXCEPTION;
-    SkkSlot *s = skkslot_lookup(id);
-    if (s)
-        skkslot_free(s); /* closing twice is not an error, as ssh.close */
-    return JS_UNDEFINED;
-}
-
-/* Every accessor below resolves the handle the same way. Returns NULL
-   with an exception already thrown, so callers just return JS_EXCEPTION.
-   A handle from a closed IME, from an older generation, or from another
-   app lands here — it never reaches whoever reused the slot. */
-static SkkSlot *skk_arg_slot(JSContext *ctx, JSValue *argv)
-{
-    int id;
-    if (JS_ToInt32(ctx, &id, argv[0]))
-        return NULL;
-    SkkSlot *s = skkslot_lookup(id);
-    if (!s)
-        JS_ThrowTypeError(ctx, "invalid skk handle");
-    return s;
-}
-
-JSValue js_skk_enable(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    skk_enable(s->core, uiw_truthy(ctx, argv[1]) > 0);
-    return JS_UNDEFINED;
-}
-
-/* skk.key(h, k) -> status bitmask. THE hot path: one integer out, no
-   allocation, no string built. 0 means the IME did not take the key and
-   the app must run its own handling.
-
-   `k` is passed straight through from ui.onKey, bytes and length as
-   delivered — a "\0name" token is recognised by its leading NUL, so the
-   length is load-bearing and strlen() would be wrong. */
-JSValue js_skk_key(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-
-    /* Require a string rather than letting JS_ToCStringLen coerce. A
-       mixed-up argument order (skk.key(k, h)) or a stray number would
-       otherwise be stringified and typed into the IME as text, which
-       reads as a rendering bug rather than as the caller error it is. */
-    if (!JS_IsString(ctx, argv[1]))
-        return JS_ThrowTypeError(ctx, "skk.key(handle, string)");
-
-    JSCStringBuf kbuf;
-    size_t klen;
-    const char *k = JS_ToCStringLen(ctx, &klen, argv[1], &kbuf);
-    if (!k)
-        return JS_EXCEPTION;
-    char key[16]; /* 打鍵 1 つはこれで足りる; 余りは異常入力の吸収代 */
-    if (klen > sizeof key)
-        klen = sizeof key;
-    memcpy(key, k, klen);
-
-    /* 学習は IME 所有タスクと共有 (s_skk_mru_lock)。素通しの打鍵でも取るのは、
-       食われたかどうかが分かるのが skk_key() から帰ってきた後だから。鍵を t0 の
-       外に置いてあるのは、計測したいのがエンジンの仕事であって待ち時間では
-       ないため。 */
-    mru_lock();
-    int64_t t0 = time_us();
-    uint32_t st = skk_key(s->core, key, klen);
-    mru_unlock();
-
-    /* Passthrough leaves before the instrumentation. §4.2 promises that
-       a key the IME does not take costs one C call and nothing else, and
-       a second clock read plus a 32-byte struct copy on every ASCII
-       keystroke is precisely the per-key overhead the bitmask design
-       exists to avoid. A key that was not consumed cannot have searched
-       the dictionary either, so there is nothing to attribute. What
-       remains on that path is the single t0 read, which has to happen
-       before the call. */
-    if (st == SKK_ST_PASSTHROUGH)
-        return JS_NewInt32(ctx, 0);
-
-    /* A commit out of SELECT is the only thing that reaches the personal
-       dictionary (skk_attach_mru), and the other COMMIT kinds — raw kana,
-       katakana — are cheap to over-count. Marking here rather than saving
-       here is the whole policy: the file is up to 4.9 KB and writing it
-       on the key path would stall typing. */
-    if (st & SKK_ST_COMMIT)
-        s_skk_mru_dirty = true;
-
-    uint32_t us = (uint32_t)(time_us() - t0);
-    /* Attribute the µs to the right bucket. "Did this key search the
-       dictionary?" is the engine's lookup counter, not SKK_ST_CANDS: a
-       search that matched nothing sets no bit at all and would
-       otherwise be charged to the keystroke budget it blows through. */
-    skk_stats_t es;
-    skk_stats(s->core, &es);
-    if (es.lookups != s->last_lookups) {
-        s->last_lookups = es.lookups;
-        s->conv_calls++;
-        s->conv_us += us;
-        if (us > s->conv_max_us)
-            s->conv_max_us = us;
-    } else {
-        s->key_calls++;
-        s->key_us += us;
-        if (us > s->key_max_us)
-            s->key_max_us = us;
-    }
-    return JS_NewInt32(ctx, (int)st);
-}
-
-JSValue js_skk_preedit(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    size_t len = 0;
-    const char *p = skk_preedit(s->core, &len);
-    return JS_NewStringLen(ctx, p ? p : "", p ? len : 0);
-}
-
-JSValue js_skk_commit(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    size_t len = 0;
-    const char *p = skk_commit(s->core, &len);
-    return JS_NewStringLen(ctx, p ? p : "", p ? len : 0);
-}
-
-/* skk.candidates(h) -> [string]. Called once per entry into v mode, on
-   SKK_ST_CANDS — never per keystroke (moving through the list only sets
-   SKK_ST_SEL, which is an int read).
-
-   The candidate bytes live in the dictionary image, not the GC heap, so
-   JS_NewStringLen cannot invalidate them. The array itself is rooted and
-   each string is built in its own statement: a nested
-   JS_SetPropertyUint32(..., JS_NewStringLen(...)) may read arr_ref.val
-   before the allocation that moves it. */
-JSValue js_skk_candidates(JSContext *ctx, JSValue *this_val, int argc,
-                          JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-
-    JSGCRef arr_ref;
-    JSValue arr = JS_NewArray(ctx, 0);
-    if (JS_IsException(arr))
-        return arr;
-    JS_PUSH_VALUE(ctx, arr);
-    /* SKK_SRC_USER の候補 — 辞書がもう持っていない、学習だけが覚えているもの —
-       は skk_mru_text() が返す MRU の中身をそのまま指す (skk_kana.c:1240)。
-       所有タスクの昇格 memmove と重なると、候補が半分ずれた文字列で JS へ出る。
-       ここでの hold は候補数ぶん (最大 SKK_CAND_MAX) だが、待つ相手は所有タスク
-       だけで、所有タスクがこちらを待つ経路は無い = 逆向きは起きない。 */
-    mru_lock();
-    int n = skk_cand_count(s->core);
-    for (int i = 0; i < n; i++) {
-        size_t len = 0;
-        const char *p = skk_cand(s->core, i, &len);
-        if (!p)
-            break;
-        JSValue v = JS_NewStringLen(ctx, p, len);
-        JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)i, v);
-    }
-    mru_unlock();
-    JS_POP_VALUE(ctx, arr);
-    return arr;
-}
-
-JSValue js_skk_sel(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    return JS_NewInt32(ctx, skk_sel(s->core));
-}
-
-JSValue js_skk_mode(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    return JS_NewInt32(ctx, (int)skk_mode(s->core));
-}
-
-/* skk.setMode(h, mode) -> 1 / 0. Only ASCII/KANA/KATA are settable.
-   This exists because real SKK leaves ASCII mode with C-j and kbd_core
-   already spends 0x0A on Enter, so the engine cannot honour it: an app
-   wires this to the same surface as its IME toggle. Discards any
-   preedit, like skk.reset(). */
-JSValue js_skk_setMode(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    int m;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    if (JS_ToInt32(ctx, &m, argv[1]))
-        return JS_EXCEPTION;
-    return JS_NewInt32(ctx, skk_set_mode(s->core, (skk_mode_t)m) == SKK_OK);
-}
-
-/* skk.reset(h): drop the preedit and candidates WITHOUT committing.
-   For losing focus, or the ssh session being typed into going away. */
-JSValue js_skk_reset(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    skk_reset(s->core);
-    return JS_UNDEFINED;
-}
-
-/* skk.stats(h) -> JSON string, the audio.stats()/camera.status() shape.
-   The µs live here rather than in JS because performance.now() is
-   milliseconds and because bracketing the call from JS would measure
-   the mquickjs dispatch too. keyUs/convUs are the engine alone. */
-JSValue js_skk_stats(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    skk_stats_t st;
-    skk_stats(s->core, &st);
-    const SkkImage *im = &s_skk_img[s->img];
-    /* 512 no longer fits: the source string is up to MQJS_SKK_PATH_MAX
-       and snprintf would truncate the JSON into something JS cannot
-       parse rather than fail visibly. */
-    char buf[512 + MQJS_SKK_PATH_MAX + 32];
-    snprintf(buf, sizeof buf,
-             "{\"keys\":%lu,\"consumed\":%lu,\"lookups\":%lu,\"probes\":%lu,"
-             "\"fullcmp\":%lu,\"cands\":%lu,\"dropped\":%lu,\"commits\":%lu,"
-             "\"keyCalls\":%lu,\"keyUs\":%lu,\"keyMaxUs\":%lu,"
-             "\"convCalls\":%lu,\"convUs\":%lu,\"convMaxUs\":%lu,"
-             "\"dictBytes\":%lu,\"loadUs\":%lu,\"nasi\":%lu,\"ari\":%lu,"
-             "\"dict\":\"%s\",\"levels\":%u}",
-             (unsigned long)st.keys, (unsigned long)st.consumed,
-             (unsigned long)st.lookups, (unsigned long)st.probes,
-             (unsigned long)st.fullcmp, (unsigned long)st.cands,
-             (unsigned long)st.dropped, (unsigned long)st.commits,
-             (unsigned long)s->key_calls, (unsigned long)s->key_us,
-             (unsigned long)s->key_max_us,
-             (unsigned long)s->conv_calls, (unsigned long)s->conv_us,
-             (unsigned long)s->conv_max_us,
-             (unsigned long)im->len, (unsigned long)im->load_us,
-             (unsigned long)im->dict.blk[SKK_BLK_NASI].count,
-             (unsigned long)im->dict.blk[SKK_BLK_ARI].count,
-             /* which source skk.open() settled on, and how many tree
-                levels it is searching through — the two things you need
-                to tell plum from bamboo without guessing from the size */
-             im->path[0] ? im->path : "builtin",
-             (unsigned)im->dict.blk[SKK_BLK_NASI].levels);
-    return JS_NewString(ctx, buf);
-}
-
-/* skk.save(h) -> bool. Write the personal dictionary to littlefs now.
- *
- * Cheap when nothing was learned since the last write (returns true
- * without touching the filesystem), so an app may call it freely — at
- * the IME toggle, on losing focus, wherever it has a quiet moment. It
- * also happens automatically on skk.close() and when an app is stopped;
- * this exists so the window a power cut can eat is the app's to choose.
- * The handle is taken for the usual ownership check, not because the
- * store is per handle — there is one per device (see skk_mru_get). */
-JSValue js_skk_save(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    if (!skk_arg_slot(ctx, argv))
-        return JS_EXCEPTION;
-    return JS_NewBool(skk_mru_flush());
-}
-
-JSValue js_skk_statsReset(JSContext *ctx, JSValue *this_val, int argc,
-                          JSValue *argv)
-{
-    (void)this_val;
-    (void)argc;
-    SkkSlot *s = skk_arg_slot(ctx, argv);
-    if (!s)
-        return JS_EXCEPTION;
-    skk_stats_reset(s->core);
-    s->last_lookups = 0; /* must track the counter it is compared against */
-    s->key_calls = s->key_us = s->key_max_us = 0;
-    s->conv_calls = s->conv_us = s->conv_max_us = 0;
-    return JS_UNDEFINED;
-}
-
-/* Release the IMEs one app opened. Called from app_reset_bindings, so
-   the dictionary's PSRAM comes back when the app stops rather than
-   whenever a finalizer happens to run — the reason these are int
-   handles and not JS class objects. */
-static void skk_release_app(int worker)
-{
-    for (int i = 0; i < MQJS_MAX_SKK; i++)
-        if (s_skk[i].used && s_skk[i].worker == (uint8_t)worker)
-            skkslot_free(&s_skk[i]);
-}
-
 /* ---- platform IME session (docs/keyboard-ime-unification.md §7) ------
  *
  * ONE ime_t for the device, not one per app. 辞書も学習も既に device
@@ -6304,8 +5807,9 @@ static void skk_release_app(int worker)
  * 打鍵を通すかは MqjsWorker.ime_used (ui.ime(1) の opt-in) が決めるので、
  * ゲームのキーが黙って食われることはない。
  *
- * 上の skk.* ハンドルは残してある: skk_test.js はエンジンの試験台で、
- * 直叩きがその仕事。
+ * かつて隣に skk.* のハンドル API があり、アプリがエンジンを直接叩けた。
+ * 2026-07-30 に削除 — 最後の利用者 (skk_test.js) がここへ移ったのと、
+ * 直叩きこそが「あ」キーの面を嘘にしていた当のものだったため (§6.2)。
  *
  * 所有タスク: s_ime に触ってよいのは「所有タスク」1 つだけ、例外なし。
  * ime_t は単一タスク所有が前提 (ime_core.h) なのに、打鍵の入口
@@ -6333,13 +5837,11 @@ static volatile int s_ime_field = -1;
 static volatile int16_t s_ime_field_x, s_ime_field_y, s_ime_field_h;
 #endif
 
-/* --- ここから 3 つは所有タスクの上でしか呼ばない (ESP では IME タスク、
+/* --- ここから下は所有タスクの上でしか呼ばない (ESP では IME タスク、
    ホストには入力タスクが無いので mqjs タスクがそのまま所有者)。
-   単一所有になるのは s_ime だけ、という点は正確に読むこと: 学習 (skk_mru_t)
-   は js_skk_open が配る skk.* ハンドルと同じ 1 つを共有しており、skk_test.js
-   が mqjs タスクから skk.key を叩けば所有タスクの ime_feed と同時に同じ構造体
-   を書く。この変更は MRU の 2 人目の所有者を「消した」のではなく「改名した」
-   だけで、直すなら skk.* に MRU を共有させるのをやめる方 (別件・要判断)。 --- */
+   学習 (skk_mru_t) を書くのも今はこのタスクだけになった — skk.* ハンドルが
+   消えて 2 人目の書き手が居なくなったため。それでも鍵が残っているのは、
+   読み手 (skk_mru_flush) が mqjs タスクに居るから (s_skk_mru_lock 参照)。 --- */
 
 /* セッションを使える状態にする。辞書は初回だけ開く。
    失敗を恒久ラッチしないのが肝で (§4-4)、skk_dict.bin は gitignore 対象
@@ -6355,8 +5857,26 @@ static bool ime_arm_now(void)
         int err = 0;
         const char *first = "";
         int img = skkimg_acquire_best("", &err, &first);
-        if (img < 0)
+        if (img < 0) {
+            /* 辞書が無いことを黙って起こさない。旧 skk.open() は JS 例外で
+               「どこに何を焼けばいいか」まで名指ししていたが、その口は消えた。
+               ui.ime(1) が返す false だけでは、アプリ側は「この機種は日本語が
+               打てない」としか分からず、辞書を焼き忘れただけの実機と区別が
+               付かない。ログを埋めないよう 1 起動 1 回。 */
+            static bool warned;
+            if (!warned) {
+                warned = true;
+#ifdef ESP_PLATFORM
+                ESP_LOGW(TAG, "IME: no dictionary (%s, err %d) — flash one into "
+                              "the `jisyo` partition (README 3.5) or pick one in "
+                              "menuconfig", first[0] ? first : "(built-in)", err);
+#else
+                printf("[ime] no dictionary (%s, err %d)\n",
+                       first[0] ? first : "(built-in)", err);
+#endif
+            }
             return false;
+        }
         s_ime_img = img;
         ime_attach(&s_ime, &s_skk_img[img].dict);
         /* NULL でも IME は動く (学習しなくなるだけ) */
@@ -6395,7 +5915,7 @@ typedef struct {
     uint32_t key_calls, key_us, key_max_us;    /* 辞書を引かなかった打鍵 */
     uint32_t conv_calls, conv_us, conv_max_us; /* 引いた打鍵 */
     uint32_t hop_calls, hop_us, hop_max_us;    /* post → 所有タスクが拾う */
-    uint32_t last_lookups;   /* 上の振り分けに使う前回値 (js_skk_key と同じ) */
+    uint32_t last_lookups;   /* 上の振り分けに使う前回値 */
 } ImeMeter;
 static ImeMeter s_ime_m;
 /* 数えるのは打鍵を投げる側 (LVGL / ドックの kbd)。2 つのタスクの非アトミック
@@ -6506,7 +6026,7 @@ static void ime_float_update(void)
     body[0] = '\0';
 
     /* 候補文字列は学習ストア (skk_mru_text) を指すことがあり、それは
-       skk.* ハンドルと共有している。組み終わるまで鍵を持つ。 */
+       mqjs タスクの書き戻しと共有している。組み終わるまで鍵を持つ。 */
     mru_lock();
 
     /* 境界はエンジンから貰う。▼ では候補と送り仮名が区切り記号なしで
@@ -6614,11 +6134,11 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
         s_ime_m.hop_max_us = hop;
 
     if (s_ime_img >= 0) {
-        /* 学習は skk.* ハンドルと 1 つを共有しているので、エンジンを回す間だけ
-           鍵を取る (s_skk_mru_lock)。ime_text() が指すのは skk_t の commit
-           バッファであって MRU ではないから、外に出してよい。
-           t0 を鍵の内側に置くのは js_skk_key と同じ理由 — 測りたいのは
-           エンジンの仕事であって鍵の待ち時間ではない (待ちは hop が持つ)。 */
+        /* 学習は mqjs タスクの skk_mru_flush() と共有しているので、エンジンを
+           回す間だけ鍵を取る (s_skk_mru_lock)。ime_text() が指すのは skk_t の
+           commit バッファであって MRU ではないから、外に出してよい。
+           t0 を鍵の内側に置くのは、測りたいのがエンジンの仕事であって鍵の
+           待ち時間ではないから (待ちは hop が持つ)。 */
         mru_lock();
         int64_t t0 = time_us();
         d = ime_feed(&s_ime, key, len);
@@ -6630,7 +6150,7 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
             uint32_t us = (uint32_t)(time_us() - t0);
             /* 「この打鍵は変換か」はエンジンの lookups で決める。候補ゼロの
                空振りはビットが 1 本も立たないので、状態ビットで振り分けると
-               いちばん高い打鍵が打鍵バケツに紛れる (js_skk_key と同じ判断)。 */
+               いちばん高い打鍵が打鍵バケツに紛れる。 */
             skk_stats_t es;
             skk_stats(&s_ime.skk, &es);
             if (es.lookups != s_ime_m.last_lookups) {
@@ -6647,7 +6167,7 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
             }
         }
         if (d == IME_TEXT) {
-            s_skk_mru_dirty = true; /* js_skk_key と同じ: 印だけ、書き戻しは後 */
+            s_skk_mru_dirty = true; /* 印だけ。書き戻しは境界でまとめて */
             key = ime_text(&s_ime, &len);
             if (!key || len == 0)
                 d = IME_TAKEN;      /* 空の確定は流さない */
@@ -6656,7 +6176,7 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
            次の打鍵が fwrite/fsync の後ろで待たされ、キューが埋まれば静かに
            消えるだけ (「あ」で切った縁もここでは書かない)。印
            (s_skk_mru_dirty) は確定のたびに立っているので、次の境界
-           — ime_disarm / skk.save / アプリ停止 — がまとめて書く。 */
+           — ime_disarm / アプリ停止 — がまとめて書く。 */
 
         /* 何を描き直すかは view ビットだけで決める (再導出しない)。素通しの
            打鍵では 1 本も立たないので post も起きないし、▼ の中の SPACE 連打は
@@ -6876,7 +6396,7 @@ JSValue js_ui_ime(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 /* ui.imeStats() -> object | null。プラットフォーム IME の実測値。
  *
  * ui.* に置いたのは、アプリから見える IME がもう ui.ime / ui.caret の 2 本
- * しかないから — 計測もその隣に置く。文字列 (audio.stats / skk.stats の形)
+ * しかないから — 計測もその隣に置く。文字列 (audio.stats の形)
  * ではなくオブジェクトを返すのは、呼び手が必ずやることが JSON.stringify で
  * MQTT へ流すことだから: 文字列で返すと JSON.parse して組み直すぶん、
  * アプリのアリーナで無駄に往復する。
@@ -7042,9 +6562,12 @@ static void app_reset_bindings(MqjsWorker *app)
         }
     }
 #endif
-    /* not inside the ESP_PLATFORM block: skk_core is pure logic and its
-       dictionary is a real allocation on the host too */
-    skk_release_app(app->idx);
+    /* No skk handles to release any more. NB the dictionary image no
+       longer comes back when an app stops: the platform session holds it
+       for the rest of the boot (one ime_t per device), and the app-stop
+       path below only folds the reading and flushes learning. That is a
+       property of the shared session, not something lost with the
+       handles — it has been true since the first ui.ime(1) landed. */
     for (int i = 0; i < MQJS_MAX_MQTT_SUB; i++) {
         if (app->mqtt_subs[i].used) {
             JS_DeleteGCRef(ctx, &app->mqtt_subs[i].fn);
