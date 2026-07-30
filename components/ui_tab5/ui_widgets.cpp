@@ -544,13 +544,23 @@ extern "C" uint32_t ui_tab5_w_create(int kind, uint32_t parent,
         lv_obj_set_width(obj, LV_PCT(100));
         lv_obj_set_style_bg_color(obj, lv_color_hex(UI_COL_PANEL), 0);
         lv_obj_set_style_text_color(obj, lv_color_hex(UI_COL_TEXT), 0);
-        /* visible focus (user feedback): accent border + lighter bg on
-           the focused field, dim hairline otherwise */
+        /* visible focus (user feedback): accent ring + lighter bg on the
+           focused field, dim hairline otherwise.
+           ⚠️ リングは outline で描く。border の幅は箱の高さに算入されるので、
+           フォーカスで 1->3px にすると**下に並ぶ要素が 4px 押し下がる**
+           (W1 から入っていた副作用。フォーカスの出入りが稀なうちは目立た
+           なかったが、I3 で入力欄が頻繁に開閉するようになって表面化した)。
+           outline は箱の外側に描かれてレイアウトに参加しないので動かない。
+           幅は 2px — コンテナの pad_row が 4px なので、隣の要素へはみ出さない。 */
         lv_obj_set_style_border_width(obj, 1, 0);
         lv_obj_set_style_border_color(obj, lv_color_hex(UI_COL_DIM), 0);
-        lv_obj_set_style_border_width(obj, 3, LV_STATE_FOCUSED);
         lv_obj_set_style_border_color(obj, lv_color_hex(UI_COL_ACCENT),
                                       LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(obj, 2, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_color(obj, lv_color_hex(UI_COL_ACCENT),
+                                       LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_pad(obj, 0, LV_STATE_FOCUSED);
         lv_obj_set_style_bg_color(obj, lv_color_hex(0x223240),
                                   LV_STATE_FOCUSED);
         if (a == UI_FIELD_PASSWORD)
