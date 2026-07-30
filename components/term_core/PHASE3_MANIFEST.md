@@ -697,21 +697,29 @@ here.
 - **Not run** (orchestrator's steps, deliberately): the device build, the
   flash, and any push to the device.
 
-### Open on the device
+### Open on the device — ANSWERED (device run 2026-07-30, tools/probe_blackbox.js)
 
-- **Is the LP region write-buffered from the HP core?** Everything here
-  assumes a store to LP SRAM is visible to the next boot immediately, which
-  §1's probe cannot distinguish (it crashed 15 s after writing). If P4's LP
-  RAM were behind a write-back cache, the *last* record before a panic could
-  be lost. The observable: whether the record immediately preceding a crash is
-  present in `lastboot`. Expected present (LP RAM is outside the cached
-  address ranges).
-- **`.rtc_noinit` placement and size** in the device `.map` (expected 0x7E0C
-  at 0x50108080), and that the ~336 B remainder does not upset
-  `heap_caps_init` — §1 established that a region too small for
-  `multi_heap_register` is logged and skipped, not fatal.
-- The first real `retention` verdict after a panic: expected `ok` with
-  `prev: captured`, which is §1's result restated on live data.
+All three closed by a two-boot run (plant marks → external esptool
+watchdog reset → auto re-run publishes lastboot); raw JSON in the session
+transcript:
+
+- **LP writes are not buffered.** The record written moments before the
+  reset (`sys: stop 'probe_bb'`) is present in `lastboot`, along with both
+  planted marks (`app/probe_bb: BBMARK-print-77 …`, `BBMARK-termlog-77 RED
+  plain` — SGR stripped as specified). Nothing between the last append and
+  the reset was lost.
+- **`.rtc_noinit` landed at 0x50108080 size 0x7E10** (4 B over the 0x7E0C
+  prediction — alignment padding between the pre-existing 12 B guards and
+  the ring struct), inside `lp_ram_seg`; boot clean, heap_caps un-upset.
+- **boot 1 after flashing over the §1 probe firmware: `retention=corrupt,
+  prev=garbage`** (the probe's PRNG image correctly judged not-a-ring and
+  reformatted — the garbage-vs-empty distinction on real data). **boot 2:
+  `retention=ok, prev=captured, lastboot=1`** with the full previous boot
+  readable. Bonus: the reset used was `wdt (id 7)` — the RTC WDT that
+  esptool's watchdog-reset fires, a cause §1 never measured — and the
+  region survived it bit-perfectly too. Writer tags and the SYS/APP split
+  visible end to end (`last: sys rec=2, app rec=4`); `dropped=0 trunc=0
+  refused=0 unnamed=0`.
 
 ## 3. MQTT responder + signature gate (§7.3)
 
