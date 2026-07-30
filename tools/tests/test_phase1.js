@@ -1,5 +1,5 @@
 // PC smoke for the Phase 1 name-based app API (app-manager migration):
-//   /tmp/run_pc tools/test_phase1.js tools/test_phase1_peer.js
+//   /tmp/run_pc tools/tests/test_phase1.js tools/tests/test_phase1_peer.js
 // The peer runs as a concurrent app named "test_phase1_peer"; this
 // script exercises sys.start/open/focus/stop by name against it and
 // the unknown-name false paths. Exits non-zero JS rc on failure.

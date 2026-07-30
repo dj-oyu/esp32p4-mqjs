@@ -1,6 +1,6 @@
 /*
  * audio_device: token-based arbitration over the single Tab5 speaker
- * (P1 of docs/audio-device-design.md). Producers (tone, WAV, future Opus
+ * (P1 of docs/history/audio-device-design.md). Producers (tone, WAV, future Opus
  * / JS) ask for a stream with audio_request(); the manager task grants a
  * capability token via callback when the device is free, queueing the rest
  * by priority. Only the live token may write PCM; finish/abort revoke it

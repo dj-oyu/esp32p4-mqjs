@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 
 
-MODULE = Path(__file__).with_name("mqjs_provision_qr.py")
+MODULE = Path(__file__).resolve().parents[1] / "mqjs_provision_qr.py"
 spec = importlib.util.spec_from_file_location("mqjs_provision_qr", MODULE)
 assert spec and spec.loader
 qr = importlib.util.module_from_spec(spec)

@@ -25,7 +25,7 @@
  *   python tools/skk_prep.py build SKK-JISYO.L -o /tmp/skk_dict_L.bin
  *   gcc -O1 -g -fsanitize=address -std=c99 -Wall -Wextra \
  *       -I components/skk_core/include \
- *       tools/test_skk_e2e.c components/skk_core/skk_kana.c \
+ *       tools/tests/test_skk_e2e.c components/skk_core/skk_kana.c \
  *       components/skk_core/skk_dict.c -o /tmp/test_skk_e2e
  *   /tmp/test_skk_e2e /tmp/skk_dict_L.bin
  */

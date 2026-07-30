@@ -74,7 +74,7 @@ typedef enum {
 
 /* One scan request, posted to the resident owner task's command queue. Cancel
  * is a separate atomic flag (s_cancel), NOT a queued command (see §7 of
- * docs/camera-lifecycle-plan.md): teardown must run on the owner, so cancel
+ * docs/history/camera-lifecycle-plan.md): teardown must run on the owner, so cancel
  * only requests a stop. */
 typedef struct {
     cam_tab5_cb_t cb;
@@ -316,7 +316,7 @@ static bool scan_region(const uint16_t *px, int w, int h,
         vext = 16;
     int joff = vext / 8 < 2 ? 2 : vext / 8;
     /* S2 staging was measured here and REJECTED (see
-       docs/scanline-opt-plan.md §S2 post-mortem): luma conversion is
+       docs/history/scanline-opt-plan.md §S2 post-mortem): luma conversion is
        ALU-bound (~12 cyc/px) and stages beyond the 128KB L2 scatter
        anyway — staged frames clocked 2x slower than direct ones.
        bc_stage_region/bc_sample_line_l8 stay in bc_locate (host-tested)
@@ -324,7 +324,7 @@ static bool scan_region(const uint16_t *px, int w, int h,
     const bc_stage_t *stg = NULL;
 
     int best_dig = 0, best_off = 0;
-    /* S1 (docs/scanline-opt-plan.md): walk the 16 offsets center-out
+    /* S1 (docs/history/scanline-opt-plan.md): walk the 16 offsets center-out
        (7,8,6,9,...) — the code usually straddles the region center, so
        the early lines are the likely hits and a decode frame stops
        after far fewer PSRAM-scattering lines. Full coverage and the
@@ -751,7 +751,7 @@ struct qr_tmp {
  * gives only ~4.6 px/module → quirc detects it but ECC-fails. 640x640 lets a
  * QR filling the reticle (~540px) reach ~8 px/module — comfortably above the
  * ~6 px/module decode threshold for v12. Buffer ≈ 800KB RGB565 + ~400KB quirc
- * image (PSRAM). See docs/qr-read-performance.md, camera-lifecycle-plan §6/§8. */
+ * image (PSRAM). See docs/history/qr-read-performance.md, camera-lifecycle-plan §6/§8. */
 #define QR_HI_W 640
 #define QR_HI_H 640
 /* decode window centered in the 1600x1200 frame, in absolute frame coordinates.

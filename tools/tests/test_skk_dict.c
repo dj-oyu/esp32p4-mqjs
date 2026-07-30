@@ -1,5 +1,5 @@
 /*
- * tools/test_skk_dict.c — host unit test for the dictionary half of
+ * tools/tests/test_skk_dict.c — host unit test for the dictionary half of
  * skk_core (components/skk_core/skk_dict.c), S2 in docs/skk-ime-design.md.
  *
  * The one bug this file exists to prevent: SKK-JISYO ships sorted in
@@ -32,7 +32,7 @@
  *
  * Build (see README):
  *   gcc -O2 -std=c99 -Wall -Wextra -Icomponents/skk_core/include \
- *       -Icomponents/skk_core tools/test_skk_dict.c \
+ *       -Icomponents/skk_core tools/tests/test_skk_dict.c \
  *       components/skk_core/skk_kana.c -o /tmp/test_skk_dict
  *   /tmp/test_skk_dict <dir with SKK-JISYO.*.utf8> [dir with skk_dict_*.bin]
  */

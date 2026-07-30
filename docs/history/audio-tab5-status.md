@@ -1,10 +1,10 @@
 # audio_tab5 — Tab5 スピーカー再生パス (opus-decoder-plan P2)
 
-> 設計と API の正式ドキュメントは **[audio-pipeline.md](audio-pipeline.md)**。
+> 設計と API の正式ドキュメントは **[audio-pipeline.md](../audio-pipeline.md)**。
 > 本ファイルは実装の経緯・検証ログ・コミット履歴を残す状態メモ。
 
 ステータス: **実機検証済み (2026-06-13, COM8 flash)**。ブート時のビープ +
-WAV 自動再生をユーザーが実聴確認。`tools/probe_audio.js` の MQTT テレメトリで
+WAV 自動再生をユーザーが実聴確認。`tools/probes/probe_audio.js` の MQTT テレメトリで
 frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレートで PCM 消費)、
 リングは 64KB で頭打ち (バックプレッシャー動作)、underrun は意図したギャップ
 のみ (再生中の途切れなし)。Opus デコーダ (`codex/opus-float-plan` worktree) と
@@ -13,7 +13,7 @@ frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレ�
 
 ## 実装
 
-`docs/opus-decoder-plan.md` §4 の `audio_tab5` 仕様に準拠:
+`docs/history/opus-decoder-plan.md` §4 の `audio_tab5` 仕様に準拠:
 
 - `components/audio_tab5/` — ES8388 を esp_codec_dev (~1.5, 公式
   m5stack_tab5 BSP と同系) で駆動。共有 I2C バス `ui_tab5_i2c_bus()`
@@ -37,7 +37,7 @@ frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレ�
    1319Hz の 300ms ビープ ×2 がスピーカーから鳴る。**実聴 OK。**
 2. `CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY=y` で続けて WAV 自動再生。
    **実聴 OK。**
-3. `tools/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
+3. `tools/probes/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
    audio.stats() を時系列で publish。確認済み実測 (COM 不要):
    - playWav 347584 → wav-2s 453120 → wav-5s 596992 frames = **48000/s
      ちょうど** (I2S が正レートで消費)。

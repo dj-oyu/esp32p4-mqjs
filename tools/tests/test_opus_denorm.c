@@ -8,7 +8,7 @@
  *
  * Build/run (host, WSL):
  *   gcc -O2 -Wall -I components/opus_p4_kernels/include \
- *       tools/test_opus_denorm.c components/opus_p4_kernels/opus_p4_kernels.c \
+ *       tools/tests/test_opus_denorm.c components/opus_p4_kernels/opus_p4_kernels.c \
  *       -o /tmp/test_opus_denorm && /tmp/test_opus_denorm
  */
 #include <assert.h>

@@ -185,7 +185,7 @@ uint8_t skk_char_code(uint32_t cp)
  *     zlib.crc32(ALPHABET.encode("utf-8"))
  *
  * EXPECTED VALUE FOR THE 182-CHARACTER TABLE ABOVE: 0xE4EF637F, verified
- * against tools/skk_prep.py by tools/test_skk_dict.c, which opens the
+ * against tools/skk_prep.py by tools/tests/test_skk_dict.c, which opens the
  * images that tool actually writes.
  * If the prep tool computes anything else, the two disagree about
  * ordering and every image it writes would be silently wrong — which is

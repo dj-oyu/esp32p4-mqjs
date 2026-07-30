@@ -19,7 +19,7 @@ scan の支配項は **PSRAM の散発読み**であって ALU ではない:
 - ean13 デコーダは van Herk + RLE の O(n) で対象外
 
 よって **PIE 直行は筋が悪い** (esp-dsp がテンソルで負けたのと同じ構図、
-docs/pie-tensor-asm-plan.md §1)。効くのは「読み方を変える」アルゴリズム
+docs/history/pie-tensor-asm-plan.md §1)。効くのは「読み方を変える」アルゴリズム
 側。また pv (PPA ピクセルレート) がフレーム天井なので、scan 単独の短縮は
 fps では 16 → 20 程度が上限 — 狙いは fps ではなく**手ブレ時のロック追従
 とレイテンシ**。
@@ -101,6 +101,6 @@ walk 長を bbox 対角/2+48 → **バー方向射影/2+48** に短縮 — direc
 ## 4. 参考
 
 - 実測の出どころ: camera.status() 末尾 "[pv loc scan ms/f ... fanR/H]"
-- PIE の前例と教訓: docs/pie-tensor-asm-plan.md (§1 ライブラリ PIE が
+- PIE の前例と教訓: docs/history/pie-tensor-asm-plan.md (§1 ライブラリ PIE が
   負けた理由、§0 ニーモニック確定事項)
 - PSRAM 帯域の教訓: メモリ mqjs-seed-apps「PSRAM-bus budget」(c2e4e6a)

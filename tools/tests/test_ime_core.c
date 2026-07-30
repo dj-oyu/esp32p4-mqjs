@@ -37,7 +37,7 @@ static int g_fails;
         }                                                                 \
     } while (0)
 
-/* ---- fake dictionary (same shape as tools/test_skk_kana.c) --------- */
+/* ---- fake dictionary (same shape as tools/tests/test_skk_kana.c) --------- */
 
 #define FK_MAX   8
 #define FK_CANDS 4

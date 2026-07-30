@@ -672,22 +672,21 @@ components/smooth_ui_toolkit/ LVGL C++ ラッパー、アニメーション、UI
 components/cam_tab5/     Tab5 カメラとバーコード認識
 components/sshc/         wolfSSH クライアント
 examples/                配信して試せる JavaScript アプリ
-tools/                   鍵生成、MQTT 配信、Web UI、検証ツール
+tools/                   鍵生成、MQTT 配信、Web UI、辞書・フォント生成 ([tools/README.md](tools/README.md))
+tools/probes/            実機 dev スロットへ push する計測スクリプト
+tools/tests/             ホストで走る自動テスト (実機不要)
 tools/agents/skills/     AI エージェント向けスキル (canonical / ESP32-P4 PIE SIMD 参照を含む)
 .claude/skills/          Claude Code プロジェクトスキル (tools/agents/skills/ から tools/sync-claude-skills.sh で再生成。手編集しない)
-docs/                    UI、ランチャー、SSH 端末などの設計文書
+docs/                    現役の設計文書 ([docs/README.md](docs/README.md))
+docs/history/            決着済みキャンペーンの記録 (実測値・採否の理由・検死)
+sdkconfig.opus/          Opus 実験ビルド用の Kconfig 断片 (組み合わせ方は docs/history/opus-decoder-plan.md)
 ```
 
 実装を拡張するときは、まず以下を参照してください。
 
 - [examples/README.md](examples/README.md): サンプル一覧、JavaScript のルール、ランタイム制約
-- [docs/launcher-multiapp-design.md](docs/launcher-multiapp-design.md): マルチアプリと MQTT ストア
-- [docs/app-manager-migration.md](docs/app-manager-migration.md): App Manager 移行設計 (Phase 0-4 実装済み: 名前ベース API、App record / Worker 分離、policy、LRU eviction)
-- [docs/widget-framework-design.md](docs/widget-framework-design.md): ウィジェット UI
-- [docs/tab5-ui-design.md](docs/tab5-ui-design.md): Tab5 UI の構成
-- [docs/ssh-terminal-design.md](docs/ssh-terminal-design.md): SSH 端末
-- [docs/system-settings-design.md](docs/system-settings-design.md): System Vault、デバイス設定、プロビジョニング QR
-- [docs/qr-read-performance.md](docs/qr-read-performance.md): QR 読み取り性能の評価方法と実機計測計画
+- [docs/README.md](docs/README.md): 設計文書の索引。現役リファレンス 11 本と、決着済み記録の一覧
+- [tools/README.md](tools/README.md): 道具・probe・テストの索引
 - [tools/agents/skills/esp32p4-pie-simd/SKILL.md](tools/agents/skills/esp32p4-pie-simd/SKILL.md): ESP32-P4 PIE SIMD スキル参照
 
 ## ライセンス

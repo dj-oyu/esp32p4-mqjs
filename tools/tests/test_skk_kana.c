@@ -11,14 +11,14 @@
  *
  * Build/run (host):
  *   gcc -O2 -Wall -Wextra -std=c99 -I components/skk_core/include \
- *       tools/test_skk_kana.c components/skk_core/skk_kana.c \
+ *       tools/tests/test_skk_kana.c components/skk_core/skk_kana.c \
  *       -o /tmp/test_skk_kana && /tmp/test_skk_kana
  *
  * Same with the allocation check armed — skk_core must never allocate
  * (design §4.3), and this proves it at run time rather than by reading:
  *   gcc -O2 -Wall -Wextra -std=c99 -DSKK_WRAP_ALLOC \
  *       -I components/skk_core/include \
- *       tools/test_skk_kana.c components/skk_core/skk_kana.c \
+ *       tools/tests/test_skk_kana.c components/skk_core/skk_kana.c \
  *       -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free \
  *       -o /tmp/test_skk_kana && /tmp/test_skk_kana
  *
