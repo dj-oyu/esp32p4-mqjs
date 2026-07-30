@@ -62,6 +62,7 @@
    unconditionally and term.* works in run_pc exactly as ui.* does. The
    device glue behind term_ui_tab5.h is the only ESP-only part. */
 #include "term_registry.h"
+#include "term_lp_probe.h"
 #include "app/mqjs_app_manager_internal.h"
 /* mkdir()/fsync() for the personal dictionary (S7). Outside the
    ESP_PLATFORM block on purpose: the same code runs in run_pc, and
@@ -6426,6 +6427,40 @@ JSValue js_term_close(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     if (!owner || !term_registry_ready())
         return term_err_value(ctx, TERM_ERR_NOT_READY);
     return term_err_value(ctx, term_registry_close((term_id_t)id, owner));
+}
+
+/* sys.lpProbe([action]) -> the LP SRAM retention probe's state and verdicts
+   as a JSON string (see term_lp_probe.h for the shape).
+     sys.lpProbe()        read only
+     sys.lpProbe("arm")   arm the sequence — ONE-SHOT: a no-op when one is
+                          already running or when results are present, so the
+                          dev-slot script that arms it can re-run on every
+                          boot (which it does) without re-arming
+     sys.lpProbe("clear") erase state + results; also stands down a sequence
+                          still inside its pre-crash delay window
+   Always returns the report, whatever the action, so a caller never has to
+   make a second call to see what it did. Dev-facing: this is the §11.3
+   prerequisite probe, not part of the term contract of §8. */
+JSValue js_sys_lpProbe(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    char act[16];
+    act[0] = '\0';
+    if (argc >= 1 && uiw_copy_str(ctx, argv[0], act, sizeof act))
+        return JS_EXCEPTION;
+    if (!strcmp(act, "arm"))
+        term_lp_probe_arm();
+    else if (!strcmp(act, "clear"))
+        term_lp_probe_clear();
+    /* Off the JS heap: a kilobyte of report should not move an app's arena,
+       and the buffer is gone before JS_NewStringLen can trigger a GC. */
+    char *buf = malloc(TERM_LP_PROBE_REPORT_MAX);
+    if (!buf)
+        return JS_NULL;
+    size_t len = term_lp_probe_report(buf, TERM_LP_PROBE_REPORT_MAX);
+    JSValue v = JS_NewStringLen(ctx, buf, len);
+    free(buf);
+    return v;
 }
 
 /* ------------------------------------------------------------------ */

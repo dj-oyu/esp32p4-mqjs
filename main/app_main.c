@@ -31,6 +31,7 @@
 #include "opus_player.h"
 #include "wifi.h"
 #include "tailscale_adapter.h"
+#include "term_lp_probe.h"
 
 static const char *TAG = "app";
 
@@ -146,6 +147,14 @@ static void tab5_ui_ready(void *arg)
 
 void app_main(void)
 {
+    /* LP SRAM retention probe (docs/term-design.md §11.3, the prerequisite of
+       the §4.4 black box). First thing in app_main so the RTC_NOINIT region is
+       judged before anything else in the boot could touch LP RAM, and so a
+       verdict is logged even if a later stage of boot fails. Does nothing at
+       all unless sys.lpProbe("arm") armed a sequence: no state key, no task,
+       no crash. See components/term_core/PHASE3_MANIFEST.md. */
+    term_lp_probe_boot();
+
     /* boot-time micro-benches (2026-06-12): ppa_bench_run() /
        ppa_bench_crossover() / jsmem_bench_run() — call here to
        re-measure on a quiet system. Measured at -O2: PPA 4x on big

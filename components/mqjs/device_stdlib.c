@@ -688,6 +688,10 @@ static const JSPropDef js_sys[] = {
     /* §11 store catalog: browse the shelf, install on demand */
     JS_CFUNC_DEF("store", 0, js_sys_store),
     JS_CFUNC_DEF("install", 1, js_sys_install),
+    /* term phase-3 prerequisite (docs/term-design.md §11.3): the LP SRAM
+       retention probe. Dev-facing, read-mostly; "arm" is one-shot and
+       "clear" is the abort. Returns a JSON string. */
+    JS_CFUNC_DEF("lpProbe", 1, js_sys_lpProbe),
     JS_PROP_END,
 };
 
