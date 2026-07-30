@@ -33,6 +33,7 @@
 #include "sdkconfig.h"
 #if CONFIG_MQJS_TAB5_UI
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -41,9 +42,10 @@
 #include "ui_tab5.h"
 #include "ui_tab5_internal.h"
 
-/* JS runtime entry point (extern decl instead of REQUIRES: mqjs already
+/* JS runtime entry points (extern decl instead of REQUIRES: mqjs already
    depends on this component — same trick as mqjs_post_touch). */
 extern "C" void mqjs_post_widget(uint32_t handle, int32_t value);
+extern "C" void mqjs_ime_field_focus(int mode, int x, int y, int h);
 
 static const char *TAG = "ui_w";
 
@@ -65,6 +67,7 @@ typedef struct {
     uint16_t gen;      /* survives slot reuse; part of the handle */
     uint8_t kind;      /* ui_widget_kind_t, or UI_WK_SCREEN_SLOT */
     uint8_t scr_slot;  /* owning screen's table slot (screens: own slot) */
+    uint8_t mode;      /* UI_WK_FIELD only: ui_field_mode_t (I3) */
     bool used;
 } ui_w_entry_t;
 
@@ -82,13 +85,22 @@ static int s_cur = -1;       /* slot of the ACTIVE widget screen, -1 = console.
                                 unwind idiom) raced and stopped after one pop
                                 (user-reported W2 bug). */
 static lv_obj_t *s_root;     /* console screen (bottom of every stack) */
-static lv_obj_t *s_field_kb; /* shared lv_keyboard for FIELD textareas */
 static int s_pending_load = -1; /* screen awaiting its slide-in: created by
                                    ui_tab5_w_screen but loaded only by
                                    ui_tab5_w_commit at end-of-dispatch, so
                                    children are built BEFORE the animation
                                    starts (P4a §3.4: no pop-in, no lock
                                    contention with the slide). */
+
+/* The focused FIELD (I3). A HANDLE and not an lv_obj_t*: the screen it
+   lives on can be destroyed at any time, and w_lookup then reports the
+   entry stale instead of handing out a dangling pointer.
+   s_field_mode is the sink decision itself and is read from whichever
+   task a keystroke came in on, so it is separate (and volatile) — an
+   int write is atomic on this core and a stale read only costs one
+   keystroke going to the app instead of the field. */
+static uint32_t s_field_h;
+static volatile int s_field_mode = -1; /* -1 = no field has focus */
 
 static inline uint32_t w_handle(int slot)
 {
@@ -127,11 +139,13 @@ static int w_alloc(uint8_t kind, uint8_t scr_slot, lv_obj_t *obj)
    itself included): one generation bump kills all JS handles at once.
    Purely bookkeeping — the lv tree is freed separately (lv_obj_del or
    the load-anim auto_del), one recursion for the whole tree (§4④). */
+static void field_focus_drop(void); /* fwd: the focused field may be here */
+
 static void w_orphan_screen(int slot)
 {
-    if (s_field_kb && s_w[slot].obj &&
-        lv_obj_get_screen(s_field_kb) == s_w[slot].obj)
-        s_field_kb = NULL; /* dies with the tree */
+    int f = w_lookup(s_field_h);
+    if (f >= 0 && s_w[f].scr_slot == (uint8_t)slot)
+        field_focus_drop(); /* its textarea is about to be freed */
     for (int i = 0; i < UI_W_MAX; i++) {
         if (s_w[i].used && s_w[i].scr_slot == slot) {
             s_w[i].used = false;
@@ -157,40 +171,154 @@ static void w_event_cb(lv_event_t *e)
     mqjs_post_widget(handle, value);
 }
 
-/* ---- FIELD on-screen keyboard (LVGL task only) -------------------- */
+/* ---- FIELD on the platform keyboard (I3) ---------------------------
+ *
+ * docs/keyboard-ime-unification.md §2/§5: this was the one input
+ * surface that never joined kbd_core. A field used to create a stock
+ * lv_keyboard wired straight into its lv_textarea, which meant the dock
+ * could not type into it at all (dock keys only exist as mqjs_post_key),
+ * the on-screen keys came up even with the dock attached, the thing was
+ * 400px of portrait geometry that rotation never folded, and no control
+ * bar, no modifier LEDs and no IME could reach it.
+ *
+ * Now the field borrows the platform keyboard and the keystrokes come
+ * back the long way round — through mqjs_post_key, kbd_core and the IME
+ * — landing here as UI_CMD_FIELD_KEY. Two rules make that safe:
+ *   - focus state lives here (LVGL task writes it, posters read it),
+ *   - nothing outside the LVGL task ever touches the lv_textarea.
+ */
 
-static void field_kb_hide(lv_event_t *e)
+/* Give the field up: keyboard back to whatever the app wanted, IME
+   folded, keys back to the JS app. LVGL task (or under its lock). */
+static void field_focus_drop(void)
 {
-    (void)e;
-    if (s_field_kb)
-        lv_obj_add_flag(s_field_kb, LV_OBJ_FLAG_HIDDEN);
+    if (s_field_mode < 0)
+        return;
+    int slot = w_lookup(s_field_h);
+    if (slot >= 0 && s_w[slot].obj)
+        lv_obj_remove_state(s_w[slot].obj, LV_STATE_FOCUSED);
+    s_field_mode = -1; /* first: it is what stops the posters */
+    s_field_h = 0;
+    ui_tab5_kb_field(-1);
+    /* Leaving a field always folds the IME. A half-typed reading belongs
+       to the field it was anchored to; carrying it to the next sink
+       would put someone else's characters into someone else's line. */
+    mqjs_ime_field_focus(-1, 0, 0, 0);
+}
+
+static void field_focus_take(uint32_t handle, int slot)
+{
+    if (s_field_h != handle)
+        field_focus_drop(); /* field -> field: the old one lets go first */
+    lv_obj_t *ta = s_w[slot].obj;
+    s_field_h = handle;
+    s_field_mode = s_w[slot].mode;
+    lv_obj_add_state(ta, LV_STATE_FOCUSED); /* re-tap path: see below */
+    ui_tab5_kb_field(s_field_mode);
+    /* The IME float anchors on the field's own rectangle. Widget apps
+       never call ui.caret (they do not know a preedit exists), so
+       without this the composition would float in the screen corner
+       instead of at what the user is typing. Canvas coordinates: the
+       overlay adds the status bar back. */
+    lv_area_t a;
+    lv_obj_get_coords(ta, &a);
+    mqjs_ime_field_focus(s_field_mode, a.x1, a.y1 - UI_STATUSBAR_H,
+                         lv_area_get_height(&a));
 }
 
 static void field_focus_cb(lv_event_t *e)
 {
-    lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
+    uint32_t handle = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_FOCUSED) {
-        lv_obj_t *scr = lv_obj_get_screen(ta);
-        if (!s_field_kb || lv_obj_get_screen(s_field_kb) != scr) {
-            if (s_field_kb)
-                lv_obj_delete(s_field_kb);
-            s_field_kb = lv_keyboard_create(scr);
-            lv_obj_set_size(s_field_kb, LV_PCT(100), 400);
-            lv_obj_align(s_field_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-            /* OK / close on the keyboard hides it again */
-            lv_obj_add_event_cb(s_field_kb, field_kb_hide, LV_EVENT_READY,
-                                NULL);
-            lv_obj_add_event_cb(s_field_kb, field_kb_hide, LV_EVENT_CANCEL,
-                                NULL);
-        }
-        lv_keyboard_set_textarea(s_field_kb, ta);
-        lv_obj_remove_flag(s_field_kb, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_field_kb);
-    } else if (code == LV_EVENT_DEFOCUSED) {
-        if (s_field_kb && lv_keyboard_get_textarea(s_field_kb) == ta)
-            lv_obj_add_flag(s_field_kb, LV_OBJ_FLAG_HIDDEN);
+    if (code == LV_EVENT_DEFOCUSED) {
+        if (s_field_h == handle)
+            field_focus_drop();
+        return;
     }
+    /* FOCUSED *and* CLICKED. LVGL only emits FOCUSED when the press
+       lands on a different object than the last one (indev_click_focus),
+       so after Enter folds the keyboard, tapping the SAME field again
+       would raise nothing at all and the field would be unreachable
+       for the rest of the page. */
+    int slot = w_lookup(handle);
+    if (slot < 0 || s_w[slot].kind != UI_WK_FIELD)
+        return;
+    if (s_field_h == handle && s_field_mode >= 0)
+        return; /* already up: a tap inside the field just moves the caret */
+    field_focus_take(handle, slot);
+}
+
+/* One keystroke, off the UI command queue (see UI_CMD_FIELD_KEY).
+   Everything the platform keyboard, the control bar and the dock can
+   produce arrives here as kbd_core spelled it. */
+void ui_tab5_field_key_apply(const char *utf8, size_t len)
+{
+    int slot = w_lookup(s_field_h);
+    if (slot < 0 || s_w[slot].kind != UI_WK_FIELD || !len) {
+        field_focus_drop(); /* the field went away under the keystroke */
+        return;
+    }
+    lv_obj_t *ta = s_w[slot].obj;
+
+    if (len >= 2 && utf8[0] == '\0') { /* "\0name" token (kbd_core §7) */
+        const char *tok = utf8 + 1;
+        if (!strcmp(tok, "left"))
+            lv_textarea_cursor_left(ta);
+        else if (!strcmp(tok, "right"))
+            lv_textarea_cursor_right(ta);
+        else if (!strcmp(tok, "home"))
+            lv_textarea_set_cursor_pos(ta, 0);
+        else if (!strcmp(tok, "end"))
+            lv_textarea_set_cursor_pos(ta, LV_TEXTAREA_CURSOR_LAST);
+        else if (!strcmp(tok, "del"))
+            lv_textarea_delete_char_forward(ta);
+        else if (!strcmp(tok, "esc"))
+            field_focus_drop();
+        return; /* ime/rotate/F-keys/copy/paste mean nothing to a field */
+    }
+    if (len == 1) {
+        char c = utf8[0];
+        if (c == '\b' || c == 0x7f) {
+            lv_textarea_delete_char(ta);
+            return;
+        }
+        if (c == '\n' || c == '\r') {
+            field_focus_drop(); /* one-line field: Enter means "done" */
+            return;
+        }
+        if ((unsigned char)c < 0x20)
+            return; /* a Ctrl chord: never a character in a form field */
+    }
+    lv_textarea_add_text(ta, utf8); /* the queue's copy is NUL-terminated */
+}
+
+/* Any task: is this keystroke the field's? (mqjs's key funnel asks
+   before it looks at the app's ui.onKey — that test is exactly what
+   used to kill dock keys in widget-only apps.) */
+extern "C" bool ui_tab5_field_key(const char *utf8, size_t len)
+{
+    if (s_field_mode < 0 || !utf8 || len == 0)
+        return false;
+    /* "\0rotate" is not a keystroke — it is the platform telling the
+       foreground app that ui.size() changed, riding on the key channel.
+       A field that swallowed it would leave the app with no way to hear
+       about a rotation while any text box happens to have focus. */
+    if (len == 7 && memcmp(utf8, "\0rotate", 7) == 0)
+        return false;
+    if (len > 512)
+        return true; /* absurd: drop it, but never leak it to the app */
+    char *copy = (char *)malloc(len + 1);
+    if (!copy)
+        return true; /* the sink is still the field: do NOT leak it to JS */
+    memcpy(copy, utf8, len);
+    copy[len] = '\0';
+    ui_cmd_t c = {};
+    c.op = UI_CMD_FIELD_KEY;
+    c.w = (int16_t)len;
+    c.text = copy;
+    if (!ui_tab5_cmd(&c))
+        free(copy); /* queue full: dropped like any other command */
+    return true;
 }
 
 /* ---- screens ------------------------------------------------------ */
@@ -342,9 +470,9 @@ extern "C" void ui_tab5_w_reset(void)
         return;
     lvgl_port_lock(0);
     s_pending_load = -1;
+    field_focus_drop(); /* the app stops: its keyboard and IME go with it */
     if (lv_screen_active() != s_root)
         lv_screen_load(s_root);
-    s_field_kb = NULL;
     for (int i = 0; i < UI_W_MAX; i++) {
         if (s_w[i].used && s_w[i].kind == UI_WK_SCREEN_SLOT && s_w[i].obj) {
             lv_obj_t *scr = s_w[i].obj;
@@ -416,19 +544,27 @@ extern "C" uint32_t ui_tab5_w_create(int kind, uint32_t parent,
         lv_obj_set_width(obj, LV_PCT(100));
         lv_obj_set_style_bg_color(obj, lv_color_hex(UI_COL_PANEL), 0);
         lv_obj_set_style_text_color(obj, lv_color_hex(UI_COL_TEXT), 0);
-        /* visible focus (user feedback): accent border + lighter bg on
-           the focused field, dim hairline otherwise */
+        /* visible focus (user feedback): accent ring + lighter bg on the
+           focused field, dim hairline otherwise.
+           ⚠️ リングは outline で描く。border の幅は箱の高さに算入されるので、
+           フォーカスで 1->3px にすると**下に並ぶ要素が 4px 押し下がる**
+           (W1 から入っていた副作用。フォーカスの出入りが稀なうちは目立た
+           なかったが、I3 で入力欄が頻繁に開閉するようになって表面化した)。
+           outline は箱の外側に描かれてレイアウトに参加しないので動かない。
+           幅は 2px — コンテナの pad_row が 4px なので、隣の要素へはみ出さない。 */
         lv_obj_set_style_border_width(obj, 1, 0);
         lv_obj_set_style_border_color(obj, lv_color_hex(UI_COL_DIM), 0);
-        lv_obj_set_style_border_width(obj, 3, LV_STATE_FOCUSED);
         lv_obj_set_style_border_color(obj, lv_color_hex(UI_COL_ACCENT),
                                       LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(obj, 2, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_color(obj, lv_color_hex(UI_COL_ACCENT),
+                                       LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_pad(obj, 0, LV_STATE_FOCUSED);
         lv_obj_set_style_bg_color(obj, lv_color_hex(0x223240),
                                   LV_STATE_FOCUSED);
-        if (a)
+        if (a == UI_FIELD_PASSWORD)
             lv_textarea_set_password_mode(obj, true);
-        lv_obj_add_event_cb(obj, field_focus_cb, LV_EVENT_FOCUSED, NULL);
-        lv_obj_add_event_cb(obj, field_focus_cb, LV_EVENT_DEFOCUSED, NULL);
         break;
     }
     case UI_WK_LIST: {
@@ -506,6 +642,18 @@ extern "C" uint32_t ui_tab5_w_create(int kind, uint32_t parent,
         else if (kind == UI_WK_TOGGLE || kind == UI_WK_SLIDER)
             lv_obj_add_event_cb(obj, w_event_cb, LV_EVENT_VALUE_CHANGED,
                                 (void *)(uintptr_t)h);
+        else if (kind == UI_WK_FIELD) {
+            /* registered here and not in the switch above: the handle is
+               the callbacks' user_data, and it only exists once the slot
+               is allocated */
+            s_w[slot].mode = (uint8_t)a;
+            lv_obj_add_event_cb(obj, field_focus_cb, LV_EVENT_FOCUSED,
+                                (void *)(uintptr_t)h);
+            lv_obj_add_event_cb(obj, field_focus_cb, LV_EVENT_DEFOCUSED,
+                                (void *)(uintptr_t)h);
+            lv_obj_add_event_cb(obj, field_focus_cb, LV_EVENT_CLICKED,
+                                (void *)(uintptr_t)h);
+        }
         lvgl_port_unlock();
         return h;
     }

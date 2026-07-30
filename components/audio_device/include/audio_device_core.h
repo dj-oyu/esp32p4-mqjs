@@ -1,5 +1,5 @@
 /*
- * audio_device core state machine (P1 of docs/audio-device-design.md).
+ * audio_device core state machine (P1 of docs/history/audio-device-design.md).
  *
  * Pure C: no FreeRTOS, no I2S, no locks. A single owner (the manager task
  * on device, or the test harness on the host) serializes every call. The

@@ -1577,10 +1577,33 @@ static uint32_t s_kb_shift_id = LV_BUTTONMATRIX_BUTTON_NONE;
 static lv_obj_t *s_cbar;     /* T3a terminal control bar (mode 2) */
 static bool s_cbar_fn;       /* current map: false = main, true = F1-F12 */
 static int s_cbar_map_fn = -1; /* map the bar actually draws; -1 = none */
-static lv_obj_t *s_root_scr; /* console screen: fixed parent for s_kb (a
-                                widget screen could be active when JS calls
-                                ui.keyboard(1); parenting there would leave
-                                s_kb dangling when that screen is freed) */
+static lv_obj_t *s_root_scr; /* console screen (still the canvas' home) */
+
+/* Every piece of input chrome — keyboard, its top strip, control bar,
+   stats panel, overlays — lives on lv_layer_top(), the display-global
+   layer the status bar already uses.
+   It used to be parented to the console screen, which was fine while
+   only canvas apps raised a keyboard: a W1 widget screen is a separate
+   lv screen, so a keyboard parented to the console is simply not drawn
+   while a settings page is up. I3 puts the widget `field` on this very
+   keyboard, so that is no longer a corner case. Coordinates do not
+   change (screens are full-display), and unlike a screen child the
+   chrome does not slide with lv_screen_load_anim or get freed with the
+   page under it. */
+static inline lv_obj_t *ui_chrome_parent(void)
+{
+    return lv_layer_top();
+}
+
+/* Anything the finger can land on while a FIELD has focus must NOT be
+   click-focusable: LVGL's indev sends DEFOCUSED to the textarea the
+   moment the press lands on another focusable object, so a keyboard
+   that keeps the flag dismisses itself on its own first keystroke.
+   This is exactly what lv_keyboard does in its own constructor. */
+static void ui_chrome_no_focus_steal(lv_obj_t *o)
+{
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+}
 
 /* Modifier state of the TOUCH surface (keyboard + bar together, so a
    bar Ctrl applies to the next on-screen letter). The dock keeps its
@@ -1601,12 +1624,25 @@ static const char *CB_LBL_CTRL = "Ctrl";
 static const char *CB_LBL_CTRL_LOCK = "CTRL"; /* locked: shouting = latched */
 static const char *CB_LBL_ALT = "Alt";
 static const char *CB_LBL_ALT_LOCK = "ALT";
+/* The IME key's face IS the mode display (design §6.2), indexed by
+   ui_ime_face_t. Written by the IME's owner task, read by the LVGL task:
+   a plain int is enough — a torn read is not possible and the worst
+   outcome of a lost update is one stale face until the next mode change. */
+static const char *CB_LBL_IME[] = {
+    "A", "\xe3\x81\x82" /* あ */, "\xe3\x82\xa2" /* ア */,
+};
+static int s_cbar_ime_face = UI_IME_FACE_ASCII;
+/* 「あ」 is inert while a non-Japanese FIELD has focus (I3). LVGL task
+   only — set through ui_tab5_kb_field(), which the widget layer calls
+   from the focus event. */
+static bool s_cbar_ime_off;
 
 /* one row, so array index == button id */
-/* "あ" is the IME toggle: it sends "\0ime", which an app with Japanese
-   input turns into skk.enable() and every other app ignores. It is here
-   rather than on a control byte because the classic SKK toggles are all
-   unreachable on this keyboard — see the comment on KBD_K_IME. */
+/* "あ" is the IME toggle: it sends "\0ime", which the platform IME
+   session answers (ime_feed owns that token outright). It is here rather
+   than on a control byte because the classic SKK toggles are all
+   unreachable on this keyboard — see the comment on KBD_K_IME. Its face
+   is rewritten by cbar_apply_labels to show the current mode. */
 static const char *CB_MAP_MAIN[] = {
     "Esc", "Tab", "Ctrl", "Alt", "Fn",
     LV_SYMBOL_LEFT, LV_SYMBOL_DOWN, LV_SYMBOL_UP, LV_SYMBOL_RIGHT,
@@ -1615,6 +1651,7 @@ static const char *CB_MAP_MAIN[] = {
 #define CB_ID_CTRL 2
 #define CB_ID_ALT  3
 #define CB_ID_FN   4
+#define CB_ID_IME  11
 static const kbd_key_t CB_KEY_MAIN[] = {
     KBD_K_ESC, KBD_K_TAB,
     KBD_K_NONE /* Ctrl */, KBD_K_NONE /* Alt */, KBD_K_NONE /* Fn */,
@@ -1659,13 +1696,13 @@ struct ui_overlay_t {
     lv_obj_t *row;                       /* item container (flex) */
     lv_obj_t *item[UI_OVERLAY_ITEMS];    /* candidate chips */
 };
-static ui_overlay_t s_ovl[UI_OVERLAY_MAX];
+static ui_overlay_t s_ovl[UI_OVERLAY_SLOTS]; /* + the platform IME float */
 
 #define UI_OVL_PAD 6
 
 static void ovl_build(ui_overlay_t *o)
 {
-    lv_obj_t *parent = s_root_scr ? s_root_scr : lv_screen_active();
+    lv_obj_t *parent = ui_chrome_parent();
 
     o->box = lv_obj_create(parent);
     lv_obj_remove_style_all(o->box);
@@ -1705,7 +1742,7 @@ static void ovl_build(ui_overlay_t *o)
 
 static void ovl_hide(int id)
 {
-    if (id < 0 || id >= UI_OVERLAY_MAX || !s_ovl[id].box)
+    if (id < 0 || id >= UI_OVERLAY_SLOTS || !s_ovl[id].box)
         return;
     lv_obj_add_flag(s_ovl[id].box, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1713,7 +1750,7 @@ static void ovl_hide(int id)
 /* UI task only. The public ui_tab5_overlay_hide_all() posts commands. */
 static void ovl_hide_all(void)
 {
-    for (int i = 0; i < UI_OVERLAY_MAX; i++)
+    for (int i = 0; i < UI_OVERLAY_SLOTS; i++)
         ovl_hide(i);
 }
 
@@ -1788,7 +1825,7 @@ static void ovl_place(ui_overlay_t *o, const ui_cmd_t &cmd)
 static void ovl_apply(const ui_cmd_t &cmd)
 {
     int id = cmd.w;
-    if (id < 0 || id >= UI_OVERLAY_MAX)
+    if (id < 0 || id >= UI_OVERLAY_SLOTS)
         return;
     if (!cmd.text) {
         ovl_hide(id);
@@ -1809,6 +1846,12 @@ static void ovl_apply(const ui_cmd_t &cmd)
     for (char *q = body; *q; q++)
         if (*q == '\1')
             *q = '\n';
+    /* Per-span colour is all this firmware can do: CONFIG_LV_USE_SPAN is
+       off, so lv_spangroup does not exist and only recolor markup gets
+       more than one colour into a label (design §6.3). Per handle, not
+       once at build: an app's lines are plain text, and turning recolor
+       on for them would eat their '#'. */
+    lv_label_set_recolor(o->lines, (cmd.bg & 0x8) != 0);
     lv_label_set_text(o->lines, body);
     if (*body)
         lv_obj_remove_flag(o->lines, LV_OBJ_FLAG_HIDDEN);
@@ -1879,6 +1922,17 @@ static void cbar_apply_mods(void)
             lv_buttonmatrix_clear_button_ctrl(s_cbar, m.id,
                                               LV_BUTTONMATRIX_CTRL_CHECKED);
     }
+    /* An ASCII / password FIELD has focus: 「あ」 must not be able to arm
+       the IME (I3). DISABLED and not just ignored in the handler — LVGL
+       both refuses the press and draws the key greyed, and a key that
+       looks live while doing nothing reads as a broken keyboard. Re-run
+       after every set_map: that reallocates and zeroes the ctrl flags. */
+    if (s_cbar_ime_off)
+        lv_buttonmatrix_set_button_ctrl(s_cbar, CB_ID_IME,
+                                        LV_BUTTONMATRIX_CTRL_DISABLED);
+    else
+        lv_buttonmatrix_clear_button_ctrl(s_cbar, CB_ID_IME,
+                                          LV_BUTTONMATRIX_CTRL_DISABLED);
 }
 
 /* Everything about the bar that needs a set_map: the Fn layer, and the
@@ -1888,15 +1942,22 @@ static void cbar_apply_mods(void)
    the arrays LVGL is still using for that press. */
 static void cbar_apply_labels(void)
 {
-    if (!s_cbar)
-        return;
     const char *ctrl_lbl =
         s_ui_mods.ctrl.lock ? CB_LBL_CTRL_LOCK : CB_LBL_CTRL;
     const char *alt_lbl = s_ui_mods.alt.lock ? CB_LBL_ALT_LOCK : CB_LBL_ALT;
+    const char *ime_lbl = CB_LBL_IME[s_cbar_ime_face];
     bool relabel = CB_MAP_MAIN[CB_ID_CTRL] != ctrl_lbl ||
-                   CB_MAP_MAIN[CB_ID_ALT] != alt_lbl;
+                   CB_MAP_MAIN[CB_ID_ALT] != alt_lbl ||
+                   CB_MAP_MAIN[CB_ID_IME] != ime_lbl;
+    /* The map is kept current even with no bar on screen: mode changes
+       happen while the bar is down (the dock types without one), and
+       cbar_show() installs whatever the array holds — a face written only
+       when a bar exists would come up stale. */
     CB_MAP_MAIN[CB_ID_CTRL] = ctrl_lbl;
     CB_MAP_MAIN[CB_ID_ALT] = alt_lbl;
+    CB_MAP_MAIN[CB_ID_IME] = ime_lbl;
+    if (!s_cbar)
+        return;
     if (!relabel && s_cbar_map_fn == (int)s_cbar_fn)
         return;
     s_cbar_map_fn = s_cbar_fn;
@@ -1938,8 +1999,8 @@ static void cbar_show(bool show)
         return;
     }
     if (!s_cbar) {
-        s_cbar = lv_buttonmatrix_create(s_root_scr ? s_root_scr
-                                                   : lv_screen_active());
+        s_cbar = lv_buttonmatrix_create(ui_chrome_parent());
+        ui_chrome_no_focus_steal(s_cbar);
         lv_obj_set_size(s_cbar, ui_cur_hres(), UI_CB_H);
         lv_obj_set_style_pad_all(s_cbar, 4, 0);
         lv_obj_set_style_pad_gap(s_cbar, 4, 0);
@@ -2163,7 +2224,8 @@ static void spanel_update(lv_timer_t *t)
 
 static void spanel_build(void)
 {
-    s_spanel = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    s_spanel = lv_obj_create(ui_chrome_parent());
+    ui_chrome_no_focus_steal(s_spanel);
     lv_obj_set_style_bg_color(s_spanel, lv_color_hex(UI_COL_BG), 0);
     lv_obj_set_style_bg_opa(s_spanel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_spanel, 1, 0);
@@ -2187,6 +2249,7 @@ static void spanel_build(void)
 
     /* right: brightness arc (relative drag + 5% snap + ± nudge) */
     s_sp_arc = lv_arc_create(s_spanel);
+    ui_chrome_no_focus_steal(s_sp_arc);
     lv_obj_set_size(s_sp_arc, 200, 200);
     lv_obj_align(s_sp_arc, LV_ALIGN_TOP_RIGHT, -20, 0);
     lv_arc_set_range(s_sp_arc, 5, 100);
@@ -2215,6 +2278,7 @@ static void spanel_build(void)
                                 { LV_SYMBOL_KEYBOARD, 0 } };
     for (int i = 0; i < 3; i++) {
         lv_obj_t *b = lv_button_create(s_spanel);
+        ui_chrome_no_focus_steal(b);
         lv_obj_set_size(b, 88, 64);
         lv_obj_align(b, LV_ALIGN_BOTTOM_RIGHT, -20 - (2 - i) * 100, -8);
         lv_obj_set_style_bg_color(b, lv_color_hex(UI_COL_BAR), 0);
@@ -2486,7 +2550,8 @@ static void kb_clip_refresh(void)
 static void kb_top_create(void)
 {
     int w = ui_cur_hres();
-    s_kb_top = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    s_kb_top = lv_obj_create(ui_chrome_parent());
+    ui_chrome_no_focus_steal(s_kb_top);
     lv_obj_remove_flag(s_kb_top, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(s_kb_top, w, UI_KB_TOP_H);
     lv_obj_align(s_kb_top, LV_ALIGN_BOTTOM_MID, 0,
@@ -2497,6 +2562,7 @@ static void kb_top_create(void)
     lv_obj_set_style_bg_color(s_kb_top, lv_color_hex(UI_COL_BG), 0);
 
     s_kb_clip = lv_button_create(s_kb_top);
+    ui_chrome_no_focus_steal(s_kb_clip);
     lv_obj_set_size(s_kb_clip, w - UI_KB_TOP_H * 2 - UI_KB_LOCK_W - 12,
                     UI_KB_TOP_H - 4);
     lv_obj_align(s_kb_clip, LV_ALIGN_LEFT_MID, 0, 0);
@@ -2538,6 +2604,7 @@ static void kb_top_create(void)
     kb_lock_refresh();
 
     lv_obj_t *close = lv_button_create(s_kb_top);
+    ui_chrome_no_focus_steal(close);
     lv_obj_set_size(close, UI_KB_TOP_H * 2, UI_KB_TOP_H - 4);
     lv_obj_align(close, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_radius(close, 4, 0);
@@ -2602,7 +2669,8 @@ static void kb_show(int mode)
     /* The container. It owns the background for the whole key area —
        the row matrices only paint from the first key down, so the 4px
        above row 0 would otherwise show the console through. */
-    s_kb = lv_obj_create(s_root_scr ? s_root_scr : lv_screen_active());
+    s_kb = lv_obj_create(ui_chrome_parent());
+    ui_chrome_no_focus_steal(s_kb);
     lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(s_kb, ui_cur_hres(), KB_AREA_H);
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -2620,6 +2688,7 @@ static void kb_show(int mode)
     for (int r = 0; r < KB_ROWS; r++) {
         lv_obj_t *m = lv_buttonmatrix_create(s_kb);
         s_kb_row[r] = m;
+        ui_chrome_no_focus_steal(m);
         lv_obj_set_size(m, ui_cur_hres(), KB_ROW_PITCH);
         /* one pitch tall, carrying the inter-row gap as its own bottom
            padding, so the keys land where the 4-row matrix put them */
@@ -2722,6 +2791,37 @@ static void kb_show(int mode)
         lv_obj_add_event_cb(s_kb_row[r], key_cb, LV_EVENT_VALUE_CHANGED,
                             nullptr);
     kb_apply_map(); /* widths, and whatever state survived an app switch */
+}
+
+/* A widget FIELD took (mode >= 0) or lost (-1) focus — the widget layer
+   calls this from the LVGL task, i.e. already under the LVGL lock.
+   Mode 2 is what a text field wants: keys plus the control bar, whose
+   Esc / arrows / copy / paste / 「あ」 have no other home. Everything
+   that used to be missing comes along for free, because this IS the
+   platform keyboard — the dock suppresses the on-screen keys
+   (ui_tab5_kb_reserved / kb_show), rotation folds and rebuilds it, and
+   the modifier LEDs are the same kbd_mods_t.
+   The app's own ui.keyboard() mode is saved and put back on blur: a
+   canvas app that had asked for a keyboard must not lose it because a
+   settings page borrowed one. */
+static int s_field_kb_saved = -1; /* app's mode while a field holds it */
+
+void ui_tab5_kb_field(int mode)
+{
+    if (!s_canvas_w)
+        return;
+    if (mode >= 0) {
+        if (s_field_kb_saved < 0)
+            s_field_kb_saved = s_app_kb_mode;
+        s_cbar_ime_off = mode != UI_FIELD_JA;
+        kb_show(2);
+    } else {
+        s_cbar_ime_off = false;
+        int back = s_field_kb_saved;
+        s_field_kb_saved = -1;
+        kb_show(back > 0 ? back : 0);
+    }
+    cbar_apply_mods(); /* paints 「あ」's DISABLED flag */
 }
 
 /* Temporary instrumentation: what does each kind of keyboard repaint
@@ -2971,6 +3071,14 @@ public:
                 /* not a canvas op: composited above, so it must not
                    unhide the canvas or count as "drew" */
                 ovl_apply(cmd);
+                free(cmd.text);
+                continue;
+            }
+            if (cmd.op == UI_CMD_FIELD_KEY) {
+                /* a keystroke for a widget page, not for the canvas:
+                   this is where the key finally reaches an lv_obj, on
+                   the one task allowed to touch it (I3) */
+                ui_tab5_field_key_apply(cmd.text, (size_t)(uint16_t)cmd.w);
                 free(cmd.text);
                 continue;
             }
@@ -3430,6 +3538,26 @@ private:
 extern "C" bool ui_tab5_landscape(void)
 {
     return s_landscape;
+}
+
+/* The IME's mode, on the key that changes it (design §6.2). Called from
+   the IME's owner task, i.e. never from inside the bar's own event
+   callback — but the relabel still goes through ui_kb_refresh(), because
+   a set_map is only safe from the LVGL loop (see cbar_apply_labels).
+   No deadlock: this waits for the LVGL task, and the LVGL task only ever
+   posts to the IME queue without waiting. */
+extern "C" void ui_tab5_ime_face(int face)
+{
+    if (face < UI_IME_FACE_ASCII || face > UI_IME_FACE_KATA)
+        face = UI_IME_FACE_ASCII;
+    if (s_cbar_ime_face == face)
+        return;
+    s_cbar_ime_face = face;
+    if (!s_disp)
+        return;
+    lvgl_port_lock(0);
+    ui_kb_refresh();
+    lvgl_port_unlock();
 }
 
 /* Keyboard dock present: stop raising the on-screen keyboard (mode 1

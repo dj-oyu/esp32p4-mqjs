@@ -11,7 +11,7 @@
  * Output matches the C reference (bc_tensor_block) BIT-FOR-BIT; the boot
  * self-check in bc_locate.c verifies that on real silicon.
  *
- * --- design notes (resolved §6 of docs/pie-tensor-asm-plan.md) -------
+ * --- design notes (resolved §6 of docs/history/pie-tensor-asm-plan.md) -------
  * G6 extraction WITHOUT a lane-shift instruction: mask each 16-bit lane
  * with 0x07E0 (esp.andq against a splatted constant). That leaves the
  * green field as G<<5 = 32*G, so every gradient is 32x and every product

@@ -61,15 +61,24 @@ typedef enum {
 
                          x, y  anchor top-left (canvas pixels)
                          h     anchor height, so "below" clears the line
-                         w     handle id, 0 .. UI_OVERLAY_MAX-1
+                         w     handle id, 0 .. UI_OVERLAY_SLOTS-1
                          color selected item index, -1 for none
                          bg    bit0-1 place: 0 auto, 1 below, 2 above
                                bit2   items direction: 0 horizontal, 1 vertical
+                               bit3   lines carry LVGL recolor markup
+                                      (#RRGGBB ...#; the IME paints the
+                                      preedit's spans with it)
                          text  content, or NULL to hide this handle:
                                  line ("\1" line)* ["\2" item ("\1" item)*]
                                i.e. \1 separates, \2 starts the item list. */
     UI_CMD_RESET,     /* foreground-app switch: clear + hide the canvas and
                          hide the keyboard (same hygiene as a task switch) */
+    UI_CMD_FIELD_KEY, /* I3: one keystroke for the focused widget FIELD.
+                         text = heap copy, w = its LENGTH — the "\0name"
+                         tokens start with a NUL, so strlen would read
+                         them as empty. Posted from whichever task the
+                         key came in on; applied to the lv_textarea by
+                         the UI task (no lv_obj is touched off it). */
 } ui_cmd_op_t;
 
 typedef struct {
@@ -89,6 +98,24 @@ typedef struct {
    allocated up-front per handle on first use. */
 #define UI_OVERLAY_MAX   4
 #define UI_OVERLAY_ITEMS 10
+
+/* One more slot, above every app handle: the platform's own IME float
+   (preedit + candidates), issued by C now that apps do not see a preedit
+   at all. It is separate rather than "id 0 by convention" because an app
+   that opts into the IME goes on using its own overlays — ssh_vt held id
+   0 for the IME and gets it back. */
+#define UI_OVERLAY_IME   UI_OVERLAY_MAX
+#define UI_OVERLAY_SLOTS (UI_OVERLAY_MAX + 1)
+
+/* What the control bar's 「あ」 key shows (design §6.2): the thing you
+   press to change the mode is the thing that shows it, so no app needs a
+   mode indicator of its own. Values, not skk_mode_t — the UI layer must
+   not learn the engine's enum. */
+typedef enum {
+    UI_IME_FACE_ASCII = 0, /* IME off / ASCII: "A"  */
+    UI_IME_FACE_KANA  = 1, /* hiragana:        "あ" */
+    UI_IME_FACE_KATA  = 2, /* katakana:        "ア" */
+} ui_ime_face_t;
 
 /* Overlays are taken down by UI_CMD_RESET, which mqjs already posts both
    when the foreground app switches and when a foreground app stops — the
@@ -110,12 +137,31 @@ typedef struct {
 typedef enum {
     UI_WK_BUTTON = 0,
     UI_WK_LABEL  = 1,
-    UI_WK_FIELD  = 2, /* labelled one-line textarea; a!=0 -> password   */
+    UI_WK_FIELD  = 2, /* labelled one-line textarea; a = ui_field_mode_t */
     UI_WK_LIST   = 3,
     UI_WK_ITEM   = 4, /* list row; parent must be a UI_WK_LIST handle   */
     UI_WK_TOGGLE = 5, /* labelled switch; a!=0 -> initially on          */
     UI_WK_SLIDER = 6, /* a=min b=max c=initial value                    */
 } ui_widget_kind_t;
+
+/* What a UI_WK_FIELD accepts (I3). The platform, not the app, enforces
+ * it: on focus a non-JA field forces the IME off and the control bar's
+ * 「あ」 key goes DISABLED, so no app can forget to constrain a field.
+ *
+ * ASCII is the default deliberately. The two failure modes are not
+ * symmetric — forgetting "ja" on a free-text field only means the user
+ * cannot type Japanese there (obvious, harmless), while forgetting to
+ * constrain a Wi-Fi SSID field means kana in an SSID and a connection
+ * that fails for a reason nobody can see.
+ *
+ * PASSWORD == 1 on purpose: the old API was a truthy "secret" flag, so
+ * every existing {secret:true} caller keeps its exact behaviour. Values
+ * are mirrored in components/mqjs/mqjs_classes.h — keep both in sync. */
+typedef enum {
+    UI_FIELD_ASCII    = 0, /* ASCII only; the IME cannot be armed */
+    UI_FIELD_PASSWORD = 1, /* password mode; the IME is never allowed */
+    UI_FIELD_JA       = 2, /* Japanese allowed (「あ」 is live) */
+} ui_field_mode_t;
 
 typedef void (*ui_tab5_ready_cb_t)(void *arg);
 
@@ -153,6 +199,12 @@ void ui_tab5_cell_size(int *w, int *h);
  * Depends on the keyboard dock: docked, mode 1 reserves nothing (the
  * dock types directly) and mode 2 only the control bar's height. */
 int ui_tab5_kb_reserved(int mode);
+
+/* Show the IME's mode on the control bar's 「あ」 key (see
+ * ui_ime_face_t). Callable from any task (takes the LVGL lock; the
+ * relabel itself is deferred to the LVGL loop like every other
+ * control-bar map change). */
+void ui_tab5_ime_face(int face);
 
 /* Keyboard dock presence (kbd_tab5): while set, ui.keyboard() requests
  * raise no on-screen keyboard — mode 2 keeps only the control bar
@@ -198,6 +250,14 @@ bool ui_tab5_w_set_text(uint32_t handle, const char *text);
 bool ui_tab5_w_value_str(uint32_t handle, char *buf, size_t cap);
 /* ... or of a TOGGLE (0/1) / SLIDER (int). 0 for stale handles. */
 int ui_tab5_w_value_int(uint32_t handle);
+
+/* I3: deliver one keystroke to the focused FIELD, if any. Returns true
+ * when a field took it — i.e. "this key is not the JS app's". Callable
+ * from any task (the mqjs key funnel runs on the LVGL task, on the
+ * keyboard dock's task and on the IME's owner task): it only reads a
+ * focus flag and posts a UI command, never an lv_obj. `utf8` may be a
+ * "\0name" token, hence the explicit length. */
+bool ui_tab5_field_key(const char *utf8, size_t len);
 
 /* Destroy every widget screen and return to the console screen. Called
  * by the JS runtime when a task ends (same role as the canvas clear on
@@ -339,6 +399,7 @@ static inline int ui_tab5_kb_reserved(int mode)
     (void)mode;
     return 0;
 }
+static inline void ui_tab5_ime_face(int face) { (void)face; }
 static inline uint32_t ui_tab5_w_screen(const char *title, uint32_t *evicted)
 {
     (void)title;
@@ -380,6 +441,12 @@ static inline int ui_tab5_w_value_int(uint32_t handle)
 {
     (void)handle;
     return 0;
+}
+static inline bool ui_tab5_field_key(const char *utf8, size_t len)
+{
+    (void)utf8;
+    (void)len;
+    return false;
 }
 static inline void ui_tab5_w_reset(void) {}
 static inline void ui_tab5_w_commit(void) {}

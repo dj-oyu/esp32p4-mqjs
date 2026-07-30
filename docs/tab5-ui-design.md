@@ -88,7 +88,8 @@ app が background へ移ると Widget と Canvas は破棄されます。timer�
 
 ## パネル、タッチ、フォント
 
-- 画面はネイティブ縦 720x1280。
+- 画面はネイティブ縦 720x1280。キーボードドック装着中は flush ごとに PPA で回して
+  横 1280x720 として見せるため、`ui.size()` の値は実行中に入れ替わる。
 - パネル個体差として ST7121、ST7123、ILI9881C を検出する。
 - タッチは ST7123 または GT911 を使い、LVGL input device と mqjs event の両方へ渡す。
 - 通常 UI は日本語対応 Noto Sans CJK JP font を使う。

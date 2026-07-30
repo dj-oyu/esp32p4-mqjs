@@ -25,7 +25,7 @@
  * flood-fill rereads it constantly), so prefer internal SRAM — cache-friendly,
  * no PSRAM-cache stalls — and fall back to the default heap (PSRAM via SPIRAM
  * malloc) when a contiguous internal block isn't available. cam_tab5 frees
- * internal by suspending the radio for QR scans (docs/camera-lifecycle-plan.md
+ * internal by suspending the radio for QR scans (docs/history/camera-lifecycle-plan.md
  * §8). Logs the placement + the contiguous block at alloc time (M1/M3). */
 static void *quirc_image_alloc(size_t n)
 {

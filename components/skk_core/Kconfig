@@ -1,145 +1,120 @@
 menu "mqjs SKK Japanese input"
 
-choice MQJS_SKK_BUILTIN_DICT
-    prompt "Built-in conversion dictionary"
-    default MQJS_SKK_DICT_M
+choice MQJS_SKK_DICT_WHERE
+    prompt "Where the conversion dictionary lives"
+    default MQJS_SKK_DICT_AT_PARTITION
     help
-        Which SKK-JISYO gets built into the firmware image and read in
-        place out of flash rodata (docs/skk-ime-design.md §6.6).
+        ONE dictionary, in ONE place. Both places are flash read through
+        the MMU in place — no allocation, no load, and the same search
+        speed (docs/skk-ime-design.md §6.6). What differs is what the
+        space costs and what it takes to change it.
 
-        This is the dictionary a device has with nothing else flashed. A
-        bigger one can also be written to the `jisyo` partition at any
-        time WITHOUT rebuilding, and skk.open() prefers it — so the
-        choice here is really "what should this image fall back to", and
-        the largest useful answer is usually not the largest dictionary.
+        The partition is the default because it does not compete with the
+        code for the 6 MB app partition, holds up to 8.5 MB, and can be
+        rewritten without rebuilding the firmware.
 
-        The build downloads nothing. Point MQJS_SKK_DICT_SOURCE_DIR at a
-        directory holding SKK-JISYO.{S,M,ML,L} from
-        https://github.com/skk-dev/dict and the build regenerates the
-        image with tools/skk_prep.py, which re-sorts into UTF-8 byte
-        order and verifies every entry before writing (the EUC-JP sort
-        trap, §6.1). Without the sources the build falls back to an
-        already-generated components/skk_core/skk_dict.bin, and without
-        that it links no dictionary at all — the firmware still builds
-        and skk.open() then needs the partition or a file.
-
-config MQJS_SKK_DICT_NONE
-    bool "none (partition or file only)"
+config MQJS_SKK_DICT_AT_NONE
+    bool "nowhere — build without a dictionary"
     help
-        No dictionary in the image: -0 KB. skk.open() finds the `jisyo`
-        partition, or throws. Right for a device that always has the
-        partition flashed — the built-in copy is dead weight there.
+        skk.open() then finds nothing and throws, unless the app passes
+        an explicit path to a file. Saves the whole image; right for a
+        build that will never type Japanese.
 
-config MQJS_SKK_DICT_S
-    bool "S — 3,379 headings (image 117 KB)"
+config MQJS_SKK_DICT_AT_BUILTIN
+    bool "in the firmware image (flash rodata)"
     help
-        Smallest. Okuri-ari is only 998 entries, so verb and adjective
-        conjugation is largely absent. Useful mainly to prove the path
-        works with the least flash.
+        Linked into the app image with .incbin. Costs app partition space
+        — with 1.66 MB free today, anything past M is tight — and
+        changing the dictionary means rebuilding and re-flashing 4.5 MB.
 
-config MQJS_SKK_DICT_M
-    bool "M — 8,346 headings (image 303 KB)"
+        In exchange it can never go missing: the bootloader verifies the
+        whole app image with SHA-256 on every boot, so skk.open() skips
+        the CRC pass and takes 175 us instead of 197 ms.
+
+config MQJS_SKK_DICT_AT_PARTITION
+    bool "in the `jisyo` partition"
     help
-        The default. Enough for everyday nouns; 1,412 okuri-ari entries
-        means conjugated forms often miss. The personal dictionary fills
-        the gap over time.
+        The default. `idf.py flash` writes it for you, at the offset the
+        partition table gives; `idf.py app-flash` leaves it alone and the
+        contents survive, so the everyday loop is unaffected.
 
-config MQJS_SKK_DICT_ML
-    bool "ML — 48,750 headings (image 1.86 MB)"
-    help
-        Where continuous Japanese writing starts to work (4,349
-        okuri-ari entries against M's 1,412).
-
-        It does link, but only just: measured 2026-07-29 the image comes
-        out at 6,191,264 B against a 6 MB `factory`, i.e. 2% free. That
-        is not headroom worth spending — the next feature breaks the
-        build, and the fix would be growing `factory`, which is the exact
-        edit that moves `storage` and loses every installed app.
-
-        FLASH ML INTO THE `jisyo` PARTITION INSTEAD (README 3.5). Same
-        bytes, same speed — it is mmap'd rather than copied either way —
-        but it costs the app image nothing and can be replaced without a
-        rebuild. Choose it here only for a device that must work with
-        nothing but `idf.py flash`.
-
-config MQJS_SKK_DICT_L
-    bool "L — 175,790 headings (image 8.07 MB)"
-    help
-        Does not fit the 6 MB app partition, so choosing it fails the
-        build. Listed because the tooling and the host tests support it;
-        on a device it belongs in the `jisyo` partition.
+        Nothing verifies a partition — it is outside the image the
+        bootloader checks — so skk.open() runs a CRC32 over it once:
+        197 ms for ML, 826 ms for L. Conversion speed is unaffected.
 
 endchoice
 
-choice MQJS_SKK_JISYO_DICT
-    prompt "Dictionary written to the `jisyo` partition by `idf.py flash`"
-    default MQJS_SKK_JISYO_ML
+choice MQJS_SKK_DICT_SIZE
+    prompt "Which SKK-JISYO"
+    depends on !MQJS_SKK_DICT_AT_NONE
+    default MQJS_SKK_DICT_M if MQJS_SKK_DICT_AT_BUILTIN
+    default MQJS_SKK_DICT_ML
     help
-        THIS is where a big dictionary belongs. The partition is mmap'd
-        and read in place, exactly like the built-in image, so the search
-        is the same speed — but it costs the app image nothing, it can
-        hold pine (8.07 MB) which the app partition never could, and it
-        can be replaced without rebuilding the firmware.
+        From https://github.com/skk-dev/dict . The number that decides
+        whether continuous Japanese writing works is the OKURI-ARI count,
+        not the total: conjugated verbs and adjectives are looked up
+        there, and M has 1,412 of them against ML's 4,349.
 
-        Needs MQJS_SKK_DICT_SOURCE_DIR set (the image is generated from
-        the SKK-JISYO source) or a prepared components/skk_core/
-        skk_jisyo.bin. With neither, the build says so and skips the
-        step: `idf.py flash` still works and the device falls back to
-        whatever is built in.
-
-        `idf.py flash` then writes ~1.9 MB more, about 9 seconds.
-        `idf.py app-flash` does not, and the partition survives it — so
-        the day-to-day loop is unaffected.
-
-config MQJS_SKK_JISYO_NONE
-    bool "none — leave the partition alone"
+config MQJS_SKK_DICT_S
+    bool "S — 3,379 headings (117 KB), 998 okuri-ari"
     help
-        `idf.py flash` does not touch `jisyo`. Whatever was flashed there
-        before stays. Use tools: parttool.py write_partition (README 3.5).
+        Smallest. Conjugation is largely absent; useful mainly to prove
+        the path works with the least flash.
 
-config MQJS_SKK_JISYO_M
-    bool "M — 8,346 headings (303 KB)"
+config MQJS_SKK_DICT_M
+    bool "M — 8,346 headings (303 KB), 1,412 okuri-ari"
     help
-        The same dictionary the firmware already carries. Pointless
-        unless the built-in one is set to `none`.
+        Everyday nouns. Conjugated forms often miss, and the personal
+        dictionary fills the gap over time. The largest that leaves the
+        app partition comfortable, so it is the default for a built-in
+        dictionary.
 
-config MQJS_SKK_JISYO_ML
-    bool "ML — 48,750 headings (1.86 MB)"
+config MQJS_SKK_DICT_ML
+    bool "ML — 48,750 headings (1.86 MB), 4,349 okuri-ari"
     help
-        The default. 4,349 okuri-ari entries against M's 1,412, which is
-        the number that decides whether conjugated verbs and adjectives
-        convert — i.e. whether continuous Japanese writing works at all.
+        Where continuous Japanese writing starts to work, and the default
+        for the partition. Built in it does link — measured 6,191,264 B
+        against a 6 MB `factory` — but with 2% left, which the next
+        feature spends.
 
-config MQJS_SKK_JISYO_L
-    bool "L — 175,790 headings (8.07 MB)"
+config MQJS_SKK_DICT_L
+    bool "L — 175,790 headings (8.07 MB), 15,996 okuri-ari"
+    depends on !MQJS_SKK_DICT_AT_BUILTIN
     help
-        Everything. Fits the 8.5 MB partition. Two costs: `idf.py flash`
-        writes 8 MB (~34 s), and skk.open() spends 826 ms verifying the
-        CRC once per app rather than 197 ms. Conversion speed is
-        identical — the index is a sampled tree, so it is 6 cache lines
-        either way.
+        Everything. Not offered for a built-in dictionary because it does
+        not fit the 6 MB app partition at all. In the partition it costs
+        ~34 s per `idf.py flash` and makes skk.open() 826 ms instead of
+        197 ms — the CRC pass, nothing else. Conversion stays at 6 cache
+        lines per lookup because the index is a sampled tree.
 
 endchoice
 
 config MQJS_SKK_DICT_SOURCE_DIR
     string "Directory holding SKK-JISYO.{S,M,ML,L}"
     default ""
+    depends on !MQJS_SKK_DICT_AT_NONE
     help
-        Absolute path, or relative to the project root. Empty means "do
-        not regenerate": the build uses components/skk_core/skk_dict.bin
-        as it is, whichever dictionary that happens to be, and warns if
-        it is missing. That is the default because the source
+        Absolute, or relative to the project root. Set it and the build
+        prepares the image with tools/skk_prep.py, which transcodes,
+        RE-SORTS into UTF-8 byte order and verifies every entry before
+        writing anything (the EUC-JP sort trap, §6.1).
+
+        Empty means "do not regenerate": the prepared .bin in
+        components/skk_core/ is used exactly as it is, and the build
+        prints how many headings it actually holds rather than which one
+        was selected here. That is the default because the source
         dictionaries are large, carry their own licence terms and are
-        gitignored.
+        gitignored. With neither a source nor a .bin the build says so
+        and still succeeds — a dictionary must not be what stops a fresh
+        clone from flashing.
 
 config MQJS_SKK_DICT_STRIP_ANNOTATIONS
     bool "Strip ';annotation' from candidates"
     default n
-    depends on !MQJS_SKK_DICT_NONE
+    depends on !MQJS_SKK_DICT_AT_NONE
     help
         Drops the explanatory note some entries carry after ';'. Saves
-        538 KB on L and almost nothing on M, and the annotations are not
-        displayed in v1 anyway. Only has an effect when the image is
-        regenerated (MQJS_SKK_DICT_SOURCE_DIR is set).
+        538 KB on L, almost nothing on M, and v1 does not display them
+        anyway. Only acts when the image is regenerated.
 
 endmenu

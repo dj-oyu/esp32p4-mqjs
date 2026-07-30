@@ -3,44 +3,52 @@
 // @icon 
 // @desc SKK 日本語入力の変換精度と性能を実測する簡易入力ツール。
 // @perm ui
-/* Tab5 SKK 入力テストツール (docs/skk-ime-design.md の S5 受け皿)。
+/* Tab5 SKK 入力テストツール (docs/keyboard-ime-unification.md I4)。
  *
  * 目的は2つある。ひとつは「変換が当たるか」を人間が目で確かめること、
  * もうひとつは「打鍵と変換がいくら食うか」を遠隔で採ること。前者が画面、
  * 後者が MQTT の proberep で、どちらもファイルには落とさない — 保存機能は
  * 意図的に持たない (メモ帳ではなく計測台なので、電源を切れば消えてよい)。
  *
- * ⚠️ 前提: いま実機の ui.cells に日本語は出ない。端末フォント
- * font_term_mono の かな/カナ/漢字 は 0 グリフで (実測 2026-07-29)、
- * ▽ (U+25BD) も ▼ (U+25BC) も無い。しかも blit_glyph() はグリフ記述子の
- * 取得に失敗すると豆腐ではなく「何も描かずに return」する = 空白セルに
- * なるので、壊れていることが画面から分からない。設計の S3 (cells の
- * 全角2セル対応) と S4 (フォント再生成) が入るまでこれは変わらない。
+ * I4: 日本語入力はプラットフォームの持ち物。このアプリがするのは ui.ime(1)
+ * の opt-in と、カーソルが動いたときの ui.caret(x,y,h) だけで、「あ」の
+ * トグルも preedit も候補もモード表示も C が持ち、確定した日本語は
+ * ui.onKey に**普通の文字列として**届く (ssh_vt.js と同じ形)。
  *
- * そこでこのツールは桁と描画を分けてある。
+ * ここには以前 skk.* (エンジンを直接叩くハンドル API) の私設セッションが
+ * あり、「エンジンの試験台だから」という理由で残していた。それが表示の嘘を
+ * 1つ作っていた: 制御バーの「あ」キーの面はプラットフォームのセッションを
+ * 見て A/あ/ア を出すので、このアプリで日本語を打っている間ずっと
+ * **「A」= 英数** と主張していた (実機報告 2026-07-30)。面の側に「どちらとも
+ * 言えない」4つ目の状態を足すより、例外の側を無くす方が正しい。
+ * この移行で skk.* は最後の利用者を失い、**バインディングごと削除された**
+ * (2026-07-30)。もう `typeof skk === "undefined"` で、戻る道は無い。
+ *
+ * 計測も一緒に移った。私設セッションで測る µs は、移行後は**誰も通らない道**
+ * の値になる — 実際の打鍵は mqjs_post_key → コマンドキュー → 所有タスク →
+ * ime_feed → skk_key と流れ、キューの待ちも学習の鍵も私設セッションには
+ * 無い。いまはその経路そのものを C 側が測っていて、ui.imeStats() が
+ * エンジンのカウンタ・変換の µs・**キューで待った時間 (hop)** を返す。
+ * hop はこの構造にしか無い数字で、「打鍵が重いか」の答えはたいていそこに居る。
+ *
+ * 桁と描画:
  *   - 桁の計算は必ず ui.cells のモデル (ui.cellWidth + CONT セル) で行う。
- *     S3/S4 が来た日にそのまま正しく描けるのが目的で、いま画面に何が
- *     見えているかとは独立に検証できる。
- *   - 実際の描画は行単位で選ぶ: ASCII だけの行は ui.cells、日本語を含む
- *     行は ui.text (font_noto_jp_20_4 = かな87 + カナ90 + 漢字3,517)。
- * F3 で ui.cells 固定に切り替えられる。そのモードで日本語が空白になるのが
- * 現状の正しい挙動で、S3/S4 の進捗はここで見る。
- *
- * ⚠️ IME トグルは設計 §9.3 の2経路がどちらも現状のファームで届かない。
- *   - Ctrl+Space: kbd_core.c が `if (uc == ' ') return 0;` で明示的に捨てる
- *     (NUL が "\x00name" トークンの先頭と衝突するため)。キーイベント自体が
- *     生成されないので、アプリ側でどう書いても拾えない。
- *   - "\x00ime" トークン: key_token() にまだ無い (C 側の追加が要る)。
- * そこで届く経路に割り当ててある。"\x00ime" も受けるので、C 側にトークンが
- * 入った日にこのファイルは 1 行も変えずに設計どおりになる。
+ *   - 描画は行単位で選ぶ: ASCII だけの行は ui.cells、日本語を含む行は
+ *     ui.text (font_noto_jp = かな + 漢字3,517)。F3 で ui.cells 固定。
+ * ⚠️ 2026-07-29 の e36ea53 以降、端末フォント font_term_mono にも かな と
+ * JIS 第1水準 (2,965 字) が入り、ui.cells は全角を2セルで描く。つまり F3 は
+ * 「日本語が空白になる」モードではなく **2つの描画経路の比較** になった。
+ * 第2水準と記号の一部は今も端末フォントに無く、blit_glyph は記述子を引け
+ * ないと豆腐ではなく無描画 = 空白セルになるので、そこは F3 で見つかる。
  *
  * キー割り当て:
- *   F1 / Ctrl+\ / Ctrl+O / 画面左上タップ … IME オン・オフ
- *   F2 / 画面右上タップ                   … proberep をいま送る
- *   F3 … ui.cells 固定トグル (S3/S4 の進捗確認)
+ *   「あ」(制御バー) / ドックの IME キー … 日本語入力オン・オフ (C が処理)
+ *   F2 / 画面右上タップ … proberep をいま送る
+ *   F3 … ui.cells 固定トグル (2経路の比較)
  *   F4 … 操作ヘルプ (SKK は大文字で変換を始める — 知らないと詰む)
  *   F5 … 本文クリア
  *   Space=変換 / x=前候補 / Enter=確定 / C-g=取消 は skk_core が解釈する
+ *   (これらの打鍵はアプリまで降りてこない。ime_feed が先に食う)
  *
  * プローブ: <BASE>/proberep へ 30 秒ごと + オンデマンド + 停止時。
  *   push   : uv run --with cryptography python tools/mqjs_push.py \
@@ -48,13 +56,17 @@
  *   受信   : mosquitto_sub -h 192.168.1.2 -t 'esp32p4-mqjs/task/u7q3x9f2/#' -v
  *   終わったら tools/dev_idle.js を push し直して dev スロットを戻すこと。
  *
+ * ⚠️ 日本語入力は**実機でしか試せない**。IME のフックは mqjs_post_key() の
+ * #ifdef ESP_PLATFORM の中にあり、run_pc では ui.onKey がそもそも発火しない。
+ * エンジンとセッション方針は tools/tests/ime_diff.sh と
+ * tools/tests/test_ime_core.c がホストで見ている。
+ *
  * 検証フラグ (コメントは 1 行に収める — sed で書き換えて push するため):
  *   SELFTEST=true … PC (run_pc) で台本キーを流して結果を print する */
 "use strict";
 sys.setAppName("skk_test");
 
-var SELFTEST = false; /* PC: 台本キーを流して変換結果と統計を print する */
-var DICT = "";        /* skk.open() に渡す辞書パス。"" = プラットフォーム既定 */
+var SELFTEST = false; /* PC: 台本キーを流して描画モデルと統計を print する */
 
 var BASE = "esp32p4-mqjs/task/u7q3x9f2"; /* 既存 probe_*.js と同じ dev タスク配下 */
 var PUB_MS = 30000;   /* 定期 publish の間隔 */
@@ -65,44 +77,29 @@ var FG = 0xC9D1D9;
 var CURSOR = 0x4FC3F7;
 var BAR_BG = 0x1A222C;
 var BAR_FG = 0x8B98A5;
-var PRE_FG = 0xFFD479;   /* preedit (▽/▼ 付きの未確定文字列) */
-var CAND_FG = 0xC9D1D9;
-var SEL_BG = 0x2E6BD6;   /* 選択中の候補だけ別 run で反転 (設計 §9.2) */
-var SEL_FG = 0xFFFFFF;
-var ERR_FG = 0xE05A4E;
+var TITLE_FG = 0xFFD479;   /* ヘルプの見出し */
 
 /* ---- 計測 (要件: 遠隔からハードウェアリソース消費を確認できること) ----
    JS から取れる単調時計は performance.now() の 1 ms と sys.micros() の
-   1 µs の2つしかない。打鍵経路は設計 §4.1 で µs 規模なので ms では 0 と
-   しか読めず、ここは sys.micros() を使う。
+   1 µs の2つしかない。ここで測れるのは「アプリが 1 打鍵で使った時間」だけ
+   で、ms では 0 としか読めないので sys.micros() を使う。
    ⚠️ sys.micros() は絶対値なので、稼働 17.9 分 (2^30 µs) を超えると
    mquickjs の short int を外れて呼ぶたびにアリーナを確保する。差分を取る
-   ぶんには値は正しいが、長時間稼働では計測自体が僅かに重くなる。 */
+   ぶんには値は正しいが、長時間稼働では計測自体が僅かに重くなる。
+
+   エンジンと打鍵経路そのものの µs はもうここでは測らない (測れない — 変換
+   中の打鍵はアプリまで降りてこない)。C 側が出荷する経路を測っていて、
+   ui.imeStats() が返す。両者を突き合わせると「1 打鍵のうち JS が何割か」が
+   出るのは以前と同じ。 */
 var HAVE_US = (typeof sys.micros === "function");
-var HAVE_OVERLAY = (typeof ui.overlay === "function");
-var keyN = 0, keySum = 0, keyMin = 0, keyMax = 0;    /* 打鍵→再描画 (µs) */
-var convN = 0, convSum = 0, convMin = 0, convMax = 0; /* Space→候補 (µs) */
-var convTry = 0, convHit = 0;   /* 変換を試みた / 候補が出た */
-var misses = [];                /* 候補が無かった見出しの実物 (数件) */
-var recent = [];                /* 直近の 見出し→確定 の対 (精度の目視用) */
+var HAVE_IMESTATS = (typeof ui.imeStats === "function");
+var keyN = 0, keySum = 0, keyMin = 0, keyMax = 0;  /* アプリに届いた打鍵 (µs) */
 var pubs = 0;
 var linkUp = false;
 var heapBefore = null, heapAfter = null;
 var heapNow = [0, 0, 0];   /* sys.heap() のキャッシュ (statusDraw の項を参照) */
-var dictLoadUs = 0, dictBytes = 0, idxBytes = 0, entries = 0;
-
-/* ---- IME ハンドル ----
-   skk が無いファーム / 辞書が入っていない実機 / run_pc のどれでも
-   「構文エラーなくロードできる」ことが要件なので、未定義参照は typeof で
-   避け、open は必ず try で囲む (未定義グローバルの直接参照は ReferenceError、
-   typeof だけが安全)。 */
-var ime = 0;
-var imeReady = false;
-var imeOn = false;
-var imeErr = "";
-var cands = [];
-var candSel = 0;
-var lastReading = "";  /* 直近の変換試行の見出し (確定と対にして記録する) */
+var imeOk = false;         /* ui.ime(1) が通ったか (= 辞書のあるファーム) */
+var core = null;           /* ui.imeStats() のキャッシュ。1 秒ティックで更新 */
 
 /* ---- 入力バッファ ----
    1 要素 = 1 文字 (サロゲートペアは結合済み)。bufW は同じ添字のセル幅で、
@@ -114,11 +111,14 @@ var cur = 0;
 var BUF_MAX = 1200;   /* 計測台なので上限は小さくてよい。溢れたら頭を捨てる */
 
 /* ---- 画面メトリクス ----
-   行割り: 0 = ステータス、1..TROWS = 本文、下から2行目 = IME バー、
-   最下行 = ヒント。桁数と行数は必ず ui.size()/ui.cellSize() から導く。 */
+   行割り: 0 = ステータス、1..TROWS = 本文、最下行 = ヒント。
+   桁数と行数は必ず ui.size()/ui.cellSize() から導く。
+   以前あった「IME バー」の行は消えた: かな/カナ/英数 は制御バーの「あ」
+   キーの面が出し、変換中は C のフロート窓が出す (設計 §6)。アプリの画面に
+   モード表示を置くと、同じ状態を語る場所が2つになって必ずずれる。 */
 var W = 720, H = 1192, KB_H = 480, CW = 9, LH = 24;
-var COLS = 80, GRID_ROWS = 29, TROWS = 26, WRAP = 72;
-var BODY_TOP = 1, IME_ROW = 27, HINT_ROW = 28;
+var COLS = 80, GRID_ROWS = 29, TROWS = 27, WRAP = 72;
+var BODY_TOP = 1, HINT_ROW = 28;
 var TXT_A = 10, TXT_F = 20;   /* ui.text の実測幅: 半角 / 全角 */
 var BLANK = "";
 var CELLS_ONLY = false;       /* F3: ui.cells だけで描く (S3/S4 の進捗確認) */
@@ -182,26 +182,6 @@ function cpSplit(s) {
     return out;
 }
 
-/* 表示用の見出し。preedit は "▽かんじ" の形で来るのでマーカーを外す。 */
-function stripMark(s) {
-    if (!s)
-        return "";
-    var c = s.charCodeAt(0);
-    if (c === 0x25BD || c === 0x25BC)
-        return s.slice(1);
-    return s;
-}
-
-function modeName(m) {
-    if (m === skk.ASCII) return "ascii";
-    if (m === skk.KANA) return "kana";
-    if (m === skk.KATA) return "kata";
-    if (m === skk.MIDASHI) return "midashi";
-    if (m === skk.OKURI) return "okuri";
-    if (m === skk.SELECT) return "select";
-    return "?";
-}
-
 /* ---- レイアウト ---- */
 /* 負数 = 表示を変えない純クエリ。0 は「キーボードが無い」ではなく
    「キャンバス未生成でまだ答えられない」なので、そのまま信じて行を
@@ -223,9 +203,8 @@ function measure() {
     if (GRID_ROWS < 4)
         GRID_ROWS = 4;
     BODY_TOP = 1;
-    IME_ROW = GRID_ROWS - 2;
     HINT_ROW = GRID_ROWS - 1;
-    TROWS = GRID_ROWS - 3;
+    TROWS = GRID_ROWS - 2;
     if (TROWS < 1)
         TROWS = 1;
     COLS = (W / CW) | 0;
@@ -326,6 +305,22 @@ function cursorXY() {
     return [cx, curRow - top];
 }
 
+/* 変換中のフロートを出す位置。C が唯一知り得ない値なので JS が渡す
+   (フロートは「目線を動かさない」ために在るので、固定位置に出したら本末
+   転倒)。動いたときだけ投げる — 点滅タイマーが毎秒2回 bodyDraw を呼ぶので、
+   無条件に呼ぶと何も起きていないのに ui コマンドが積まれ続ける。 */
+var caretX = -1, caretY = -1;
+function reportCaret(xy) {
+    if (typeof ui.caret !== "function")
+        return;
+    var y = (BODY_TOP + xy[1]) * LH;
+    if (xy[0] === caretX && y === caretY)
+        return;
+    caretX = xy[0];
+    caretY = y;
+    ui.caret(caretX, caretY, LH);
+}
+
 function bodyDraw(force) {
     /* 前回カーソルが覆った行を汚す。この後の描画で下の本文が戻る。 */
     for (var fi = 0; fi < dirtyRows.length; fi++)
@@ -371,6 +366,7 @@ function bodyDraw(force) {
         if (blinkOn)
             ui.rect(xy[0], (BODY_TOP + xy[1]) * LH + 2, 2, LH - 4, CURSOR);
         dirtyRows.push(xy[1]);
+        reportCaret(xy);   /* 描き終えた = カーソルが本当に居る場所が確定 */
     }
 }
 
@@ -379,76 +375,33 @@ function bodyDraw(force) {
    ui_tab5_lv_mem_free() → lvgl_port_lock() + lv_mem_monitor() で、LVGL の
    ロックを取って tlsf プールを歩く。打鍵ごとに呼ぶと描画タスクの 1 フレーム
    分ブロックしうるうえ、いま測っている打鍵レイテンシそのものを汚す。
-   1 秒のティックで採ったキャッシュを表示する。 */
+   1 秒のティックで採ったキャッシュを表示する。
+   モード (かな/カナ/英数) はここに出さない。出す場所は制御バーの「あ」
+   キーの面で、C がそれを持っている (§6.2)。
+   エンジン側の数字も同じキャッシュから出す — ui.imeStats() は所有タスクへの
+   往復なので、打鍵のたびに呼ぶものではない。 */
 function statusDraw() {
     var h = heapNow;
-    var m = imeReady ? (imeOn ? modeName(skk.mode(ime)) : "OFF") : "n/a";
-    var s = "SKK:" + m +
-        " buf:" + buf.length +
+    var s = "buf:" + buf.length +
         " ram:" + kbytes(h[0]) + "/" + kbytes(h[1]) + "/" + kbytes(h[2]) +
-        " cv:" + convHit + "/" + convTry +
+        " lk:" + (core ? core.lookups : 0) +
+        " cm:" + (core ? core.commits : 0) +
+        " c:" + (core && core.convCalls
+                    ? ((core.convUs / core.convCalls) | 0) : 0) + "u" +
+        " q:" + (core && core.hopCalls
+                    ? ((core.hopUs / core.hopCalls) | 0) : 0) + "u" +
         " k:" + (keyN ? ((keySum / keyN) | 0) : 0) + "u" +
-        " c:" + (convN ? ((convSum / convN) | 0) : 0) + "u" +
         " up:" + upSec() + " pub:" + pubs;
     ui.cells(0, 0, pad(s, COLS), BAR_FG, BAR_BG);
 }
 
+/* ヒント行は ASCII だけで組む。全角を混ぜるなら CONT セルを自分で入れる
+   必要があり (ui.cells は 1 コードポイント = 1 セル)、忘れると C 側が
+   「CONT filler を落とした」と警告しながらグリフを切る。 */
 function hintDraw() {
-    var s = "F1/C-\\ IME  F2 send  F3 cells-only  F4 clear  " +
-        "tap: TL=IME TR=send";
+    var s = "IME: kana key   F2 send  F3 cells-only  F4 help  F5 clear  " +
+        "tap: TR=send";
     ui.cells(0, HINT_ROW, pad(s, COLS), BAR_FG, BAR_BG);
-}
-
-/* 下部の状態行。モードと操作ヒントだけ。preedit と候補はカーソル位置の
-   フロート窓へ移した (imeFloatDraw)。
-   ▽▼ もかなも端末フォントに無いので、この行は常に ui.text で描く
-   (CELLS_ONLY でも同じ — cells にすると行ごと空白になって何も見えない)。 */
-function imeDraw() {
-    var y = IME_ROW * LH;
-    ui.rect(0, y, W, LH, BAR_BG);
-    if (!imeReady) {
-        ui.text(4, y + 1, imeErr ? imeErr : "skk なし", ERR_FG);
-        return;
-    }
-    if (!imeOn) {
-        ui.text(4, y + 1, "IME OFF  —  F1 / Ctrl+\\ / 左上タップ", BAR_FG);
-        return;
-    }
-    ui.text(4, y + 1, "かな入力中  —  大文字で変換開始 (F4 で操作ヘルプ)",
-            BAR_FG);
-}
-
-/* 変換中のフロート窓。C 側の ui.overlay に丸投げする (docs/ui-overlay-plan.md)。
-   アプリが渡すのは「カーソルがどこか」だけで、クランプも上下反転も
-   キーボード回避も、覆った下地の復元も向こうの仕事。
-   以前はここで ui.rect/ui.text を使って自前で描き、覆った行を dirtyRows に
-   記帳していた — 約60行あったうえ、同じ記帳をカーソルで忘れて残像バグを
-   出した。オーバーレイは LVGL が合成するので、その種のバグが起こらない。
-   おまけに端末フォントではなく UI フォント (漢字3,517字) で描かれるので、
-   cells の全角対応を待たずに今日から読める。 */
-function imeFloatDraw() {
-    if (!HAVE_OVERLAY)
-        return;
-    if (!imeReady || !imeOn || helpOn) {
-        ui.overlay(0, null);
-        return;
-    }
-    var pre = skk.preedit(ime);
-    if (!pre && !cands.length) {
-        ui.overlay(0, null);
-        return;
-    }
-    var xy = cursorXY();
-    if (xy[1] < 0 || xy[1] >= TROWS) {
-        ui.overlay(0, null);
-        return;
-    }
-    ui.overlay(0, {
-        x: xy[0], y: (BODY_TOP + xy[1]) * LH, h: LH,
-        lines: pre ? [pre] : [],
-        items: cands,
-        sel: candSel
-    });
 }
 
 /* F4 の操作ヘルプ。SKK は「大文字で変換を始める」を知らないと一文字も
@@ -475,14 +428,15 @@ var HELP = [
     "  ※ ドックの大文字は Aa を 1 回タップ (次の 1 キーだけ)",
     "     ダブルタップでロック",
     "",
-    "  F1 IME on/off   F2 計測送信   F3 cells 固定   F5 本文クリア",
+    "  日本語入力の on/off は制御バーの「あ」キー (面が今のモード)",
+    "  F2 計測送信   F3 cells 固定   F5 本文クリア",
 ];
 
 function helpDraw() {
     ui.rect(0, BODY_TOP * LH, W, TROWS * LH, BAR_BG);
     for (var i = 0; i < HELP.length && i < TROWS; i++)
         ui.text(8, (BODY_TOP + i) * LH + 1, HELP[i],
-                i === 0 ? PRE_FG : FG);
+                i === 0 ? TITLE_FG : FG);
 }
 
 function redrawAll() {
@@ -490,14 +444,11 @@ function redrawAll() {
     drawn = [];
     dirtyRows = [];
     relayoutText();
-    if (helpOn) {
+    if (helpOn)
         helpDraw();
-    } else {
+    else
         bodyDraw(true);
-        imeFloatDraw();
-    }
     statusDraw();
-    imeDraw();
     hintDraw();
 }
 
@@ -550,159 +501,40 @@ function bufText() {
     return buf.join("");
 }
 
-/* ---- IME ---- */
-function openIme() {
-    if (typeof skk === "undefined") {
-        imeErr = "skk バインディング無し (ROM 未再生成)";
-        return;
-    }
+/* ---- IME ----
+   opt-in はこの 1 行きり。あとは C がやる: 「あ」のトグルも、preedit と候補の
+   フロートも、モード表示 (制御バーの「あ」キーの面) も、学習の書き戻しも。
+   確定した日本語は ui.onKey に普通の文字列として届く。
+   ヒープを前後で撮るのは、辞書イメージと索引が実際に食った量が sys.heap()
+   の差でしか測れないため (largest contiguous は JS に出ていない)。
+   ⚠️ 差が 0 になることがある。プラットフォームのセッションは device で 1 つ
+   なので、先に ssh_vt や "ja" の field が arm 済みなら辞書はもう載っていて、
+   このアプリは 1 バイトも払わない。0 は「辞書がタダ」ではない。 */
+function armIme() {
     heapBefore = sys.heap();
-    var t0 = nowUs();
-    try {
-        ime = skk.open(DICT);
-    } catch (eOpen) {
-        imeErr = "skk.open 失敗: " + eOpen;
-        heapAfter = heapBefore;
-        heapNow = heapBefore;
-        return;
-    }
-    dictLoadUs = (nowUs() - t0) | 0;
+    imeOk = ui.ime(1);   /* false = 辞書の無いファーム */
     heapAfter = sys.heap();
     heapNow = heapAfter;
-    imeReady = true;
-    imeOn = true;
-    skk.enable(ime, true);
-    var st = coreStats();
-    if (st) {
-        dictBytes = st.dictBytes;
-        /* 索引のバイト数。image は「本文 + packed key 8B + オフセット 4B」で
-           見出し 1 件あたり 12 B なので、見出し数から逆算できる (設計 §6.4:
-           梅で 8,346 件 = 約 100 KB)。C 側が内訳を返さないのでここで組む。 */
-        idxBytes = (st.nasi + st.ari) * 12;
-        entries = st.nasi + st.ari;
-    }
+    core = imeStats();
 }
 
-function toggleIme() {
-    if (!imeReady)
-        return;
-    imeOn = !imeOn;
-    skk.enable(ime, imeOn);
-    if (imeOn)
-        skk.setMode(ime, skk.KANA);   /* C-j が届かないので明示的に戻す */
-    else
-        skk.reset(ime);
-    cands = [];
-    candSel = 0;
-    sys.notify(imeOn ? "IME オン (かな)  大文字で変換開始 / F4 ヘルプ"
-                     : "IME オフ");
-    bodyDraw(false);
-    imeFloatDraw();
-    imeDraw();
-    statusDraw();
-}
-
-/* skk.stats() は audio.stats() と同じ「JSON 文字列 1 本」形。C 側で µs を
-   積算しているので、JS で performance.now() を挟むより正確 (mquickjs の
-   ディスパッチが混ざらない)。 */
-function coreStats() {
-    if (!imeReady)
+/* 出荷する打鍵経路の実測。私設セッションを開いて測っていた頃の数字は、
+   移行後は誰も通らない道の値になるので C 側へ移した (ファイル冒頭)。 */
+function imeStats() {
+    if (!HAVE_IMESTATS)
         return null;
-    try {
-        return JSON.parse(skk.stats(ime));
-    } catch (eStat) {
-        return null;
-    }
-}
-
-/* proberep 1 通を esp-mqtt の既定バッファ (1024 B) に収めるため、記録する
-   文字列は短く切る。日本語は JSON で 1 文字 3 バイトに膨らむ。 */
-function clip(s, n) {
-    return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
-function noteMiss(reading) {
-    if (!reading)
-        return;
-    for (var i = 0; i < misses.length; i++)
-        if (misses[i] === reading)
-            return;
-    if (misses.length < 6)
-        misses.push(clip(reading, 12));
-}
-
-function noteRecent(reading, out) {
-    if (!reading || !out)
-        return;
-    recent.push({ r: clip(reading, 12), c: clip(out, 12) });
-    while (recent.length > 4)
-        recent.shift();
-}
-
-/* IME へ 1 キー渡す。戻り値 = ステータスビットマスク (0 = 素通し)。
-   辞書を引いた打鍵とそうでない打鍵は予算が3桁違う (設計 §4.1: 打鍵 55 ms /
-   変換は実質数十 ms) ので、µs は別々のバケツに積む。
-
-   「この打鍵は変換か」の判定が地味に難しい。Space の明示変換だけを数えると
-   送りありの「送り仮名が確定した瞬間の自動変換」を丸ごと取りこぼし、C 側の
-   lookups と件数が合わなくなる (実測: 台本で lookups 4 に対し 3 しか数え
-   られなかった)。なので ▽/▼ を組んでいる最中の打鍵で、Space か、候補が
-   出たか、▼ に入ったかのどれかが起きたものを変換として数える。
-   候補ゼロの空振りも変換に数える — 数十 µs 使うのに CANDS が立たないので、
-   落とすと「引けなかった見出し」が統計から消える。 */
-function feedIme(k) {
-    var mode = skk.mode(ime);
-    var composing = (mode === skk.MIDASHI || mode === skk.OKURI);
-    /* 見出しを控えるのは「この打鍵が変換を起こしうる」ときだけ。
-       組んでいる最中の全打鍵で preedit を引くと、読みを打つ間ずっと
-       1 打鍵あたり JS 文字列を 1 本作ることになる — 設計 §4.2 が
-       bitmask で消したはずのコストがアプリ側に戻ってしまう。
-       変換が起きうるのは (a) Space の明示変換、(b) 大文字で送り仮名が
-       始まる瞬間、(c) OKURI 中の打鍵で送り仮名の頭が確定する瞬間、の
-       3 つだけ。読みを打っている間の小文字は 1 本も作らない。
-       変換後は preedit が候補 (▼漢字) に変わって読みが読めなくなるので、
-       これは呼ぶ前に控えておくしかない。 */
-    var mayConvert = composing &&
-                     (k === " " || mode === skk.OKURI ||
-                      (k.length === 1 && k >= "A" && k <= "Z"));
-    var reading = mayConvert ? stripMark(skk.preedit(ime)) : "";
-    var t0 = nowUs();
-    var st = skk.key(ime, k);
-    var dt = (nowUs() - t0) | 0;
-    if (composing &&
-        ((st & skk.CANDS) || k === " " || skk.mode(ime) === skk.SELECT)) {
-        lastReading = reading;
-        convTry++;
-        if (st & skk.CANDS)
-            convHit++;
-        else
-            noteMiss(reading);
-        convN++;
-        convSum += dt;
-        if (convN === 1 || dt < convMin)
-            convMin = dt;
-        if (dt > convMax)
-            convMax = dt;
-    }
-    return st;
+    return ui.imeStats();   /* null = 一度も arm されていない */
 }
 
 /* ---- キー処理 ---- */
 function handleKey(k) {
     var code = k.charCodeAt(0);
 
-    /* レイアウト変更は IME より先。セッションもバッファも関係ない */
+    /* レイアウト変更はバッファに関係なく先に処理する */
     if (code === 0) {
         var name = k.slice(1);
         if (name === "rotate") {
             relayout();
-            return;
-        }
-        /* アプリ自身のホットキーは IME より先に取る。"\x00ime" は設計 §9.3 が
-           要求しているトークンだが C 側にまだ無いので、届く F1 を主経路に
-           する (制御バーの Fn レイヤ)。 */
-        if (name === "ime" || name === "f1") {
-            toggleIme();
             return;
         }
         if (name === "f2") {
@@ -712,8 +544,8 @@ function handleKey(k) {
         }
         if (name === "f3") {
             CELLS_ONLY = !CELLS_ONLY;
-            sys.notify(CELLS_ONLY ? "cells 固定 (日本語は空白が正)"
-                                  : "自動 (日本語は ui.text)");
+            sys.notify(CELLS_ONLY ? "cells 固定 (端末フォント。第2水準は空白)"
+                                  : "自動 (日本語の行は ui.text)");
             redrawAll();
             return;
         }
@@ -729,57 +561,10 @@ function handleKey(k) {
         }
     }
 
-    /* ドックの Ctrl+\ (= 0x1C) を IME トグルに割り当てる。設計 §9.3 は
-       Ctrl+Space と書いているが、kbd_core は Ctrl+Space を明示的に捨てる
-       (NUL が "\x00name" トークンの先頭と衝突するため) ので届かない。
-       Ctrl+\ は emacs の toggle-input-method と同じで US 配列にもある。 */
-    if (code === 0x1C || code === 0x0F) {   /* Ctrl+\ / Ctrl+O */
-        toggleIme();
-        return;
-    }
-
-    /* IME が消費したらここで終わり (設計 §8 の使い方そのまま)。
-       imeOn が false なら skk.key() すら呼ばない = C 関数呼び出し 1 回ぶんの
-       オーバーヘッドも出さない (§4.2)。 */
-    if (imeOn && imeReady) {
-        var st = feedIme(k);
-        if (st !== 0) {
-            if (st & skk.COMMIT) {
-                var out = skk.commit(ime);
-                if (out) {
-                    insertText(out);
-                    noteRecent(lastReading, out);
-                    lastReading = "";
-                    /* 本文が変わるのは確定したときだけ。ここを IME が
-                       消費した全打鍵で回すと、preedit を 1 文字動かす
-                       たびに最大 BUF_MAX 要素の折り返し計算をやり直す
-                       ことになる (本文は 1 文字も変わっていないのに)。 */
-                    relayoutText();
-                }
-            }
-            /* 候補配列を作り直すのは CANDS が立った 1 回だけ (設計 §4.4)。
-               ▼ の中を Space/x で移動する連打は SEL しか立たないので、
-               整数を 1 つ読むだけで済む — ここで candidates() を毎回
-               呼ぶと ▼ 連打のたびに文字列を作り直すことになる。 */
-            if (st & skk.CANDS) {
-                cands = skk.candidates(ime);
-                candSel = skk.sel(ime);
-            } else if (st & skk.SEL) {
-                candSel = skk.sel(ime);
-            } else if (skk.mode(ime) !== skk.SELECT) {
-                cands = [];    /* ▼ を抜けた: 候補バーを畳む */
-                candSel = 0;
-            }
-            blinkOn = true;   /* 打鍵中は点灯のまま */
-            bodyDraw(false);
-            imeFloatDraw();
-            imeDraw();
-            statusDraw();
-            return;
-        }
-    }
-
-    /* ここから下は IME が触らなかったキー */
+    /* ここへ来る打鍵は既に IME を通り抜けたもの — 素通しのキーか、確定した
+       日本語の文字列。変換中に飲まれる打鍵 (読みの小文字、Space、Enter、
+       ▽ が開いている間の矢印と ESC) はそもそも届かないし、「あ」の
+       "\x00ime" も C が食う。順序を間違えようがないのがこの層の目的。 */
     if (code === 0) {
         var tok = k.slice(1);
         if (tok === "left") {
@@ -816,7 +601,6 @@ function handleKey(k) {
     relayoutText();
     blinkOn = true;   /* 打鍵中は点灯のまま */
     bodyDraw(false);
-    imeFloatDraw();
     statusDraw();
 }
 
@@ -879,35 +663,32 @@ function publishNow(phase) {
         pub: pubs,
         heap: { iram: h[0], psram: h[1], lvgl: h[2] },
         imeHeap: { iram: dInt, psram: dPs, lvgl: dLv },
-        dict: { loadUs: dictLoadUs, bytes: dictBytes, idx: idxBytes,
-                keys: entries, ok: imeReady ? 1 : 0 },
+        ime: imeOk ? 1 : 0,
+        /* アプリ側の打鍵レイテンシ。届くのは IME を通り抜けた打鍵だけなので、
+           変換中の打鍵はここに入らない (それは core の conv が持っている)。 */
         key: { n: keyN, minUs: keyMin, avgUs: avg(keySum, keyN), maxUs: keyMax },
-        conv: { n: convN, minUs: convMin, avgUs: avg(convSum, convN),
-                maxUs: convMax, tries: convTry, hits: convHit },
         buf: buf.length,
         cols: WRAP,
         rows: TROWS
     };
     var sent = pub(main);
-    /* C 側の µs とプローブ数は別メッセージ。JS 側の計測と突き合わせると
-       「JS の何割がエンジンか」が出る。 */
-    var core = coreStats();
+    /* 出荷する打鍵経路の実測は別メッセージ。JS 側の key と突き合わせると
+       「1 打鍵のうち JS が何割か」が出る。JSON 文字列ではなくオブジェクトで
+       返ってくるので、そのまま入れ子にして流せる。 */
+    core = imeStats();
     if (core)
         sent += pub({ phase: phase + "-core", core: core });
-    /* 変換精度の実体: 外した見出しと、直近の 見出し→確定 の対 */
-    if (misses.length || recent.length)
-        sent += pub({ phase: phase + "-acc", miss: misses, recent: recent });
     return sent;
 }
 
 /* ---- 起動 ---- */
 measure();
-openIme();
+armIme();
 
 var HAVE_SCREEN = ui.size()[0] !== 0;
 if (HAVE_SCREEN) {
     ui.clear(BG);
-    ui.keyboard(2);   /* キーボード + 制御バー (Fn レイヤに F1-F4 がある) */
+    ui.keyboard(2);   /* キーボード + 制御バー (「あ」と Fn レイヤの F2-F5) */
     redrawAll();
 }
 
@@ -917,11 +698,10 @@ ui.onTouch(function (x, y, kind) {
     if (kind !== 0)
         return;
     if (y < LH) {
-        /* ステータス行を操作面に使う: 左 1/3 = IME トグル、右 1/3 = 送信。
-           ドックが無いときに F1/F2 の代わりになる唯一の経路。 */
-        if (x < W / 3)
-            toggleIme();
-        else if (x > W * 2 / 3) {
+        /* ステータス行の右 1/3 = 計測送信。ドックが無いときに F2 の代わりに
+           なる唯一の経路。左 1/3 にあった IME トグルは無くなった — 切り替え
+           るものは制御バーの「あ」キーで、そこが状態表示も兼ねている。 */
+        if (x > W * 2 / 3) {
             publishNow("ondemand");
             sys.notify(linkUp ? "proberep 送信" : "MQTT 未接続");
             statusDraw();
@@ -939,6 +719,7 @@ ui.onTouch(function (x, y, kind) {
    ついでにステータス行の稼働時間とヒープもここで更新する。 */
 setInterval(function () {
     heapNow = sys.heap();   /* 打鍵経路から追い出した唯一の重いクエリ */
+    core = imeStats();      /* 同じ理由でここ: IME 所有タスクへの往復 */
     var s = ui.size();
     if (s[0] !== W || s[1] !== H || currentKb() !== KB_H) {
         relayout();
@@ -953,13 +734,12 @@ setInterval(function () { publishNow("tick"); }, PUB_MS);
 /* カーソルの点滅。棒を消すには下の行を引き直すしかない (キャンバスに直接
    描いているので「棒だけ消す」と下の文字も削れる) ので、bodyDraw の差分
    描画に任せる — dirtyRows のおかげで引き直るのはカーソルのいた 1 行だけ。
-   ヘルプ表示中とフロートに覆われている間は動かさない。 */
+   ヘルプ表示中は動かさない。 */
 setInterval(function () {
     if (!HAVE_SCREEN || helpOn)
         return;
     blinkOn = !blinkOn;
     bodyDraw(false);
-    imeFloatDraw();
 }, BLINK_MS);
 
 net.onReady(function (token) {
@@ -984,9 +764,15 @@ sys.onForeground(function () {
 
 /* ---- run_pc 用のセルフテスト ----
    ui.onKey は PC では絶対に発火しないので、台本を直接ハンドラへ流す。
-   ここを通しておくと「block 内の function 宣言が巻き上がらない」以外の
-   ロジックバグは実機へ持って行く前に落ちる (キー経路そのものは PC でも
-   同じ関数を通る)。 */
+   ⚠️ ここに流せるのは**アプリまで降りてくる打鍵**だけになった。変換は
+   mqjs_post_key() の中 (#ifdef ESP_PLATFORM) で起きるので、run_pc に
+   "K","a","n","j","i"," " を流しても「かんじ」にはならず ASCII が 6 文字
+   入るだけ — 変換を模した台本を置くと、通っていない道を通ったつもりに
+   なる。エンジンとセッション方針はホストの ime_diff.sh と test_ime_core.c
+   が見ているので、ここで見るのは**このアプリが持っている部分** =
+   桁のモデル (CONT セル)、折り返し、カーソル、素通し経路。
+   確定した日本語は「普通の文字列」として届くので、そこは実物と同じ形で
+   流せる (下の insertText 経由の行)。 */
 function feedScript(a) {
     for (var i = 0; i < a.length; i++)
         onKeyTimed(a[i]);
@@ -994,23 +780,18 @@ function feedScript(a) {
 
 function selftest() {
     print("skk_test selftest ------------------------------------------");
-    print("ime      : " + (imeReady ? "ok" : "NG " + imeErr));
-    print("dict     : " + dictBytes + " B / idx " + idxBytes +
-          " B / " + entries + " keys / open " + dictLoadUs + " us");
+    print("ime      : " + (imeOk ? "armed" : "not armed (辞書なし?)"));
+    print("stats    : " + (core ? JSON.stringify(core) : "-"));
 
-    /* 変換: 送りなし・送りあり・カタカナ・引けない見出し。Enter は ▼ を
-       確定するので本文には改行が入らない (SKK としてこれが正しい)。 */
-    feedScript(["K", "a", "n", "j", "i", " ", "\n"]);
-    feedScript(["O", "k", "u", "R", "u", "\n"]);
-    feedScript(["N", "i", "h", "o", "n", "g", "o", " ", "\n"]);
-    feedScript(["q", "k", "a", "t", "a", "q"]);         /* カタカナモード */
-    feedScript(["Z", "z", "z", "z", "z", "z", " ", "\n"]); /* 引けない見出し */
-    print("conv buf : " + JSON.stringify(bufText()));
-
-    /* 素通し経路: IME を落として ASCII と改行と Backspace を通す。 */
-    feedScript(["\x00f1"]);
+    /* 素通し経路: ASCII と改行と Backspace。 */
     feedScript(["\n", "a", "b", "c", "!", "\b"]);
     print("ascii buf: " + JSON.stringify(bufText()));
+
+    /* 確定した日本語の受け口。実機ではこの形で ui.onKey に届く
+       (1 打鍵 = 1 文字列、複数コードポイントもあり得る)。 */
+    feedScript(["\x00f5"]);   /* clear */
+    feedScript(["漢字", "を", "書く"]);
+    print("commit   : " + JSON.stringify(bufText()) + " cur=" + cur);
 
     /* 桁詰めと折り返し: 全角だけを WRAP + 4 セルぶん流し込むと、
        CONT が正しければ ちょうど 2 行になり、1 行目の描画文字列は
@@ -1038,12 +819,6 @@ function selftest() {
 
     print("key us   : n=" + keyN + " min=" + keyMin +
           " avg=" + avg(keySum, keyN) + " max=" + keyMax);
-    print("conv us  : n=" + convN + " min=" + convMin +
-          " avg=" + avg(convSum, convN) + " max=" + convMax +
-          " try=" + convTry + " hit=" + convHit);
-    print("miss     : " + JSON.stringify(misses));
-    print("recent   : " + JSON.stringify(recent));
-    print("core     : " + (imeReady ? skk.stats(ime) : "-"));
     print("heap d   : " + (heapBefore && heapAfter
         ? (heapBefore[0] - heapAfter[0]) + " iram / " +
           (heapBefore[1] - heapAfter[1]) + " psram"

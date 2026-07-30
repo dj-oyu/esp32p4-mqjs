@@ -1,5 +1,5 @@
 /*
- * Tab5 speaker playback path (P2 of docs/opus-decoder-plan.md).
+ * Tab5 speaker playback path (P2 of docs/history/opus-decoder-plan.md).
  *
  * Producer (Opus decode task, tone generator, future JS binding) pushes
  * interleaved signed 16-bit PCM frames; a writer task drains the bounded

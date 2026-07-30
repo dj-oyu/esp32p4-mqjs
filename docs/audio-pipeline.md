@@ -3,10 +3,10 @@
 M5Stack Tab5 (ESP32-P4) のスピーカー再生パス `components/audio_tab5` の
 設計ドキュメント。**何をするか**だけでなく**なぜその設計か**を記録する。
 
-- 状態・検証ログ・コミット履歴: [audio-tab5-status.md](audio-tab5-status.md)
-- Opus デコーダ統合計画: [opus-decoder-plan.md](opus-decoder-plan.md)
+- 状態・検証ログ・コミット履歴: [audio-tab5-status.md](history/audio-tab5-status.md)
+- Opus デコーダ統合計画: [opus-decoder-plan.md](history/opus-decoder-plan.md)
 - 複数 producer の所有権・cancel・overdub 設計:
-  [audio-device-design.md](audio-device-design.md)
+  [audio-device-design.md](history/audio-device-design.md)
 
 実機検証済み (2026-06-13, COM8): ブートビープ + WAV 自動再生を実聴、
 MQTT テレメトリで再生中 frames が 48000/s ちょうど・バックプレッシャー
@@ -23,13 +23,13 @@ ES8388 経由で Tab5 内蔵スピーカーへ音切れなく流すのが責務�
 将来、複数 producer は上位の `audio_device` を経由し、`audio_tab5` を直接
 操作しない。`audio_device` は capability token と request queue を管理し、
 必要な場合だけ mixer を有効化する。詳細は
-[audio-device-design.md](audio-device-design.md) を参照。
+[audio-device-design.md](history/audio-device-design.md) を参照。
 
 - 対応レート: 8 / 12 / 16 / 24 / 44.1 / 48 kHz
 - 対応チャネル: mono / stereo 入力 (出力は後述のとおり実質モノ)
 - 非対象: エンコード、Ogg/MP3 demux、マイク入力/AEC、音量 UI
 
-設計の上位原則は [opus-decoder-plan.md](opus-decoder-plan.md) §4-5 と整合。
+設計の上位原則は [opus-decoder-plan.md](history/opus-decoder-plan.md) §4-5 と整合。
 
 Opusの初期再生経路は`components/opus_player/`がOgg packetを解析・decodeし、
 このcomponentの`audio_tab5_write()`へPCMを供給する。codec/container責務は
@@ -182,7 +182,7 @@ DAC を引き込むクロス経路が無い**。つまりコーデックでは L
 → スカラ C のまま。`audio_tab5_write` 内の独立ループ = カーネル境界として
 切ってあるので、万一「ステレオ + Opus + カメラ + UI 同時」でオーディオ CPU
 逼迫が**計測されたら**そこだけ差し替えられる。PIE 予算は Opus の CELT
-カーネル (iMDCT/FFT/inner product, [opus-decoder-plan](opus-decoder-plan.md)
+カーネル (iMDCT/FFT/inner product, [opus-decoder-plan](history/opus-decoder-plan.md)
 §5-6) に回す。そこは計算律速で実益が出る。
 
 ---
@@ -269,7 +269,7 @@ DAC を引き込むクロス経路が無い**。つまりコーデックでは L
 ### P2 ゲート (PCM 経路、コーデック非依存)
 1. `_SELFTEST=y`: ブート後ビープ ×2 (880/1319Hz)。**実聴 OK**。
 2. `_BOOT_WAV_AUTOPLAY=y`: 続けて WAV 自動再生。**実聴 OK**。
-3. `tools/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
+3. `tools/probes/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
    `audio.stats()` を時系列 publish (COM 不要):
    - 再生中 frames が **48000/s ちょうど**で増加 (I2S が正レートで消費)。
    - queued ≈ 64KB で頭打ち (バックプレッシャー)。
@@ -292,7 +292,7 @@ flash 直後は Tab5 がダウンロードモードで沈黙するので watchdo
 - **クリック/ポップ**: トーン/WAV が非ゼロ振幅で終わると段差クリックが出る。
   対策方針 = コンテンツへのフェードではなく **(a) writer の「実音↔無音
   継ぎ目」デクリックランプ + (b) トーンのゼロ交差合成**
-  ([audio-tab5-status.md](audio-tab5-status.md) 参照)。アイドルのヒスは
+  ([audio-tab5-status.md](history/audio-tab5-status.md) 参照)。アイドルのヒスは
   アンプ常時通電とのトレードオフ (コーデックのソフトミュートで対処可)。
   **未実装。**
 - **JS からの PCM 投入** (`audio.play`) と**ファイル名指定再生**
@@ -300,7 +300,7 @@ flash 直後は Tab5 がダウンロードモードで沈黙するので watchdo
 - **ヘッドホン真ステレオ出力**: ルーティング切替は未対応。出すなら
   `audio.downmix(0)` + 出力先選択ロジックが要る。
 - **Opus 統合 (P3)**: デコード出力を `audio_tab5_write()` に繋ぐ。CELT
-  カーネルが PIE の本命 ([opus-decoder-plan](opus-decoder-plan.md))。
+  カーネルが PIE の本命 ([opus-decoder-plan](history/opus-decoder-plan.md))。
 - **同時動作 (P4)**: UI/カメラ/MQTT と同時再生時の writer affinity/priority・
   PSRAM バス帯域・アンダーランを計測して調整。
 

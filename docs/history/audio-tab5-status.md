@@ -1,0 +1,129 @@
+# audio_tab5 — Tab5 スピーカー再生パス (opus-decoder-plan P2)
+
+> 設計と API の正式ドキュメントは **[audio-pipeline.md](../audio-pipeline.md)**。
+> 本ファイルは実装の経緯・検証ログ・コミット履歴を残す状態メモ。
+
+ステータス: **実機検証済み (2026-06-13, COM8 flash)**。ブート時のビープ +
+WAV 自動再生をユーザーが実聴確認。`tools/probes/probe_audio.js` の MQTT テレメトリで
+frames_written が再生中ちょうど 48000/s で増加 (I2S が正しいレートで PCM 消費)、
+リングは 64KB で頭打ち (バックプレッシャー動作)、underrun は意図したギャップ
+のみ (再生中の途切れなし)。Opus デコーダ (`codex/opus-float-plan` worktree) と
+並行作業のため、本件は `feat/audio-tab5` ブランチ / 専用 worktree / 専用
+`build_tab5` で行う。
+
+## 実装
+
+`docs/history/opus-decoder-plan.md` §4 の `audio_tab5` 仕様に準拠:
+
+- `components/audio_tab5/` — ES8388 を esp_codec_dev (~1.5, 公式
+  m5stack_tab5 BSP と同系) で駆動。共有 I2C バス `ui_tab5_i2c_bus()`
+  (port 1) を使用し、新しい master bus は作らない。
+- I2S master TX: MCLK=G30 BCLK=G27 WS=G29 DOUT=G26、16-bit Philips
+  stereo 固定、MCLK=256*fs、`auto_clear` (underrun は無音)。
+  mono 入力はソフトで両チャネル複製。
+- SPK_EN = PI4IOE 0x43 の P1。レジスタ 0x05 を read-modify-write
+  (P4 LCD_RST / P5 TP_RST / P6 CAM_RST が同じバイトに同居)。
+- PCM ring buffer (PSRAM, `CONFIG_MQJS_TAB5_AUDIO_RING_KB`, 既定 64KB
+  ≒ 340ms @48k stereo) → writer task (core 1, prio 10) → I2S DMA。
+- API: `audio_tab5_start(rate, ch)` / `audio_tab5_write(pcm, frames,
+  timeout)` (backpressure 付き) / `stop` / `set_volume` / `get_stats`
+  (underruns, frames_written, queued_bytes) / `tone`。
+- 非 Tab5 build は inline stub (`ui_tab5.h` と同パターン)、Kconfig
+  `CONFIG_MQJS_TAB5_AUDIO` で sources ごと外れる。
+
+## P2 ゲートの検証手順 (flash 後) — 2026-06-13 PASS
+
+1. `CONFIG_MQJS_TAB5_AUDIO_SELFTEST=y` でブート ~3 秒後に 880Hz /
+   1319Hz の 300ms ビープ ×2 がスピーカーから鳴る。**実聴 OK。**
+2. `CONFIG_MQJS_TAB5_AUDIO_BOOT_WAV_AUTOPLAY=y` で続けて WAV 自動再生。
+   **実聴 OK。**
+3. `tools/probes/probe_audio.js` を dev タスクに push → `<topic>/proberep` に
+   audio.stats() を時系列で publish。確認済み実測 (COM 不要):
+   - playWav 347584 → wav-2s 453120 → wav-5s 596992 frames = **48000/s
+     ちょうど** (I2S が正レートで消費)。
+   - 再生中 queued ≈ 65280/65536 (リング満杯 = バックプレッシャー)。
+   - underruns はトーン後/WAV 後のドレインのみ (途切れなし)。
+   probe 後は `tools/dev_idle.js` を push して dev スロット復元。
+4. タッチ / カメラの回帰がないこと (I2C 共有の確認) — 未確認 (次回)。
+
+## JS バインディング `audio.*` (commit af2c98a, PC 検証済み)
+
+実装済み。デコード済み PCM は C 側 (Opus パス) が `audio_tab5_write` に
+直接流すので、JS はスカラ制御 + テレメトリのみ (エンジンに TypedArray
+の公開リーダが無いことも確認 — 余計な複雑さを避けた)。
+
+- `audio.start(rate=48000, ch=2)` -> bool
+- `audio.stop()`
+- `audio.tone(hz, ms)` -> bool — 非ブロッキング (一発タスク、再入ガード)。
+  これが MQTT 越しに叩ける P2 検証トリガ。
+- `audio.volume([pct])` -> 0..100
+- `audio.stats()` -> JSON 文字列 (running/rate/ch/queued/underruns/
+  frames) — COM8 不要のリモート読み出し。
+
+`examples/audio_test.js`: Tab5 はボタン付きパネル、画面なし機はビープ列 +
+MQTT へ stats publish。run_pc スモークテスト通過、Tab5 ビルドもクリーン。
+
+実機 P2 検証 (flash 後) の遠隔手順:
+1. `audio_test` を push (`tools/mqjs_push.py` または webui)。
+2. UI 機ならボタンでビープ。画面なし機なら自動でビープ列。
+3. `audio.stats()` の JSON を MQTT で受けて underruns/frames を確認。
+   COM8 を開かずに P2 を判定できる。
+
+## WAV 再生パイプライン (commit 1ec13d3, host + build 検証済み)
+
+Opus デコーダより先に再生パスを実体化。テスト素材は実 WAV
+`assets/audio/tab5-boot.wav` (48k / stereo / 16-bit / 6.3s)。
+
+データフロー: WAV ソース → `wav_parse_mem` → PCM フレーム →
+`audio_tab5_write` → リング → I2S → ES8388。
+
+- `components/audio_tab5/wav.c/.h`: 純 C の RIFF/WAVE パーサ。チャンクを
+  走査して fmt+data を探し LIST/INFO 等はスキップ、data サイズ過大は
+  clamp、奇数サイズの word パディングに耐性。`tools/wav_test.c` で
+  ASAN ホストテスト (実アセット + 合成エッジケース) 全合格。
+- `audio_tab5_play_wav_mem(blob, len)`: 16-bit PCM (1|2ch) を解析して
+  バックプレッシャー付きでストリーム。`stop()` / 新規再生で中断可。
+  `_async()` はタスク化 + 再生中クリップをプリエンプト。mono は既存
+  write パスがステレオ複製。
+- 埋め込み boot WAV: 1.2MB の WAV は 1MB の littlefs storage に入らない
+  ので **EMBED_FILES でファーム埋め込み** (Kconfig
+  `MQJS_TAB5_AUDIO_BOOT_WAV`、既定オフ — flash 毎に肥大するため)。
+  `_AUTOPLAY` でブート ~3.5s 後に自動再生。`audio.playWav()` /
+  `audio_tab5_play_boot_wav()` でオンデマンド再生 (MQTT から実音検証)。
+- ビルド: bin 5.17MB (factory 6MB に収まる)、SDIO/C6 無傷。
+
+将来のファイル転送パス (LittleFS への WAV 転送、あるいは partition 拡張)
+が出来たら `audio_tab5_play_wav_file(path)` を足す。
+
+## ステレオ→モノ ダウンミックス (commit 0a3821e)
+
+Tab5 スピーカーは物理モノ (NS4150B 単入力)。esp_codec_dev の es8388 初期化は
+ストレートステレオ結線 (`device/es8388/es8388.c`: DACCONTROL17/20 = "only
+left/right DAC to its own mixer" + DACCONTROL24=0x1E で 4 出力 0dB)。ES8388
+ミキサーは「自側 DAC + 同側ライン入力バイパス」のみで反対側 DAC を引き込む
+クロス経路が無いため、**コーデックは L+R を合成しない** → 未 fold の 2ch
+素材は片 ch がスピーカーから落ちる。
+
+対策: `audio_tab5_write` のモノ経路で `(L+R)>>1` を両レーンに展開
+(int32 和 →>>1 は int16 範囲ちょうど、クリップ不要)。既定 ON
+(`s_downmix`、駆動先がモノスピーカーのみのため — ユーザー方針「スピーカー
+出力なら常に L+R」)。ヘッドホン等の真ステレオ出力用に OFF も可。JS
+`audio.downmix([on])` でトグル。**実機検証済み 2026-06-13** (downmix ON で
+flash、probe_audio.js で frames 48000/s・バックプレッシャー・途切れなしを
+確認、ステレオ boot WAV が片 ch 落ちなく再生)。
+
+PIE は使わない判断: ダウンミックスは 48kHz で ~0.04% CPU・I2S 律速で
+ボトルネックでないため計測ゲートを通らない (連続データで PIE 向きではあるが
+インタリーブの deinterleave 前処理が要りコスト先行)。PIE 予算は Opus CELT
+カーネル (opus-decoder-plan §5/§6) へ。カーネル境界は差し替え可能に残してある。
+
+## 未決 / 次フェーズ
+
+- `audio.play(pcm)` (JS からの任意 PCM 投入) は未実装。エンジンに
+  TypedArray の生ポインタ取得 API が無く、Array 反復は遅い。Opus path
+  は C 内完結なので P3 では不要。必要になったらエンジンに最小の
+  TypedArray アクセサを足してから対応。
+- writer task の affinity/priority は plan §5 のとおり同時動作計測
+  (P4) で見直す。
+- `audio_tab5_stop()` は HW を落とさない (再 start を速くするため)。
+  省電力が必要になったら deinit を足す。

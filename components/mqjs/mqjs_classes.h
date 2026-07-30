@@ -24,3 +24,9 @@
 #define UIW_K_SLIDER 6
 /* JS-side only: marks the opaque of a UiScreen object */
 #define UIW_K_SCREEN 0xFF
+
+/* == ui_field_mode_t (ui_tab5.h): what a field accepts (I3).
+   PASSWORD == 1 keeps the old truthy "secret" flag working unchanged. */
+#define UIW_FIELD_ASCII    0
+#define UIW_FIELD_PASSWORD 1
+#define UIW_FIELD_JA       2

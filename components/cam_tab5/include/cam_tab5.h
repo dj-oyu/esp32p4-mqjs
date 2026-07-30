@@ -30,7 +30,7 @@ void cam_tab5_set_i2c(void *i2c_master_bus_handle);
 /* Optional network-exclusion hooks. A scan suspends the heavy network traffic
  * (Tailscale/microlink) that otherwise starves the camera (measured: 0.2 fps,
  * quirc identify 26 s while a tailnet session is connected — see
- * docs/camera-lifecycle-plan.md §1). suspend() MUST block until the network is
+ * docs/history/camera-lifecycle-plan.md §1). suspend() MUST block until the network is
  * observably stopped (the camera then owns the CPU/DMA bus before it streams);
  * resume() re-arms it during scan teardown. Either may be NULL (no exclusion).
  * Register once at boot, before the first scan; keeps cam_tab5 network-agnostic

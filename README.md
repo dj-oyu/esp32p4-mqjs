@@ -308,24 +308,24 @@ Tab5 は USB の DTR/RTS リセットが効かない場合があるため、書�
 
 ### 3.5. 日本語入力の辞書 (任意)
 
-**辞書の置き場所は 2 か所**あります。どちらもフラッシュを mmap してその場で
-読むので、**探索速度は同じ**です。違うのは場所の性質だけ:
+**辞書は 1 つ、置き場所も 1 か所**です。menuconfig の
+`mqjs SKK Japanese input` が「どこに置くか」と「どれを置くか」を聞きます。
+どちらの置き場所もフラッシュを mmap してその場で読むので、**探索速度は
+同じ**です。違うのは場所の性質だけ:
 
-| | ファーム埋め込み | **`jisyo` パーティション** |
+| | ファーム埋め込み | **`jisyo` パーティション (既定)** |
 |---|---|---|
 | 場所 | `factory` の中 (6 MB、コードと共有) | 専用 8.5 MB |
 | 上限 | ML で残り 2%、L は入らない | L (8.07 MB) も入る |
-| 差し替え | ファーム再ビルド + 4.5 MB 再書き込み | 辞書だけ書けば済む |
-| `skk.open()` | 175 µs | 197 ms (竹) — CRC32 の分 |
+| 差し替え | ファーム再ビルド + 4.2 MB 再書き込み | 辞書だけ書けば済む |
+| 辞書ロード | 175 µs | 197 ms (ML) — CRC32 の分 |
 
-**`skk.open()` の 197 ms はパーティションだからではなく、誰も検証していない
+**この 197 ms はパーティションだからではなく、誰も検証していない
 から**です。埋め込みはブートローダが毎起動 app image 全体を SHA-256 検証
 しているので、そのぶんを省けます。
 
-既定はこうなっています:
-
-- **埋め込み = M** (8,346 見出し、303 KB) — パーティションが空のときの受け皿
-- **パーティション = ML** (48,750 見出し、1.86 MB) — `idf.py flash` が一緒に焼く
+**既定は「`jisyo` パーティションに ML」** (48,750 見出し、1.86 MB)。
+`idf.py flash` が一緒に焼きます。
 
 **辞書のソースを置く場所だけ教えてください。** あとはビルドが
 `tools/skk_prep.py` で image を作り、`idf.py flash` がパーティションまで
@@ -356,13 +356,25 @@ parttool.py --port COM8 --partition-table-file build_tab5/partition_table/partit
             write_partition --partition-name jisyo --input jisyo.bin
 ```
 
-どちらの辞書も menuconfig (`mqjs SKK Japanese input`) で none/S/M/ML/L から
-選べます。埋め込みを `none` にすると 303 KB 戻ります (パーティションが必ず
-ある端末向け)。ソースが無いときはどちらも黙って飛ばされ、ビルドは通ります。
+埋め込みに切り替えるなら menuconfig で置き場所を
+`in the firmware image` にします (辞書は M が既定になり、L は 6 MB に
+入らないので選択肢から消えます)。**両方には置けません** — 同じバイト列を
+同じ速度で読むだけなので、二重に持っても誰も読まないフラッシュと、
+食い違いうる管理対象が増えるだけだからです。
+
+ソースも生成済み .bin も無いときはビルドが警告してスキップし、ファーム自体は
+焼けます。その状態で日本語入力を使うアプリを起動すると、`ui.ime(1)` が
+`false` を返して英数のまま動き (制御バーの「あ」キーの面も変わりません)、
+シリアルに 1 度だけどこを見ればいいかが出ます:
+
+```
+W (12345) mqjs: IME: no dictionary (part:jisyo, err -104) — flash one into
+                the `jisyo` partition (README 3.5) or pick one in menuconfig
+```
 
 実測 (Tab5、2026-07-29):
 
-| 辞書 | 見出し | image | `skk.open()` | 変換 1 回 | 索引の探索 |
+| 辞書 | 見出し | image | 辞書ロード | 変換 1 回 | 索引の探索 |
 |---|---:|---:|---:|---:|---:|
 | M (埋め込み、既定) | 8,346 | 303 KB | **0.2 ms** | 75 µs | 5 ライン |
 | **ML** | **48,750** | **1.86 MB** | **197 ms** | 76 µs | 6 ライン |
@@ -372,18 +384,19 @@ parttool.py --port COM8 --partition-table-file build_tab5/partition_table/partit
 サンプリング木で、触るキャッシュラインが log₈ で増えるためです
 (docs/skk-ime-design.md §6.5)。
 
-`skk.open()` の時間はイメージ全体の CRC32 検証です (パーティションは
-ブートローダの検証範囲外なので、ここでしか壊れを検出できません)。1 回だけ
-かかり、日本語を打たないアプリは辞書に触りません。L の 826 ms が気になる
-なら ML を選んでください。
+辞書ロードの時間はイメージ全体の CRC32 検証です (パーティションは
+ブートローダの検証範囲外なので、ここでしか壊れを検出できません)。最初に
+`ui.ime(1)` を呼んだアプリが 1 回だけ払い、日本語を打たないアプリは辞書に
+触りません。L の 826 ms が気になるなら ML を選んでください。
 
 ⚠️ `--max-size` を必ず付けてください。パーティションより大きいイメージは
 **静かに切り詰められ**、切れたイメージは開けるし引けるのに切れ目から先だけ
 誤答します。
 
-変換の学習 (どの候補を選んだか) は端末全体で共有され、`/littlefs/skk/mru.txt`
-へ書き戻されます。書くのは `skk.save()` を呼んだときとアプリ停止時で、打鍵ごと
-ではありません。`ssh_vt` は IME をオフにした瞬間に呼びます。
+**変換の学習はありません。** 以前は選んだ候補を `/littlefs/skk/mru.txt` へ
+書き戻していましたが、2026-07-30 に削除しました
+([`docs/skk-ime-design.md`](docs/skk-ime-design.md) の S7 追記)。候補は常に
+辞書順で、同じ語を何度変換しても並びは変わりません。
 
 `--strip-annotations` で候補の注釈を落とすと L が 538 KB 縮みます。
 `python tools/skk_prep.py inspect jisyo.bin --lookup かんじ` で中身を確認できます。
@@ -589,10 +602,12 @@ gcc -O2 -I mquickjs -o /tmp/stdlib_tool device_stdlib.c mquickjs/mquickjs_build.
 mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h
 /tmp/stdlib_tool -m64 > gen_pc/device_stdlib.h
-gcc -O2 -I. -Igen_pc -Imquickjs -I../skk_core/include -I../ui_tab5/include \
+gcc -O2 -I. -Igen_pc -Imquickjs -I../skk_core/include -I../ime_core/include \
+  -I../ui_tab5/include \
   -o /tmp/run_pc tools/run_pc.c \
   mqjs_runtime.c system_vault.c tailscale_adapter.c app/mqjs_app_manager.c \
   ../skk_core/skk_kana.c ../skk_core/skk_dict.c ../skk_core/skk_builtin.c \
+  ../ime_core/ime_core.c \
   mquickjs/mquickjs.c mquickjs/cutils.c mquickjs/dtoa.c mquickjs/libm.c -lm
 
 /tmp/run_pc ../../examples/bench.js
@@ -657,22 +672,21 @@ components/smooth_ui_toolkit/ LVGL C++ ラッパー、アニメーション、UI
 components/cam_tab5/     Tab5 カメラとバーコード認識
 components/sshc/         wolfSSH クライアント
 examples/                配信して試せる JavaScript アプリ
-tools/                   鍵生成、MQTT 配信、Web UI、検証ツール
+tools/                   鍵生成、MQTT 配信、Web UI、辞書・フォント生成 ([tools/README.md](tools/README.md))
+tools/probes/            実機 dev スロットへ push する計測スクリプト
+tools/tests/             ホストで走る自動テスト (実機不要)
 tools/agents/skills/     AI エージェント向けスキル (canonical / ESP32-P4 PIE SIMD 参照を含む)
 .claude/skills/          Claude Code プロジェクトスキル (tools/agents/skills/ から tools/sync-claude-skills.sh で再生成。手編集しない)
-docs/                    UI、ランチャー、SSH 端末などの設計文書
+docs/                    現役の設計文書 ([docs/README.md](docs/README.md))
+docs/history/            決着済みキャンペーンの記録 (実測値・採否の理由・検死)
+sdkconfig.opus/          Opus 実験ビルド用の Kconfig 断片 (組み合わせ方は docs/history/opus-decoder-plan.md)
 ```
 
 実装を拡張するときは、まず以下を参照してください。
 
 - [examples/README.md](examples/README.md): サンプル一覧、JavaScript のルール、ランタイム制約
-- [docs/launcher-multiapp-design.md](docs/launcher-multiapp-design.md): マルチアプリと MQTT ストア
-- [docs/app-manager-migration.md](docs/app-manager-migration.md): App Manager 移行設計 (Phase 0-4 実装済み: 名前ベース API、App record / Worker 分離、policy、LRU eviction)
-- [docs/widget-framework-design.md](docs/widget-framework-design.md): ウィジェット UI
-- [docs/tab5-ui-design.md](docs/tab5-ui-design.md): Tab5 UI の構成
-- [docs/ssh-terminal-design.md](docs/ssh-terminal-design.md): SSH 端末
-- [docs/system-settings-design.md](docs/system-settings-design.md): System Vault、デバイス設定、プロビジョニング QR
-- [docs/qr-read-performance.md](docs/qr-read-performance.md): QR 読み取り性能の評価方法と実機計測計画
+- [docs/README.md](docs/README.md): 設計文書の索引。現役リファレンス 11 本と、決着済み記録の一覧
+- [tools/README.md](tools/README.md): 道具・probe・テストの索引
 - [tools/agents/skills/esp32p4-pie-simd/SKILL.md](tools/agents/skills/esp32p4-pie-simd/SKILL.md): ESP32-P4 PIE SIMD スキル参照
 
 ## ライセンス

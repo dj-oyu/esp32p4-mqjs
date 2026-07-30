@@ -434,6 +434,9 @@ static const JSPropDef js_ui[] = {
     JS_CFUNC_DEF("overlay", 2, js_ui_overlay),
     JS_CFUNC_DEF("onTouch", 1, js_ui_onTouch),
     JS_CFUNC_DEF("onKey", 1, js_ui_onKey),
+    JS_CFUNC_DEF("ime", 1, js_ui_ime),   /* canvas アプリの IME opt-in */
+    JS_CFUNC_DEF("caret", 3, js_ui_caret), /* 変換中の文字列を出す位置 */
+    JS_CFUNC_DEF("imeStats", 0, js_ui_imeStats), /* 出荷する打鍵経路の実測 */
     /* widget layer (W1) */
     JS_CFUNC_DEF("screen", 1, js_ui_screen),
     JS_CFUNC_DEF("back", 0, js_ui_back),
@@ -504,54 +507,6 @@ static const JSPropDef js_ssh[] = {
 
 static const JSClassDef js_ssh_obj =
     JS_OBJECT_DEF("SSH", js_ssh);
-
-/* ---- device API: skk object (skk_core — local Japanese IME).
-   docs/skk-ime-design.md §8. Handle-style like ssh: open() loads a
-   dictionary lazily and returns an int id, every other call takes it
-   first. key() returns ONLY a status bitmask, so a keystroke the IME
-   passes through allocates nothing; the preedit string and the
-   candidate array are materialised on demand, i.e. only when the bits
-   say they changed. Shared by every app — ssh_vt and a test app use the
-   identical surface. ---- */
-static const JSPropDef js_skk[] = {
-    JS_CFUNC_DEF("open", 1, js_skk_open),           /* ([path]) -> handle */
-    JS_CFUNC_DEF("close", 1, js_skk_close),
-    JS_CFUNC_DEF("enable", 2, js_skk_enable),
-    JS_CFUNC_DEF("key", 2, js_skk_key),             /* -> status bitmask */
-    JS_CFUNC_DEF("preedit", 1, js_skk_preedit),
-    JS_CFUNC_DEF("candidates", 1, js_skk_candidates),
-    JS_CFUNC_DEF("sel", 1, js_skk_sel),
-    JS_CFUNC_DEF("commit", 1, js_skk_commit),
-    JS_CFUNC_DEF("mode", 1, js_skk_mode),
-    /* beyond §8: C-j is unreachable on this keyboard (Enter owns 0x0A),
-       so leaving ASCII mode needs an explicit call */
-    JS_CFUNC_DEF("setMode", 2, js_skk_setMode),
-    JS_CFUNC_DEF("reset", 1, js_skk_reset),
-    JS_CFUNC_DEF("stats", 1, js_skk_stats),
-    JS_CFUNC_DEF("statsReset", 1, js_skk_statsReset),
-    /* S7: flush the personal dictionary to littlefs. Free when nothing
-       was learned, so an app can call it at any quiet moment; close()
-       and being stopped do it too. */
-    JS_CFUNC_DEF("save", 1, js_skk_save),
-    /* status bits returned by key(), so apps need no magic numbers */
-    JS_PROP_DOUBLE_DEF("CONSUMED", 1, 0),
-    JS_PROP_DOUBLE_DEF("PREEDIT", 2, 0),
-    JS_PROP_DOUBLE_DEF("CANDS", 4, 0),
-    JS_PROP_DOUBLE_DEF("SEL", 8, 0),
-    JS_PROP_DOUBLE_DEF("COMMIT", 16, 0),
-    JS_PROP_DOUBLE_DEF("MODE", 32, 0),
-    /* mode() / setMode() values (skk_mode_t) */
-    JS_PROP_DOUBLE_DEF("ASCII", 0, 0),
-    JS_PROP_DOUBLE_DEF("KANA", 1, 0),
-    JS_PROP_DOUBLE_DEF("KATA", 2, 0),
-    JS_PROP_DOUBLE_DEF("MIDASHI", 3, 0),
-    JS_PROP_DOUBLE_DEF("OKURI", 4, 0),
-    JS_PROP_DOUBLE_DEF("SELECT", 5, 0),
-    JS_PROP_END,
-};
-
-static const JSClassDef js_skk_obj =
-    JS_OBJECT_DEF("SKK", js_skk);
 
 /* ---- device API: clipboard object (P4d typed clipboard IPC) ----
    One system-shared, typed value in a C buffer outside every JS
@@ -762,7 +717,8 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("ui", &js_ui_obj),
     JS_PROP_CLASS_DEF("ssh", &js_ssh_obj),
     JS_PROP_CLASS_DEF("term", &js_term_obj),
-    JS_PROP_CLASS_DEF("skk", &js_skk_obj),
+    /* `skk` was here. Japanese input is ui.ime(1) + ui.onKey now; no app
+       drives the engine directly (docs/keyboard-ime-unification.md §6.2). */
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
     JS_PROP_CLASS_DEF("vault", &js_vault_obj),

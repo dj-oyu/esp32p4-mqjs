@@ -1,14 +1,14 @@
 # 電源ステート設計
 
 Status: 2026-06-13 起案。**P0 screen slice（ACTIVE/DIMMED/SCREEN_OFF +
-backlight + idle clock + wake-touch 食い + monitor ログ）実装済**
-（`mqjs_power.{c,h}`、TEST しきい値 `T_dim`=5s/`T_off`=10s）。
-**P0 全項目デバイス検証済 2026-06-13 COM8**（App 11bfddc）: idle 進行
-(init→ACTIVE、+5.04s DIMMED bl10%、+10.03s SCREEN_OFF)、wake-on-touch
-(タップで SCREEN_OFF→ACTIVE を3回、再 dim/off サイクルも正常)。タップ食いは
-目視確認。BEEP(SELFTEST)無効化も同ビルドで確認(WAV のみ再生)。
-本番しきい値(60s/180s)への復帰は未(現状 TEST 5s/10s)。SUSPEND・OFF・
-INA226・wake-lock は未実装（P1 以降）。
+backlight + idle clock + wake-touch 食い + monitor ログ）実装済・main マージ済**
+（`mqjs_power.{c,h}`、`65843b2`）。本番しきい値 `T_dim`=60s/`T_off`=180s で稼働中。
+**P0 全項目デバイス検証済 2026-06-13 COM8**（App 11bfddc、当時は検証用の
+TEST しきい値 5s/10s）: idle 進行 (init→ACTIVE、+5.04s DIMMED bl10%、
++10.03s SCREEN_OFF)、wake-on-touch (タップで SCREEN_OFF→ACTIVE を3回、
+再 dim/off サイクルも正常)。タップ食いは目視確認。
+**SUSPEND・OFF・INA226・wake-lock は未実装（P1 以降）** — 本書のうち生きた
+計画はここから先だけ。
 
 ESP-IDF の `esp_pm`（DFS / 自動 light-sleep）を**前提にしない**。
 M5Tab5-UserDemo 公式も `CONFIG_PM_ENABLE is not set` で、電源 UX は

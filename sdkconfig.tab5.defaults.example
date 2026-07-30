@@ -61,7 +61,7 @@ CONFIG_ESP_IPA_SHARPEN_FREQUENCY_FEEDBACK=y
 
 # HTTPS support for http.get().
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 
 # Speaker playback path (ES8388 + I2S; audio_tab5 component).
 CONFIG_MQJS_TAB5_AUDIO=y
@@ -75,29 +75,74 @@ CONFIG_MQJS_TAB5_AUDIO=y
 # CONFIG_OPUS_PLAYER_BOOT_OPUS=y
 # CONFIG_OPUS_PLAYER_BOOT_AUTOPLAY=y
 
-# --- SKK Japanese input: where the dictionaries come from -------------
+# --- SKK Japanese input -----------------------------------------------
+# ONE dictionary in ONE place; menuconfig asks WHERE and WHICH
+# separately. Default: SKK-JISYO.ML in the `jisyo` partition, which
+# `idf.py flash` writes for you. Both places are mmap'd flash read in
+# place, so the search speed is identical — the partition just does not
+# compete with the code for the 6 MB app partition, holds up to 8.5 MB,
+# and can be rewritten without a firmware rebuild.
+#
 # Point this at a directory holding SKK-JISYO.{S,M,ML,L} from
-# https://github.com/skk-dev/dict and the build prepares BOTH images with
-# tools/skk_prep.py (UTF-8 re-sort + full verification), and `idf.py
-# flash` writes the partition one for you. Leave it empty and the
-# prepared .bin files are used as they are; with neither, the build says
-# so and still succeeds.
+# https://github.com/skk-dev/dict and the build prepares the image with
+# tools/skk_prep.py (UTF-8 re-sort + full verification). Empty, the
+# prepared .bin in components/skk_core/ is used as it is; with neither,
+# the build warns, skips, and still succeeds.
 # CONFIG_MQJS_SKK_DICT_SOURCE_DIR="../skk-dict"
 #
-# Two places, same mmap and the same search speed. The partition does not
-# compete with the code for the 6 MB app partition, holds up to 8.5 MB,
-# and can be replaced without rebuilding. Defaults: M built in (the
-# fallback when the partition is empty), ML in the partition.
+# Where:
+# CONFIG_MQJS_SKK_DICT_AT_BUILTIN=y  # in the app image instead. Costs
+#                                    # app partition space, needs a full
+#                                    # rebuild to change, but skk.open()
+#                                    # is 175 us rather than 197 ms (the
+#                                    # bootloader already checks it).
+# CONFIG_MQJS_SKK_DICT_AT_NONE=y     # no dictionary at all
 #
-# CONFIG_MQJS_SKK_DICT_NONE=y    # nothing built in (-303 KB). Fine when
-#                                # the partition is always flashed.
-# CONFIG_MQJS_SKK_DICT_S=y       # 3,379 headings, 117 KB
-# CONFIG_MQJS_SKK_DICT_ML=y      # 48,750 headings, 1.86 MB — links, but
-#                                # leaves `factory` 2% free. Prefer the
-#                                # partition.
-#
-# CONFIG_MQJS_SKK_JISYO_NONE=y   # `idf.py flash` leaves `jisyo` alone
-# CONFIG_MQJS_SKK_JISYO_L=y      # 175,790 headings, 8.07 MB. Adds ~34 s
-#                                # to `idf.py flash` and makes skk.open()
-#                                # 826 ms instead of 197 ms (the CRC).
-#                                # Conversion speed is identical.
+# Which (default M when built in, ML in the partition):
+# CONFIG_MQJS_SKK_DICT_S=y   # 3,379 headings, 117 KB
+# CONFIG_MQJS_SKK_DICT_M=y   # 8,346 headings, 303 KB
+# CONFIG_MQJS_SKK_DICT_L=y   # 175,790 headings, 8.07 MB. Partition only;
+#                            # +34 s per flash, skk.open() 826 ms.
+
+# --- size/SRAM diet (perf/size-diet, 2026-07-29) ----------------------
+# Flash: drop assert location strings, the esp_err name table, the FULL
+# CA bundle (CMN keeps the ~40 common roots), LVGL widgets this UI never
+# creates, and SW-render color formats it never draws (all surfaces are
+# RGB565; ARGB8888 stays for intermediate layers, A8 for masks). LVGL
+# example sources stop being compiled at all.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_USE_ANIMIMG=n
+CONFIG_LV_USE_ARCLABEL=n
+CONFIG_LV_USE_CALENDAR=n
+CONFIG_LV_USE_CHART=n
+CONFIG_LV_USE_CHECKBOX=n
+CONFIG_LV_USE_DROPDOWN=n
+CONFIG_LV_USE_IMAGEBUTTON=n
+CONFIG_LV_USE_LED=n
+CONFIG_LV_USE_LINE=n
+CONFIG_LV_USE_MENU=n
+CONFIG_LV_USE_MSGBOX=n
+CONFIG_LV_USE_ROLLER=n
+CONFIG_LV_USE_SCALE=n
+CONFIG_LV_USE_SPAN=n
+CONFIG_LV_USE_SPINBOX=n
+CONFIG_LV_USE_SPINNER=n
+CONFIG_LV_USE_TABLE=n
+CONFIG_LV_USE_TABVIEW=n
+CONFIG_LV_USE_TILEVIEW=n
+CONFIG_LV_USE_WIN=n
+CONFIG_LV_USE_THEME_SIMPLE=n
+CONFIG_LV_DRAW_SW_SUPPORT_RGB565A8=n
+CONFIG_LV_DRAW_SW_SUPPORT_RGB888=n
+CONFIG_LV_DRAW_SW_SUPPORT_XRGB8888=n
+CONFIG_LV_DRAW_SW_SUPPORT_ARGB8888_PREMULTIPLIED=n
+CONFIG_LV_DRAW_SW_SUPPORT_L8=n
+CONFIG_LV_DRAW_SW_SUPPORT_AL88=n
+CONFIG_LV_DRAW_SW_SUPPORT_I1=n
+# Internal SRAM: P4 L2MEM is ONE pool (IRAM/DRAM are the same 768 KB),
+# so IRAM code moved to flash is heap gained, byte for byte.
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
+CONFIG_ESP_PERIPH_CTRL_FUNC_IN_IRAM=n

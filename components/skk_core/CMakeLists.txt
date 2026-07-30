@@ -17,22 +17,27 @@
 # whole point of the packed key (see skk_core.h).
 set(SKK_SRCS "skk_kana.c" "skk_dict.c" "skk_builtin.c")
 
-# The built-in dictionary image, embedded into flash rodata and read in
-# place: zero allocation, zero load time (docs/skk-ime-design.md §6.6).
+# The dictionary image: flash, read in place through the MMU, zero
+# allocation and zero load time wherever it sits (§6.6).
 #
-# WHICH dictionary is a menuconfig choice (Kconfig in this directory).
-# Two ways to satisfy it:
+# WHERE and WHICH are two menuconfig questions (Kconfig in this
+# directory), and WHERE is a choice — the firmware image or the `jisyo`
+# partition, never both. Two copies would be the same bytes read the same
+# way at the same speed, with skk.open() silently preferring the
+# partition; the built-in one would be flash nobody reads and a second
+# thing to keep in step.
+#
+# Two ways to satisfy WHICH:
 #
 #   1. CONFIG_MQJS_SKK_DICT_SOURCE_DIR points at a directory holding the
 #      SKK-JISYO.* files -> the image is regenerated here, by the same
 #      tools/skk_prep.py that re-sorts into UTF-8 byte order and verifies
 #      every entry before writing (the EUC-JP sort trap, §6.1).
-#   2. It is empty -> skk_dict.bin is used exactly as it is. That is the
-#      default, because the source dictionaries are large, carry their
-#      own licence terms and are gitignored.
+#   2. It is empty -> the prepared .bin is used exactly as it is. That is
+#      the default, because the source dictionaries are large, carry
+#      their own licence terms and are gitignored.
 #
-# Either way, with no image at all the component still builds and links;
-# skk.open() then falls back to the `jisyo` partition or a file. The
+# With no image at all the component still builds and links, loudly. The
 # dictionary is deliberately NOT a build-time requirement.
 #
 # NOT `EMBED_FILES`: that path emits no alignment directive at all
@@ -122,9 +127,14 @@ function(skk_image_headings path out_var)
     set(${out_var} "${n}" PARENT_SCOPE)
 endfunction()
 
-if(CONFIG_MQJS_SKK_DICT_NONE)
-    set(SKK_WANT "")
-elseif(CONFIG_MQJS_SKK_DICT_S)
+# ------------------------------------------------------------------
+# ONE dictionary, in ONE place (Kconfig: MQJS_SKK_DICT_WHERE). The two
+# destinations are exclusive on purpose: they hold the same bytes, read
+# the same way, at the same speed, so carrying both is pure duplication —
+# and skk.open() would silently prefer the partition, leaving the built-in
+# copy as flash nobody reads and a second thing to keep in step.
+
+if(CONFIG_MQJS_SKK_DICT_S)
     set(SKK_WANT "S")
 elseif(CONFIG_MQJS_SKK_DICT_ML)
     set(SKK_WANT "ML")
@@ -134,13 +144,22 @@ else()
     set(SKK_WANT "M")   # also the case when Kconfig is absent (host builds)
 endif()
 
-if(CONFIG_MQJS_SKK_DICT_NONE)
-    # Selected "none": do not link an image even if skk_dict.bin exists,
-    # or the choice would be silently ignored on a tree that once built
-    # one.
+if(CONFIG_MQJS_SKK_DICT_AT_NONE)
+    set(SKK_WANT "")
     set(SKK_IMAGE "")
-else()
+    set(SKK_JISYO_IMAGE "")
+    message(STATUS "skk_core: built without a dictionary by choice — "
+                   "skk.open() will need an explicit path")
+elseif(CONFIG_MQJS_SKK_DICT_AT_BUILTIN)
+    set(SKK_JISYO_IMAGE "")           # exclusive: nothing goes to `jisyo`
+    # Must happen BEFORE idf_component_register: whether the image exists
+    # decides whether skk_dict_image.S is in SRCS.
     skk_make_image("${SKK_WANT}" "${SKK_IMAGE}" "" SKK_REGENERATED)
+else()
+    set(SKK_IMAGE "")                 # exclusive: nothing is linked in
+    # The partition image is generated further down instead — it is not a
+    # compilation input, and partition_table_get_partition_info() is not
+    # defined yet at this point in the configure.
 endif()
 
 if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
@@ -150,6 +169,7 @@ endif()
 idf_component_register(SRCS ${SKK_SRCS}
                        INCLUDE_DIRS "include")
 
+# ---- built into the firmware ----
 if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
     # .incbin resolves against the assembler's include path.
     target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
@@ -158,7 +178,6 @@ if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
     set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/skk_dict_image.S"
                  APPEND PROPERTY OBJECT_DEPENDS "${SKK_IMAGE}")
     file(SIZE "${SKK_IMAGE}" SKK_IMAGE_BYTES)
-
     skk_image_headings("${SKK_IMAGE}" SKK_IMAGE_NASI)
     if(SKK_REGENERATED)
         message(STATUS "skk_core: embedding the ${SKK_WANT} dictionary — "
@@ -169,73 +188,51 @@ if(SKK_IMAGE AND EXISTS "${SKK_IMAGE}")
                        "The menuconfig choice (${SKK_WANT}) only takes effect once "
                        "CONFIG_MQJS_SKK_DICT_SOURCE_DIR points at the SKK-JISYO files")
     endif()
-elseif(CONFIG_MQJS_SKK_DICT_NONE)
-    message(STATUS "skk_core: no built-in dictionary by choice — "
-                   "skk.open() needs the `jisyo` partition or a path")
-else()
+elseif(CONFIG_MQJS_SKK_DICT_AT_BUILTIN)
     # Not fatal on purpose: a fresh clone has no skk_dict.bin and must
     # still build. Say what to do rather than failing the build.
     message(WARNING "skk_core: components/skk_core/skk_dict.bin is missing, so "
-                    "this image has NO built-in dictionary. Either set "
+                    "this image has NO dictionary. Either set "
                     "CONFIG_MQJS_SKK_DICT_SOURCE_DIR to a directory holding "
-                    "SKK-JISYO.${SKK_WANT}, run tools/skk_prep.py yourself, or "
-                    "flash the `jisyo` partition (README 3.5).")
+                    "SKK-JISYO.${SKK_WANT}, or run tools/skk_prep.py yourself.")
 endif()
 
-# ------------------------------------------------------------------
-# The `jisyo` partition — where a big dictionary actually belongs.
-#
-# Same bytes, same mmap, same search speed as the embedded copy, but it
-# does not compete with the code for the 6 MB app partition, it can hold
-# pine (8.07 MB) which the app partition never could, and replacing it
-# does not mean rebuilding and re-flashing the firmware.
+# ---- written to the `jisyo` partition ----
 #
 # Registered with esptool_py_flash_to_partition so plain `idf.py flash`
 # delivers it — the offset comes from the partition table rather than
 # from a number written down twice. `idf.py app-flash` does not touch it
 # and the contents survive, so the day-to-day loop is unaffected.
-
-if(CONFIG_MQJS_SKK_JISYO_M)
-    set(SKK_JISYO_WANT "M")
-elseif(CONFIG_MQJS_SKK_JISYO_L)
-    set(SKK_JISYO_WANT "L")
-elseif(CONFIG_MQJS_SKK_JISYO_NONE)
-    set(SKK_JISYO_WANT "")
-else()
-    set(SKK_JISYO_WANT "ML")
-endif()
-
-if(SKK_JISYO_WANT)
+if(CONFIG_MQJS_SKK_DICT_AT_PARTITION)
     # --max-size is the partition's, so an oversized dictionary is refused
     # here rather than truncated at the boundary at flash time — and a
     # truncated image is not obviously broken, it opens and searches and
     # answers wrong past the cut.
     partition_table_get_partition_info(SKK_JISYO_SIZE
                                        "--partition-name jisyo" "size")
-    skk_make_image("${SKK_JISYO_WANT}" "${SKK_JISYO_IMAGE}"
+    skk_make_image("${SKK_WANT}" "${SKK_JISYO_IMAGE}"
                    "${SKK_JISYO_SIZE}" SKK_JISYO_REGENERATED)
 endif()
 
-if(SKK_JISYO_WANT AND EXISTS "${SKK_JISYO_IMAGE}")
+if(SKK_JISYO_IMAGE AND EXISTS "${SKK_JISYO_IMAGE}")
     file(SIZE "${SKK_JISYO_IMAGE}" SKK_JISYO_BYTES)
     skk_image_headings("${SKK_JISYO_IMAGE}" SKK_JISYO_NASI)
     esptool_py_flash_to_partition(flash "jisyo" "${SKK_JISYO_IMAGE}")
     if(SKK_JISYO_REGENERATED)
         message(STATUS "skk_core: `idf.py flash` will write the "
-                       "${SKK_JISYO_WANT} dictionary to `jisyo` — "
+                       "${SKK_WANT} dictionary to `jisyo` — "
                        "${SKK_JISYO_BYTES} B, ${SKK_JISYO_NASI} okuri-nasi headings")
     else()
         message(STATUS "skk_core: `idf.py flash` will write skk_jisyo.bin to "
                        "`jisyo` as it stands — ${SKK_JISYO_BYTES} B, "
                        "${SKK_JISYO_NASI} okuri-nasi headings. The menuconfig "
-                       "choice (${SKK_JISYO_WANT}) only takes effect once "
+                       "choice (${SKK_WANT}) only takes effect once "
                        "CONFIG_MQJS_SKK_DICT_SOURCE_DIR is set")
     endif()
-elseif(SKK_JISYO_WANT)
-    # Not fatal: a fresh clone has neither the source dictionaries nor a
-    # prepared image, and must still build and flash.
-    message(STATUS "skk_core: no skk_jisyo.bin, so `jisyo` is left alone. "
-                   "Set CONFIG_MQJS_SKK_DICT_SOURCE_DIR to a directory holding "
-                   "SKK-JISYO.${SKK_JISYO_WANT} and the build will prepare and "
-                   "flash it (README 3.5)")
+elseif(CONFIG_MQJS_SKK_DICT_AT_PARTITION)
+    message(WARNING "skk_core: no skk_jisyo.bin, so `jisyo` is left alone and "
+                    "this build has NO dictionary anywhere. Set "
+                    "CONFIG_MQJS_SKK_DICT_SOURCE_DIR to a directory holding "
+                    "SKK-JISYO.${SKK_WANT} and the build will prepare and flash "
+                    "it (README 3.5).")
 endif()

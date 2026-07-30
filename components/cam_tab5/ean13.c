@@ -9,9 +9,45 @@
  */
 #include "ean13.h"
 
+#include <stdlib.h>
 #include <string.h>
+#ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
+#endif
 
 #define MAX_RUNS 2048
+
+/* Scan scratch (~24 KB). Heap-allocated on first use and freed by
+ * ean13_scratch_release() at scan teardown, so it costs nothing while
+ * no scan runs (it used to be permanent .bss). Internal RAM preferred
+ * on device — this is the hot binarization path. Single scanner
+ * (cam_tab5's one scan task) — still non-reentrant. */
+typedef struct {
+    uint8_t pmin[MAX_RUNS], smin[MAX_RUNS];
+    uint8_t pmax[MAX_RUNS], smax[MAX_RUNS];
+    int runs[MAX_RUNS];
+    int pos[MAX_RUNS + 1];
+} ean13_scratch_t;
+
+static ean13_scratch_t *s_scratch;
+
+static ean13_scratch_t *scratch_get(void)
+{
+#ifdef ESP_PLATFORM
+    if (!s_scratch)
+        s_scratch = heap_caps_malloc(sizeof *s_scratch,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
+    if (!s_scratch)
+        s_scratch = malloc(sizeof *s_scratch);
+    return s_scratch;
+}
+
+void ean13_scratch_release(void)
+{
+    free(s_scratch);
+    s_scratch = NULL;
+}
 
 /* run widths in modules for L-codes, runs read space-first.
  * G(d) = the same row reversed; R(d) = same row read bar-first. */
@@ -231,7 +267,7 @@ int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
      * gradients elsewhere on the scanline pull it out of the barcode's
      * local black/white range. Flat windows (no local contrast, e.g.
      * the quiet zone) extend the current state instead of chattering
-     * on noise. NOTE: static scratch makes this non-reentrant — there
+     * on noise. NOTE: shared scratch makes this non-reentrant — there
      * is exactly one scanner (cam_tab5's single scan task).
      * A moving-AVERAGE threshold was tried first and failed: next to
      * the quiet zone the average sits near white and swallowed the
@@ -243,12 +279,15 @@ int ean13_scan_gray_line(const uint8_t *line, int n, ean13_scan_t *st)
     int flat = (mx - mn) / 5;
     if (flat < 12)
         flat = 12;
-    static uint8_t pmin[MAX_RUNS], smin[MAX_RUNS];
-    static uint8_t pmax[MAX_RUNS], smax[MAX_RUNS];
-    static int runs[MAX_RUNS];     /* static scratch: see note above */
-    static int pos[MAX_RUNS + 1];  /* run k starts at pixel pos[k] */
     if (n > MAX_RUNS)
         return 0;
+    ean13_scratch_t *scr = scratch_get();
+    if (!scr)
+        return 0;
+    uint8_t *const pmin = scr->pmin, *const smin = scr->smin;
+    uint8_t *const pmax = scr->pmax, *const smax = scr->smax;
+    int *const runs = scr->runs;   /* shared scratch: see note above */
+    int *const pos = scr->pos;     /* run k starts at pixel pos[k] */
     for (int i = 0; i < n; i++) {
         if (i % W) {
             pmin[i] = line[i] < pmin[i - 1] ? line[i] : pmin[i - 1];

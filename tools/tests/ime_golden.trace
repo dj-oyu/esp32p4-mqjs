@@ -1,0 +1,31 @@
+DICT ?
+T 0 TAKEN pre= mode=1 nc=0 txt=
+T 1 TEXT pre= mode=1 nc=0 txt=あ
+T 2 TEXT pre= mode=1 nc=0 txt=い
+T 3 TAKEN pre=▽k mode=3 nc=0 txt=
+T 4 TAKEN pre=▽か mode=3 nc=0 txt=
+T 5 TAKEN pre=▽かn mode=3 nc=0 txt=
+T 6 TAKEN pre=▽かんj mode=3 nc=0 txt=
+T 7 TAKEN pre=▽かんじ mode=3 nc=0 txt=
+T 8 TAKEN pre=▼漢字 mode=5 nc=2 txt=
+T 9 TAKEN pre=▼幹事 mode=5 nc=2 txt=
+T 10 TEXT pre= mode=1 nc=0 txt=幹事
+T 11 TAKEN pre=▽お mode=3 nc=0 txt=
+T 12 TAKEN pre=▽おk mode=3 nc=0 txt=
+T 13 TAKEN pre=▽おく mode=3 nc=0 txt=
+T 14 TAKEN pre=▽おく*r mode=4 nc=0 txt=
+T 15 TAKEN pre=▼送る mode=5 nc=4 txt=
+T 16 TEXT pre= mode=1 nc=0 txt=送る
+T 17 TAKEN pre=▽k mode=3 nc=0 txt=
+T 18 TAKEN pre=▽か mode=3 nc=0 txt=
+T 19 TAKEN pre=▽かn mode=3 nc=0 txt=
+T 20 TAKEN pre=▽か mode=3 nc=0 txt=
+T 21 TAKEN pre=▽か mode=3 nc=0 txt=
+T 22 TAKEN pre= mode=1 nc=0 txt=
+T 23 PASS pre= mode=1 nc=0 txt=
+T 24 TAKEN pre= mode=1 nc=0 txt=
+T 25 PASS pre= mode=1 nc=0 txt=
+T 26 PASS pre= mode=1 nc=0 txt=
+T 27 PASS pre= mode=1 nc=0 txt=
+READY 1 ERR -
+TRACE END

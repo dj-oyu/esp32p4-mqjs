@@ -36,16 +36,11 @@ sdkconfig.tab5*
 # Python bytecode caches
 **/__pycache__/
 
+# Opus 実験ビルドが吐く完全生成 sdkconfig (1 本 141KB)。再現レシピは
+# docs/history/opus-decoder-plan.md、組み合わせる Kconfig 断片は
+# sdkconfig.opus/ (アンダースコアを含まないのでここには当たらない)。
+sdkconfig.opus_*
 build_opus_fixed_prof/*.sdkconfig
-sdkconfig.opus_asm
-sdkconfig.opus_bench
-sdkconfig.opus_fixed
-sdkconfig.opus_fixed_prof
-sdkconfig.opus_combpie
-sdkconfig.opus_denormpie
-sdkconfig.opus_normrespie
-sdkconfig.opus_playpie
-sdkconfig.opus_play
 build_opus_*_log.txt
 
 # host QR investigation scratch (raw gray corpus)
