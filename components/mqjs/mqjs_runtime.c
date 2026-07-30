@@ -59,10 +59,9 @@
    ui_tab5 cell renderer classify from one table on both targets. */
 #include "ui_cell_width.h"
 #include "app/mqjs_app_manager_internal.h"
-/* mkdir()/fsync() for the personal dictionary (S7). Outside the
-   ESP_PLATFORM block on purpose: the same code runs in run_pc, and
-   inside it the host build fell back to an implicit declaration. */
-#include <sys/stat.h>
+/* usleep(). Outside the ESP_PLATFORM block on purpose: the same code
+   runs in run_pc, and inside it the host build fell back to an implicit
+   declaration. */
 #include <unistd.h>
 
 #ifdef ESP_PLATFORM
@@ -5296,14 +5295,16 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 }
 
 /* ------------------------------------------------------------------ */
-/* Dictionary images + the personal dictionary (docs/skk-ime-design.md) */
+/* Dictionary images (docs/skk-ime-design.md)                           */
 /*                                                                      */
 /* THERE IS NO LONGER A JS-FACING skk.* API. Apps ask for Japanese      */
 /* input with ui.ime(1) and receive committed text through ui.onKey;    */
 /* everything between those two lives in ime_core behind the platform   */
 /* session (see "platform IME session" below). What survives here is    */
 /* what that session needs: loading and refcounting the dictionary      */
-/* image, and the one learning store the device shares.                 */
+/* image. Nothing else — the learning store was deleted on 2026-07-30   */
+/* (docs/skk-ime-design.md §S7), and with it the only piece of this     */
+/* subsystem that had two touching tasks and a file to write.           */
 /*                                                                      */
 /* The handle API (skk.open/key/preedit/candidates/... , a 4-slot table */
 /* with generation-tagged ids) was deleted on 2026-07-30 once its last  */
@@ -5322,7 +5323,6 @@ static void dispatch_mqtt_data(MqjsWorker *app, MqjsEvent *ev)
 #define MQJS_SKK_DIR          "skk"
 #endif
 #define MQJS_SKK_DEFAULT_DICT MQJS_SKK_DIR "/skk_dict_M.bin"
-#define MQJS_SKK_MRU_PATH     MQJS_SKK_DIR "/mru.txt"
 
 /* Where a dictionary can come from. The string is the cache key, so each
  * source names exactly one set of bytes:
@@ -5463,168 +5463,6 @@ static int skkpart_open(const char *name, SkkImage *im)
     return SKK_OK;
 }
 #endif /* ESP_PLATFORM */
-
-/* ---- the personal dictionary (design S7) ------------------------- */
-/*
- * ONE store for the device, kept in PSRAM and written back to littlefs.
- *
- * Shared rather than per app, and that is a deliberate line: it matches
- * store.* (one NVS namespace, no per-app prefix) rather than vault.*
- * (isolated per owner). What is in it is which kanji you picked for
- * which reading — the same class of thing as store.*, and an IME that
- * only learns inside one app is not much of an IME. If that ever needs
- * to change, the change is here: key the file by app name and hand each
- * worker its own skk_mru_t.
- *
- * PERSISTENCE POLICY: written when an app stops or is evicted, when the
- * IME is folded (the 「あ」 key going off, a field losing focus), and
- * never on a commit — the file is up to 4.9 KB and littlefs would stall
- * the key path. A power cut loses learning since the last of those.
- */
-static skk_mru_t *s_skk_mru;
-static bool       s_skk_mru_dirty;
-
-/* 学習を守る唯一の鍵。読み手も書き手も、例外なくこれを取る。
- *
- * skk.* ハンドルが消えて書き手は IME 所有タスク 1 つになったが、鍵は残す。
- * 読み手が別タスクに居るからで、mqjs タスクの skk_mru_flush() (アプリ停止 /
- * ime_disarm の後) は所有タスクが変換の最中に触っている構造体を丸ごと読む。
- *
- * 危ないのは昇格がバイトを物理的に動かすことで、mru_to_front()
- * (skk_dict.c:1200) は最大 47 record × ~100B ≒ 4.7KB の memmove。その最中に
- * 読むと record が重複したり半分だけ動いた姿で見える。しかも読み手 2 つは
- * どちらも派手に落ちず静かに壊れる:
- *   - skk_mru_apply() (skk_kana.c:686) 変換ごと 1 回。候補列に混ざる =
- *     利用者には誤変換として出る。
- *   - skk_mru_save()  壊れた個人辞書をそのままファイルへ焼く。skk_mru_load()
- *     は解釈できない行を黙って捨てるので、次の起動では「なぜか覚えていない」
- *     としか見えない。
- *
- * 計数セマフォで reader-writer にするのは検討して捨てた: 読み手はどう多くても
- * 2 人、1 回の仕事は辞書引き ~77µs の隣に置く数µs でしかなく、並列度を上げても
- * 測れる差にならない。逆に書き手は N 個のトークンを非アトミックに集めることに
- * なり、結局そのための writer mutex が要るうえ、優先度継承と再帰検出を失う。
- * 「改善」しないこと。
- *
- * 鍵を skk_core の中には置かない: skk_core.h:36 が "A skk_t is owned by ONE
- * task, so nothing here locks" と宣言していて、あの component は I/O も
- * allocation も lock も持たないからこそホストの素の gcc で単体試験がビルド
- * できる。FreeRTOS のハンドルを 1 個入れた時点でそれが壊れる。だから mqjs 側の
- * 境界 — 学習に届くエンジン呼び出し — で包む。MRU そのものを守るより粗いが、
- * 正しくて安い。 */
-#ifdef ESP_PLATFORM
-static SemaphoreHandle_t s_skk_mru_lock;
-
-/* 生成が起きるのは mqjs タスクの上だけ。2 人目の触り手である IME 所有タスクを
-   作るのは ime_owner_start() で、そこが xTaskCreate の前にこれを呼ぶ。だから
-   所有タスクが初めて mru_lock() へ来たときには必ず出来上がっており、遅延生成
-   そのものが競合することはない。 */
-static void mru_lock_init(void)
-{
-    if (!s_skk_mru_lock)
-        s_skk_mru_lock = xSemaphoreCreateRecursiveMutex();
-}
-static void mru_lock(void)
-{
-    mru_lock_init();
-    if (s_skk_mru_lock)
-        xSemaphoreTakeRecursive(s_skk_mru_lock, portMAX_DELAY);
-}
-static void mru_unlock(void)
-{
-    if (s_skk_mru_lock)
-        xSemaphoreGiveRecursive(s_skk_mru_lock);
-}
-#else
-/* ホストには打鍵を投げてくるタスクが無く、mqjs タスクが唯一の触り手。 */
-#define mru_lock_init() ((void)0)
-#define mru_lock()      ((void)0)
-#define mru_unlock()    ((void)0)
-#endif
-
-static skk_mru_t *skk_mru_get(void)
-{
-    /* 生成と初回ロードは鍵の内側。下の flush と違ってファイル I/O を抱えた
-       まま持つ唯一の場所だが、これは 1 起動 1 回・IME の arm の縁でしか
-       走らず打鍵の経路には無い。外へ出すと「まだ load 途中の store」を
-       もう一方のタスクが引くか、両方が 4.7KB を malloc して片方を捨てる。 */
-    mru_lock();
-    if (s_skk_mru) {
-        mru_unlock();
-        return s_skk_mru;
-    }
-#ifdef ESP_PLATFORM
-    s_skk_mru = heap_caps_malloc(sizeof *s_skk_mru,
-                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-    s_skk_mru = malloc(sizeof *s_skk_mru);
-#endif
-    if (!s_skk_mru) {
-        mru_unlock();
-        return NULL;                 /* no learning is better than no IME */
-    }
-    skk_mru_init(s_skk_mru);
-
-    FILE *f = fopen(MQJS_SKK_MRU_PATH, "rb");
-    if (f) {
-        char *buf = malloc(SKK_MRU_SAVE_MAX);
-        if (buf) {
-            size_t n = fread(buf, 1, SKK_MRU_SAVE_MAX, f);
-            /* skk_mru_load() skips lines it cannot parse rather than
-               failing, so a truncated file costs the tail and not the
-               whole personal dictionary. */
-            (void)skk_mru_load(s_skk_mru, buf, n);
-            free(buf);
-        }
-        fclose(f);
-    }
-    s_skk_mru_dirty = false;
-    mru_unlock();
-    return s_skk_mru;
-}
-
-/* Write the store back. True when the file is up to date afterwards,
-   including the "nothing to do" case. */
-static bool skk_mru_flush(void)
-{
-    if (!s_skk_mru || !s_skk_mru_dirty)
-        return true;
-
-    char *buf = malloc(SKK_MRU_SAVE_MAX);
-    size_t len = 0;
-    if (!buf)
-        return false;
-    /* 鍵はメモリ上のレンダだけ。ここから先の mkdir/fopen/fwrite/fsync まで
-       抱えると、IME 所有タスクが littlefs の裏で止まり、81031dc が入力経路から
-       追い出したはずの同期 I/O が鍵という別の顔で戻ってくる。skk_core は I/O を
-       しないので、この境目はちょうど skk_mru_save() の出口に引ける。 */
-    mru_lock();
-    int save_rc = skk_mru_save(s_skk_mru, buf, SKK_MRU_SAVE_MAX, &len);
-    mru_unlock();
-    if (save_rc != SKK_OK) {
-        free(buf);
-        return false;
-    }
-    mkdir(MQJS_SKK_DIR, 0777);       /* EEXIST is the normal case */
-    FILE *f = fopen(MQJS_SKK_MRU_PATH, "wb");
-    if (!f) {
-        free(buf);
-        return false;
-    }
-    size_t wr = fwrite(buf, 1, len, f);
-    /* fsync before fclose. littlefs syncs on close and this ought to be
-       redundant, but the thing being defended against is a reset landing
-       between the write and the metadata commit, and that is exactly the
-       failure this file is FOR — learning that survives a reboot. */
-    fflush(f);
-    fsync(fileno(f));
-    fclose(f);
-    free(buf);
-    if (wr != len)
-        return false;
-    s_skk_mru_dirty = false;
-    return true;
-}
 
 /* Load `path` (or take another reference to it) and return its index in
    s_skk_img, or -1 with *out_err set to an skk_err_t / -100 for I/O. */
@@ -5801,8 +5639,8 @@ static int skkimg_acquire_best(const char *path, int *out_err,
 
 /* ---- platform IME session (docs/keyboard-ime-unification.md §7) ------
  *
- * ONE ime_t for the device, not one per app. 辞書も学習も既に device
- * 単位で共有されていて (skkimg_acquire / skk_mru_get)、セッションだけ
+ * ONE ime_t for the device, not one per app. 辞書は既に device 単位で
+ * 共有されていて (skkimg_acquire)、セッションだけ
  * 増やしても「どこにも描かれない 2 つ目の preedit」ができるだけ。誰の
  * 打鍵を通すかは MqjsWorker.ime_used (ui.ime(1) の opt-in) が決めるので、
  * ゲームのキーが黙って食われることはない。
@@ -5839,9 +5677,9 @@ static volatile int16_t s_ime_field_x, s_ime_field_y, s_ime_field_h;
 
 /* --- ここから下は所有タスクの上でしか呼ばない (ESP では IME タスク、
    ホストには入力タスクが無いので mqjs タスクがそのまま所有者)。
-   学習 (skk_mru_t) を書くのも今はこのタスクだけになった — skk.* ハンドルが
-   消えて 2 人目の書き手が居なくなったため。それでも鍵が残っているのは、
-   読み手 (skk_mru_flush) が mqjs タスクに居るから (s_skk_mru_lock 参照)。 --- */
+   IME に属する可変状態はもう s_ime だけで、それに触るタスクは 1 つ。
+   だからこの層に鍵は 1 つも無い (学習ストアを消した 2026-07-30 まで、
+   他タスクから読まれる唯一の構造体がそれだった)。 --- */
 
 /* セッションを使える状態にする。辞書は初回だけ開く。
    失敗を恒久ラッチしないのが肝で (§4-4)、skk_dict.bin は gitignore 対象
@@ -5879,16 +5717,13 @@ static bool ime_arm_now(void)
         }
         s_ime_img = img;
         ime_attach(&s_ime, &s_skk_img[img].dict);
-        /* NULL でも IME は動く (学習しなくなるだけ) */
-        ime_attach_mru(&s_ime, skk_mru_get());
     }
     return true;
 }
 
 /* IME を降りるときの後始末。読みかけは捨てる (確定させない — 誤操作で
    リモートのシェルへ文字列を押し込むより、数文字打ち直す方がまし)。
-   学習の書き戻しはここには無い: I/O は所有タスクの仕事ではなく、畳んだ後に
-   呼び手 (mqjs タスク) が同期で書く — 下の ime_disarm()。 */
+   メモリの中だけで完結する: この境界に書き戻すものはもう無い。 */
 static void ime_fold_now(void)
 {
     if (!s_ime_init)
@@ -6025,10 +5860,6 @@ static void ime_float_update(void)
     size_t len = 0;
     body[0] = '\0';
 
-    /* 候補文字列は学習ストア (skk_mru_text) を指すことがあり、それは
-       mqjs タスクの書き戻しと共有している。組み終わるまで鍵を持つ。 */
-    mru_lock();
-
     /* 境界はエンジンから貰う。▼ では候補と送り仮名が区切り記号なしで
        連結されるので、文字列をいくら眺めても切れ目は出てこない (§6.1)。 */
     const skk_span_t *sp = NULL;
@@ -6069,7 +5900,6 @@ static void ime_float_update(void)
     } else {
         sel = -1;
     }
-    mru_unlock();
 
     /* アンカーはアプリのカーソル (ui.caret)。ただし field にフォーカスが
        あるときは、その矩形が正しい行き先 — アプリは preedit を知らないので
@@ -6134,15 +5964,8 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
         s_ime_m.hop_max_us = hop;
 
     if (s_ime_img >= 0) {
-        /* 学習は mqjs タスクの skk_mru_flush() と共有しているので、エンジンを
-           回す間だけ鍵を取る (s_skk_mru_lock)。ime_text() が指すのは skk_t の
-           commit バッファであって MRU ではないから、外に出してよい。
-           t0 を鍵の内側に置くのは、測りたいのがエンジンの仕事であって鍵の
-           待ち時間ではないから (待ちは hop が持つ)。 */
-        mru_lock();
         int64_t t0 = time_us();
         d = ime_feed(&s_ime, key, len);
-        mru_unlock();
         /* 素通しは計測の手前で抜ける (§4.2)。辞書を引いていない = 帰属先が
            無いし、ASCII の 1 打鍵に 2 回目の時計読みと struct 複製を足すのは
            bitmask 設計が消したはずのコストそのもの。 */
@@ -6167,16 +5990,10 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
             }
         }
         if (d == IME_TEXT) {
-            s_skk_mru_dirty = true; /* 印だけ。書き戻しは境界でまとめて */
             key = ime_text(&s_ime, &len);
             if (!key || len == 0)
                 d = IME_TAKEN;      /* 空の確定は流さない */
         }
-        /* 打鍵の経路に同期の littlefs I/O は置かない。所有タスクへ移しても
-           次の打鍵が fwrite/fsync の後ろで待たされ、キューが埋まれば静かに
-           消えるだけ (「あ」で切った縁もここでは書かない)。印
-           (s_skk_mru_dirty) は確定のたびに立っているので、次の境界
-           — ime_disarm / アプリ停止 — がまとめて書く。 */
 
         /* 何を描き直すかは view ビットだけで決める (再導出しない)。素通しの
            打鍵では 1 本も立たないので post も起きないし、▼ の中の SPACE 連打は
@@ -6254,9 +6071,6 @@ static bool ime_owner_start(void)
     s_ime_q = xQueueCreate(MQJS_IME_QUEUE_LEN, sizeof(ImeCmd));
     if (!s_ime_q)
         return false;
-    /* 所有タスクを起こす前に。ここが MRU の鍵の唯一の生成点であることの
-       裏付けで、以降 mru_lock() の遅延生成は競合しない。 */
-    mru_lock_init();
     /* 優先度は打鍵を渡してくる側 (mqjs/kbd_tab5 = 5) と同じ。上げると入力面を
        押しのけ、下げると打鍵がここで待たされる。 */
     if (xTaskCreate(ime_owner_task, "mqjs_ime", 4096, NULL, 5, NULL) != pdPASS) {
@@ -6348,24 +6162,15 @@ static bool ime_arm(void)
     return ime_owner_start() && ime_cmd_sync(IME_CMD_ARM);
 }
 
-/* 畳むのは所有タスク、書き戻すのはこのタスク。分けてあるのは、境界での
-   書き戻しが「同期であること」に意味があるから (アプリ停止でこの後 JS の
-   文脈が消える。誰かに投げると投げた先が書く前に落ちる)。ack を待った後
-   なので打鍵はもう来ておらず、学習を触っているのはこのタスクだけ。
-
-   ⚠ 順序は入れ替えられないし、この 2 行を鍵で囲ってもいけない。
-   ime_cmd_sync() は所有タスクの返事を待ち、所有タスクは仕事をするのに
-   s_skk_mru_lock を取る — 鍵を持ったまま ack を待てばそのまま睨み合いになる。
-   鍵が現れるのは skk_mru_flush() の内側だけ、という形を守ること。 */
+/* 畳むのは所有タスク。畳み終わるのを待つだけで、この後に続く仕事は無い。 */
 static void ime_disarm(void)
 {
     (void)ime_cmd_sync(IME_CMD_FOLD);
-    (void)skk_mru_flush();
 }
 #else
 /* ホストには打鍵を投げてくるタスクが無く、mqjs タスクが唯一の所有者。 */
 static bool ime_arm(void)    { return ime_arm_now(); }
-static void ime_disarm(void) { ime_fold_now(); (void)skk_mru_flush(); }
+static void ime_disarm(void) { ime_fold_now(); }
 #endif
 
 /* ui.ime(mode) — canvas アプリの opt-in (§7/§8.2)。1 = このアプリの打鍵を
@@ -6592,13 +6397,10 @@ static void app_reset_bindings(MqjsWorker *app)
     }
 #ifdef ESP_PLATFORM
     /* field 経由で IME を使ったアプリは ime_used が立たないので、上の枝では
-       拾えない (I3)。学習の書き戻しはこの境界が最後の機会で、mqjs タスクの
-       同期 I/O でやる決まり — LVGL タスクの blur では踏めない。 */
+       拾えない (I3)。 */
     if (s_ime_field >= 0) {
         s_ime_field = -1;      /* 先に落とす: poster を止めてから畳む */
         ime_disarm();          /* 読みかけを次のアプリへ持ち越さない */
-    } else {
-        (void)skk_mru_flush(); /* 既に blur 済み。汚れていなければ即 return */
     }
 #endif
     if (app->fg_used) {
