@@ -23,6 +23,7 @@
 | [system-settings-design.md](system-settings-design.md) | System Vault、デバイス設定、プロビジョニング QR の wire format |
 | [skk-ime-design.md](skk-ime-design.md) | SKK 日本語入力。`skk_core` (C) と mqjs フロントエンド、辞書 image の形式 |
 | [audio-pipeline.md](audio-pipeline.md) | ES8388 + I2S + PCM ring のスピーカー再生パス |
+| [battery-power-design.md](battery-power-design.md) | Tab5 の電池。INA226 ゲージ (IR 補正 + クーロン + 錨)、充電制御と上限、過放電の段階的ロードシェッドと自動シャットダウン。**実機未検証** |
 | [power-states.md](power-states.md) | 4 ステート電源モデル。P0 (画面) は実装済、SUSPEND 以降が生きた計画 |
 | [mquickjs-patches.md](mquickjs-patches.md) | vendored mquickjs (upstream `203d5bb`) に載せたローカルパッチの全量 |
 | [ui-overlay-plan.md](ui-overlay-plan.md) | `ui.overlay` / `ui.cursor` — 浮かせるものを C 側へ寄せる。**未着手の設計** |

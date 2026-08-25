@@ -559,6 +559,7 @@ idf.py "-DMQJS_SCRIPT=life.js" build flash monitor
 | `store` | 全アプリ共有の NVS キーバリュー保存 |
 | `vault` | アプリ単位の秘密保存 (`put/has/del`、値の読み戻し不可) |
 | `clipboard` | アプリ間で共有され、再起動後も残るクリップボード |
+| `power` | Tab5 バッテリー。`battery()` は全アプリ、充電制御はシステムアプリ専用 |
 | `sys` | アプリ管理、前面切替、通知、アプリ間シグナル、ストア |
 | グローバル | `print`、`console.log`、タイマー、`Date`、`performance.now` |
 
@@ -613,7 +614,7 @@ mkdir -p gen_pc
 /tmp/stdlib_tool -a -m64 > gen_pc/mquickjs_atom.h
 /tmp/stdlib_tool -m64 > gen_pc/device_stdlib.h
 gcc -O2 -I. -Igen_pc -Imquickjs -I../skk_core/include -I../ime_core/include \
-  -I../ui_tab5/include \
+  -I../ui_tab5/include -I../pwr_tab5/include \
   -o /tmp/run_pc tools/run_pc.c \
   mqjs_runtime.c system_vault.c tailscale_adapter.c app/mqjs_app_manager.c \
   ../skk_core/skk_kana.c ../skk_core/skk_dict.c ../skk_core/skk_builtin.c \
