@@ -144,7 +144,13 @@ function availPage(it) {
     var s = ui.screen((it.icon ? it.icon + " " : "") + it.title);
     var src = it.src || "mqtt";
     s.label("name: " + it.name);
-    s.label("出所: " + (src === "sd" ? "microSD (署名済み)" : "棚 (ブローカー)"));
+    /* カタログ行の署名はまだ確かめていない。一覧で 1 本ずつ検証すると
+       実機 226ms × 本数ぶん UI が止まるので、確認はインストールの瞬間に
+       1 回だけ走る (§13.3)。ここで「署名済み」と書くと嘘になる。 */
+    if (src === "sd")
+        s.label("出所: microSD — 署名は入れるときに確認します");
+    else
+        s.label("出所: 棚 (ブローカー)");
     if (it.desc)
         s.label(it.desc);
     if (it.perm)
@@ -158,8 +164,11 @@ function availPage(it) {
             sys.notify(src === "sd" ? "インストール: " + it.name
                                     : "インストール要求: " + it.name);
         else
-            sys.notify(src === "sd" ? "カードから読めません: " + it.name
-                                    : "要求できません (ブローカー未接続?)");
+            /* カード側の失敗はほぼ「署名が合わない」。理由の全文は C 側の
+               ログにしか出せない (sys.install は bool しか返せない)。 */
+            sys.notify(src === "sd"
+                       ? "入れられません: 署名が合わないか読めません — " + it.name
+                       : "要求できません (ブローカー未接続?)");
         ui.back(); /* 完了は installed: 通知 → ストアを開き直すと済み側 */
     });
     s.button("戻る", function () { ui.back(); });
