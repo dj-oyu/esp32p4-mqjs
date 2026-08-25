@@ -1,5 +1,5 @@
 /*
- * microSD 上の署名済みアプリを、棚 (MQTT) と同じカタログ契約で見せる。
+ * microSD 上のアプリを、棚 (MQTT) と同じカタログ契約で見せる。
  * docs/filer-storage-design.md §13。
  *
  * ねらいは「ブローカー無しで配れること」であって、容量ではない
@@ -12,9 +12,14 @@
  * そこへ届く経路が署名検証済みしか無いからで (main/storage.c 冒頭)、
  * カードは誰でも PC で書ける。そこで **カード上のファイルは MQTT に
  * publish されるのと同じバイト列** —— signature(64) || script —— を
- * そのまま置き、読むたびに crypto_sign_open で検証する。新しい暗号は
- * 1 行も要らず、鍵の持ち主だけが配れるという性質が保たれる。
+ * そのまま置き、**インストールする瞬間に** crypto_sign_open で検証する。
+ * 新しい暗号は 1 行も要らず、鍵の持ち主だけが配れるという性質が保たれる。
  * 作るのは tools/mqjs_pack.py。
+ *
+ * 検証はインストールにしかない。一覧は信頼できる必要がないからで、
+ * 逆に一覧で検証すると (実機 226ms/本) ストア画面を開くたびに JS タスクが
+ * 秒単位で止まる。カタログ行は「カードにこういう名前のものが在る」以上の
+ * ことを主張していない。
  *
  * 走査はカタログの count() の中でだけ走る。ストア画面を開いたときにしか
  * 呼ばれないので、常駐タスクもタイマーも要らない (電源方針)。
@@ -36,6 +41,10 @@
 #define CARD_DIR   "/sd/apps"
 #define CARD_EXT   ".mjsa"
 #define SIG_LEN    64
+/* マニフェスト行が始まるオフセット。カード上の形は signature(64) || script
+   なので、署名を読み飛ばした先がそのままスクリプトの先頭
+   ("// @title ...") になる。 */
+#define MANIFEST_OFF SIG_LEN
 /* 1 回の走査で覚えるアプリ数。カタログ 1 画面ぶんあれば十分で、
    これ以上は人が選べない。 */
 #define CARD_MAX   32
@@ -78,18 +87,31 @@ static bool split_name(const char *fname, char *out, size_t cap)
 }
 
 /* 署名付きの塊を読み、検証して、中身を返す。戻り値は malloc'd な
-   スクリプト本体 (NUL 終端)、*len に長さ。検証に落ちたら NULL。 */
-static char *load_verified(const char *name, size_t *len)
+   スクリプト本体 (NUL 終端)、*len に長さ。検証に落ちたら NULL で、
+   *why に短い理由が入る (why は NULL 可)。
+ *
+ * **実機で 1 本 226ms**。crypto_sign_open は Ed25519 のソフト実装で、
+ * JS タスク (協調・単一スレッド) の上で回ると UI ごと止まる。だから
+ * ここを呼ぶのはインストールの瞬間だけ —— 人が押したボタン 1 回に
+ * 対して 1 回で、それは待たされてよい時間。一覧では呼ばない。 */
+static char *load_verified(const char *name, size_t *len, const char **why)
 {
     *len = 0;
+    if (why)
+        *why = "unknown";
     char vpath[128];
     snprintf(vpath, sizeof vpath, CARD_DIR "/%s" CARD_EXT, name);
 
     fs_stat_t st;
-    if (fs_stat(vpath, &st) != ESP_OK || st.is_dir)
+    if (fs_stat(vpath, &st) != ESP_OK || st.is_dir) {
+        if (why)
+            *why = "not on the card any more";
         return NULL;
+    }
     if (st.size <= SIG_LEN || st.size > SIG_LEN + MQJS_SCRIPT_MAX) {
         ESP_LOGW(TAG, "'%s': implausible size %llu", name, st.size);
+        if (why)
+            *why = "implausible size";
         return NULL;
     }
 
@@ -100,22 +122,28 @@ static char *load_verified(const char *name, size_t *len)
     if (!sm || !m) {
         free(sm);
         free(m);
+        if (why)
+            *why = "out of memory";
         return NULL;
     }
     size_t got = 0;
     if (fs_read(vpath, 0, sm, n, &got) != ESP_OK || got != n) {
         free(sm);
         free(m);
+        if (why)
+            *why = "cannot read the card";
         return NULL;
     }
     unsigned long long mlen = 0;
     int rc = crypto_sign_open(m, &mlen, sm, n, MQJS_TASK_PUBKEY);
     free(sm);
     if (rc != 0) {
-        /* 署名が合わない = 鍵の持ち主が配ったものではない。黙って無視
-           するのではなくログに出す: カードに置いたのに出てこない理由が
-           分からないと、人は「壊れている」と思ってしまう。 */
+        /* 署名が合わない = 鍵の持ち主が配ったものではない。一覧には
+           出したうえで、ここで断る (以前は一覧から黙って消していたので、
+           カードに置いたのに出てこない理由が誰にも分からなかった)。 */
         ESP_LOGW(TAG, "'%s': signature rejected", name);
+        if (why)
+            *why = "signature rejected";
         free(m);
         return NULL;
     }
@@ -126,6 +154,26 @@ static char *load_verified(const char *name, size_t *len)
 
 /* ---- カタログ契約 (mqjs_store_api_t) ---------------------------- */
 
+/* 一覧は**署名を確かめない**。
+ *
+ * 以前はここで 1 本ずつ load_verified() を回していた。実機の実測で
+ * 1 本 226ms、カードに 8 本で 1.8 秒、20 本なら 4.5 秒 —— しかも
+ * ストア画面を開くたび。JS タスクは協調・単一スレッドなので、その間
+ * UI も他のアプリも全部止まる。
+ *
+ * 一覧に信頼性は要らない。要るのはインストールの側だけで、そちらは
+ * card_install() が crypto_sign_open で確かめて落ちれば断る。カタログ行が
+ * 名乗る @title は所詮 自称であって、それを信じて何かが起きるわけではない
+ * (押して初めて検証が走る)。だから読むのはマニフェスト行だけ: 署名 64 バイト
+ * を飛ばした先から HEAD_MAX だけ。全文を読むことも malloc することもない。
+ *
+ * 副作用として、署名が合わないファイルも**一覧に出る**ようになった。これは
+ * 改善で、以前はログにしか出ないまま一覧から消えていたので、カードに置いた
+ * のに出てこない理由が画面からは分からなかった。行には verified が付かない
+ * (sys.store() 参照) ので、UI は「まだ確かめていない」と正しく言える。
+ *
+ * 残る一覧時の門は split_name() のファイル名検査だけ。安いし、名前はその
+ * まま /littlefs/apps/<name>.js になるので依然として必要。 */
 static int card_count(void)
 {
     s_cat_n = 0;
@@ -144,21 +192,43 @@ static int card_count(void)
         char name[25];
         if (!split_name(e.name, name, sizeof name))
             continue;
-        size_t len = 0;
-        char *body = load_verified(name, &len);
-        if (!body)
-            continue;               /* 署名なし / 壊れている */
+
+        char vpath[128];
+        snprintf(vpath, sizeof vpath, CARD_DIR "/%s" CARD_EXT, name);
+        fs_stat_t st;
+        if (fs_stat(vpath, &st) != ESP_OK || st.is_dir)
+            continue;
+        /* 大きさの妥当性だけは一覧でも見る。署名しか入っていない
+           ファイルや、そもそも読み込めない大きさのものを行にしても
+           押した先で必ず断られるだけ。 */
+        if (st.size <= SIG_LEN || st.size > SIG_LEN + MQJS_SCRIPT_MAX) {
+            ESP_LOGW(TAG, "'%s': implausible size %llu", name, st.size);
+            continue;
+        }
+
+        char  *head = s_cat[s_cat_n].head;
+        size_t got  = 0;
+        if (fs_read(vpath, MANIFEST_OFF, head, HEAD_MAX - 1, &got) != ESP_OK)
+            continue;
+        head[got] = '\0';
+        /* 検証前のバイト列が初めてカタログ行になるので、制御文字だけは
+           落とす。'\n' は残す (マニフェストの行境界)。0x80 以上は UTF-8
+           の続きなので触らない —— @title は日本語で書かれる。
+           署名の合わないファイルがステータスバーへ ESC を撃ち込めない
+           ようにするためだけの、行儀の悪いバイトへの目張り。 */
+        for (size_t k = 0; k < got; k++) {
+            unsigned char c = (unsigned char)head[k];
+            if ((c < 0x20 && c != '\n') || c == 0x7f)
+                head[k] = ' ';
+        }
+
         snprintf(s_cat[s_cat_n].name, sizeof s_cat[s_cat_n].name, "%s", name);
-        size_t hn = len < HEAD_MAX - 1 ? len : HEAD_MAX - 1;
-        memcpy(s_cat[s_cat_n].head, body, hn);
-        s_cat[s_cat_n].head[hn] = '\0';
-        s_cat[s_cat_n].size = (long)len;
+        s_cat[s_cat_n].size = (long)(st.size - SIG_LEN);
         s_cat_n++;
-        free(body);
     }
     fs_dir_close(d);
     if (s_cat_n)
-        ESP_LOGI(TAG, "%d signed app(s) on the card", s_cat_n);
+        ESP_LOGI(TAG, "%d app(s) on the card (signatures unchecked)", s_cat_n);
     return s_cat_n;
 }
 
@@ -167,26 +237,45 @@ static bool card_get(int idx, char *name, size_t ncap, char *head, size_t hcap)
     if (idx < 0 || idx >= s_cat_n)
         return false;
     snprintf(name, ncap, "%s", s_cat[idx].name);
-    /* カタログ行の @size は本体の実長。棚側と同じ形にしておくと
-       ランチャーが出所を意識せず同じコードで表示できる。 */
-    snprintf(head, hcap, "%s\n// @size %ld\n", s_cat[idx].head,
-             s_cat[idx].size);
+    /* カタログ行の @size は本体の実長 (ファイル長 - 署名 64)。棚側と
+       同じ形にしておくとランチャーが出所を意識せず同じコードで表示できる。
+     *
+     * @size を**先に**置くのは、マニフェストが hcap を埋め尽くしたときに
+     * 切り落とされるのが末尾だから。後ろに付けると、行の多いアプリだけ
+     * サイズが 0 と表示される。@ 行の順序は読む側 (manifest_field) には
+     * 関係ない。 */
+    snprintf(head, hcap, "// @size %ld\n%s", s_cat[idx].size,
+             s_cat[idx].head);
     return true;
 }
 
 /* 棚側の install は非同期 (ブローカーへ取りに行く) だが、こちらは
    目の前のカードから読むだけなのでその場で終わる。戻り値も
-   「要求を受け付けた」ではなく「入った」になる。 */
+   「要求を受け付けた」ではなく「入った」になる。
+ *
+ * **署名検証はここにしかない。** 一覧は誰でも書けるカードのバイト列を
+ * そのまま並べているだけなので、/littlefs/apps/ の不変条件を守っている
+ * のはこの crypto_sign_open ただ 1 つ。226ms かかるが、人がボタンを
+ * 押した 1 回に対する 1 回なので払ってよい。 */
 static bool card_install(const char *name)
 {
     size_t len = 0;
-    char *body = load_verified(name, &len);
-    if (!body)
+    const char *why = NULL;
+    char *body = load_verified(name, &len, &why);
+    if (!body) {
+        /* 断った理由を残す。一覧に出ているのに入らないアプリが在りうる
+           ようになったので、「読めません」だけでは人が次に何をすれば
+           いいか分からない。 */
+        ESP_LOGE(TAG, "refusing to install '%s': %s", name, why);
         return false;
+    }
     bool ok = storage_save_app(name, body, len);
     free(body);
     if (ok)
-        ESP_LOGI(TAG, "installed '%s' from the card", name);
+        ESP_LOGI(TAG, "installed '%s' from the card (signature verified)", name);
+    else
+        ESP_LOGE(TAG, "refusing to install '%s': cannot write to internal storage",
+                 name);
     return ok;
 }
 

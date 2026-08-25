@@ -5226,10 +5226,12 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return arr;
 }
 
-/* sys.store() -> [{name, title, icon, desc, size, installed}] straight
-   from the broker catalog (§11). Catalog-only on purpose: the launcher
-   merges it with sys.installed() itself, and a device-side install
-   shows up here as installed=true on the next call. */
+/* sys.store() -> [{name, title, icon, desc, size, installed, src,
+   verified}] straight from the broker catalog (§11). Catalog-only on
+   purpose: the launcher merges it with sys.installed() itself, and a
+   device-side install shows up here as installed=true on the next call.
+   `verified` is always false: a catalogue row's signature is not checked
+   until the body is actually installed. */
 JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSGCRef arr_ref;
@@ -5294,6 +5296,13 @@ JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         JS_SetPropertyStr(ctx, obj_ref.val, "installed", JS_NewBool(inst));
         JSValue v_src = JS_NewString(ctx, cat_src[c]);
         JS_SetPropertyStr(ctx, obj_ref.val, "src", v_src);
+        /* カタログ行は署名を**見ていない**。棚は retained メッセージを
+           読んだだけ、カードはファイルの先頭 224 バイトを読んだだけで、
+           どちらも本体の検証はインストールの瞬間まで走らない (カードで
+           実機 226ms/本、一覧で回すと画面を開くたびに秒単位で固まる)。
+           行に書いてある @title も @desc も自称にすぎないので、UI が
+           「署名済み」と言い切ってよい根拠はここには無い。 */
+        JS_SetPropertyStr(ctx, obj_ref.val, "verified", JS_NewBool(0));
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)n++, obj);
     }
