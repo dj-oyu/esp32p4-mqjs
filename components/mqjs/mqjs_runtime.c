@@ -184,7 +184,8 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
                EV_TERM_REPLY, /* term.onReply: a DSR/DA answer, inline */
                EV_NET, /* broadcast: release the net.onReady wait queue */
-               EV_FSGRANT /* fs.request: the consent answer came back */
+               EV_FSGRANT, /* fs.request: the consent answer came back */
+               EV_FSOP /* a long fs job (format) finished on its own task */
              } MqjsEventType;
 
 typedef struct {
@@ -202,6 +203,7 @@ typedef struct {
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
         struct { uint32_t id; uint8_t ok; } fsgrant; /* fs.request answer */
+        struct { uint8_t ok; } fsop;                 /* fs.format result */
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
@@ -316,6 +318,8 @@ typedef struct {
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
     bool fsreq_used; JSGCRef fsreq_cb; /* fs.request one-shot: fires with the
                                           grant token, or 0 when refused */
+    bool fsop_used;  JSGCRef fsop_cb;  /* fs.format one-shot: fires with the
+                                          result once its task is done */
     bool net_used;  JSGCRef net_cb;  /* net.onReady one-shot: the app's ticket
                                         in the network wait queue (fires once
                                         the link is up, then auto-releases) */
@@ -571,7 +575,16 @@ void mqjs_set_print_sink(void (*fn)(const char *, size_t))
 /* §11 store catalog provider + uninstall unsubscribe hook (both
    host-registered; NULL on the PC build) */
 static const mqjs_store_api_t *s_store_api;
+/* 同じ契約の第 2 のカタログ: microSD 上の署名済みアプリ。棚 (MQTT) と
+   混ぜずに別ソースとして並べる —— 同名衝突は勝者を決めずに両方見せる
+   (docs/filer-storage-design.md §13)。 */
+static const mqjs_store_api_t *s_card_api;
 static void (*s_uninstall_hook)(const char *name);
+
+void mqjs_set_card_provider(const mqjs_store_api_t *api)
+{
+    s_card_api = api;
+}
 
 void mqjs_set_store_provider(const mqjs_store_api_t *api)
 {
@@ -3135,6 +3148,18 @@ JSValue js_fs_volumes(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
         JSValue s_path = JS_NewString(ctx, vroot);
         JS_SetPropertyStr(ctx, obj_ref.val, "path", s_path);
         JS_SetPropertyStr(ctx, obj_ref.val, "mounted", JS_NewBool(mounted));
+        /* 「入っていない」と「入っているが読めない」を混ぜない。混ぜると
+           未フォーマットのカードが「入っていません」と出て、直す導線が
+           画面から消える (docs/filer-storage-design.md §12)。 */
+        const char *st = "absent";
+        switch (fsvol_state(v)) {
+        case FSVOL_ST_MOUNTED:    st = "mounted";    break;
+        case FSVOL_ST_UNKNOWN:    st = "unknown";    break;
+        case FSVOL_ST_UNREADABLE: st = "unreadable"; break;
+        default:                                     break;
+        }
+        JSValue s_state = JS_NewString(ctx, st);
+        JS_SetPropertyStr(ctx, obj_ref.val, "state", s_state);
         JS_SetPropertyStr(ctx, obj_ref.val, "removable",
                           JS_NewBool((v->flags & FSVOL_REMOVABLE) ? 1 : 0));
         JS_SetPropertyStr(ctx, obj_ref.val, "system",
@@ -3631,6 +3656,73 @@ JSValue js_fs_copy(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #else
     (void)this_val; (void)argc; (void)argv;
     return JS_ThrowTypeError(ctx, "fs.copy: no filesystem on this build");
+#endif
+}
+
+#ifdef ESP_PLATFORM
+/* フォーマットは専用タスクで走らせる。大容量カードでは FAT テーブル
+   だけで数十 MB 書くので、JS タスク上で回すと MQJS_MAX_RUN_MS (5 秒) の
+   コールバック watchdog に確実に轢かれる。同時に 1 本だけ。 */
+static const fsvol_t *s_fmt_vol;
+static uint8_t        s_fmt_worker;
+static uint16_t       s_fmt_gen;
+
+static void fs_format_task(void *arg)
+{
+    (void)arg;
+    esp_err_t err = fsvol_format(s_fmt_vol);
+    MqjsEvent ev = { .type = EV_FSOP, .worker = s_fmt_worker,
+                     .gen = s_fmt_gen };
+    ev.u.fsop.ok = (err == ESP_OK) ? 1 : 0;
+    ev_post(&ev, 0);
+    s_fmt_vol = NULL;
+    vTaskDelete(NULL);
+}
+#endif
+
+/* fs.format(grant, volumeId, cb) -> bool (要求を受け付けたか)
+   中身は消える。grant はそのボリュームへの書き込み権限で、フォーマットに
+   成功しても失敗しても epoch が進むのでこの grant はここで死ぬ —— 消えた
+   データへの権限が残らない。cb(ok) は終わってから呼ばれる。 */
+JSValue js_fs_format(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+#ifdef ESP_PLATFORM
+    char id[32];
+    if (uiw_copy_str(ctx, argv[1], id, sizeof id))
+        return JS_EXCEPTION;
+    const fsvol_t *v = fsvol_find(id);
+    if (!v)
+        return fs_throw(ctx, "format", ESP_ERR_NOT_FOUND);
+    /* 内蔵は消させない。アプリも設定も辞書もそこに在る。 */
+    if (v->flags & FSVOL_SYSTEM)
+        return JS_ThrowTypeError(ctx, "fs.format: '%s' is system storage", id);
+    char vroot[40];
+    snprintf(vroot, sizeof vroot, "/%s", id);
+    if (!fs_grant_for(ctx, argv[0], vroot, true))
+        return JS_EXCEPTION;
+    if (s_fmt_vol)
+        return JS_ThrowTypeError(ctx, "fs.format: already running");
+
+    JSValue r = register_cb(ctx, argv[2], &s_cur_wk->fsop_used,
+                            &s_cur_wk->fsop_cb);
+    if (JS_IsException(r))
+        return r;
+    s_fmt_vol    = v;
+    s_fmt_worker = s_cur_wk->idx;
+    s_fmt_gen    = s_cur_wk->gen;
+    /* 6KB: f_mkfs は作業バッファを自分で確保するが、VFS/FATFS の呼び出しが
+       深いので既定の 4KB では心もとない。 */
+    if (xTaskCreate(fs_format_task, "fs_format", 6144, NULL, 4, NULL) != pdPASS) {
+        s_fmt_vol = NULL;
+        s_cur_wk->fsop_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->fsop_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.format: no filesystem on this build");
 #endif
 }
 
@@ -4140,6 +4232,27 @@ static void dispatch_fsgrant(MqjsWorker *app, const MqjsEvent *ev)
     (void)app;
     (void)ev;
 #endif
+}
+
+/* fs.format の結果。専用タスクから戻ってきた 1 ビットを渡すだけ。 */
+static void dispatch_fsop(MqjsWorker *app, const MqjsEvent *ev)
+{
+    JSContext *ctx = app->ctx;
+    if (!app->fsop_used)
+        return;
+    if (JS_StackCheck(ctx, 3)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, JS_NewBool(ev->u.fsop.ok));   /* arg0 */
+    JS_PushArg(ctx, app->fsop_cb.val);            /* func */
+    JS_PushArg(ctx, JS_NULL);                     /* this */
+    app->fsop_used = false;
+    JS_DeleteGCRef(ctx, &app->fsop_cb);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 1);
+    if (JS_IsException(ret))
+        dump_error(ctx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -5118,10 +5231,19 @@ JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return arr;
     JS_PUSH_VALUE(ctx, arr);
     int n = 0;
-    int cnt = s_store_api ? s_store_api->count() : 0;
+    /* 棚 (MQTT) とカード (microSD) を続けて並べる。同名が両方に在っても
+       勝者を決めない: 出所を row に付けて両方見せ、どちらを入れるかは
+       人が選ぶ (docs/filer-storage-design.md §13)。カード側は count() が
+       走査そのものなので、ストア画面を開いたときだけ読みに行くことに
+       なる —— 常駐の監視は置かない。 */
+    const mqjs_store_api_t *const cats[2] = { s_store_api, s_card_api };
+    static const char *const cat_src[2]   = { "mqtt", "sd" };
+    for (int c = 0; c < 2; c++) {
+    const mqjs_store_api_t *api = cats[c];
+    int cnt = api ? api->count() : 0;
     for (int i = 0; i < cnt; i++) {
         char name[25], head[224];
-        if (!s_store_api->get(i, name, sizeof name, head, sizeof head))
+        if (!api->get(i, name, sizeof name, head, sizeof head))
             continue;
         size_t hlen = strlen(head);
         char title[48], icon[8], desc[120], perm[48], sizes[16];
@@ -5163,8 +5285,11 @@ JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         JS_SetPropertyStr(ctx, obj_ref.val, "size",
                           JS_NewInt32(ctx, (int32_t)size));
         JS_SetPropertyStr(ctx, obj_ref.val, "installed", JS_NewBool(inst));
+        JSValue v_src = JS_NewString(ctx, cat_src[c]);
+        JS_SetPropertyStr(ctx, obj_ref.val, "src", v_src);
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)n++, obj);
+    }
     }
     JS_POP_VALUE(ctx, arr);
     return arr;
@@ -5178,8 +5303,14 @@ JSValue js_sys_install(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     char name[64];
     if (uiw_copy_str(ctx, argv[0], name, sizeof name))
         return JS_EXCEPTION;
-    bool ok = s_store_api && name[0] && !strchr(name, '/') &&
-              s_store_api->install(name);
+    /* 同じ名前が棚とカードの両方に在りうるので、どちらから入れるかは
+       呼び出し側が名指しする (§13)。省略時は従来どおり棚。 */
+    char src[8] = "";
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]) &&
+        uiw_copy_str(ctx, argv[1], src, sizeof src))
+        return JS_EXCEPTION;
+    const mqjs_store_api_t *api = !strcmp(src, "sd") ? s_card_api : s_store_api;
+    bool ok = api && name[0] && !strchr(name, '/') && api->install(name);
     return JS_NewBool(ok);
 }
 
@@ -8288,6 +8419,12 @@ static void app_reset_bindings(MqjsWorker *app)
         JS_DeleteGCRef(ctx, &app->fsreq_cb);
         app->fsreq_used = false;
     }
+    if (app->fsop_used) {
+        JS_DeleteGCRef(ctx, &app->fsop_cb);
+        app->fsop_used = false;
+        /* 走っているフォーマットは止められない。結果イベントは
+           世代チェックで捨てられる (§3.2)。 */
+    }
 #ifdef ESP_PLATFORM
     /* 権限は世代で自然に失効するが (fs_grant_get)、席を空けておく方が
        素直。同意待ちの要求も、返事が来ても行き先が無いので捨てる。 */
@@ -8623,6 +8760,7 @@ static MqjsWorker *event_owner(const MqjsEvent *ev)
     case EV_CAM:
     case EV_HTTP:
     case EV_FSGRANT:
+    case EV_FSOP:
     case EV_TERM_REPLY: {
         MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
@@ -8663,6 +8801,7 @@ static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
     case EV_FSGRANT:        dispatch_fsgrant(app, ev);       break;
+    case EV_FSOP:           dispatch_fsop(app, ev);          break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
     case EV_TERM_REPLY:     dispatch_term_reply(app, ev);    break;
     }

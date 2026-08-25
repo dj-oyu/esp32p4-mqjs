@@ -108,6 +108,37 @@ uint32_t fsvol_epoch(const fsvol_t *v)
     return e;
 }
 
+fsvol_state_t fsvol_state(const fsvol_t *v)
+{
+    if (fsvol_mounted(v))
+        return FSVOL_ST_MOUNTED;
+    if (!v || !v->ops || !v->ops->media_state)
+        return FSVOL_ST_ABSENT;   /* 区別できない実装は「無い」に倒す */
+    return v->ops->media_state(v);
+}
+
+esp_err_t fsvol_format(const fsvol_t *v)
+{
+    lock();
+    esp_err_t err;
+    int idx = index_of(v);
+    if (idx < 0) {
+        err = ESP_ERR_NOT_FOUND;
+    } else if (!v->ops || !v->ops->format) {
+        err = ESP_ERR_NOT_SUPPORTED;
+    } else {
+        err = v->ops->format(v);
+        /* 成功しても失敗しても epoch は進める。中身が変わったかどうかを
+           後から確かめる術は無いので、**発行済みの権限は全部失効させる**
+           のが安全側 (消えたかもしれないデータへの grant を残さない)。 */
+        s_epoch[idx]++;
+        s_mounted[idx] = (err == ESP_OK);
+        ESP_LOGW(TAG, "volume '%s' formatted: %s", v->id, esp_err_to_name(err));
+    }
+    unlock();
+    return err;
+}
+
 /* ロックを持った状態で呼ぶ。probe が「もう居ない」と言ったら、
    ここでアンマウントまで済ませる — 抜かれたカードのマウント状態を
    引きずったまま open すると VFS 層で長いタイムアウトを食う。 */

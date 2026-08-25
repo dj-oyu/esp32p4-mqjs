@@ -617,6 +617,9 @@ static const JSPropDef js_fs[] = {
     JS_CFUNC_DEF("rename", 3, js_fs_rename),
     JS_CFUNC_DEF("copy", 3, js_fs_copy),
     JS_CFUNC_DEF("unmount", 2, js_fs_unmount),
+    /* 中身を捨てる。専用タスクで走るので cb(ok) が終わりを知らせる。
+       内蔵ボリュームには使えない (C 側で拒否)。 */
+    JS_CFUNC_DEF("format", 3, js_fs_format),
     JS_PROP_END,
 };
 
@@ -697,7 +700,7 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("notices", 0, js_sys_notices),
     /* §11 store catalog: browse the shelf, install on demand */
     JS_CFUNC_DEF("store", 0, js_sys_store),
-    JS_CFUNC_DEF("install", 1, js_sys_install),
+    JS_CFUNC_DEF("install", 2, js_sys_install),
     /* term phase 3 (docs/term-design.md §4.4): the LP SRAM black box.
        No argument = stats (any app). "live"/"lastboot" = the log tail, and
        that read is gated on the dev slot or an embedded system app (§7.2).

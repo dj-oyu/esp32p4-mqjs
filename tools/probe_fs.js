@@ -43,6 +43,7 @@ var run = function () {
             label: vols[i].label,
             fstype: vols[i].fstype,
             mounted: vols[i].mounted,
+            state: vols[i].state,
             removable: vols[i].removable,
             total: vols[i].total,
             free: vols[i].free
@@ -134,6 +135,43 @@ var run = function () {
         } catch (e4) {
             out("roundtrip", { vol: target, err: "" + e4 });
         }
+
+        /* ---- 6. カード上のアプリ: 署名が無いものは載らないこと ------
+           これは検出器そのものの試験。正しく署名した .mjsa が出てくる
+           ことは PC でしか作れないので確かめられないが、**でたらめな
+           中身が「入手可能」に並んでしまわない**ことはここで言える。
+           §13 の信頼モデルはこの一点に乗っている。 */
+        if (target === "sd") {
+            var appdir = "/sd/apps";
+            var fake = appdir + "/probefake.mjsa";
+            try {
+                try { fs.mkdir(g, appdir); } catch (eA) { /* 既にある */ }
+                /* 64 バイトの偽署名 + それらしいマニフェスト */
+                var pad = "0123456789abcdef".repeat(4);   /* 64 B */
+                fs.write(g, fake,
+                         pad + "// @app probefake\n// @title 偽物\n");
+                var before = sys.store();
+                var seen = false;
+                for (var q = 0; q < before.length; q++)
+                    if (before[q].name === "probefake")
+                        seen = true;
+                /* seen が true なら穴: 署名検証を通っていない */
+                out("cardapp_reject", { listed: seen, n: before.length });
+                fs.remove(g, fake, false);
+            } catch (e5) {
+                out("cardapp_reject", { err: "" + e5 });
+            }
+        }
+
+        /* ---- 7. 内蔵はフォーマットできないこと -------------------- */
+        var refused = "NOT-THROWN";      // これが出たら穴
+        try {
+            fs.format(g, "internal", function () {});
+        } catch (e6) {
+            refused = "" + e6;
+        }
+        out("format_internal", { got: refused });
+
         out("done", {});
         sys.stop("fsprobe");
     });

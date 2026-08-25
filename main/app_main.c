@@ -37,6 +37,7 @@
 #include "esp_log.h"
 #include "board_tab5.h"
 #include "mqjs_runtime.h"
+#include "card_apps.h"
 #include "sdcard.h"
 #include "storage.h"
 #include "task_source.h"
@@ -240,6 +241,7 @@ void app_main(void)
     mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
     storage_init();            /* mount LittleFS for persisted tasks */
     sdcard_init();             /* "sd" volume, if this board has a slot */
+    card_apps_init();          /* signed apps on the card = a 2nd catalogue */
 
     /* Platform-owned network defaults: apps never hardcode the broker or the
        topic namespace. The namespace is the first segment of the task topic

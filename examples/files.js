@@ -129,12 +129,18 @@ volumesPage = function () {
     var list = s.list();
     for (var i = 0; i < vols.length; i++) {
         (function (v) {
-            var line;
+            /* 「入っていない」と「入っているが読めない」を分けて出す。
+               混ぜると、未フォーマットのカードが「入っていません」と
+               表示されて直す導線が消える。 */
+            var line = v.label + "   ";
             if (v.mounted)
-                line = v.label + "   " + fmtSize(v.total - v.free) +
-                       " / " + fmtSize(v.total);
+                line += fmtSize(v.total - v.free) + " / " + fmtSize(v.total);
+            else if (v.state === "unreadable")
+                line += "読めません (未フォーマット?)";
+            else if (v.state === "absent")
+                line += "入っていません";
             else
-                line = v.label + "   (入っていません)";
+                line += "タップして読み込む";
             list.add(line, function () {
                 if (!v.mounted) {
                     /* マウントは何も壊さないので grant 不要 */
@@ -150,6 +156,18 @@ volumesPage = function () {
                 render();
             });
         })(vols[i]);
+    }
+    /* 読めないカードを使えるようにする道。ここからしか到達できない ——
+       一覧の常設ボタンにすると、押し間違いで戻せないものを消せてしまう。
+       ランチャーが確認ページを置かないのは「停止は 1 タップで戻せる」
+       からで、フォーマットは戻せないので逆の結論になる。 */
+    for (var f0 = 0; f0 < vols.length; f0++) {
+        (function (v) {
+            if (v.state !== "unreadable")
+                return;
+            s.button(v.label + " をフォーマットして使えるようにする",
+                     function () { formatPage(v); });
+        })(vols[f0]);
     }
     for (var j = 0; j < vols.length; j++) {
         (function (v) {
@@ -169,6 +187,39 @@ volumesPage = function () {
     if (clip)
         s.label("保留中: " + (clip.op === "copy" ? "コピー" : "移動") +
                 " " + clip.name);
+};
+
+/* 取り消せない操作なので、タップだけでは実行しない。FORMAT と打たせる
+   のは 2 段確認より誤爆に強いから (誤タップは連続しても文字にならない)。 */
+var formatPage = function (v) {
+    var s = ui.screen("フォーマット: " + v.label);
+    s.label("このカードの中身はすべて消えます。取り消せません。");
+    if (v.mounted)
+        s.label("使用中: " + fmtSize(v.total - v.free) + " / " +
+                fmtSize(v.total));
+    else
+        s.label("中身は読めていないので、何が入っているかは分かりません。");
+    s.label("別の機器で使っているカードなら、先に中身を確認してください。");
+    var f = s.field("実行するには FORMAT と入力");
+    s.button("フォーマットする", function () {
+        if (f.value() !== "FORMAT") {
+            msg = "FORMAT と入力されていません";
+            render();
+            return;
+        }
+        withGrant(v.id, v.label + " をフォーマットする", function (g) {
+            /* 大容量カードでは FAT テーブルだけで数十 MB 書く。C 側が
+               専用タスクへ逃がすので、ここは終わりを待つだけ。 */
+            msg = "フォーマット中... しばらくかかります";
+            fs.format(g, v.id, function (ok) {
+                msg = ok ? v.label + " を初期化しました"
+                         : "フォーマットに失敗しました";
+                grants[v.id] = 0;   /* 成功しても epoch が進んで失効する */
+                render();
+            });
+        });
+    });
+    s.button("やめる", function () { render(); });
 };
 
 /* ---- ディレクトリ ------------------------------------------------ */

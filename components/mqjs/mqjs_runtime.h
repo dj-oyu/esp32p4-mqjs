@@ -185,6 +185,16 @@ typedef struct {
 void mqjs_set_store_provider(const mqjs_store_api_t *api);
 
 /*
+ * The same catalogue contract, second source: signed apps sitting on a
+ * removable card (docs/filer-storage-design.md section 13). count() IS the
+ * scan, so nothing reads the card until the store page asks. Rows from this
+ * provider are tagged src:"sd" by sys.store(), and sys.install(name, "sd")
+ * routes here -- a name present in both catalogues is shown twice rather
+ * than silently resolved, because there is no version field to compare.
+ */
+void mqjs_set_card_provider(const mqjs_store_api_t *api);
+
+/*
  * Called on the JS task right after sys.uninstall removes an app file:
  * the host drops the app's registry subscription so the retained body
  * does not reinstall it on the next broker sync (§11).

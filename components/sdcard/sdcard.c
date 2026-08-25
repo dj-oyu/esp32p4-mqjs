@@ -27,8 +27,25 @@ static const char *TAG = "sdcard";
 
 static sdmmc_card_t         *s_card;
 static sd_pwr_ctrl_handle_t  s_pwr;
+/* 直近のマウント試行の結果。ESP_OK 以外のとき「カードが無い」のか
+   「カードは在るがファイルシステムが読めない」のかを、この値だけで
+   見分ける (下の sd_media_state)。 */
+static esp_err_t             s_last_mount = ESP_ERR_INVALID_STATE;
+static bool                  s_tried;
+
+/* format=true で呼ぶと、f_mount が FR_NO_FILESYSTEM / FR_INT_ERR を
+   返したときに限り FATFS を作り直してからマウントし直す。ここが
+   未フォーマット・exFAT・壊れたカードの唯一の救済路で、
+   esp_vfs_fat_sdcard_format() では代われない —— あちらは
+   「既にマウントできている FAT」しか作り直せないため (§12)。 */
+static esp_err_t sd_mount_maybe_format(const fsvol_t *v, bool format);
 
 static esp_err_t sd_mount(const fsvol_t *v)
+{
+    return sd_mount_maybe_format(v, false);
+}
+
+static esp_err_t sd_mount_maybe_format(const fsvol_t *v, bool format)
 {
     (void)v;
 
@@ -71,14 +88,18 @@ static esp_err_t sd_mount(const fsvol_t *v)
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
     esp_vfs_fat_sdmmc_mount_config_t cfg = {
-        /* 絶対に自動フォーマットしない。読めないカードの正体はたいてい
-           「別の機器の大事なデータ」であって、空にしてよい理由にならない。 */
-        .format_if_mount_failed = false,
+        /* 既定では絶対に自動フォーマットしない。読めないカードの正体は
+           たいてい「別の機器の大事なデータ」であって、空にしてよい理由に
+           ならない。true になるのは、ユーザが画面で明示的に承諾した
+           フォーマット経路から呼ばれたときだけ。 */
+        .format_if_mount_failed = format,
         .max_files              = CONFIG_MQJS_SDCARD_MAX_FILES,
         .allocation_unit_size   = 16 * 1024,
     };
 
     esp_err_t err = esp_vfs_fat_sdmmc_mount(SD_MOUNT, &host, &slot, &cfg, &s_card);
+    s_tried      = true;
+    s_last_mount = err;
     if (err != ESP_OK) {
         /* カードが入っていないだけなら日常茶飯事なので警告どまり。 */
         ESP_LOGW(TAG, "mount: %s", esp_err_to_name(err));
@@ -122,11 +143,43 @@ static esp_err_t sd_usage(const fsvol_t *v, uint64_t *total, uint64_t *freeb)
     return esp_vfs_fat_info(SD_MOUNT, total, freeb);
 }
 
+/* マウントできなかった理由。esp_vfs_fat_sdmmc_mount は
+ *   - カードの初期化そのものが失敗 -> SDMMC 由来のエラー (TIMEOUT ほか)
+ *   - カードは応答したが f_mount が失敗 -> ESP_FAIL
+ * と返し分ける (IDF の vfs_fat_sdmmc.c: s_f_mount)。検出ピンが無いこの
+ * ハードで「入っていない」と「未フォーマット」を分ける唯一の手掛かりが
+ * これで、区別できないとファイラが未フォーマットのカードを
+ * 「入っていません」と表示してしまい、直す導線が消える。 */
+static fsvol_state_t sd_media_state(const fsvol_t *v)
+{
+    (void)v;
+    if (!s_tried)
+        return FSVOL_ST_UNKNOWN;
+    return s_last_mount == ESP_FAIL ? FSVOL_ST_UNREADABLE : FSVOL_ST_ABSENT;
+}
+
+static esp_err_t sd_format(const fsvol_t *v)
+{
+    if (s_card) {
+        /* 読めている FAT を作り直す。API は「既にマウント済み」を要求する。 */
+        esp_err_t err = esp_vfs_fat_sdcard_format(SD_MOUNT, s_card);
+        if (err == ESP_OK)
+            return ESP_OK;
+        ESP_LOGE(TAG, "format: %s", esp_err_to_name(err));
+        /* 作り直しに失敗した後は状態が読めない。畳んでから下の救済路へ。 */
+        sd_unmount(v);
+    }
+    /* 未フォーマット / exFAT / 壊れたカード: マウント時フォーマットが唯一の道。 */
+    return sd_mount_maybe_format(v, true);
+}
+
 static const fsvol_ops_t s_ops = {
-    .mount   = sd_mount,
-    .unmount = sd_unmount,
-    .probe   = sd_probe,
-    .usage   = sd_usage,
+    .mount       = sd_mount,
+    .unmount     = sd_unmount,
+    .probe       = sd_probe,
+    .usage       = sd_usage,
+    .media_state = sd_media_state,
+    .format      = sd_format,
 };
 
 static const fsvol_t s_vol = {

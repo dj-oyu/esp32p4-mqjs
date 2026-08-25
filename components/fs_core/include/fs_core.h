@@ -48,6 +48,19 @@ extern "C" {
 
 typedef struct fsvol fsvol_t;
 
+/* マウントされていないボリュームが「なぜ」使えないのか。
+ *
+ * 検出ピンの無いハードでは、媒体が在るかどうかはマウントを試すまで
+ * 分からない ので UNKNOWN から始まる。この区別を持たないと、未フォーマット
+ * のカードが「入っていません」と表示されてしまい、直す手段が画面から
+ * 消える (docs/filer-storage-design.md §12)。 */
+typedef enum {
+    FSVOL_ST_MOUNTED = 0,  /* 読み書きできる */
+    FSVOL_ST_UNKNOWN,      /* まだ試していない */
+    FSVOL_ST_ABSENT,       /* 媒体が無い (カードが入っていない) */
+    FSVOL_ST_UNREADABLE,   /* 媒体は在るが、ファイルシステムが読めない */
+} fsvol_state_t;
+
 typedef struct {
     /* NULL 可。NULL の場合そのボリュームは常時マウント済みとして扱う。 */
     esp_err_t (*mount)(const fsvol_t *v);
@@ -57,6 +70,12 @@ typedef struct {
     bool      (*probe)(const fsvol_t *v);
     /* 総容量と空き。NULL なら fs_usage() が ESP_ERR_NOT_SUPPORTED。 */
     esp_err_t (*usage)(const fsvol_t *v, uint64_t *total, uint64_t *freeb);
+    /* マウントできていないときの理由。NULL なら ABSENT と区別しない。
+       直近のマウント試行の結果から答える (§12)。 */
+    fsvol_state_t (*media_state)(const fsvol_t *v);
+    /* 中身を捨てて新しいファイルシステムを作る。NULL = 非対応。
+       時間がかかるので JS タスクからは決して直接呼ばないこと。 */
+    esp_err_t (*format)(const fsvol_t *v);
 } fsvol_ops_t;
 
 #define FSVOL_REMOVABLE 0x01  /* 抜き挿しされうる。ファイラが「取り出し」を出す */
@@ -89,6 +108,18 @@ esp_err_t fsvol_unmount(const fsvol_t *v);  /* 冪等 */
    アンマウント時にコールバックで回る必要をなくす (JS の grant は
    これを控えておいて、使うときに見比べるだけでよい)。 */
 uint32_t fsvol_epoch(const fsvol_t *v);
+
+/* マウント済みなら MOUNTED、そうでなければ ops->media_state の答え。 */
+fsvol_state_t fsvol_state(const fsvol_t *v);
+
+/* 中身を捨てて作り直し、マウントし直す。成功すると epoch が進むので、
+   このボリュームに対して発行済みの grant はすべて失効する —— 消えた
+   データへの書き込み権限が残らない。
+ *
+ * **JS タスクから直接呼んではいけない。** 大容量カードでは FAT テーブル
+ * だけで数十 MB 書くので、5 秒のコールバック watchdog に確実に轢かれる
+ * (docs/filer-storage-design.md §12)。専用タスクへ逃がすこと。 */
+esp_err_t fsvol_format(const fsvol_t *v);
 
 /* ---- 仮想パスの解決 --------------------------------------------- */
 
