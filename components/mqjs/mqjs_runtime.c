@@ -65,6 +65,10 @@
 #include "term_registry.h"
 #include "term_lp_ring.h"
 #include "term_pipe.h"
+/* Battery state + charge policy. Like term_registry.h above, the header is
+   type-only outside an ESP build (stubs, no battery), so power.* exists in
+   run_pc too and an app can be developed against it. */
+#include "pwr_tab5.h"
 #include "app/mqjs_app_manager_internal.h"
 /* usleep(). Outside the ESP_PLATFORM block on purpose: the same code
    runs in run_pc, and inside it the host build fell back to an implicit
@@ -327,6 +331,12 @@ static MqjsWorker *s_cur_wk;        /* app whose JS is on the C stack — the
                                      model: every binding reads it */
 static volatile int s_fg_worker = MQJS_WORKER_DEV; /* boot: dev app in front */
 static volatile bool s_stop_req; /* dev-slot stop (task push / PC ^C) */
+/* Battery shutdown (pwr_tab5): stop EVERY app with reason "battery" so each
+   gets its onStop, then tell the caller it may cut power. Posted from the
+   battery task, executed on js_task like every other context touch. */
+static volatile bool s_stopall_req;
+static void (*s_stopall_done)(void);
+static bool s_shutting_down;
 static int64_t s_run_deadline;   /* JS watchdog */
 
 /* P4b: relaunchable app sources (embedded buffers, live forever).
@@ -3476,6 +3486,146 @@ JSValue js_audio_stats(JSContext *ctx, JSValue *this_val, int argc,
     snprintf(buf, sizeof buf, "{\"running\":false,\"audio\":\"off\"}");
 #endif
     return JS_NewString(ctx, buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* power.*  (Tab5 battery: pwr_tab5)                                   */
+/* ------------------------------------------------------------------ */
+/* Reading is open to every app -- a battery percentage is not a        */
+/* capability. Everything that CHANGES power behaviour (charge current, */
+/* the longevity ceiling, cutting power, the bring-up sign override) is */
+/* system-app only, same gate as camera.scanQr and system.*: those      */
+/* belong to device_settings.js, not to an installed app.               */
+/* Off-device and on a Tab5 built without the battery option, battery() */
+/* reports state "unknown" and the setters are inert.                   */
+/* ------------------------------------------------------------------ */
+
+static const char *batt_state_str(int st)
+{
+    switch (st) {
+    case PWR_BATT_NONE:        return "none";
+    case PWR_BATT_DISCHARGING: return "discharging";
+    case PWR_BATT_CHARGING:    return "charging";
+    case PWR_BATT_FULL:        return "full";
+    case PWR_BATT_LIMITED:     return "limited";
+    default:                   return "unknown";
+    }
+}
+
+/* power.battery() -> {ok, pct, state, mv, ma, ocv, mohm, mah, cap, eta,
+   usb, charging, limit, tier, raw, n}. pct and eta are -1 when unknown
+   (no pack, or no sample yet); `raw` is the expander input register, in
+   the object for bring-up only. */
+JSValue js_power_battery(JSContext *ctx, JSValue *this_val, int argc,
+                         JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    pwr_batt_t b;
+    bool ok = pwr_tab5_get(&b);
+
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "ok", JS_NewBool(ok));
+    JS_SetPropertyStr(ctx, obj_ref.val, "pct", JS_NewInt32(ctx, b.pct));
+    JS_SetPropertyStr(ctx, obj_ref.val, "mv", JS_NewInt32(ctx, b.mv));
+    JS_SetPropertyStr(ctx, obj_ref.val, "ma", JS_NewInt32(ctx, b.ma));
+    JS_SetPropertyStr(ctx, obj_ref.val, "ocv", JS_NewInt32(ctx, b.ocv_mv));
+    JS_SetPropertyStr(ctx, obj_ref.val, "mohm", JS_NewInt32(ctx, b.mohm));
+    JS_SetPropertyStr(ctx, obj_ref.val, "mah", JS_NewInt32(ctx, b.mah));
+    JS_SetPropertyStr(ctx, obj_ref.val, "cap", JS_NewInt32(ctx, b.cap_mah));
+    JS_SetPropertyStr(ctx, obj_ref.val, "eta", JS_NewInt32(ctx, b.eta_min));
+    JS_SetPropertyStr(ctx, obj_ref.val, "usb", JS_NewBool(b.usb));
+    JS_SetPropertyStr(ctx, obj_ref.val, "charging",
+                      JS_NewBool(b.state == PWR_BATT_CHARGING));
+    JS_SetPropertyStr(ctx, obj_ref.val, "limit", JS_NewInt32(ctx, b.limit_pct));
+    JS_SetPropertyStr(ctx, obj_ref.val, "tier", JS_NewInt32(ctx, b.tier));
+    JS_SetPropertyStr(ctx, obj_ref.val, "raw", JS_NewInt32(ctx, b.in_sta));
+    JS_SetPropertyStr(ctx, obj_ref.val, "n", JS_NewInt32(ctx, (int32_t)b.samples));
+    /* The string goes into a local first: creating it can move `obj`, and
+       the evaluation order of the two arguments is unspecified. */
+    JSValue st = JS_NewString(ctx, batt_state_str(b.state));
+    JS_SetPropertyStr(ctx, obj_ref.val, "state", st);
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+}
+
+/* power.charge([mA]) -> current selector. 0 = off, 500 = normal,
+   1000 = quick charge. Without an argument it only reads. */
+JSValue js_power_charge(JSContext *ctx, JSValue *this_val, int argc,
+                        JSValue *argv)
+{
+    (void)this_val;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        if (!system_api_allowed(ctx))
+            return JS_EXCEPTION;
+        int ma;
+        if (JS_ToInt32(ctx, &ma, argv[0]))
+            return JS_EXCEPTION;
+        pwr_tab5_set_charge_ma(ma);
+    }
+    return JS_NewInt32(ctx, pwr_tab5_charge_ma());
+}
+
+/* power.limit([pct]) -> the charge ceiling. 100 = charge to full. */
+JSValue js_power_limit(JSContext *ctx, JSValue *this_val, int argc,
+                       JSValue *argv)
+{
+    (void)this_val;
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        if (!system_api_allowed(ctx))
+            return JS_EXCEPTION;
+        int pct;
+        if (JS_ToInt32(ctx, &pct, argv[0]))
+            return JS_EXCEPTION;
+        pwr_tab5_set_limit(pct);
+    }
+    return JS_NewInt32(ctx, pwr_tab5_limit());
+}
+
+/* power.fullOnce(): ignore the ceiling until this charge terminates. */
+JSValue js_power_full_once(JSContext *ctx, JSValue *this_val, int argc,
+                           JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    pwr_tab5_full_charge_once();
+    return JS_UNDEFINED;
+}
+
+/* power.off(): cut power now. No countdown, no onStop -- that path is the
+   battery ladder's; this is the user asking. */
+JSValue js_power_off(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    pwr_tab5_power_off();
+    return JS_UNDEFINED;
+}
+
+/* power.sign(s): bring-up only -- flips the INA226 current polarity so a
+   probe can settle the convention without a reflash. */
+JSValue js_power_sign(JSContext *ctx, JSValue *this_val, int argc,
+                      JSValue *argv)
+{
+    (void)this_val;
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    int s = 1;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &s, argv[0]))
+        return JS_EXCEPTION;
+    pwr_tab5_set_current_sign(s);
+    return JS_NewInt32(ctx, s < 0 ? -1 : 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -7376,6 +7526,7 @@ static const char *stop_reason_str(mqjs_app_stop_reason_t r)
     case MQJS_APP_STOP_UPDATED: return "updated";
     case MQJS_APP_STOP_EVICTED: return "evicted";
     case MQJS_APP_STOP_ERROR:   return "error";
+    case MQJS_APP_STOP_BATTERY: return "battery";
     default:                    return "user";
     }
 }
@@ -7855,6 +8006,12 @@ void mqjs_runtime_stop(void)
     s_stop_req = true;
 }
 
+void mqjs_request_stop_all(void (*done)(void))
+{
+    s_stopall_done = done;
+    s_stopall_req = true;
+}
+
 #ifdef ESP_PLATFORM
 /* Boot pass of the @autostart roster (design §8): start every
    installed app that (a) the user opted in by launching it locally
@@ -7951,7 +8108,7 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
            the bit and residency stops; the first boot start (no record
            yet) bootstraps it. Worker 0 stays the system app's pinned
            execution frame (an allocation rule, not policy). */
-        if (!s_workers[MQJS_WORKER_LAUNCHER].used &&
+        if (!s_shutting_down && !s_workers[MQJS_WORKER_LAUNCHER].used &&
             time_ms() >= s_launcher_retry_at) {
             const mqjs_app_snapshot_t *lrec = mqjs_app_record_find("launcher");
             if (!lrec || (lrec->policy.flags & MQJS_APP_RESTART_ON_EXIT)) {
@@ -7968,7 +8125,8 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
             s_stop_req = false;
             dev_rearm(); /* a push always reopens a held dev worker */
         }
-        if (next_dev && !s_workers[MQJS_WORKER_DEV].used && !dev_held() &&
+        if (!s_shutting_down && next_dev &&
+            !s_workers[MQJS_WORKER_DEV].used && !dev_held() &&
             time_ms() >= s_dev_retry_at) {
             const char *src = NULL, *name = NULL;
             size_t len = 0;
@@ -7987,6 +8145,19 @@ void mqjs_runtime_run(mqjs_dev_source_fn next_dev, void *user)
                                after this dispatch finished building */
         mqjs_term_pump(); /* no-op on the device: the UI task drains */
         reap_idle_apps();
+        if (s_stopall_req) {
+            /* Battery shutdown. Every app gets its onStop (the handler is
+               watchdog-bounded, so this cannot hang the countdown), the
+               restart machinery above is off for good, and the caller is
+               told once the last handler has returned. */
+            s_stopall_req = false;
+            s_shutting_down = true;
+            for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+                if (s_workers[i].used)
+                    app_stop_internal_r(&s_workers[i], MQJS_APP_STOP_BATTERY);
+            if (s_stopall_done)
+                s_stopall_done();
+        }
 #ifdef ESP_PLATFORM
         mqjs_power_update(time_ms()); /* dim/blank on idle, wake on touch */
 #endif

@@ -13,6 +13,9 @@ CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
 CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
 # CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW is not set
 CONFIG_MQJS_TAB5_POWER=y
+# Battery: INA226 gauge, charge control, over-discharge protection.
+# Without this a Tab5 never charges (the charger is firmware-gated).
+CONFIG_MQJS_TAB5_BATTERY=y
 
 # Local network settings. Replace these values after copying the file.
 CONFIG_MQJS_WIFI_SSID="YOUR_WIFI_SSID"

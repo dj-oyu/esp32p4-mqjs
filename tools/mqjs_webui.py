@@ -55,7 +55,9 @@ def build_tools():
         if os.path.exists(out_path):
             continue
         cmd = ["gcc", "-O2", f"-I{MQJS_DIR}", f"-I{MQJS_DIR}/gen_pc",
-               f"-I{MQJS_DIR}/mquickjs", "-o", out_path,
+               f"-I{MQJS_DIR}/mquickjs",
+               f"-I{os.path.join(ROOT, 'components', 'pwr_tab5', 'include')}",
+               "-o", out_path,
                os.path.join(MQJS_DIR, main_src)] + srcs + ["-lm"]
         print(f"[tools] building {out} ...")
         subprocess.run(cmd, check=True)

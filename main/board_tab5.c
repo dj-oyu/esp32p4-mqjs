@@ -4,7 +4,12 @@
  * SDA=G31 SCL=G32). Its P0 (WLAN_PWR_EN) must be driven high before the
  * SDIO transport can find the C6. Register values mirror
  * bsp_io_expander_pi4ioe_init() in the M5Tab5-UserDemo BSP
- * (P0=WLAN_PWR_EN, P3=USB5V_EN high; P7=CHG_EN left low).
+ * (P0=WLAN_PWR_EN, P3=USB5V_EN high).
+ *
+ * Charging is turned on here too, from the same bus, before anything else
+ * in the boot exists: the Tab5 charges ONLY while powered on with CHG_EN
+ * asserted by firmware, so a build that waits for the UI (or forgets) runs
+ * the pack down while plugged in. pwr_tab5 owns the bit ordering.
  *
  * The I2C bus is created, used and deleted again so JS i2c.setup(0,...)
  * can claim the port afterwards.
@@ -18,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "board_tab5.h"
+#include "pwr_tab5.h"
 
 #define PI4IOE2_ADDR 0x44
 
@@ -63,6 +69,12 @@ void board_tab5_power_init(void)
         err = i2c_master_transmit(dev, seq[i], 2, 50);
 
     i2c_master_bus_rm_device(dev);
+
+    /* Charging on, while we still have a bus. Deliberately not gated on the
+       expander sequence above succeeding in full: a failure there means Wi-Fi
+       is in trouble, which is no reason to also leave the battery draining. */
+    pwr_tab5_early_charge_on(bus);
+
     i2c_del_master_bus(bus);
 
     if (err != ESP_OK) {

@@ -13,7 +13,8 @@ RUN_PC=${RUN_PC:-/tmp/run_pc}
 gcc -O2 -I"$MQJS" -I"$MQJS/gen_pc" -I"$MQJS/mquickjs" \
     -I"$ROOT/components/skk_core/include" \
     -I"$ROOT/components/ime_core/include" \
-    -I"$ROOT/components/ui_tab5/include" -o "$RUN_PC" \
+    -I"$ROOT/components/ui_tab5/include" \
+    -I"$ROOT/components/pwr_tab5/include" -o "$RUN_PC" \
     "$MQJS/tools/run_pc.c" "$MQJS/mqjs_runtime.c" "$MQJS/system_vault.c" \
     "$MQJS/tailscale_adapter.c" "$MQJS/app/mqjs_app_manager.c" \
     "$ROOT/components/skk_core/skk_kana.c" \

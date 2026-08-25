@@ -11,3 +11,8 @@ void ui_status_set_net(bool wifi_up, const char *ip);   /* ip NULL = "" */
 void ui_status_set_mqtt(bool up);
 void ui_status_set_task(const char *name, const char *origin);
 void ui_status_set_event(const char *event);            /* last_event */
+/* Battery for the status bar. `pct` -1 = unknown/no pack, `state` is
+   pwr_batt_state_t (components/pwr_tab5/include/pwr_tab5.h), `eta_min` -1 =
+   unknown. Called at 1 Hz from the battery task, so main/app_main filters
+   out the samples that would not change anything on screen. */
+void ui_status_set_battery(int pct, int state, int eta_min);

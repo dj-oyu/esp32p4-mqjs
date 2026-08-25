@@ -30,6 +30,7 @@
  * Status bar: the chip opens the previous app, a long-press opens the
  * launcher.
  */
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -43,6 +44,7 @@
 #include "cam_tab5.h"
 #include "audio_tab5.h"
 #include "kbd_tab5.h"
+#include "pwr_tab5.h"
 #include "opus_player.h"
 #include "wifi.h"
 #include "tailscale_adapter.h"
@@ -133,10 +135,57 @@ static void kbd_dock_changed(bool present)
 }
 #endif
 
+/* ---- battery: last words before an over-discharge shutdown --------
+   The ladder in pwr_tab5 decides WHEN; this decides what gets saved. Order
+   matters: the black-box line first (so the reason survives even if the app
+   sweep goes wrong), then every app's sys.onStop("battery"), then the ack
+   that lets the battery task cut power. A charger appearing mid-countdown
+   aborts the whole thing on the pwr_tab5 side. */
+static void battery_apps_stopped(void)
+{
+    pwr_tab5_shutdown_ack();
+}
+
+static void battery_shutdown(const char *reason, int grace_s)
+{
+    pwr_batt_t b;
+    pwr_tab5_get(&b);
+    char note[TERM_LP_PANIC_MAX];
+    int n = snprintf(note, sizeof note,
+                     "shutdown: %s ocv=%ldmV vbat=%ldmV %ld%% %ldmA grace=%ds",
+                     reason ? reason : "battery", (long)b.ocv_mv, (long)b.mv,
+                     (long)b.pct, (long)b.ma, grace_s);
+    if (n > 0)
+        term_lp_log(TERM_LP_CLASS_SYS, "battery", note, (size_t)n);
+    ESP_LOGE(TAG, "%s", note);
+    mqjs_request_stop_all(battery_apps_stopped);
+}
+
+/* 1 Hz from the battery task. The status bar only ever shows a percentage
+   and a state, so anything else is filtered here rather than waking the LVGL
+   snapshot (and its label churn) once a second for a millivolt. */
+static void battery_sample(const pwr_batt_t *b)
+{
+    static int last_pct = -2, last_state = -1;
+    if (b->pct == last_pct && b->state == last_state)
+        return;
+    last_pct = b->pct;
+    last_state = b->state;
+    ui_status_set_battery(b->pct, b->state, b->eta_min);
+}
+
 static void tab5_ui_ready(void *arg)
 {
     (void)arg;
     cam_tab5_set_i2c(ui_tab5_i2c_bus()); /* camera SCCB rides the touch bus */
+
+    /* Battery monitoring rides the same bus (INA226 0x41 + the two IO
+       expanders), so it starts here rather than in app_main. Charging itself
+       was already enabled in board_tab5_power_init. */
+    pwr_tab5_set_notify_cb(ui_status_set_event);
+    pwr_tab5_set_sample_cb(battery_sample);
+    pwr_tab5_set_shutdown_cb(battery_shutdown);
+    pwr_tab5_start();
 
 #if CONFIG_MQJS_TAB5_KEYBOARD
     /* Keyboard dock: own I2C bus (port 0, pogo pins), hot-pluggable.
