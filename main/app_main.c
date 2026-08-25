@@ -37,6 +37,7 @@
 #include "esp_log.h"
 #include "board_tab5.h"
 #include "mqjs_runtime.h"
+#include "sdcard.h"
 #include "storage.h"
 #include "task_source.h"
 #include "ui_status.h"
@@ -238,6 +239,7 @@ void app_main(void)
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
     mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
     storage_init();            /* mount LittleFS for persisted tasks */
+    sdcard_init();             /* "sd" volume, if this board has a slot */
 
     /* Platform-owned network defaults: apps never hardcode the broker or the
        topic namespace. The namespace is the first segment of the task topic

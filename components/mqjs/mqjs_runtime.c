@@ -97,6 +97,9 @@
 #include "cam_tab5.h"
 #include "audio_tab5.h"
 #include "term_ui_tab5.h"
+/* ボリューム登録簿。fs.* はこの層の仮想パスしか知らない
+   (docs/filer-storage-design.md §3)。 */
+#include "fs_core.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -180,7 +183,8 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
                EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
                EV_TERM_REPLY, /* term.onReply: a DSR/DA answer, inline */
-               EV_NET /* broadcast: release the net.onReady wait queue */
+               EV_NET, /* broadcast: release the net.onReady wait queue */
+               EV_FSGRANT /* fs.request: the consent answer came back */
              } MqjsEventType;
 
 typedef struct {
@@ -197,6 +201,7 @@ typedef struct {
         struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
+        struct { uint32_t id; uint8_t ok; } fsgrant; /* fs.request answer */
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
@@ -309,6 +314,8 @@ typedef struct {
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
     bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
+    bool fsreq_used; JSGCRef fsreq_cb; /* fs.request one-shot: fires with the
+                                          grant token, or 0 when refused */
     bool net_used;  JSGCRef net_cb;  /* net.onReady one-shot: the app's ticket
                                         in the network wait queue (fires once
                                         the link is up, then auto-releases) */
@@ -2944,6 +2951,737 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* fs.*  — 内蔵ストレージと microSD (docs/filer-storage-design.md)      */
+/*                                                                     */
+/* このブロックは fs_core の仮想パス ("/internal/...", "/sd/...") しか  */
+/* 知らない。"/littlefs" も SDMMC も LittleFS も一度も出てこないので、  */
+/* Tab5 と Stamp-P4 で同じコードが動く —— 差は fs.volumes() が何本      */
+/* 返すかだけになる (§2: Stamp は「カードが永久に入っていない Tab5」)。 */
+/*                                                                     */
+/* 読み取りは全アプリに開放 (この 2 ボリュームに秘密は無い。vault と    */
+/* Wi-Fi 資格情報は NVS 側)。書き込み・削除・マウント操作は grant を    */
+/* 要求する。grant は net.onReady のトークンと同じ不透明な整数で、      */
+/* ユーザの同意を経ないと手に入らない = トップレベルで書けない (§7)。  */
+/* 同意画面はランチャーが描く: 要求元のアプリに描かせると偽装できる。   */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_FS_GRANTS    4
+#define MQJS_FS_SCOPE_MAX 128
+#define MQJS_FS_READ_MAX  65536
+#define MQJS_FS_READ_DEF  8192
+#define MQJS_FS_LIST_MAX  512
+#define MQJS_FS_REASON_MAX 96
+
+#ifdef ESP_PLATFORM
+
+typedef struct {
+    uint32_t       token;    /* 0 = 空き */
+    uint8_t        worker;
+    uint16_t       gen;
+    bool           write;
+    uint32_t       epoch;    /* 発行時のボリュームのマウント世代 */
+    const fsvol_t *vol;
+    char           root[MQJS_FS_SCOPE_MAX];
+} FsGrant;
+
+static FsGrant  s_fs_grants[MQJS_FS_GRANTS];
+static uint32_t s_fs_token_seq;
+
+/* 同意待ちの要求。ランチャーが sys.fsConsent(id, ok) で返事するまで
+   ここに置く。要求 1 件がアプリ 1 つに対応する (fsreq_cb が一発限りの
+   ハンドラなので、同じアプリからの二重要求は後勝ちで潰す)。 */
+typedef struct {
+    uint32_t id;             /* 0 = 空き */
+    uint8_t  worker;
+    uint16_t gen;
+    bool     write;
+    char     root[MQJS_FS_SCOPE_MAX];
+} FsPending;
+
+static FsPending s_fs_pending[MQJS_FS_GRANTS];
+static uint32_t  s_fs_req_seq;
+
+/* パス引数をスタックへ写す。JS の文字列は以降の割り当てで動きうるので、
+   触る前に必ずコピーを取る (store_key と同じ理由)。 */
+static int fs_path_arg(JSContext *ctx, JSValue v, char *dst, size_t cap)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *s = JS_ToCStringLen(ctx, &len, v, &buf);
+    if (!s)
+        return -1;
+    if (len == 0 || len >= cap) {
+        JS_ThrowRangeError(ctx, "fs: path length must be 1..%d", (int)cap - 1);
+        return -1;
+    }
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return 0;
+}
+
+static JSValue fs_throw(JSContext *ctx, const char *what, esp_err_t err)
+{
+    JS_ThrowTypeError(ctx, "fs.%s: %s", what, fs_err_str(err));
+    return JS_EXCEPTION;
+}
+
+/* grant を引き当てる。持ち主・世代・マウント世代がすべて一致したものだけ
+   が生きている: アプリが止まればその grant は使えなくなり、カードを
+   抜き差しすれば epoch がずれて死ぬ。掃除の常駐処理は要らない (§7)。 */
+static FsGrant *fs_grant_get(JSContext *ctx, JSValue v, bool need_write)
+{
+    int token = 0;   /* JS_ToInt32 は int* を取る (riscv32) */
+    if (JS_ToInt32(ctx, &token, v) || token <= 0) {
+        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request(...)");
+        return NULL;
+    }
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        FsGrant *g = &s_fs_grants[i];
+        if (!g->token || g->token != (uint32_t)token)
+            continue;
+        if (!s_cur_wk || g->worker != s_cur_wk->idx || g->gen != s_cur_wk->gen)
+            break;
+        if (fsvol_epoch(g->vol) != g->epoch) {
+            g->token = 0;              /* 抜かれたカードの権限 */
+            break;
+        }
+        if (need_write && !g->write) {
+            JS_ThrowTypeError(ctx, "fs: this grant is read-only");
+            return NULL;
+        }
+        return g;
+    }
+    JS_ThrowTypeError(ctx, "fs: grant expired or not yours");
+    return NULL;
+}
+
+/* path が grant の範囲に入っているか。root そのものか root + '/'。 */
+static bool fs_in_scope(const FsGrant *g, const char *path)
+{
+    size_t n = strlen(g->root);
+    if (strncmp(path, g->root, n))
+        return false;
+    return path[n] == '\0' || path[n] == '/';
+}
+
+static FsGrant *fs_grant_for(JSContext *ctx, JSValue gv, const char *path,
+                             bool need_write)
+{
+    FsGrant *g = fs_grant_get(ctx, gv, need_write);
+    if (!g)
+        return NULL;
+    if (!fs_in_scope(g, path)) {
+        JS_ThrowTypeError(ctx, "fs: '%s' is outside the granted scope '%s'",
+                          path, g->root);
+        return NULL;
+    }
+    return g;
+}
+
+/* 一番古い grant を潰して席を空ける (4 席、LRU ですらない単純な使い回し:
+   アプリが同時に 4 つの範囲へ書くことは想定していない)。 */
+static FsGrant *fs_grant_slot(void)
+{
+    for (int i = 0; i < MQJS_FS_GRANTS; i++)
+        if (!s_fs_grants[i].token)
+            return &s_fs_grants[i];
+    FsGrant *oldest = &s_fs_grants[0];
+    for (int i = 1; i < MQJS_FS_GRANTS; i++)
+        if (s_fs_grants[i].token < oldest->token)
+            oldest = &s_fs_grants[i];
+    return oldest;
+}
+
+#endif /* ESP_PLATFORM */
+
+/* fs.volumes() -> [{id,label,path,fstype,mounted,removable,system,total,free}]
+   ボードにボリュームが 1 本しか無ければ 1 本返る。アプリはこの配列を
+   回すだけで、どのボードで動いているかを知る必要がない。 */
+JSValue js_fs_volumes(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+#ifdef ESP_PLATFORM
+    JS_PUSH_VALUE(ctx, arr);
+    int n = 0;
+    int count = fsvol_count();
+    for (int i = 0; i < count; i++) {
+        const fsvol_t *v = fsvol_at(i);
+        if (!v)
+            continue;
+        bool mounted = fsvol_mounted(v);
+        uint64_t total = 0, freeb = 0;
+        if (mounted)
+            fs_usage(v->id, &total, &freeb);
+
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        /* 文字列は必ず自分の文だけで作る: 生成中の GC が obj を動かしても
+           obj_ref.val は追随するが、入れ子にすると評価順で古い値を読む。 */
+        JSValue s_id = JS_NewString(ctx, v->id);
+        JS_SetPropertyStr(ctx, obj_ref.val, "id", s_id);
+        JSValue s_label = JS_NewString(ctx, v->label ? v->label : v->id);
+        JS_SetPropertyStr(ctx, obj_ref.val, "label", s_label);
+        JSValue s_type = JS_NewString(ctx, v->fstype ? v->fstype : "");
+        JS_SetPropertyStr(ctx, obj_ref.val, "fstype", s_type);
+        char vroot[40];
+        snprintf(vroot, sizeof vroot, "/%s", v->id);
+        JSValue s_path = JS_NewString(ctx, vroot);
+        JS_SetPropertyStr(ctx, obj_ref.val, "path", s_path);
+        JS_SetPropertyStr(ctx, obj_ref.val, "mounted", JS_NewBool(mounted));
+        JS_SetPropertyStr(ctx, obj_ref.val, "removable",
+                          JS_NewBool((v->flags & FSVOL_REMOVABLE) ? 1 : 0));
+        JS_SetPropertyStr(ctx, obj_ref.val, "system",
+                          JS_NewBool((v->flags & FSVOL_SYSTEM) ? 1 : 0));
+        /* バイト数は 32bit int に収まらない (32GB カード)。倍精度なら
+           2^53 まで正確なので、そのまま数として渡してよい。 */
+        JS_SetPropertyStr(ctx, obj_ref.val, "total",
+                          JS_NewFloat64(ctx, (double)total));
+        JS_SetPropertyStr(ctx, obj_ref.val, "free",
+                          JS_NewFloat64(ctx, (double)freeb));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    JS_POP_VALUE(ctx, arr);
+#else
+    (void)this_val; (void)argc; (void)argv;
+#endif
+    return arr;
+}
+
+/* fs.list(path[, {offset, limit, stat}]) -> [{name,dir,size,mtime}]
+   size/mtime は既定で埋めるが、limit を大きく取ると FAT の線形検索で
+   高くつくので {stat:false} で外せる。truncated は配列の .more に立つ。 */
+JSValue js_fs_list(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+
+    int offset = 0, limit = MQJS_FS_LIST_MAX;
+    bool want_stat = true;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int tmp = 0;
+        JSValue v = JS_GetPropertyStr(ctx, argv[1], "offset");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            offset = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "limit");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            limit = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "stat");
+        if (!JS_IsUndefined(v))
+            want_stat = uiw_truthy(ctx, v);
+    }
+    if (offset < 0)
+        offset = 0;
+    if (limit < 0 || limit > MQJS_FS_LIST_MAX)
+        limit = MQJS_FS_LIST_MAX;
+
+    fs_dir_t *dir = NULL;
+    esp_err_t err = fs_dir_open(path, &dir);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "list", err);
+
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr)) {
+        fs_dir_close(dir);
+        return arr;
+    }
+    JS_PUSH_VALUE(ctx, arr);
+    int total = fs_dir_count(dir);
+    int n = 0;
+    for (int i = offset; i < total && n < limit; i++) {
+        fs_entry_t e;
+        if (!fs_dir_get(dir, i, &e))
+            break;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            break;
+        JS_PUSH_VALUE(ctx, obj);
+        /* 名前は dir のプールを指している。JS_NewString は JS ヒープしか
+           動かさないので、プールが消えるのは fs_dir_close のときだけ。 */
+        JSValue s_name = JS_NewString(ctx, e.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", s_name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "dir", JS_NewBool(e.is_dir));
+        if (want_stat) {
+            fs_stat_t st;
+            if (fs_dir_stat(dir, i, &st) == ESP_OK) {
+                JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                                  JS_NewFloat64(ctx, (double)st.size));
+                JS_SetPropertyStr(ctx, obj_ref.val, "mtime",
+                                  JS_NewFloat64(ctx, (double)st.mtime));
+            }
+        }
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    /* 一覧そのものが長すぎて切られたか (FS_DIR_MAX)、あるいは窓の先に
+       まだ続きがあるか。黙って切ると「全部見た」と誤読される。 */
+    JS_SetPropertyStr(ctx, arr_ref.val, "more",
+                      JS_NewBool(fs_dir_truncated(dir) ||
+                                 offset + n < total));
+    JS_SetPropertyStr(ctx, arr_ref.val, "total", JS_NewInt32(ctx, total));
+    JS_POP_VALUE(ctx, arr);
+    fs_dir_close(dir);
+    return arr;
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewArray(ctx, 0);
+#endif
+}
+
+/* fs.stat(path) -> {name,dir,size,mtime} | undefined (存在しないとき) */
+JSValue js_fs_stat(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+    fs_stat_t st;
+    esp_err_t err = fs_stat(path, &st);
+    if (err == ESP_ERR_NOT_FOUND)
+        return JS_UNDEFINED;         /* 「無い」は例外ではない */
+    if (err != ESP_OK)
+        return fs_throw(ctx, "stat", err);
+
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "dir", JS_NewBool(st.is_dir));
+    JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                      JS_NewFloat64(ctx, (double)st.size));
+    JS_SetPropertyStr(ctx, obj_ref.val, "mtime",
+                      JS_NewFloat64(ctx, (double)st.mtime));
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+#else
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return JS_UNDEFINED;
+#endif
+}
+
+/* fs.read(path[, {offset, length, hex}]) -> string
+   既定は先頭 8KB のテキスト。hex:true なら 16 進 2 桁/バイトで返す
+   (バイナリを JS 文字列に押し込むと UTF-8 の検査で壊れるため)。 */
+JSValue js_fs_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+
+    int offset = 0, length = MQJS_FS_READ_DEF;
+    bool hex = false;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int tmp = 0;
+        JSValue v = JS_GetPropertyStr(ctx, argv[1], "offset");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            offset = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "length");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            length = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "hex");
+        hex = uiw_truthy(ctx, v);
+    }
+    if (offset < 0)
+        offset = 0;
+    if (length <= 0)
+        return JS_NewStringLen(ctx, "", 0);
+    if (length > MQJS_FS_READ_MAX)
+        length = MQJS_FS_READ_MAX;
+    if (hex && length > MQJS_FS_READ_MAX / 2)
+        length = MQJS_FS_READ_MAX / 2;   /* 出力が倍になる */
+
+    /* JS ヒープの外で読む: 数十 KB をアリーナに置くと GC が動く。 */
+    char *buf = heap_caps_malloc((size_t)length, MALLOC_CAP_SPIRAM);
+    if (!buf)
+        buf = malloc((size_t)length);
+    if (!buf)
+        return JS_ThrowOutOfMemory(ctx);
+    size_t got = 0;
+    esp_err_t err = fs_read(path, (uint64_t)offset, buf, (size_t)length, &got);
+    if (err != ESP_OK) {
+        free(buf);
+        return fs_throw(ctx, "read", err);
+    }
+    JSValue out;
+    if (hex) {
+        static const char HEX[] = "0123456789abcdef";
+        char *h = malloc(got * 2 + 1);
+        if (!h) {
+            free(buf);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        for (size_t i = 0; i < got; i++) {
+            h[i * 2]     = HEX[(unsigned char)buf[i] >> 4];
+            h[i * 2 + 1] = HEX[(unsigned char)buf[i] & 15];
+        }
+        out = JS_NewStringLen(ctx, h, got * 2);
+        free(h);
+    } else {
+        out = JS_NewStringLen(ctx, buf, got);
+    }
+    free(buf);
+    return out;
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewStringLen(ctx, "", 0);
+#endif
+}
+
+/* JSON 文字列リテラルへ安全に埋める。reason はアプリが自由に書ける
+   ので、素で連結すると引用符を閉じて別の op を注入できてしまう
+   (ランチャーはこの JSON を JSON.parse する)。 */
+static void fs_json_escape(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+    for (; *src && o + 7 < cap; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') {
+            dst[o++] = '\\';
+            dst[o++] = (char)c;
+        } else if (c < 0x20) {
+            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
+        } else {
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+}
+
+/* fs.request({path, write, reason}, cb) -> bool
+   同意を求め、返事が出たら cb(grant) を呼ぶ (拒否なら cb(0))。grant は
+   ここでしか手に入らないので、トップレベルでの書き込みは書けない。 */
+JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char root[MQJS_FS_SCOPE_MAX];
+    char reason[MQJS_FS_REASON_MAX];
+    bool write = true;
+
+    if (argc < 2 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+        return JS_ThrowTypeError(ctx,
+            "fs.request({path, write, reason}, cb)");
+    if (fs_path_arg(ctx, JS_GetPropertyStr(ctx, argv[0], "path"),
+                    root, sizeof root))
+        return JS_EXCEPTION;
+    JSValue wv = JS_GetPropertyStr(ctx, argv[0], "write");
+    if (!JS_IsUndefined(wv))
+        write = uiw_truthy(ctx, wv);
+    reason[0] = '\0';
+    JSValue rv = JS_GetPropertyStr(ctx, argv[0], "reason");
+    if (!JS_IsUndefined(rv) && uiw_copy_str(ctx, rv, reason, sizeof reason))
+        return JS_EXCEPTION;
+
+    /* 範囲が実在するボリュームを指しているか、ここで確かめる。カードが
+       入っていないのに同意画面を出しても意味がない。 */
+    const fsvol_t *vol = NULL;
+    esp_err_t err = fsvol_resolve(root, &vol, NULL, 0);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "request", err);
+
+    JSValue r = register_cb(ctx, argv[1], &s_cur_wk->fsreq_used,
+                            &s_cur_wk->fsreq_cb);
+    if (JS_IsException(r))
+        return r;
+
+    /* 同じアプリの前の要求は捨てる (ハンドラは一発限りなので、返事が
+       二度来ると片方が宙に浮く)。 */
+    FsPending *p = NULL;
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        if (s_fs_pending[i].id && s_fs_pending[i].worker == s_cur_wk->idx)
+            s_fs_pending[i].id = 0;
+        if (!s_fs_pending[i].id && !p)
+            p = &s_fs_pending[i];
+    }
+    if (!p)
+        p = &s_fs_pending[0];
+    if (++s_fs_req_seq == 0)
+        s_fs_req_seq = 1;
+    p->id     = s_fs_req_seq;
+    p->worker = s_cur_wk->idx;
+    p->gen    = s_cur_wk->gen;
+    p->write  = write;
+    snprintf(p->root, sizeof p->root, "%s", root);
+
+    /* dev スロットは同意を経ずに通す。camera.scanQr / sys.blackbox /
+       system.* と同じ最高権限を既に持っており、ここだけ締めても新しい
+       安全性は生まれない一方、MQTT で押し込む probe が画面を触れずに
+       止まってしまう。 */
+    if (s_cur_wk->idx == MQJS_WORKER_DEV) {
+        MqjsEvent ev = { .type = EV_FSGRANT, .worker = s_cur_wk->idx,
+                         .gen = s_cur_wk->gen };
+        ev.u.fsgrant.id = p->id;
+        ev.u.fsgrant.ok = 1;
+        if (!ev_post(&ev, 0)) {
+            p->id = 0;
+            return JS_NewBool(0);
+        }
+        return JS_NewBool(1);
+    }
+
+    /* ランチャーへ同意要求を送る。届かない (ランチャーが居ない = UI の
+       無いボードや起動直後) ときは黙って拒否 — 誰も尋ねられないなら
+       書かせない、が既定。 */
+    MqjsWorker *ui = &s_workers[MQJS_WORKER_LAUNCHER];
+    if (!ui->used) {
+        MqjsEvent ev = { .type = EV_FSGRANT, .worker = s_cur_wk->idx,
+                         .gen = s_cur_wk->gen };
+        ev.u.fsgrant.id = p->id;
+        ev.u.fsgrant.ok = 0;
+        ev_post(&ev, 0);
+        return JS_NewBool(1);
+    }
+
+    char e_app[72], e_root[MQJS_FS_SCOPE_MAX * 2 + 8];
+    char e_vol[72], e_reason[MQJS_FS_REASON_MAX * 2 + 8];
+    fs_json_escape(e_app, sizeof e_app, s_cur_wk->name);
+    fs_json_escape(e_root, sizeof e_root, root);
+    fs_json_escape(e_vol, sizeof e_vol, vol->label ? vol->label : vol->id);
+    fs_json_escape(e_reason, sizeof e_reason, reason);
+
+    size_t jcap = sizeof e_app + sizeof e_root + sizeof e_vol +
+                  sizeof e_reason + 128;
+    char *json = malloc(jcap);
+    if (!json) {
+        p->id = 0;
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    snprintf(json, jcap,
+             "{\"op\":\"fs-consent\",\"id\":%u,\"app\":\"%s\","
+             "\"path\":\"%s\",\"write\":%s,\"vol\":\"%s\","
+             "\"reason\":\"%s\"}",
+             (unsigned)p->id, e_app, e_root, write ? "true" : "false",
+             e_vol, e_reason);
+
+    MqjsEvent sig = { .type = EV_SIGNAL, .worker = ui->idx, .gen = ui->gen };
+    sig.u.signal.value = json;
+    snprintf(sig.u.signal.from, sizeof sig.u.signal.from, "system");
+    if (!ev_post(&sig, 0)) {
+        free(json);
+        p->id = 0;
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.request: no filesystem on this build");
+#endif
+}
+
+/* fs.release(grant) -> bool: 使い終わった権限を自分から返す。 */
+JSValue js_fs_release(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    FsGrant *g = fs_grant_get(ctx, argv[0], false);
+    if (!g)
+        return JS_EXCEPTION;
+    g->token = 0;
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return JS_NewBool(0);
+#endif
+}
+
+/* sys.fsConsent(id, ok) -> bool: 同意画面を出したアプリだけが呼べる
+   返事の口。ランチャー (組み込みシステムアプリ) 以外は弾く。 */
+JSValue js_sys_fs_consent(JSContext *ctx, JSValue *this_val, int argc,
+                          JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    if (!system_api_allowed(ctx))
+        return JS_EXCEPTION;
+    int id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) || id <= 0)
+        return JS_ThrowTypeError(ctx, "sys.fsConsent(id, ok)");
+    bool ok = uiw_truthy(ctx, argv[1]);
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        FsPending *p = &s_fs_pending[i];
+        if (p->id != (uint32_t)id)
+            continue;
+        MqjsEvent ev = { .type = EV_FSGRANT, .worker = p->worker,
+                         .gen = p->gen };
+        ev.u.fsgrant.id = p->id;
+        ev.u.fsgrant.ok = ok ? 1 : 0;
+        return JS_NewBool(ev_post(&ev, 0));
+    }
+    return JS_NewBool(0);   /* 期限切れ / 二重返答 */
+#else
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return JS_NewBool(0);
+#endif
+}
+
+/* ---- grant を要る操作 -------------------------------------------- */
+
+JSValue js_fs_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+    if (!fs_grant_for(ctx, argv[0], path, true))
+        return JS_EXCEPTION;
+
+    bool append = false;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3]))
+        append = uiw_truthy(ctx, JS_GetPropertyStr(ctx, argv[3], "append"));
+
+    JSCStringBuf dbuf;
+    size_t dlen;
+    const char *data = JS_ToCStringLen(ctx, &dlen, argv[2], &dbuf);
+    if (!data)
+        return JS_EXCEPTION;
+    /* data は JS ヒープを指す。fs_write は JS の割り当てを一切しない。 */
+    esp_err_t err = fs_write(path, data, dlen, append);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "write", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.write: no filesystem on this build");
+#endif
+}
+
+JSValue js_fs_mkdir(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+    if (!fs_grant_for(ctx, argv[0], path, true))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_mkdir(path);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "mkdir", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.mkdir: no filesystem on this build");
+#endif
+}
+
+JSValue js_fs_remove(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+    if (!fs_grant_for(ctx, argv[0], path, true))
+        return JS_EXCEPTION;
+    bool recursive = argc >= 3 && uiw_truthy(ctx, argv[2]);
+    esp_err_t err = fs_remove(path, recursive);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "remove", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.remove: no filesystem on this build");
+#endif
+}
+
+/* fs.rename(grant, from, to) — 両端が同じ grant の範囲に無ければ拒否。
+   「読める範囲から書ける範囲へ動かす」ことはできない: 移動は元も消す。 */
+JSValue js_fs_rename(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
+        fs_path_arg(ctx, argv[2], to, sizeof to))
+        return JS_EXCEPTION;
+    if (!fs_grant_for(ctx, argv[0], from, true) ||
+        !fs_grant_for(ctx, argv[0], to, true))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_move(from, to);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "rename", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.rename: no filesystem on this build");
+#endif
+}
+
+/* fs.copy(grant, from, to) — 読み出し元は誰でも読めるので範囲外でよい。
+   grant が要るのは書き込み先だけ。 */
+JSValue js_fs_copy(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
+        fs_path_arg(ctx, argv[2], to, sizeof to))
+        return JS_EXCEPTION;
+    if (!fs_grant_for(ctx, argv[0], to, true))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_copy(from, to, NULL, NULL);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "copy", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.copy: no filesystem on this build");
+#endif
+}
+
+/* fs.mount(volumeId) -> bool
+   マウントは何も壊さない (入っているカードを読めるようにするだけ) ので
+   grant を要らない。fs.unmount は別扱い: 他アプリが書いている最中に
+   外せてしまうため、そのボリュームへの書き込み grant を要求する。 */
+JSValue js_fs_mount(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val; (void)argc;
+#ifdef ESP_PLATFORM
+    char id[32];
+    if (uiw_copy_str(ctx, argv[0], id, sizeof id))
+        return JS_EXCEPTION;
+    const fsvol_t *v = fsvol_find(id);
+    if (!v)
+        return fs_throw(ctx, "mount", ESP_ERR_NOT_FOUND);
+    esp_err_t err = fsvol_mount(v);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "mount", err);
+    return JS_NewBool(1);
+#else
+    (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.mount: no filesystem on this build");
+#endif
+}
+
+JSValue js_fs_unmount(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val; (void)argc;
+#ifdef ESP_PLATFORM
+    char id[32];
+    if (uiw_copy_str(ctx, argv[1], id, sizeof id))
+        return JS_EXCEPTION;
+    const fsvol_t *v = fsvol_find(id);
+    if (!v)
+        return fs_throw(ctx, "unmount", ESP_ERR_NOT_FOUND);
+    char vroot[40];
+    snprintf(vroot, sizeof vroot, "/%s", id);
+    if (!fs_grant_for(ctx, argv[0], vroot, true))
+        return JS_EXCEPTION;
+    esp_err_t err = fsvol_unmount(v);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "unmount", err);
+    return JS_NewBool(1);
+#else
+    (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.unmount: no filesystem on this build");
+#endif
+}
+/* ------------------------------------------------------------------ */
 /* clipboard: typed, system-shared buffer (P4d, ssh-terminal §7).      */
 /* One C-owned value outside every JS context: survives app stops and  */
 /* foreground switches, and is the first app-to-app data hand-off      */
@@ -3343,6 +4081,65 @@ static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
     free(ev->u.cam.text);
     if (JS_IsException(ret))
         dump_error(ctx);
+}
+
+/* fs.request の返事。grant はここ (JS タスクの上) で発行する: 権限表を
+   触るのがこのタスクだけになり、ロックが要らなくなる。 */
+static void dispatch_fsgrant(MqjsWorker *app, const MqjsEvent *ev)
+{
+#ifdef ESP_PLATFORM
+    JSContext *ctx = app->ctx;
+    uint32_t token = 0;
+
+    FsPending *p = NULL;
+    for (int i = 0; i < MQJS_FS_GRANTS; i++)
+        if (s_fs_pending[i].id && s_fs_pending[i].id == ev->u.fsgrant.id) {
+            p = &s_fs_pending[i];
+            break;
+        }
+    if (p && ev->u.fsgrant.ok) {
+        /* 同意が出るまでの間にカードが抜かれていることがある。ここで
+           解決し直し、通らなければ黙って「拒否」と同じ結果にする。 */
+        const fsvol_t *vol = NULL;
+        if (fsvol_resolve(p->root, &vol, NULL, 0) == ESP_OK) {
+            FsGrant *g = fs_grant_slot();
+            s_fs_token_seq = (s_fs_token_seq + 1) & 0x7fffffff;
+            if (!s_fs_token_seq)
+                s_fs_token_seq = 1;
+            g->token  = s_fs_token_seq;
+            g->worker = p->worker;
+            g->gen    = p->gen;
+            g->write  = p->write;
+            g->vol    = vol;
+            g->epoch  = fsvol_epoch(vol);
+            snprintf(g->root, sizeof g->root, "%s", p->root);
+            token = g->token;
+        }
+    }
+    if (p)
+        p->id = 0;
+
+    if (!app->fsreq_used)
+        return;
+    if (JS_StackCheck(ctx, 3)) {
+        dump_error(ctx);
+        return;
+    }
+    JS_PushArg(ctx, JS_NewInt32(ctx, (int32_t)token));   /* arg0 */
+    JS_PushArg(ctx, app->fsreq_cb.val);                  /* func */
+    JS_PushArg(ctx, JS_NULL);                            /* this */
+    /* 一発限り: 呼ぶ前に解放しておけば、ハンドラの中から次の
+       fs.request を出せる (cam/http と同じ約束)。 */
+    app->fsreq_used = false;
+    JS_DeleteGCRef(ctx, &app->fsreq_cb);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 1);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+#else
+    (void)app;
+    (void)ev;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -3967,6 +4764,12 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
     if (uiw_copy_str(ctx, argv[0], name, sizeof name))
         return JS_EXCEPTION;
     if (!name[0])
+        return JS_NewBool(0);
+    /* "system" is the sender the runtime itself signs its signals with
+       (the fs.request consent ask, filer-storage-design §7). An app that
+       could take that name could put a forged permission prompt in front
+       of the launcher, so the name is reserved. */
+    if (!strcmp(name, "system"))
         return JS_NewBool(0);
     for (const char *p = name; *p; p++) {
         /* names travel inside JSON open requests: keep them quote-free */
@@ -7481,6 +8284,20 @@ static void app_reset_bindings(MqjsWorker *app)
         JS_DeleteGCRef(ctx, &app->net_cb);
         app->net_used = false;
     }
+    if (app->fsreq_used) {
+        JS_DeleteGCRef(ctx, &app->fsreq_cb);
+        app->fsreq_used = false;
+    }
+#ifdef ESP_PLATFORM
+    /* 権限は世代で自然に失効するが (fs_grant_get)、席を空けておく方が
+       素直。同意待ちの要求も、返事が来ても行き先が無いので捨てる。 */
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        if (s_fs_grants[i].worker == app->idx)
+            s_fs_grants[i].token = 0;
+        if (s_fs_pending[i].worker == app->idx)
+            s_fs_pending[i].id = 0;
+    }
+#endif
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
     if (s_cam_active && s_cam_worker == app->idx)
         cam_tab5_cancel(); /* its result event dies on the gen check */
@@ -7805,6 +8622,7 @@ static MqjsWorker *event_owner(const MqjsEvent *ev)
     case EV_CLIP:
     case EV_CAM:
     case EV_HTTP:
+    case EV_FSGRANT:
     case EV_TERM_REPLY: {
         MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
@@ -7844,6 +8662,7 @@ static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
     case EV_SIGNAL:         dispatch_signal(app, ev);        break;
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
+    case EV_FSGRANT:        dispatch_fsgrant(app, ev);       break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
     case EV_TERM_REPLY:     dispatch_term_reply(app, ev);    break;
     }

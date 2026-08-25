@@ -64,3 +64,12 @@ CONFIG_LVGL_PORT_ENABLE_PPA=y
 # stay on; only a fresh sdkconfig picks this up, an existing one keeps
 # whatever it already has.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# FATFS のファイル名を UTF-8 でやり取りする (microSD を扱うファイラ用)。
+# 既定の ANSI/OEM だと日本語のファイル名がそのまま化ける。LFN が有効なら
+# 長い名前は UTF-16 で記録されるので、コードページ (SFN 用) は 437 のまま
+# でよい — CP932 のテーブルは数十 KB の flash を食う割に、効くのは LFN を
+# 持たない純 8.3 名だけ。実機で化けるカードが出たら CODEPAGE_932 に一行で
+# 切り替える。docs/filer-storage-design.md §8。
+# Stamp では FATFS を誰も使わないので無害。
+CONFIG_FATFS_API_ENCODING_UTF_8=y

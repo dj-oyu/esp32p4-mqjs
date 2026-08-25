@@ -127,6 +127,12 @@ print("hello");
   既定のまま = ASCII のみ。**どの欄で日本語を許すかは C 側が強制する**ので、
   アプリの書き忘れで ISBN にかなが混ざることはない
 - `circuit.js`: キャンバス UI、式評価、永続化
+- `files.js`: ファイラ。内蔵ストレージと microSD を `fs.volumes()` /
+  `fs.list()` で扱う。**ボードの分岐を 1 行も書かない**のが要点で、microSD の
+  無い Stamp-P4 では「内蔵」1 本の画面になるだけ
+  (`docs/filer-storage-design.md`)。書き込み・削除・取り出しは `fs.request()`
+  で得た grant が要り、許可を尋ねる画面はランチャーが出す。階層は `ui.screen`
+  を積まずに JS の `cwd` で持つ (retain 深さは 3 しかない)
 
 ### アルゴリズムと描画
 

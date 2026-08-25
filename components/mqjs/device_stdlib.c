@@ -598,6 +598,31 @@ static const JSPropDef js_http[] = {
 static const JSClassDef js_http_obj =
     JS_OBJECT_DEF("Http", js_http);
 
+/* ---- device API: fs object (内蔵ストレージ + microSD, filer-storage) ----
+   仮想パス "/internal/..." "/sd/..." だけを扱う。volumes() が返す本数が
+   ボードの差そのもので、アプリ側に #ifdef 相当の分岐は要らない。
+   読み取りは全アプリ、書き込み系は request() で得た grant が要る。 ---- */
+static const JSPropDef js_fs[] = {
+    JS_CFUNC_DEF("volumes", 0, js_fs_volumes),
+    JS_CFUNC_DEF("list", 2, js_fs_list),
+    JS_CFUNC_DEF("stat", 1, js_fs_stat),
+    JS_CFUNC_DEF("read", 2, js_fs_read),
+    JS_CFUNC_DEF("mount", 1, js_fs_mount),
+    /* 以下は grant が第 1 引数 */
+    JS_CFUNC_DEF("request", 2, js_fs_request),
+    JS_CFUNC_DEF("release", 1, js_fs_release),
+    JS_CFUNC_DEF("write", 4, js_fs_write),
+    JS_CFUNC_DEF("mkdir", 2, js_fs_mkdir),
+    JS_CFUNC_DEF("remove", 3, js_fs_remove),
+    JS_CFUNC_DEF("rename", 3, js_fs_rename),
+    JS_CFUNC_DEF("copy", 3, js_fs_copy),
+    JS_CFUNC_DEF("unmount", 2, js_fs_unmount),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_fs_obj =
+    JS_OBJECT_DEF("Fs", js_fs);
+
 /* ---- device API: store object (NVS-backed key-value, W2) ---- */
 static const JSPropDef js_store[] = {
     JS_CFUNC_DEF("get", 1, js_store_get),
@@ -686,6 +711,9 @@ static const JSPropDef js_sys[] = {
        returns 0 at once, so the caller's "about to panic" MQTT publish can
        leave the device first. Off-device it is inert and returns -1. */
     JS_CFUNC_DEF("panic", 0, js_sys_panic),
+    /* fs.request の同意画面を出したアプリだけが返事できる口
+       (docs/filer-storage-design.md §7)。ランチャーが使う。 */
+    JS_CFUNC_DEF("fsConsent", 2, js_sys_fs_consent),
     JS_PROP_END,
 };
 
@@ -751,6 +779,7 @@ static const JSPropDef js_global_object[] = {
        drives the engine directly (docs/keyboard-ime-unification.md §6.2). */
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
+    JS_PROP_CLASS_DEF("fs", &js_fs_obj),
     JS_PROP_CLASS_DEF("vault", &js_vault_obj),
     JS_PROP_CLASS_DEF("system", &js_system_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),

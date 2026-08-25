@@ -1,0 +1,85 @@
+menu "microSD card"
+
+    config MQJS_SDCARD
+        bool "Mount a microSD card as the 'sd' volume"
+        default n
+        help
+            Registers a removable FAT volume with fs_core. Off by default:
+            Stamp-P4 has no card slot and its C6 co-processor already owns
+            the pins the Tab5 wires to SDMMC, so enabling this there would
+            fight the Wi-Fi link. Tab5 builds turn it on via
+            sdkconfig.tab5.defaults.
+
+            The pin defaults below are the Tab5 wiring (SDMMC slot 0 IOMUX).
+            Keeping them in Kconfig rather than in the C is what lets the
+            same driver serve another board — see
+            docs/filer-storage-design.md section 3.
+
+    if MQJS_SDCARD
+
+    config MQJS_SDCARD_SLOT
+        int "SDMMC slot"
+        default 0
+        range 0 1
+        help
+            Tab5 uses slot 0 (fixed IOMUX pins 39-44). Slot 1 is taken by
+            the esp-hosted C6 link on both boards, so 1 is almost certainly
+            wrong here.
+
+    config MQJS_SDCARD_WIDTH
+        int "Bus width (1 or 4)"
+        default 4
+        range 1 4
+
+    config MQJS_SDCARD_PIN_CLK
+        int "CLK GPIO"
+        default 43
+
+    config MQJS_SDCARD_PIN_CMD
+        int "CMD GPIO"
+        default 44
+
+    config MQJS_SDCARD_PIN_D0
+        int "D0 GPIO"
+        default 39
+
+    config MQJS_SDCARD_PIN_D1
+        int "D1 GPIO"
+        default 40
+
+    config MQJS_SDCARD_PIN_D2
+        int "D2 GPIO"
+        default 41
+
+    config MQJS_SDCARD_PIN_D3
+        int "D3 GPIO"
+        default 42
+
+    config MQJS_SDCARD_LDO_CHAN
+        int "On-chip LDO channel powering the card's IO rail (0 = none)"
+        default 4
+        range 0 4
+        help
+            Tab5 feeds VDD_SDIO from internal LDO channel 4. Channels 1-3
+            are already spoken for (flash, PSRAM, MIPI DSI PHY). Set 0 on a
+            board whose card is powered externally.
+
+    config MQJS_SDCARD_LDO_MV
+        int "LDO output voltage (mV)"
+        default 3300
+        depends on MQJS_SDCARD_LDO_CHAN != 0
+
+    config MQJS_SDCARD_FREQ_KHZ
+        int "Bus clock (kHz)"
+        default 40000
+        help
+            40000 = SDMMC_FREQ_HIGHSPEED. Drop to 20000 if a card is flaky.
+
+    config MQJS_SDCARD_MAX_FILES
+        int "Maximum simultaneously open files"
+        default 5
+        range 1 16
+
+    endif
+
+endmenu

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "fs_core.h"
 #include "mqjs_runtime.h"
 #include "storage.h"
 
@@ -20,6 +21,36 @@
 
 static const char *TAG = "storage";
 static bool s_mounted;
+
+/* ---- fs_core への登録 -------------------------------------------- */
+
+static esp_err_t lfs_usage(const fsvol_t *v, uint64_t *total, uint64_t *freeb)
+{
+    (void)v;
+    size_t t = 0, used = 0;
+    esp_err_t err = esp_littlefs_info("storage", &t, &used);
+    if (err != ESP_OK)
+        return err;
+    *total = t;
+    *freeb = (t > used) ? t - used : 0;
+    return ESP_OK;
+}
+
+/* mount/unmount/probe を持たない = 常時マウント済みの固定ボリューム。
+   littlefs は起動時に一度マウントされたら外れない (パーティションは
+   抜けない) ので、抜き挿しの機構は要らない。 */
+static const fsvol_ops_t s_internal_ops = {
+    .usage = lfs_usage,
+};
+
+static const fsvol_t s_internal_vol = {
+    .id     = "internal",
+    .label  = "内蔵",
+    .root   = MOUNT,
+    .fstype = "littlefs",
+    .flags  = FSVOL_SYSTEM,
+    .ops    = &s_internal_ops,
+};
 
 bool storage_init(void)
 {
@@ -36,6 +67,10 @@ bool storage_init(void)
     }
     s_mounted = true;
     ESP_LOGI(TAG, "littlefs mounted at %s", MOUNT);
+    /* ファイラから見える "internal" ボリュームとして公開する。ここより
+       上の層 (fs.* バインディングも files.js も) は /littlefs という実パスを
+       一度も知らない — docs/filer-storage-design.md §4。 */
+    fsvol_register(&s_internal_vol);
     return true;
 }
 

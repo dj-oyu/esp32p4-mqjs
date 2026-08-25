@@ -17,6 +17,12 @@ CONFIG_MQJS_TAB5_POWER=y
 # Without this a Tab5 never charges (the charger is firmware-gated).
 CONFIG_MQJS_TAB5_BATTERY=y
 
+# microSD: Tab5 は SDMMC slot 0 (IOMUX 39-44) にカードスロットを持つ。
+# esp-hosted の C6 は slot 1 なので競合しない。IO 電源はオンチップ LDO ch4
+# (ch1=flash / ch2=PSRAM / ch3=MIPI DSI PHY は埋まっている)。
+# ピン既定値は Kconfig 側が Tab5 配線なので、ここでは有効化だけ。
+CONFIG_MQJS_SDCARD=y
+
 # Local network settings. Replace these values after copying the file.
 CONFIG_MQJS_WIFI_SSID="YOUR_WIFI_SSID"
 CONFIG_MQJS_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"

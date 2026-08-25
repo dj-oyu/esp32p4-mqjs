@@ -30,9 +30,54 @@ sys.onSignal(function (v, from) {
     } catch (e) {
         return; // open 規約以外のシグナルは無視
     }
-    if (req && req.op === "open" && req.app)
+    if (!req)
+        return;
+    if (req.op === "open" && req.app) {
         openApp(req.app);
+        return;
+    }
+    /* ストレージ書き込みの同意要求 (docs/filer-storage-design.md §7)。
+       差出人が "system" のものだけ受ける: この名前は C 側が自分の
+       シグナルに署名するために予約していて、アプリは名乗れない。
+       要求元アプリに描かせると偽の許可画面を出せてしまうので、
+       ここ (停止不可の組み込みシステムアプリ) が描く。 */
+    if (req.op === "fs-consent" && from === "system" && req.id) {
+        /* 画面は build() が組み立てる。ここで直接描くと、この後に届く
+           onForeground の build() が retain スタックを畳んで消してしまう
+           (sys.focus は非同期)。前面に居ても居なくても一度は描けるよう、
+           focus とその場の build() の両方を回す — build() は毎回
+           スタックを畳んでから作り直すので、二度描いても重ならない。 */
+        pendingConsent = req;
+        sys.focus("launcher");
+        build();
+    }
 });
+
+/* 許可 / 拒否の 2 択だけ。「今回だけ」は置かない: 権限はアプリが
+   止まるかカードが抜けるかで自動的に消えるので、そもそも短命。 */
+var pendingConsent = null;
+
+var consentPage = function (req) {
+    var s = ui.screen("ストレージの許可");
+    s.label(req.app + " が " + req.vol + " への" +
+            (req.write ? "書き込み" : "読み取り") + "を求めています");
+    s.label("範囲: " + req.path);
+    if (req.reason)
+        s.label("理由: " + req.reason);
+    s.label("許可は " + req.app + " が止まるかカードを抜くまで有効です");
+    var answer = function (ok) {
+        if (!pendingConsent || pendingConsent.id !== req.id)
+            return;                 /* 二重タップ / 別要求に差し替わった */
+        pendingConsent = null;
+        sys.fsConsent(req.id, ok);
+        if (ok)
+            openApp(req.app);       /* 許可したら要求元へ戻す */
+        else
+            build();
+    };
+    s.button("許可する", function () { answer(true); });
+    s.button("拒否", function () { answer(false); });
+};
 
 /* ---- §9 ストア: インストール済み (= 棚と同期した littlefs) の閲覧。
    メインのスイッチャー役を毀損しないよう ui.screen のサブページで
@@ -180,6 +225,10 @@ function build() {
             })(nts[k2]);
         }
     }
+    /* 未回答の同意要求はいちばん上に積む。build() は前面化のたびに
+       走るので、他のアプリを覗いて戻ってきても質問は残っている。 */
+    if (pendingConsent)
+        consentPage(pendingConsent);
 }
 
 sys.onForeground(build);
