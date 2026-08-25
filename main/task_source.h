@@ -13,6 +13,10 @@
 /* Start the receiver (no-op when CONFIG_MQJS_TASK_TOPIC is empty). */
 void task_source_start(void);
 
+/* Nudge the broker connection after the network changed shape (the tailnet
+   coming up). No-op before task_source_start(). Safe from any task. */
+void task_source_net_changed(void);
+
 /* Hand over the most recently received task, or NULL. *len receives
  * its size (tasks may be bytecode, so NUL-termination cannot be relied
  * on for length). The caller owns the returned buffer. */

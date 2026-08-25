@@ -266,6 +266,12 @@ void app_main(void)
        key). wifi.c owns SNTP; chain its sync callback to the adapter. */
     tailscale_adapter_init();
     wifi_set_time_sync_cb(tailscale_adapter_on_time_synced);
+    /* A broker on a 100.x address is only routable once microlink is up, and
+       on_net_up() below starts the MQTT client ~8 s earlier (on got-IP). Let
+       the tailnet tell the task source to try again when it lands, instead of
+       ordering the two -- a LAN broker must not be made to wait for a tailnet
+       that may never come. */
+    tailscale_adapter_set_connected_cb(task_source_net_changed);
     /* Camera <-> network mutual exclusion (camera-lifecycle-plan §4): a scan
        suspends the microlink session (which otherwise starves the camera to
        0.2 fps) and resumes it on teardown. cam_tab5 stays network-agnostic;
