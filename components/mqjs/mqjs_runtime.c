@@ -1957,6 +1957,15 @@ static void key_to_app(const char *utf8, size_t len)
 }
 #endif
 
+/* 最終打鍵の時刻。フラッシュ停止が打鍵と重なったかを数えるためだけに在る
+   (docs/native-editor-spec.md §C.2)。停止中の wrapper から読まれるので
+   int64 1 個で済ませ、ロックは持たない —— 1 打鍵ぶんずれても、
+   1.5 秒の窓の判定は変わらない。 */
+static volatile int64_t s_last_key_us;
+
+int64_t mqjs_last_key_us(void) { return s_last_key_us; }
+int64_t mqjs_now_us(void)      { return time_us(); }
+
 void mqjs_post_key(const char *utf8, size_t len)
 {
 #ifdef ESP_PLATFORM
@@ -1976,6 +1985,11 @@ void mqjs_post_key(const char *utf8, size_t len)
        アプリの打鍵をここで殺しており (launcher や reading のような widget
        専用アプリがそれ)、後ろに置くと「ドックの物理キーが field に入らない」
        という §2 の根っこをそのまま踏む。 */
+    /* 「打鍵中」の判定に使う (main/flash_stall_meter.c)。電源ゲートより後、
+       IME より前に置く: 画面を起こしただけのキーは打鍵として数えないが、
+       IME に吸われた打鍵は打鍵として数えたい。 */
+    s_last_key_us = time_us();
+
     if (ime_route_key(utf8, len))
         return;   /* この打鍵の行き先は所有タスクが決める */
 
@@ -6590,6 +6604,40 @@ static int skkpart_open(const char *name, SkkImage *im)
     if (image_len < sizeof(skk_image_hdr_t) || image_len > p->size)
         return SKK_ERR_TRUNCATED;
 
+#if CONFIG_MQJS_SKK_DICT_IN_PSRAM
+    /* 辞書を PSRAM へ写して、そこから読む。
+     *
+     * これ単独では速度のためではない (探索はサンプリング木で 6 ライン、
+     * 実測 77µs/変換なので、PSRAM 化で買えるのは数十 µs)。目的は
+     * **フラッシュのキャッシュ読みを打鍵経路から消すこと**で、
+     * SPIRAM_XIP_FROM_PSRAM を安全に有効化するための前提条件になる ——
+     * XIP は「コードと rodata が PSRAM にあるなら flash のキャッシュ流量は
+     * ゼロ」という IDF の仮定の上で cache_disable を省くが、mmap した辞書は
+     * その仮定を破る唯一の存在だから (spi_flash_os_func_app.c:32)。
+     *
+     * 代償は PSRAM を image 分そのまま食うこと。松なら 8.46MB。 */
+    {
+        uint8_t *ram = skk_image_alloc(image_len);
+        if (!ram)
+            return -105;                  /* PSRAM が足りない */
+        if (esp_partition_read(p, 0, ram, image_len) != ESP_OK) {
+            skk_image_free(ram);
+            return -100;
+        }
+        skk_blob_t rblob = { ram, image_len };
+        rc = skk_dict_open(&im->dict, rblob, SKK_OPEN_VERIFY);
+        if (rc != SKK_OK) {
+            skk_image_free(ram);
+            return rc;
+        }
+        im->base   = ram;
+        im->len    = image_len;
+        im->mapped = false;
+        im->owned  = true;   /* 参照ゼロで skk_image_free される */
+        return SKK_OK;
+    }
+#endif
+
     if (esp_partition_mmap(p, 0, image_len, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
         return -100;
 
@@ -6610,6 +6658,108 @@ static int skkpart_open(const char *name, SkkImage *im)
     im->owned  = false;
     return SKK_OK;
 }
+
+#if CONFIG_MQJS_SKK_BENCH
+/* 辞書の引きにかかる時間を実測する (mmap したフラッシュ vs PSRAM コピー)。
+ *
+ * 設計文書は「コールドで概算 25µs、PSRAM なら約 2.5µs」と見積もっているが、
+ * 見積もりのまま置かれている。置き場を変えるかどうかは PSRAM を 8.46MB
+ * 払う話なので、推測ではなく測ってから決める。
+ *
+ * 見出しは辞書自身から取る: skk_complete に 1 バイトの接頭辞 "\xe3"
+ * (かなの UTF-8 先頭バイト) を渡すと、実在する読みを nth で拾えるので、
+ * ソースに日本語リテラルを埋め込まずに済む。 */
+#define BENCH_N     64
+#define BENCH_STRIDE 37           /* 素数。1 つの接頭辞の中で散らす */
+#define BENCH_RDMAX 48
+
+void mqjs_skk_bench(void)
+{
+    static SkkImage im;
+    int rc = skkpart_open(MQJS_SKK_PARTITION, &im);
+    if (rc != SKK_OK) {
+        ESP_LOGE(TAG, "skk bench: open failed (%d)", rc);
+        return;
+    }
+
+    /* 1 周目: 実在する読みを集める。ここは計らない (探索そのものなので、
+       計ると 2 回引いたことになる)。
+     *
+     * 接頭辞は「有効な UTF-8 文字」でなければならない: packed key は
+     * 文字単位のランクで組まれるので、バイト 1 個では引けない (最初そう
+     * 書いて 1 件も取れなかった)。行頭のかなを 8 つ並べて、それぞれから
+     * 飛び飛びに拾う。ソースに日本語リテラルを置かずに済むよう、
+     * UTF-8 のバイト列で書く。 */
+    static const char *const pfx[] = {
+        "\xe3\x81\x82",  /* あ */ "\xe3\x81\x8b",  /* か */
+        "\xe3\x81\x95",  /* さ */ "\xe3\x81\x9f",  /* た */
+        "\xe3\x81\xaa",  /* な */ "\xe3\x81\xaf",  /* は */
+        "\xe3\x81\xbe",  /* ま */ "\xe3\x82\x89",  /* ら */
+    };
+    static char  rd[BENCH_N][BENCH_RDMAX];
+    static size_t rdlen[BENCH_N];
+    int have = 0;
+    for (size_t k = 0; k < sizeof pfx / sizeof pfx[0] && have < BENCH_N; k++) {
+        for (int j = 0; j < BENCH_N / 8 && have < BENCH_N; j++) {
+            const char *out = NULL;
+            size_t olen = 0;
+            if (skk_complete(&im.dict, SKK_BLK_NASI, pfx[k], 3,
+                             (size_t)j * BENCH_STRIDE, &out, &olen, NULL) != 1)
+                break;                 /* この接頭辞はもう尽きた */
+            if (olen == 0 || olen > BENCH_RDMAX)
+                continue;
+            memcpy(rd[have], out, olen);
+            rdlen[have] = olen;
+            have++;
+        }
+    }
+    if (!have) {
+        ESP_LOGE(TAG, "skk bench: no readings sampled");
+        return;
+    }
+
+    /* キャッシュを流す。1 周目で温まった行を追い出しておかないと、
+       「コールドで何 µs か」が測れない。 */
+    volatile uint32_t sink = 0;
+    const uint8_t *img = im.base;
+    size_t evict = im.len < (1u << 20) ? im.len : (1u << 20);
+    for (size_t i = 0; i < evict; i += 64)
+        sink += img[i];
+    (void)sink;
+
+    /* 2 周目: 引きだけを計る。 */
+    skk_cand_t cand[16];
+    skk_stats_t st;
+    uint32_t total = 0, worst = 0, hits = 0;
+    for (int i = 0; i < have; i++) {
+        size_t n = 0;
+        memset(&st, 0, sizeof st);
+        int64_t t0 = esp_timer_get_time();
+        int r = skk_lookup_stats(&im.dict, SKK_BLK_NASI, rd[i], rdlen[i],
+                                 cand, 16, &n, &st);
+        uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        if (r < 0)
+            continue;
+        hits++;
+        total += us;
+        if (us > worst)
+            worst = us;
+    }
+
+    ESP_LOGW(TAG, "==== SKK BENCH place=%s len=%u load_us=%lu",
+#if CONFIG_MQJS_SKK_DICT_IN_PSRAM
+             "psram",
+#else
+             "mmap-flash",
+#endif
+             (unsigned)im.len, (unsigned long)im.load_us);
+    ESP_LOGW(TAG, "==== lookups=%lu avg_us=%lu max_us=%lu",
+             (unsigned long)hits,
+             (unsigned long)(hits ? total / hits : 0),
+             (unsigned long)worst);
+}
+#endif /* CONFIG_MQJS_SKK_BENCH */
+
 #endif /* ESP_PLATFORM */
 
 /* Load `path` (or take another reference to it) and return its index in

@@ -201,6 +201,25 @@ void mqjs_set_store_provider(const mqjs_store_api_t *api);
 void mqjs_set_card_provider(const mqjs_store_api_t *api);
 
 /*
+ * The timestamp of the last real keystroke, and the clock it is on.
+ * These exist so the flash-stall meter can tell a stall that landed on
+ * top of typing from one that did not (docs/native-editor-spec.md C.2);
+ * that ratio is what decides whether the XIP work is worth its 12 MB.
+ * Callable with the flash cache disabled is NOT required -- the meter
+ * reads them after the cache is back.
+ */
+int64_t mqjs_last_key_us(void);
+int64_t mqjs_now_us(void);
+
+/*
+ * Dev only (CONFIG_MQJS_SKK_BENCH): time N dictionary lookups and log
+ * where the image lives, so "mmap'd flash vs a PSRAM copy" is a measured
+ * number rather than the estimate the design doc has been carrying.
+ * No-op when the Kconfig is off.
+ */
+void mqjs_skk_bench(void);
+
+/*
  * Called on the JS task right after sys.uninstall removes an app file:
  * the host drops the app's registry subscription so the retained body
  * does not reinstall it on the next broker sync (§11).

@@ -38,6 +38,8 @@
 #include "board_tab5.h"
 #include "mqjs_runtime.h"
 #include "card_apps.h"
+#include "flash_stall_meter.h"
+#include "flash_suspend_test.h"
 #include "sdcard.h"
 #include "storage.h"
 #include "task_source.h"
@@ -242,6 +244,11 @@ void app_main(void)
     storage_init();            /* mount LittleFS for persisted tasks */
     sdcard_init();             /* "sd" volume, if this board has a slot */
     card_apps_init();          /* signed apps on the card = a 2nd catalogue */
+    flash_suspend_test_start(); /* dev only: no-op unless the Kconfig is on */
+    flash_stall_meter_start();  /* dev only: no-op unless the Kconfig is on */
+#if CONFIG_MQJS_SKK_BENCH
+    mqjs_skk_bench();          /* dev only: mmap-flash vs PSRAM lookup cost */
+#endif
 
     /* Platform-owned network defaults: apps never hardcode the broker or the
        topic namespace. The namespace is the first segment of the task topic

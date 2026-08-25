@@ -155,3 +155,14 @@ CONFIG_LV_DRAW_SW_SUPPORT_I1=n
 CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
 CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
 CONFIG_ESP_PERIPH_CTRL_FUNC_IN_IRAM=n
+
+# フラッシュの erase/program 中にキャッシュを止めない設定 (両コア停止が消える)。
+# Tab5 のチップは XMC-D (0x464018) で、IDF の汎用ドライバが名指しで suspend
+# 対応にしている。**有効にする前に MQJS_FLASH_SUSPEND_TEST を通すこと** ——
+# tSUS が足りないと「黙ってゴミを読む」という壊れ方をする。
+# CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+
+# 松 (SKK-JISYO.L, image 8.07MiB) を焼く場合。ソース辞書は gitignore なので
+# 各自 https://github.com/skk-dev/dict から取得し、その置き場を指す。
+# CONFIG_MQJS_SKK_DICT_L=y
+# CONFIG_MQJS_SKK_DICT_SOURCE_DIR="/path/to/dict"

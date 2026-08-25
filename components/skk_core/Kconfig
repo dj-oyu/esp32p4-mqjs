@@ -118,3 +118,33 @@ config MQJS_SKK_DICT_STRIP_ANNOTATIONS
         anyway. Only acts when the image is regenerated.
 
 endmenu
+
+config MQJS_SKK_DICT_IN_PSRAM
+    bool "Copy the dictionary image into PSRAM instead of reading it mmap'd"
+    default n
+    depends on MQJS_SKK_DICT_AT_PARTITION
+    help
+        The image is normally read in place out of mmap'd flash: no
+        allocation, no load, no copy. Turning this on reads it into
+        PSRAM at open time instead, costing the whole image in RAM
+        (8.46 MB for pine).
+
+        Speed is not the reason. A conversion descends a sampled tree and
+        touches about six cache lines, measured at 77 us, so moving the
+        image can only buy tens of microseconds. The reason is that an
+        mmap'd dictionary is a FLASH CACHE READ, and it is the only one
+        left on the typing path once code and rodata live in PSRAM.
+        SPIRAM_XIP_FROM_PSRAM makes IDF skip disabling the cache during a
+        flash write on the assumption that no such reads exist; this
+        option is what makes that assumption true.
+
+        Meaningless on its own. Measure with MQJS_SKK_BENCH first.
+
+config MQJS_SKK_BENCH
+    bool "Time dictionary lookups at boot"
+    default n
+    depends on !MQJS_SKK_DICT_AT_NONE
+    help
+        Samples readings out of the dictionary itself, evicts the cache
+        and times the lookups, then logs where the image lives. Dev only;
+        it opens a second reference to the image at boot.
