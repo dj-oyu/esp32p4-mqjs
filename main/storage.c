@@ -161,6 +161,15 @@ bool storage_delete_app(const char *name)
     return true;
 }
 
+/* apps/ へ書ける唯一の経路。fopen/fwrite を直に使っているのは手抜きでは
+   なく、これが**特権書き込み**だからで、fs_core を通してはいけない
+   (通すと fs_path_reserved に弾かれる —— 弾くのが正しい)。
+ *
+ * 逆から言うと: このファイルの冒頭が主張する「apps/ に届く経路は署名
+ * 検証済みしか無い」は、fs_core 側が /internal/apps 以下の変更を全部
+ * 拒むことと、ここが唯一の抜け道であることの二枚で成り立っている。
+ * 「fs_core に揃えよう」と親切心で書き換えると、アプリが 1 本も
+ * インストールできなくなる。 */
 bool storage_save_app(const char *name, const char *src, size_t len)
 {
     if (!s_mounted)

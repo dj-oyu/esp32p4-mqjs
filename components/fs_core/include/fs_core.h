@@ -135,6 +135,24 @@ esp_err_t fsvol_resolve(const char *vpath, const fsvol_t **vol,
 /* エラーを JS へ返す短い英語メッセージに。fsvol_resolve と fs_* 共通。 */
 const char *fs_err_str(esp_err_t err);
 
+/* ---- 予約サブツリー --------------------------------------------- */
+
+/* vpath が「読めるが書き換えられない」領域の中か ("/internal/apps" 以下)。
+ *
+ * これは grant (§7) の外側にある不変条件で、**どんなに広い grant を
+ * 持っていても通らない**。/littlefs/apps/ のスクリプトが起動時に無検証で
+ * 走れるのは、そこへ届く経路が署名検証済みしか無いからで (main/storage.c
+ * 冒頭)、書き込みを 1 本でも開けるとその前提が消える。
+ *
+ * 読み取りは対象外: アプリのソースは秘密ではないし、署名鍵は端末に無い。
+ * 予約するのは変更だけ。
+ *
+ * fs_write / fs_mkdir / fs_remove / fs_copy(先) / fs_move(両端) は
+ * 内部でこれを見て ESP_ERR_NOT_ALLOWED を返すので、fs_core を通る限り
+ * 呼び出し側が覚えておく必要はない。この関数が公開されているのは、
+ * ファイラが「削除」ボタンを最初から出さないための事前判定用。 */
+bool fs_path_reserved(const char *vpath);
+
 /* ---- ファイル操作 (どのボリュームでも同じコード) ----------------- */
 
 typedef struct {

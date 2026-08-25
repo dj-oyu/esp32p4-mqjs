@@ -311,6 +311,9 @@ const char *fs_err_str(esp_err_t err)
     case ESP_ERR_NOT_FOUND:        return "no such volume";
     case ESP_ERR_INVALID_STATE:    return "not mounted";
     case ESP_ERR_NOT_SUPPORTED:    return "not supported on this volume";
+    /* 「パスの形が悪い」("bad path") と混ぜてはいけない。呼び出し側が
+       直せるかどうかが正反対で、こちらは何度書き直しても通らない。 */
+    case ESP_ERR_NOT_ALLOWED:      return "reserved path (read-only)";
     case ESP_ERR_NO_MEM:           return "out of memory";
     case ESP_ERR_INVALID_SIZE:     return "too large";
     case ESP_ERR_NOT_FINISHED:     return "directory not empty";

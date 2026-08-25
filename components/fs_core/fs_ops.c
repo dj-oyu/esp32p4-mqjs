@@ -46,6 +46,30 @@ static esp_err_t from_errno(int e)
     }
 }
 
+/* 中身を変える操作は**すべて**ここを通す。fsvol_resolve をそのまま
+   呼んでよいのは読み取りだけ。
+ *
+ * 予約サブツリー (fs_reserved.c) を grant の判定より内側に置くための
+ * 関門で、こうしておくと JS バインディングも、後から書くファイラや
+ * ファイルピッカーも、「apps/ を避ける」ことを覚えなくてよくなる。
+ * 覚えなければならない規則は、いつか誰かが忘れる。
+ *
+ * 形の検査を先に済ませてから予約判定に入る順にしてある: 壊れたパスは
+ * "bad path"、正しい形で禁止された場所は "reserved path" と、呼び出し側
+ * から見て別のエラーになる。 */
+static esp_err_t resolve_mut(const char *vpath, const fsvol_t **vol,
+                             char *real, size_t cap)
+{
+    esp_err_t err = fsvol_resolve(vpath, vol, real, cap);
+    if (err != ESP_OK)
+        return err;
+    if (fs_path_reserved(vpath)) {
+        ESP_LOGW(TAG, "refused mutation of reserved path %s", vpath);
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    return ESP_OK;
+}
+
 /* ---- ディレクトリのスナップショット ------------------------------ */
 
 typedef struct {
@@ -264,7 +288,7 @@ esp_err_t fs_read(const char *vpath, uint64_t off, void *buf, size_t cap,
 esp_err_t fs_write(const char *vpath, const void *buf, size_t len, bool append)
 {
     char real[FS_PATH_MAX];
-    esp_err_t err = fsvol_resolve(vpath, NULL, real, sizeof real);
+    esp_err_t err = resolve_mut(vpath, NULL, real, sizeof real);
     if (err != ESP_OK)
         return err;
 
@@ -287,7 +311,7 @@ esp_err_t fs_write(const char *vpath, const void *buf, size_t len, bool append)
 esp_err_t fs_mkdir(const char *vpath)
 {
     char real[FS_PATH_MAX];
-    esp_err_t err = fsvol_resolve(vpath, NULL, real, sizeof real);
+    esp_err_t err = resolve_mut(vpath, NULL, real, sizeof real);
     if (err != ESP_OK)
         return err;
     if (mkdir(real, 0777) != 0)
@@ -342,10 +366,12 @@ esp_err_t fs_remove(const char *vpath, bool recursive)
 {
     char real[FS_PATH_MAX];
     const fsvol_t *v;
-    esp_err_t err = fsvol_resolve(vpath, &v, real, sizeof real);
+    esp_err_t err = resolve_mut(vpath, &v, real, sizeof real);
     if (err != ESP_OK)
         return err;
-    /* ボリュームそのもの ("/sd") を消させない。 */
+    /* ボリュームそのもの ("/sd") を消させない。"/internal" もここで止まる
+       ので、再帰削除で apps/ を巻き込む経路は残らない (予約サブツリーの
+       親は内蔵のルートしかない)。 */
     if (strcmp(real, v->root) == 0)
         return ESP_ERR_INVALID_ARG;
     return rm_real(real, recursive, 0);
@@ -356,10 +382,12 @@ esp_err_t fs_copy(const char *from_vpath, const char *to_vpath,
                   void *ctx)
 {
     char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    /* 読み出し元は普通の読み取りなので予約サブツリーからでも構わない
+       (アプリのソースは秘密ではない)。守るのは書き込み先だけ。 */
     esp_err_t err = fsvol_resolve(from_vpath, NULL, from, sizeof from);
     if (err != ESP_OK)
         return err;
-    err = fsvol_resolve(to_vpath, NULL, to, sizeof to);
+    err = resolve_mut(to_vpath, NULL, to, sizeof to);
     if (err != ESP_OK)
         return err;
     if (strcmp(from, to) == 0)
@@ -419,10 +447,13 @@ esp_err_t fs_move(const char *from_vpath, const char *to_vpath)
 {
     char from[FS_PATH_MAX], to[FS_PATH_MAX];
     const fsvol_t *vf, *vt;
-    esp_err_t err = fsvol_resolve(from_vpath, &vf, from, sizeof from);
+    /* 移動は**両端**が変更になる。片側だけ見ると必ず穴が開く: 行き先しか
+       見なければ apps/ の外へ名前を付け替えて署名済みアプリを消せるし、
+       出所しか見なければ未署名のファイルを apps/ の中へ名前で運び込める。 */
+    esp_err_t err = resolve_mut(from_vpath, &vf, from, sizeof from);
     if (err != ESP_OK)
         return err;
-    err = fsvol_resolve(to_vpath, &vt, to, sizeof to);
+    err = resolve_mut(to_vpath, &vt, to, sizeof to);
     if (err != ESP_OK)
         return err;
 
