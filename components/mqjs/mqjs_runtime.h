@@ -191,6 +191,12 @@ void mqjs_set_store_provider(const mqjs_store_api_t *api);
  * provider are tagged src:"sd" by sys.store(), and sys.install(name, "sd")
  * routes here -- a name present in both catalogues is shown twice rather
  * than silently resolved, because there is no version field to compare.
+ *
+ * count()/get() must NOT verify signatures: they run on the cooperative JS
+ * task, and an Ed25519 check costs 226 ms per file on the device -- one
+ * store-page open over a card of twenty would freeze the whole UI for four
+ * and a half seconds. install() is where the signature is checked, and it
+ * must refuse on failure. Rows are therefore reported with verified:false.
  */
 void mqjs_set_card_provider(const mqjs_store_api_t *api);
 
