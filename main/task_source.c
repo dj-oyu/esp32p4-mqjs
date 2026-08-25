@@ -371,6 +371,36 @@ static void ev_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
         ui_status_set_mqtt(false);
         break;
 
+    case MQTT_EVENT_ERROR:
+        /*
+         * Without this the client fails in complete silence: esp-mqtt keeps
+         * retrying forever and the only symptom is that "ready, listening"
+         * never appears, which reads exactly like "the callback was never
+         * registered". A broker that cannot be reached is an operational
+         * fact the device should say out loud -- especially now that the
+         * broker can sit behind the tailnet, where a Tailscale ACL drops the
+         * SYN with no ICMP and nothing else in the system can see it.
+         *
+         * Rate limited, because "unreachable" is a steady state: the first
+         * few attempts, then one line every ~5 minutes. Enough to explain a
+         * dead device in the black box without flooding the scrollback.
+         */
+        {
+            static unsigned fails;
+            fails++;
+            if (fails <= 3 || fails % 30 == 0) {
+                int sock_err = 0, tcode = -1;
+                if (e->error_handle) {
+                    sock_err = e->error_handle->esp_transport_sock_errno;
+                    tcode = (int)e->error_handle->error_type;
+                }
+                ESP_LOGW(TAG, "broker %s unreachable (attempt %u, type=%d "
+                              "sock_errno=%d)",
+                         CONFIG_MQJS_TASK_BROKER, fails, tcode, sock_err);
+            }
+        }
+        break;
+
     case MQTT_EVENT_DATA: {
         if (e->current_data_offset != 0 || e->data_len != e->total_data_len) {
             ESP_LOGW(TAG, "payload does not fit the rx buffer (%d bytes), ignored",
@@ -502,6 +532,23 @@ void task_source_start(void)
     }
     esp_mqtt_client_register_event(s_cli, ESP_EVENT_ANY_ID, ev_cb, NULL);
     esp_mqtt_client_start(s_cli);
+}
+
+/*
+ * The network underneath us changed shape -- today that means the tailnet
+ * finished coming up. It matters because on_net_up() starts this client on
+ * the Wi-Fi got-IP event, which fires ~8 s BEFORE microlink has a VPN
+ * address and a route: with a broker on a 100.x address every attempt until
+ * then is guaranteed to fail. Rather than order the two (the broker may
+ * equally be on the LAN, where waiting for a tailnet that may never come
+ * would be worse), let the late arrival nudge the client.
+ */
+void task_source_net_changed(void)
+{
+    if (!s_cli)
+        return;
+    ESP_LOGI(TAG, "network changed, re-attempting %s", CONFIG_MQJS_TASK_BROKER);
+    esp_mqtt_client_reconnect(s_cli);
 }
 
 char *task_source_take(size_t *len)

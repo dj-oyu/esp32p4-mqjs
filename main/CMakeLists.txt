@@ -25,7 +25,7 @@ idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                             "jsmem_bench.c" "panic_note.c"
                        PRIV_REQUIRES mqjs term_core nvs_flash esp_wifi esp_netif esp_event
                                      tweetnacl esp_driver_i2c ui_tab5 cam_tab5
-                                     audio_tab5 audio_device kbd_tab5
+                                     audio_tab5 audio_device kbd_tab5 pwr_tab5
                                      esp_driver_ppa
                                      esp_timer esp_opus_float opus_p4_kernels
                                      opus_player

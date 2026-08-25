@@ -142,6 +142,15 @@ int mqjs_run_script(const char *src, size_t src_len, const char *name,
 void mqjs_runtime_stop(void);
 
 /*
+ * Battery shutdown: stop every app with reason "battery" so each one's
+ * sys.onStop handler runs and can persist state, then call `done`. Safe from
+ * any task (the flag is consumed on js_task); `done` runs on js_task. After
+ * this the scheduler stops resurrecting the launcher and the dev slot — the
+ * caller is expected to cut power.
+ */
+void mqjs_request_stop_all(void (*done)(void));
+
+/*
  * T3c stats panel: copy the current clipboard head (type + data
  * truncated to dcap-1 bytes at a UTF-8 boundary) for display. The only
  * clipboard entry point callable OFF the JS task (mutex-guarded).

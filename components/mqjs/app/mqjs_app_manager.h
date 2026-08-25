@@ -50,6 +50,7 @@ typedef enum {
     MQJS_APP_STOP_UPDATED,
     MQJS_APP_STOP_EVICTED,
     MQJS_APP_STOP_ERROR,
+    MQJS_APP_STOP_BATTERY, /* the pack is empty: last words, then power off */
 } mqjs_app_stop_reason_t;
 
 enum {

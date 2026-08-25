@@ -51,6 +51,9 @@ static esp_timer_handle_t s_watchdog;
 static microlink_t *s_ml;
 static char *s_session_key;          /* heap-owned, alive for the session */
 static ts_state_t s_state = TS_ST_NOT_CONFIGURED;
+/* Fired once each time the tailnet reaches CONNECTED. main uses it to nudge
+   services that were started before a 100.x route existed. */
+static void (*s_connected_cb)(void);
 static char s_detail[128]; /* Japanese; sized with tailscale_status_t.detail */
 static int s_retries;
 static int s_ntp_waits;              /* ticks spent waiting for the clock */
@@ -145,6 +148,8 @@ static void on_ml_state(microlink_t *ml, microlink_state_t st, void *ud)
         snprintf(d, sizeof d, "接続済み %s", ip);
         set_status(TS_ST_CONNECTED, d);
         ESP_LOGI(TAG, "tailnet connected: %s", ip);
+        if (s_connected_cb)
+            s_connected_cb();
     } else if (st == ML_STATE_RECONNECTING && s_connected_once) {
         set_status(TS_ST_CONNECTING, "再接続中");
     }
@@ -444,6 +449,11 @@ void tailscale_adapter_on_net_up(void)
         refresh_idle_status();
     }
     unlock();
+}
+
+void tailscale_adapter_set_connected_cb(void (*fn)(void))
+{
+    s_connected_cb = fn;
 }
 
 void tailscale_adapter_get_status(tailscale_status_t *out)

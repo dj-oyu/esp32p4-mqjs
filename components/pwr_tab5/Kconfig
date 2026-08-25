@@ -1,0 +1,45 @@
+menu "Tab5 battery"
+
+    config MQJS_TAB5_BATTERY
+        bool "Enable Tab5 battery monitoring, charge control and protection"
+        default n
+        depends on IDF_TARGET_ESP32P4
+        help
+            M5Stack Tab5 battery support: INA226 monitoring (0x41, internal
+            I2C bus), charge enable / quick-charge selection through the
+            PI4IOE5V6408 expander at 0x44, a coulomb-counting fuel gauge with
+            IR compensation, and the load-shed / over-discharge ladder that
+            shuts the device down before the pack's 6.0 V protection latches
+            (recovering from that needs the battery physically removed).
+
+            Off by default so Stamp-P4 builds are unaffected; when disabled
+            pwr_tab5.h provides no-op inline stubs.
+
+            NOTE: without this, a Tab5 never charges. The charger is gated by
+            a firmware-driven pin and the device only charges while powered
+            on, so a build with this option off drains the pack even on USB.
+
+    config MQJS_TAB5_BATTERY_INVERT_CURRENT
+        bool "INA226 current is negative while charging"
+        depends on MQJS_TAB5_BATTERY
+        default n
+        help
+            The INA226's orientation on this board is not documented; the
+            factory UI treats "current >= 0" as charging and this default
+            follows it. Set this if the device reports a discharge while it
+            is visibly charging. Also settable at runtime with
+            pwr_tab5_set_current_sign(-1) / power.sign(-1) during bring-up,
+            so a probe run does not need a reflash.
+
+    config MQJS_TAB5_BATTERY_GRACE_S
+        int "Seconds between the shutdown warning and cutting power"
+        depends on MQJS_TAB5_BATTERY
+        range 5 120
+        default 30
+        help
+            When the pack reaches the shutdown tier, apps are told through
+            sys.onStop("battery") and the countdown starts. Power is cut on
+            the acknowledgement or when this expires, whichever comes first.
+            A charger appearing during the countdown aborts it.
+
+endmenu

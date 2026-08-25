@@ -36,6 +36,20 @@ void ui_status_set_net(bool wifi_up, const char *ip)
     push_locked(mut_net, &a);
 }
 
+struct batt_arg { int pct, state, eta; };
+static void mut_batt(void *p)
+{
+    struct batt_arg *a = p;
+    s_st.batt_pct = (int8_t)(a->pct < -1 ? -1 : (a->pct > 100 ? 100 : a->pct));
+    s_st.batt_state = (uint8_t)a->state;
+    s_st.batt_eta_min = (int16_t)(a->eta > 32767 ? 32767 : a->eta);
+}
+void ui_status_set_battery(int pct, int state, int eta_min)
+{
+    struct batt_arg a = { pct, state, eta_min };
+    push_locked(mut_batt, &a);
+}
+
 static void mut_mqtt(void *p) { s_st.mqtt_up = *(bool *)p; }
 void ui_status_set_mqtt(bool up)
 {

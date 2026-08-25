@@ -51,6 +51,11 @@ void tailscale_adapter_on_net_up(void);
 void tailscale_adapter_on_time_synced(void);
 
 /* Snapshot the current status (copied; safe to read any time). */
+/* Called from the microlink state task each time the tailnet reaches
+   CONNECTED. Keep it short and non-blocking; it runs under the adapter lock,
+   so it must not call back into this component. */
+void tailscale_adapter_set_connected_cb(void (*fn)(void));
+
 void tailscale_adapter_get_status(tailscale_status_t *out);
 
 /* User on/off. enable() persists the flag and starts if the network is up;

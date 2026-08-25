@@ -59,6 +59,7 @@ print("hello");
 - `i2c_scan.js`: I2C スキャンと動的な結果一覧
 - `mqtt_demo.js`: MQTT の接続、購読、publish
 - `cam_demo.js`: カメラのコードスキャン
+- `battery_trace.js`: `power.battery()` の連続記録 (OCV テーブル較正用。常用しません)
 
 ### UI
 

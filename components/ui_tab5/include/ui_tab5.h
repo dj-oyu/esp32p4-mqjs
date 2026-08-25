@@ -27,6 +27,13 @@ typedef struct {
     bool wifi_up;
     bool mqtt_up;
     char last_event[48];  /* "accepted (3644B)" / "bad signature" ... */
+    /* Battery (pushed by main/ui_status.c from the pwr_tab5 sample hook;
+       plain ints on purpose so this header stays independent of the
+       battery component -- the encoding is pwr_batt_state_t in
+       components/pwr_tab5/include/pwr_tab5.h). -1 = unknown / no pack. */
+    int8_t  batt_pct;
+    uint8_t batt_state;
+    int16_t batt_eta_min;
 } ui_status_t;
 
 /* Drawing command posted by the JS ui.* bindings (js_task) and consumed

@@ -174,8 +174,120 @@ function tsStatusLine(st) {
     return line;
 }
 
+// --- Battery ---------------------------------------------------------------
+// The setters here are system-only APIs (power.charge / limit / fullOnce /
+// off / sign); this screen is where they belong. Reading is open to any app.
+
+var battTimer = 0;
+function clearBattTimer() {
+    if (battTimer) { clearInterval(battTimer); battTimer = 0; }
+}
+
+function battStateJa(st) {
+    if (st === "charging") return "充電中";
+    if (st === "discharging") return "放電中";
+    if (st === "full") return "満充電";
+    if (st === "limited") return "上限で停止";
+    if (st === "none") return "電池なし";
+    return "不明";
+}
+
+function battEtaJa(min) {
+    if (min < 0) return "";
+    var h = Math.floor(min / 60);
+    var m = min % 60;
+    if (h > 0) return "  残り約 " + h + "時間" + m + "分";
+    return "  残り約 " + m + "分";
+}
+
+function battShort() {
+    var b = power.battery();
+    if (!b.ok || b.pct < 0) return battStateJa(b.state);
+    return b.pct + "%  " + battStateJa(b.state);
+}
+
+function battLine(b) {
+    if (!b.ok) return "バッテリー情報を取得できません";
+    if (b.state === "none") return "電池が入っていません (USB給電)";
+    var pct = b.pct < 0 ? "--" : ("" + b.pct);
+    return pct + "%  " + battStateJa(b.state) + battEtaJa(b.eta);
+}
+
+function battDetail(b) {
+    // Everything the bring-up needs in one line: terminal voltage, the
+    // IR-compensated open-circuit voltage the protection ladder actually
+    // uses, current, the learned pack resistance and capacity, and the raw
+    // expander input register (bit 6 is the charger/USB-C status pin whose
+    // polarity is not documented).
+    return (b.mv / 1000).toFixed(2) + "V (ocv " + (b.ocv / 1000).toFixed(2) +
+           "V)  " + b.ma + "mA  " + b.mohm + "mΩ" + "\n" +
+           b.mah + "/" + b.cap + "mAh  raw=0x" + b.raw.toString(16) +
+           "  n=" + b.n;
+}
+
+function batteryPage() {
+    clearTsTimer();
+    clearBattTimer();
+    var s = ui.screen("バッテリー");
+    var b = power.battery();
+    var head = s.label(battLine(b));
+    var detail = s.label(battDetail(b));
+
+    s.label("充電の上限 (電池を長持ちさせます)");
+    var lim = s.list();
+    var setLimit = function (pct) {
+        return function () {
+            power.limit(pct);
+            batteryPage();
+        };
+    };
+    var cur = b.limit;
+    lim.add((cur === 100 ? "* " : "  ") + "100% まで充電", setLimit(100));
+    lim.add((cur === 90 ? "* " : "  ") + "90% で停止", setLimit(90));
+    lim.add((cur === 80 ? "* " : "  ") + "80% で停止", setLimit(80));
+    if (cur < 100) {
+        s.button("今回だけ満充電する", function () {
+            power.fullOnce();
+            batteryPage();
+        });
+    }
+
+    s.label("持ち出し前など、一時的に上限を外したいときに使います。");
+
+    s.button("電源を切る", function () {
+        clearBattTimer();
+        var c = ui.screen("電源を切る");
+        c.label("保存していない内容は失われます。");
+        c.label("Tab5 は電源が入っているときだけ充電できます。");
+        c.button("電源を切る", function () { power.off(); });
+        c.button("やめる", batteryPage);
+    });
+
+    // Bring-up: the INA226's orientation on this board is undocumented, so
+    // the sign is a setting until a device run pins it down.
+    if (b.ma < 0 && b.state === "charging") {
+        s.label("※ 充電中なのに電流が負です。符号を反転してください。");
+    }
+    s.button("電流の符号を反転 (動作確認用)", function () {
+        power.sign(b.ma >= 0 ? -1 : 1);
+        batteryPage();
+    });
+
+    s.button("戻る", function () {
+        clearBattTimer();
+        mainPage();
+    });
+
+    battTimer = setInterval(function () {
+        var n = power.battery();
+        head.setText(battLine(n));
+        detail.setText(battDetail(n));
+    }, 1000);
+}
+
 function mainPage() {
     clearTsTimer();
+    clearBattTimer();
     unwind();
     var s = ui.screen("デバイス設定");
     s.label("ネットワーク");
@@ -187,9 +299,13 @@ function mainPage() {
     list.add("Tailscale    " + (ts.configured ? tsShort(ts) : "未設定"),
              tailscalePage);
     list.add("QRで設定を読み込む", qrTestPage);
+    s.label("電源");
+    var plist = s.list();
+    plist.add("バッテリー    " + battShort(), batteryPage);
     s.label("この画面は端末ファームウェアに組み込まれています。");
     s.button("アプリ一覧へ戻る", function () {
         clearTsTimer();
+        clearBattTimer();
         sys.open("launcher");
     });
 }

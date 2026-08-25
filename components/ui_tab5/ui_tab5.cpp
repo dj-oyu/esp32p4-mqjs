@@ -1091,6 +1091,9 @@ static esp_err_t display_init(ui_panel_variant_t variant,
 #define UI_COL_EVENT 0xFFD479 /* last_event text */
 #define UI_COL_FLASH 0x2E6BD6 /* highlight behind a fresh event */
 #define UI_COL_DROP  0xE05A4E /* draw-cmd drop counter */
+/* Battery pictogram: shell plus a 3px nub, sized to sit on the 44px row. */
+#define UI_BATT_W    34
+#define UI_BATT_H    18
 
 static lv_obj_t *make_label(lv_obj_t *parent, uint32_t color)
 {
@@ -1199,6 +1202,53 @@ public:
         lv_obj_set_style_radius(_task_lbl, 4, 0);
         lv_obj_set_style_bg_color(_task_lbl, lv_color_hex(UI_COL_FLASH), 0);
         lv_obj_set_style_bg_opa(_task_lbl, LV_OPA_TRANSP, 0);
+
+        /* Battery. Drawn from plain objects rather than a font glyph: the
+           status-bar font is a Japanese subset and nothing guarantees a
+           battery codepoint survived it, whereas a rounded shell with a fill
+           is exact at any size and can carry the state in its colour. The
+           box is an unlaid-out container so the nub can sit outside the
+           shell without becoming its own flex item. */
+        _batt_box = lv_obj_create(row);
+        lv_obj_remove_style_all(_batt_box);
+        lv_obj_remove_flag(_batt_box, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_batt_box, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(_batt_box, UI_BATT_W + 4, UI_BATT_H);
+        lv_obj_add_flag(_batt_box, LV_OBJ_FLAG_HIDDEN); /* until first sample */
+
+        _batt = lv_obj_create(_batt_box);
+        lv_obj_remove_style_all(_batt);
+        lv_obj_remove_flag(_batt, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_batt, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(_batt, 0, 0);
+        lv_obj_set_size(_batt, UI_BATT_W, UI_BATT_H);
+        lv_obj_set_style_radius(_batt, 3, 0);
+        lv_obj_set_style_border_width(_batt, 2, 0);
+        lv_obj_set_style_border_color(_batt, lv_color_hex(UI_COL_DIM), 0);
+        lv_obj_set_style_pad_all(_batt, 2, 0);
+
+        _batt_fill = lv_obj_create(_batt);
+        lv_obj_remove_style_all(_batt_fill);
+        lv_obj_remove_flag(_batt_fill, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_batt_fill, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(_batt_fill, 0, 0);
+        lv_obj_set_size(_batt_fill, 0, UI_BATT_H - 8);
+        lv_obj_set_style_radius(_batt_fill, 1, 0);
+        lv_obj_set_style_bg_color(_batt_fill, lv_color_hex(UI_COL_OK), 0);
+        lv_obj_set_style_bg_opa(_batt_fill, LV_OPA_COVER, 0);
+
+        _batt_cap = lv_obj_create(_batt_box);
+        lv_obj_remove_style_all(_batt_cap);
+        lv_obj_remove_flag(_batt_cap, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(_batt_cap, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(_batt_cap, UI_BATT_W, (UI_BATT_H - 8) / 2);
+        lv_obj_set_size(_batt_cap, 3, 8);
+        lv_obj_set_style_radius(_batt_cap, 1, 0);
+        lv_obj_set_style_bg_color(_batt_cap, lv_color_hex(UI_COL_DIM), 0);
+        lv_obj_set_style_bg_opa(_batt_cap, LV_OPA_COVER, 0);
+
+        _batt_lbl = make_label(row, UI_COL_TEXT);
+        lv_label_set_text(_batt_lbl, "");
 
         _event_lbl = make_label(bar, UI_COL_EVENT);
         lv_obj_set_pos(_event_lbl, UI_PAD, 48);
@@ -1367,6 +1417,7 @@ private:
                                                : "未接続");
         lv_obj_set_style_text_color(
             _mqtt_dot, lv_color_hex(st.mqtt_up ? UI_COL_OK : UI_COL_DOWN), 0);
+        apply_battery(st.batt_pct, st.batt_state);
         strlcpy(_st_task, st.task_name, sizeof _st_task);
         strlcpy(_st_origin, st.task_origin, sizeof _st_origin);
         update_task_label();
@@ -1381,6 +1432,38 @@ private:
             _flash.teleport(LV_OPA_60);
             _flash.move(0);
         }
+    }
+
+    /* `state` is pwr_batt_state_t (see ui_status_t): 0 unknown, 1 no pack,
+       2 discharging, 3 charging, 4 full, 5 held at the charge ceiling.
+       Nothing is shown at all without a pack -- an empty outline would read
+       as "empty battery", which is the opposite of the truth. */
+    void apply_battery(int pct, int state)
+    {
+        if (pct < 0 || state == 0 || state == 1) {
+            lv_obj_add_flag(_batt_box, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(_batt_lbl, "");
+            return;
+        }
+        lv_obj_remove_flag(_batt_box, LV_OBJ_FLAG_HIDDEN);
+        const int inner = UI_BATT_W - 8; /* border 2 + pad 2, both sides */
+        int w = inner * pct / 100;
+        if (w < 2 && pct > 0)
+            w = 2;
+        lv_obj_set_width(_batt_fill, w);
+
+        uint32_t col = (state == 3)   ? UI_COL_FLASH
+                       : (pct <= 15)  ? UI_COL_DROP
+                       : (pct <= 30)  ? UI_COL_EVENT
+                                      : UI_COL_OK;
+        lv_obj_set_style_bg_color(_batt_fill, lv_color_hex(col), 0);
+        lv_obj_set_style_text_color(_batt_lbl, lv_color_hex(col), 0);
+        if (state == 3)
+            lv_label_set_text_fmt(_batt_lbl, "+%d%%", pct);
+        else if (state == 5)
+            lv_label_set_text_fmt(_batt_lbl, "%d%% 上限", pct);
+        else
+            lv_label_set_text_fmt(_batt_lbl, "%d%%", pct);
     }
 
     void apply_fgapps(const ui_fgapps_t &fa)
@@ -1423,6 +1506,8 @@ private:
     lv_obj_t *_mqtt_dot = nullptr, *_mqtt_lbl = nullptr;
     lv_obj_t *_task_lbl = nullptr, *_event_lbl = nullptr;
     lv_obj_t *_drop_lbl = nullptr;
+    lv_obj_t *_batt_box = nullptr, *_batt = nullptr;
+    lv_obj_t *_batt_fill = nullptr, *_batt_cap = nullptr, *_batt_lbl = nullptr;
     lv_obj_t *_chip = nullptr, *_chip_lbl = nullptr, *_strip = nullptr;
     uint32_t _seen_gen = 0;
     uint32_t _fg_seen_gen = 0;

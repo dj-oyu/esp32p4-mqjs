@@ -28,6 +28,7 @@
 extern void ui_tab5_backlight_apply(int percent);
 extern int  ui_tab5_backlight_user(void);
 extern void ui_tab5_screen_scrim(bool on); /* eat widget taps while dark */
+#include "pwr_tab5.h"
 static const char *TAG = "power";
 #define PWR_LOG(...) ESP_LOGI(TAG, __VA_ARGS__)
 #else
@@ -45,6 +46,29 @@ static void ui_tab5_screen_scrim(bool on) { (void)on; }
 #define PWR_T_DIM_MS   60000
 #define PWR_T_OFF_MS   180000
 #define PWR_DIM_PCT    10
+
+/*
+ * Battery-aware timeouts (docs/battery-power-design.md). The backlight is by
+ * far the biggest load this firmware controls, so a pack that is running out
+ * buys itself time by reaching DIMMED and SCREEN_OFF sooner. The tier is
+ * polled rather than pushed: pwr_tab5 already publishes it for anyone, this
+ * is its only consumer, and a callback would add a cross-task edge to save a
+ * word-sized read once per tick.
+ *
+ * Divisors, not separate constants, so the shape of the progression (dim at
+ * a third of the blank time) survives every tier and there is one place to
+ * change the feel.
+ */
+static int tier_divisor(void)
+{
+    switch (pwr_tab5_tier()) {
+    case PWR_TIER_LOW:      return 2;
+    case PWR_TIER_SHED:     return 3;
+    case PWR_TIER_CRITICAL: return 6;
+    case PWR_TIER_SHUTDOWN: return 6;
+    default:                return 1;
+    }
+}
 
 typedef enum {
     PWR_ACTIVE = 0,
@@ -107,9 +131,12 @@ void mqjs_power_update(int64_t now_ms)
     }
 
     int64_t idle = now_ms - s_last_input_ms;
+    const int div = tier_divisor();
+    const int64_t t_dim = PWR_T_DIM_MS / div;
+    const int64_t t_off = PWR_T_OFF_MS / div;
     switch (s_state) {
     case PWR_ACTIVE:
-        if (idle >= PWR_T_DIM_MS) {
+        if (idle >= t_dim) {
             PWR_LOG("ACTIVE -> DIMMED (idle %lldms, backlight %d%%)",
                     (long long)idle, PWR_DIM_PCT);
             ui_tab5_backlight_apply(PWR_DIM_PCT);
@@ -117,7 +144,7 @@ void mqjs_power_update(int64_t now_ms)
         }
         break;
     case PWR_DIMMED:
-        if (idle >= PWR_T_OFF_MS) {
+        if (idle >= t_off) {
             PWR_LOG("DIMMED -> SCREEN_OFF (idle %lldms, backlight off)",
                     (long long)idle);
             ui_tab5_backlight_apply(0);

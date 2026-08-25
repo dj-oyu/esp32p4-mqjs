@@ -569,6 +569,23 @@ static const JSPropDef js_audio[] = {
 static const JSClassDef js_audio_obj =
     JS_OBJECT_DEF("Audio", js_audio);
 
+/* ---- device API: power object (Tab5 battery) ----
+   battery() -> snapshot object (open to every app: a percentage is not a
+   capability). charge/limit/fullOnce/off/sign CHANGE power behaviour and
+   are system-app only, same gate as camera.scanQr. All inert off-device. */
+static const JSPropDef js_power[] = {
+    JS_CFUNC_DEF("battery", 0, js_power_battery),
+    JS_CFUNC_DEF("charge", 1, js_power_charge),
+    JS_CFUNC_DEF("limit", 1, js_power_limit),
+    JS_CFUNC_DEF("fullOnce", 0, js_power_full_once),
+    JS_CFUNC_DEF("off", 0, js_power_off),
+    JS_CFUNC_DEF("sign", 1, js_power_sign),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_power_obj =
+    JS_OBJECT_DEF("Power", js_power);
+
 /* ---- device API: http object (one-shot GET over esp_http_client) ----
    get(url, fn) -> 1/0: one request system-wide, fn(body|undefined,
    status). https:// validates against the cert bundle; http:// allowed
@@ -739,6 +756,7 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),
     JS_PROP_CLASS_DEF("camera", &js_camera_obj),
     JS_PROP_CLASS_DEF("audio", &js_audio_obj),
+    JS_PROP_CLASS_DEF("power", &js_power_obj),
     JS_PROP_CLASS_DEF("http", &js_http_obj),
     /* widget handle classes (W1): the generator only accepts class defs
        in the global object, so they live here (not constructible — use
