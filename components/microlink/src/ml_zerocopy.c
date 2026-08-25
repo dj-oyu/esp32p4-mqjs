@@ -30,6 +30,7 @@
 #include "lwip/netif.h"
 #include "wireguardif.h"
 #include "wireguard.h"
+#include "arch/sys_arch.h"
 #include <string.h>
 
 static const char *TAG = "ml_zc";
@@ -246,6 +247,23 @@ void ml_zerocopy_deinit(microlink_t *ml) {
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port) {
     if (!ml->zc.pcb || len > ML_MAX_PACKET_SIZE) return ESP_ERR_INVALID_ARG;
+
+    /* Already on tcpip_thread? Send inline. WG output reaches this function
+     * from ip_input -> wireguardif_output (a TCP ACK inside the tunnel), and
+     * posting a tcpip_callback into the mbox we are ourselves draining blocks
+     * forever the moment that mbox is full. udp_sendto is safe here: this IS
+     * the thread that owns the lwIP core. */
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER)) {
+        struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+        if (!p) return ESP_ERR_NO_MEM;
+        memcpy(p->payload, data, len);
+        ip_addr_t dest;
+        IP_SET_TYPE_VAL(dest, IPADDR_TYPE_V4);
+        ip4_addr_set_u32(ip_2_ip4(&dest), htonl(dest_ip));
+        err_t err = udp_sendto(ml->zc.pcb, p, &dest, dest_port);
+        pbuf_free(p);
+        return (err == ERR_OK) ? ESP_OK : ESP_FAIL;
+    }
 
     /* Acquire TX pool slot (SPSC: wg_mgr writes head, tcpip reads tail) */
     uint8_t head = __atomic_load_n(&ml->zc.tx_head, __ATOMIC_RELAXED);

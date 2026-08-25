@@ -241,6 +241,32 @@ esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
     return (have_ipv4 || have_ipv6) ? ESP_OK : ESP_FAIL;
 }
 
+/* Send an IPv4 STUN request out of the socket that also carries DISCO and WG,
+ * so the mapping STUN reports is the mapping peers will actually reach. In
+ * zero-copy mode that socket is a raw lwIP PCB rather than a BSD fd, which is
+ * why this cannot simply be a socket number. */
+static int stun_send_v4(microlink_t *ml, const uint8_t *req, size_t len,
+                        uint32_t dest_ip, uint16_t dest_port) {
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    if (ml->zc.pcb)
+        return (ml_zerocopy_send(ml, req, len, dest_ip, dest_port) == ESP_OK)
+                   ? (int)len : -1;
+#endif
+    int sock = ml->disco_sock4;
+    if (sock < 0) {
+        /* Fallback to a dedicated STUN socket: reports a mapping for a socket
+         * peers never send to, but it is better than no public endpoint. */
+        if (ensure_stun_socket(ml) != ESP_OK) return -1;
+        sock = ml->stun_sock;
+    }
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(dest_port),
+        .sin_addr.s_addr = htonl(dest_ip),
+    };
+    return ml_sendto(sock, req, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+}
+
 /* ============================================================================
  * Send Probe (hostname-based — legacy, resolves DNS each time)
  * ========================================================================== */
@@ -257,44 +283,36 @@ esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port)
         return ESP_FAIL;
     }
 
-    /* Use the appropriate socket for the address family.
-     * IPv4: prefer disco_sock4 so NAT mapping matches DISCO socket.
-     * IPv6: use dedicated stun_sock6 (no IPv6 DISCO socket). */
-    int sock;
-    uint8_t *txid;
-    if (res->ai_family == AF_INET6) {
-        if (ensure_stun_socket6(ml) != ESP_OK) {
-            ml_freeaddrinfo(res);
-            return ESP_FAIL;
-        }
-        sock = ml->stun_sock6;
-        txid = txid_v6;
-    } else {
-        /* Use disco_sock4 for IPv4 STUN to match NAT mapping */
-        if (ml->disco_sock4 >= 0) {
-            sock = ml->disco_sock4;
-        } else {
-            if (ensure_stun_socket(ml) != ESP_OK) {
-                ml_freeaddrinfo(res);
-                return ESP_FAIL;
-            }
-            sock = ml->stun_sock;
-        }
-        txid = txid_v4;
+    /* Pick the transmit path per address family: IPv4 goes out whatever socket
+     * carries DISCO (stun_send_v4), IPv6 has no DISCO socket to match. */
+    bool is_v6 = (res->ai_family == AF_INET6);
+    uint8_t *txid = is_v6 ? txid_v6 : txid_v4;
+    if (is_v6 && ensure_stun_socket6(ml) != ESP_OK) {
+        ml_freeaddrinfo(res);
+        return ESP_FAIL;
     }
 
     /* Build Tailscale-compatible STUN request */
     uint8_t request[STUN_REQUEST_SIZE];
     size_t req_len = build_stun_request(request, txid);
-    if (res->ai_family == AF_INET6)
+    if (is_v6)
         txid_v6_valid = true;
     else
         txid_v4_valid = true;
 
     /* Send */
-    int n = ml_sendto(sock, request, req_len, 0,
-                   res->ai_addr, res->ai_addrlen);
-    ml_freeaddrinfo(res);
+    int n;
+    if (is_v6) {
+        n = ml_sendto(ml->stun_sock6, request, req_len, 0,
+                      res->ai_addr, res->ai_addrlen);
+        ml_freeaddrinfo(res);
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)res->ai_addr;
+        uint32_t dest_ip = ntohl(a4->sin_addr.s_addr);
+        uint16_t dest_port = ntohs(a4->sin_port);
+        ml_freeaddrinfo(res);
+        n = stun_send_v4(ml, request, req_len, dest_ip, dest_port);
+    }
 
     if (n < 0) {
         ESP_LOGE(TAG, "STUN send failed: %d", errno);
@@ -312,32 +330,13 @@ esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port)
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port) {
     if (server_ip == 0) return ESP_ERR_INVALID_ARG;
 
-    /* Use disco_sock4 for STUN probes so the NAT mapping (external IP:port)
-     * applies to the same socket that receives incoming DISCO probes from peers.
-     * Without this, STUN reports a port mapped to a separate socket, and peers
-     * sending to that address reach the wrong socket (or get dropped by NAT). */
-    int sock = ml->disco_sock4;
-    if (sock < 0) {
-        /* Fallback to dedicated STUN socket if disco not available */
-        if (ensure_stun_socket(ml) != ESP_OK) return ESP_FAIL;
-        sock = ml->stun_sock;
-    }
-
-    /* Build destination from pre-resolved IP (host byte order -> network) */
-    struct sockaddr_in dest = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr.s_addr = htonl(server_ip),
-    };
-
     /* Build Tailscale-compatible STUN request */
     uint8_t request[STUN_REQUEST_SIZE];
     size_t req_len = build_stun_request(request, txid_v4);
     txid_v4_valid = true;
 
     /* Send */
-    int n = ml_sendto(sock, request, req_len, 0,
-                   (struct sockaddr *)&dest, sizeof(dest));
+    int n = stun_send_v4(ml, request, req_len, server_ip, port);
     if (n < 0) {
         ESP_LOGE(TAG, "STUN send failed: %d", errno);
         return ESP_FAIL;
