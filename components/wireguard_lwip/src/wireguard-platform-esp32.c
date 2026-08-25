@@ -6,8 +6,10 @@
 #include "wireguard-platform.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "lwip/sys.h"
 #include <string.h>
+#include <sys/time.h>
 
 /* ============================================================================
  * Time Functions
@@ -18,18 +20,33 @@ uint32_t wireguard_sys_now() {
     return sys_now();
 }
 
+/* TAI64N goes into every handshake initiation we send, and the responder
+ * REJECTS any initiation whose timestamp is not strictly greater than the
+ * greatest one it has already seen from us (WireGuard's replay defence). It
+ * must therefore be WALL-CLOCK time: uptime restarts at zero on every boot, so
+ * a peer that once stored "1970 + 175 s" from us silently refuses every
+ * initiation for the first 175 seconds of the next boot -- and a peer we talk
+ * to often (which therefore never trims the state) refuses us for as long as
+ * its stored value stands. Device-verified 2026-08-25: the broker PC ignored
+ * ten consecutive initiations while other peers, whose stored value happened
+ * to be lower than that boot's uptime, answered the first one. The clock is
+ * guaranteed here: tailscale_adapter only starts microlink after SNTP has set
+ * it (time_is_valid()). If it is somehow unset we still send something
+ * monotonic rather than nothing, but it will be rejected the same way. */
 void wireguard_tai64n_now(uint8_t *output) {
-    // TAI64N format: 8 bytes seconds + 4 bytes nanoseconds
-    // For simplicity, use Unix epoch time
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = now_us / 1000000ULL;
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t seconds = (uint64_t)tv.tv_sec;
+    uint32_t nanoseconds = (uint32_t)tv.tv_usec * 1000;
 
-    // Log raw uptime before TAI offset (only every ~5s to avoid spam)
-    static uint64_t last_log_s = 0;
-    if (seconds - last_log_s >= 5) {
-        printf("[TAI64N] uptime=%llu s, nano=%lu\n", (unsigned long long)seconds, (unsigned long)nanoseconds);
-        last_log_s = seconds;
+    if (tv.tv_sec < 1700000000) {   /* SNTP has not set the clock (~2023-11) */
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            ESP_LOGW("wg_plat", "TAI64N from an unset clock (%lld) -- peers that "
+                     "hold a newer timestamp for us will reject the handshake",
+                     (long long)tv.tv_sec);
+        }
     }
 
     // TAI64 starts at 1970-01-01 00:00:10 TAI (Unix epoch + 10 seconds)

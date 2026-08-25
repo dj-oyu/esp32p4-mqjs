@@ -316,10 +316,14 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 		} else {
 			// key has expired...
 			keypair_destroy(keypair);
+			peer->send_handshake = true;
 			result = ERR_CONN;
 		}
 	} else {
-		// No valid keys!
+		// No valid keys! Ask for a handshake: this packet is lost either way,
+		// but the next one has somewhere to go. Rate limited by REKEY_TIMEOUT
+		// in should_send_initiation(), and cleared once the initiation is sent.
+		peer->send_handshake = true;
 		result = ERR_CONN;
 	}
 	return result;
