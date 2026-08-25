@@ -12,6 +12,9 @@ JavaScript から扱えます。小さなアイデアを短いスクリプトに
 
 > このプロジェクトは開発中です。API や保存形式は今後変わる可能性があります。
 
+ライセンスは **GPL-3.0-or-later** です (SSH 端末が依存する wolfSSL/wolfSSH に合わせています)。
+理由と同梱 OSS の内訳は [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) に。
+
 ## これは何か
 
 esp32p4-mqjs は、単に「マイコンで JavaScript を動かす」ためのプロジェクトではありません。
@@ -337,6 +340,13 @@ curl.exe -O https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.M
 curl.exe -O https://raw.githubusercontent.com/skk-dev/dict/master/SKK-JISYO.ML
 cd ..\esp32p4-mqjs
 ```
+
+> **辞書のライセンス**: skk-dev/dict の SKK-JISYO.{M,ML,L} は
+> **GPL-2.0-or-later** です。このファームは GPL-3.0-or-later なので
+> 「or later」で問題なく同居しますが、**辞書を埋め込んだイメージを配布する
+> 場合は辞書側の条件も一緒に付いてきます**。生成された `.bin` はリポジトリには
+> 含まれません (`.gitignore`)。詳細は
+> [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。
 
 `sdkconfig.tab5.defaults` に置き場所を書きます。
 
@@ -664,6 +674,8 @@ idf.py -B C:\esp-build\esp32p4-mqjs -p COM7 build flash monitor
 ## リポジトリ構成
 
 ```text
+LICENSE                  GPL-3.0 全文 (このプロジェクトのライセンス)
+THIRD_PARTY_NOTICES.md   同梱・リンクする OSS の内訳と、GPLv3 を選んだ理由
 main/                    ESP-IDF エントリポイント、Wi-Fi、署名付きタスク配信、LittleFS
 components/mqjs/         mquickjs、本体 API、マルチアプリランタイム、PC ツール
 components/ui_tab5/      Tab5 の LVGL UI、パネル・タッチ対応
@@ -691,5 +703,14 @@ sdkconfig.opus/          Opus 実験ビルド用の Kconfig 断片 (組み合わ
 
 ## ライセンス
 
-mquickjs は Fabrice Bellard / Charlie Gordon による MIT License のソフトウェアです。
-詳細は [components/mqjs/mquickjs/LICENSE](components/mqjs/mquickjs/LICENSE) を参照してください。
+このプロジェクトは **GPL-3.0-or-later** です ([`LICENSE`](LICENSE))。
+
+SSH 端末が依存する wolfSSL (GPLv3+) と wolfSSH (GPLv2+) が
+`CONFIG_MQJS_SSH=y` のビルドでリンクされるためで、イメージ全体を
+配布できるライセンスはこれしかありません (Apache-2.0 の Espressif 系コンポーネントと
+互換なのも v3 だけ)。同梱する OSS の内訳と、別条件が必要な場合の選択肢は
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) にあります。
+
+主な同梱物: mquickjs (MIT, Fabrice Bellard / Charlie Gordon)、quirc (ISC)、
+Opus (BSD-3)、wireguard-lwip (BSD-3)、microlink (MIT)、TweetNaCl (public domain)、
+LVGL (MIT)、HackGen / Noto Sans CJK JP (SIL OFL 1.1)。

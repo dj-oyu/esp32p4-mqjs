@@ -1,0 +1,95 @@
+# Third-party notices
+
+esp32p4-mqjs itself is licensed **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)).
+This file records why, and what else is in the firmware image.
+
+## Why GPL-3.0-or-later
+
+The SSH terminal (`components/sshc`, JS `ssh.*`) is built on wolfSSH and
+wolfSSL, which are dual-licensed GPL / commercial:
+
+| Component | Version | License |
+| --- | --- | --- |
+| `wolfssl/wolfssl` | 5.8.2 | GPL-3.0-or-later, or a wolfSSL Inc. commercial license |
+| `wolfssl/wolfssh` | 1.4.20 | GPL-2.0-or-later, or a wolfSSL Inc. commercial license |
+
+Both are linked into the image whenever `CONFIG_MQJS_SSH=y`, which is the
+setting shipped in `sdkconfig.tab5.defaults`. Taking wolfSSH at "or later"
+(GPLv3) makes the two agree, and GPLv3 is also the only GPL version
+compatible with the Apache-2.0 components ESP-IDF pulls in — GPLv2 is not.
+So GPLv3-or-later is the one license the whole image can be distributed
+under. Everything else below is permissive and imposes no obstacle.
+
+If you need this firmware under other terms, the route is a commercial
+license from wolfSSL Inc. (<licensing@wolfssl.com>) — or a build with
+`CONFIG_MQJS_SSH=n`, which drops wolfSSL/wolfSSH from the image entirely
+(`--gc-sections` removes them; nothing else references them).
+
+## Vendored in this repository
+
+Third-party sources committed under `components/`:
+
+| Path | Upstream | License |
+| --- | --- | --- |
+| `components/mqjs/mquickjs/` | [Micro QuickJS](https://github.com/bellard/mquickjs) — Fabrice Bellard, Charlie Gordon | MIT |
+| `components/quirc/` | [quirc](https://github.com/dlbeer/quirc) — Daniel Beer | ISC |
+| `components/esp_opus_float/` | [Opus](https://opus-codec.org/) — Xiph.Org, Skype, Octasic, et al. | BSD-3-Clause |
+| `components/wireguard_lwip/` | [wireguard-lwip](https://github.com/smartalock/wireguard-lwip) — Daniel Hope, Floorsense Ltd | BSD-3-Clause |
+| `components/microlink/` | [microlink](https://github.com/CamM2325/microlink) — Cameron Malone | MIT |
+| `components/microlink/src/x25519.{c,h}` | [STROBE](https://sourceforge.net/p/strobe) — Cryptography Research, Inc. (Mike Hamburg) | MIT |
+| `components/microlink/src/nacl_box.{c,h}` | after TweetNaCl / DJB reference code | public domain |
+| `components/tweetnacl/` | [TweetNaCl](https://tweetnacl.cr.yp.to/) (Ed25519 verify subset) | public domain |
+| `components/mooncake/` | [Mooncake](https://github.com/Forairaaaaa/mooncake) — Forairaaaaa | MIT |
+| `components/smooth_ui_toolkit/` | [smooth_ui_toolkit](https://github.com/Forairaaaaa/smooth_ui_toolkit) — Forairaaaaa | MIT |
+| `components/ui_tab5/vendor/esp_lcd_st712*.{c,h}` | Espressif Systems | Apache-2.0 |
+| `components/ui_tab5/fonts/` | Noto Sans CJK JP (Adobe/Google), HackGen Console (yuru7 / Hack / GenJyuuGothic) | SIL OFL 1.1 — see [`components/ui_tab5/fonts/LICENSE`](components/ui_tab5/fonts/LICENSE) |
+| `components/cam_tab5/ipa/` | sc202cs IPA tuning data, from `espressif/esp_ipa` | ESPRESSIF MIT |
+
+Each directory keeps its own `LICENSE` where upstream ships one.
+
+`components/opus_p4_kernels/` is original code in this project (GPLv3), not
+vendored — hand-written ESP32-P4 PIE assembly that reproduces the arithmetic
+of Opus CELT inner loops. It is noted here because it is meaningless apart
+from the Opus decoder above and inherits that algorithm's provenance.
+
+The SIL OFL requires that the font license travel with any redistribution
+of the glyph data; `components/ui_tab5/fonts/LICENSE` is that copy. OFL §5
+covers the fonts only and does not reach the rest of the firmware.
+
+## Fetched at build time
+
+`managed_components/` is not committed; the IDF component manager fetches
+it from `dependencies.lock`. Licenses as of that lockfile:
+
+- **MIT** — `lvgl/lvgl` 9.4.0, `joltwallet/littlefs` (the littlefs core it
+  wraps is BSD-3-Clause), `espressif/cjson` (cJSON — Dave Gamble)
+- **Apache-2.0** — `espressif/esp_hosted`, `esp_cam_sensor`, `esp_codec_dev`,
+  `esp_h264`, `esp_lcd_ili9881c`, `esp_lcd_touch`, `esp_lcd_touch_gt911`,
+  `esp_lcd_touch_st7123`, `esp_lvgl_port`, `esp_sccb_intf`,
+  `esp_serial_slave_link`, `esp_wifi_remote`, `eppp_link`,
+  `wifi_remote_over_eppp`, `mqtt`, `usb`, `usb_host_uvc`, `cmake_utilities`,
+  and ESP-IDF itself
+- **ESPRESSIF MIT** — `espressif/esp_video`, `espressif/esp_ipa`
+- **GPL-2.0-or-later / commercial** — `wolfssl/wolfssh` (see above)
+- **GPL-3.0-or-later / commercial** — `wolfssl/wolfssl` (see above)
+
+Note on the ESPRESSIF MIT License: it is MIT with the grant limited to use
+"on all ESPRESSIF SYSTEMS products". That field-of-use limit is, read
+strictly, an additional restriction of the kind GPLv3 §7 disallows. It is
+raised here for completeness rather than as a live problem: this firmware
+targets the ESP32-P4 and cannot run anywhere else, so no recipient of it is
+denied anything the GPL promises them.
+
+## Not part of the firmware
+
+- **SKK dictionaries.** `components/skk_core/skk_dict.bin` and
+  `skk_jisyo.bin` are generated by `tools/skk_prep.py` from an upstream
+  SKK-JISYO and are `.gitignore`d, so this repository distributes no
+  dictionary data. SKK-JISYO.L and its siblings carry their own terms
+  (GPL-2.0-or-later for the main dictionaries); if you distribute a
+  **built image** with a dictionary embedded or in the `jisyo` partition,
+  those terms apply to it as well.
+- **JavaScript applications** under `examples/` are part of this project
+  and carry its license. Apps you write and push over MQTT are your own
+  work: the `mqjs` runtime executing them does not make them derivative
+  of it.
