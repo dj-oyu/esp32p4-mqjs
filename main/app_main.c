@@ -1,4 +1,19 @@
 /*
+ * esp32p4-mqjs — a JavaScript runtime for M5Stack Tab5 / Stamp-P4.
+ * Copyright (C) 2026 dj-oyu
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version. It is distributed in the hope that it will be
+ * useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+ * Public License for more details, and THIRD_PARTY_NOTICES.md for the
+ * licences of the components this firmware links against.
+ */
+/*
  * Stamp-P4 / Tab5 mquickjs host: the P4b multi-app runtime + launcher.
  *
  * js_task owns every JS context (cooperative multi-context, see

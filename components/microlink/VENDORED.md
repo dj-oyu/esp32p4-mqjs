@@ -1,6 +1,8 @@
 # Vendored: microlink (Tailscale-compatible VPN client)
 
-Upstream: <https://github.com/CamM2325/microlink> (MIT), HEAD ~2026-03-17.
+Upstream: <https://github.com/CamM2325/microlink> (MIT, Copyright (c) 2025-2026
+Cameron Malone), HEAD ~2026-03-17. The upstream licence is kept alongside this
+file as [`LICENSE`](LICENSE); MIT requires it to travel with the copy.
 
 Vendored as a patched copy (not a git submodule / managed component) because the
 upstream targets ESP-IDF 5.x and does **not** build unmodified on ESP-IDF 6.0 /
