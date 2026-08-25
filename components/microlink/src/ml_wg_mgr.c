@@ -195,7 +195,28 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
              (int)dest_port,
              len >= 1 ? data[0] : -1);
 
-    /* Use raw PCB to send — safe from any thread context */
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    /* Magicsock rule: a peer only recognises UDP that arrives from an endpoint
+     * it has already validated over DISCO. WG must therefore leave through the
+     * SAME socket as DISCO — "the single socket for ALL direct UDP traffic"
+     * (microlink.c). In zero-copy mode that socket is ml->zc.pcb on an
+     * ephemeral port, and that port is what we advertise to the control plane;
+     * sending WG from a second PCB pinned to 51820 made every handshake WE
+     * initiated invisible to tailscaled. Device-verified 2026-08-25: of 10
+     * initiations the 8 to peers that already had us configured were answered,
+     * while the two Windows peers (which had us lazily trimmed, so waking them
+     * depends on magicsock mapping the source endpoint) never answered — and
+     * the tunnel to the broker came up only when the PEER finally initiated,
+     * 175 s after boot, once mosquitto reaped its stale socket. */
+    if (ml->zc.pcb) {
+        int sent = disco_udp_sendto(ml, data, len, ip_host, dest_port);
+        return (sent == (int)len) ? ERR_OK : ERR_MEM;
+    }
+#endif
+
+    /* BSD-socket mode: disco_sock4 is bound to 51820 and this raw PCB borrows
+     * that port, so the two already match. Raw udp_sendto (not BSD sendto)
+     * because this can run on the TCPIP thread. */
     if (!s_wg_output_pcb) return ERR_CONN;
 
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
