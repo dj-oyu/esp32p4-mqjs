@@ -34,6 +34,9 @@
 #include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+/* disp->flushing を見るため。LVGL の既定の待ちは while(disp->flushing);
+   で抜け道が無く、実機で永久に回った (下の ui_flush_wait)。 */
+#include "display/lv_display_private.h"
 /* private to esp_lvgl_port; on the include path via its COMPONENT_DIR
    (see CMakeLists) so __wrap_lvgl_port_ppa_create gets the real cfg
    type instead of a hand-copied one that could drift */
@@ -3104,6 +3107,14 @@ void ui_tab5_kb_field(int mode)
 /*    している未測の数字なので、**ここに見積もりは書かない**。         */
 /*    どれも LVGL タスクの上でしか走らない = 単一書き手、ロック 0。    */
 static bool canvas_present_direct(int x, int y, int w, int h);
+/* 直接経路 (LVGL を通さず PPA SRM で FB へ) の集計。ui_prof に出す ——
+   出さないと「効いているのか、閾値に届かず毎回 LVGL へ落ちているのか」が
+   区別できない。定義は canvas_present_direct の隣。 */
+static int64_t  s_direct_us;
+static uint32_t s_direct_n;
+/* flush の完了待ちが上限に達した回数 (ui_flush_wait)。0 でないなら
+   「固まりかけたが先へ進んだ」が起きている。 */
+static uint32_t s_flush_timeouts;
 
 /*  - 書式化は窓に 1 回。しかも **RENDER_READY** で出す —— その提示の  */
 /*    画素はもう出ている (fs_picker が今日置いた作法と同じ)。          */
@@ -3160,14 +3171,19 @@ static void prof_report(int64_t now)
     /* 呼ばれるのは RENDER_READY —— この提示の画素はもう出ている。 */
     ESP_LOGW("ui_prof",
              "%s %lu refr(cv %lu) %lu ch | draw=%lld rot=%lld flush=%lld "
-             "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu",
+             "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu"
+             " | direct %lu x %lld us | flush_tmo=%lu",
              s_landscape ? "L" : "P", (unsigned long)s_pm.refr,
              (unsigned long)s_pm.refr_cv, (unsigned long)s_pm.chunks,
              (long long)s_pm.draw, (long long)s_pm.rot,
              (long long)s_pm.flush, (long long)s_pm.wait, s_pm.w_chunks,
              (long long)s_pm.w_draw, (long long)s_pm.w_rot,
              (long long)s_pm.w_flush, (long long)s_pm.w_wait,
-             (unsigned long)s_pm.dropped);
+             (unsigned long)s_pm.dropped,
+             (unsigned long)s_direct_n, (long long)s_direct_us,
+             (unsigned long)s_flush_timeouts);
+    s_direct_n = 0;
+    s_direct_us = 0;
     memset(&s_pm, 0, sizeof s_pm);
     /* 出力そのものに ~10 ms かかるので、窓の起点は書いた後で読む。 */
     s_pm.t_report = esp_timer_get_time();
@@ -3226,8 +3242,12 @@ static void prof_fold(int64_t now)
  *
  * 画面は一瞬乱れる (FB を直接書く)。**それ自体が情報**で、絵が正しい向き
  * で出れば幾何も合っていることになる。次の提示で LVGL が塗り直す。 */
+/* **既定オフ。役目は終わった** —— 測りたかった 4 数字は取れている
+   (横 全画面 37.2ms / 帯 2.05ms、縦 39.6ms / 1.19ms、どちらも 46 ns/px)。
+   これは DSI のフレームバッファを直接書く唯一の残りで、回転のたびに走る。
+   実機が LVGL の描画中に固まる件を切り分けるため、まず外す。 */
 #ifndef UI_SRM_BENCH
-#define UI_SRM_BENCH 1
+#define UI_SRM_BENCH 0
 #endif
 #if UI_SRM_BENCH
 static void srm_bench(void)
@@ -3304,6 +3324,43 @@ static void srm_bench_timer(lv_timer_t *t)
     srm_bench();
 }
 #endif /* UI_SRM_BENCH */
+
+/* flush の完了を **上限つきで** 待つ。
+ *
+ * LVGL の既定は `while(disp->flushing);` (lv_refr.c:1442) —— 完了が来なければ
+ * 永久に回り、core 1 が丸ごと死ぬ。実機で再現した (2026-08-26、横画面で
+ * エディタをスクロール中)。バックトレースで確定:
+ *   wait_for_flushing <- refr_configured_layer <- refr_area
+ *                     <- lv_display_refr_timer <- lvgl_port_task
+ *
+ * 完了は esp_async_fbcpy -> DMA2D の ISR -> lv_display_flush_ready で来る。
+ * 来ない条件は未特定だが、**DMA2D のチャネルは PPA と共有**されており
+ * (fill=tx0/rx1, blend=tx2/rx1, srm=tx1/rx1)、edit_task が LVGL の flush と
+ * 別タスクから PPA を叩く最初の利用者になった時期と一致している。
+ *
+ * ここで諦めて返れば、LVGL 自身が `disp->flushing = 0` にして次へ進む
+ * (lv_refr.c:1437)。**1 フレーム崩れるが固まらない。** 原因が分かるまでの
+ * 保険ではなく、恒久的に持っていてよい類の防御 —— 表示の完了待ちに上限が
+ * 無いのは、それ自体が設計の穴。
+ *
+ * 速度は落とさない: 通常の flush は 1〜2 ms なので、最初はこれまでどおり
+ * 回して待ち、2 ms を超えてから初めて CPU を返す (vTaskDelay(1) = 10 ms 刻み
+ * なので、常に譲ると 26 チャンク x 10 ms で桁が変わってしまう)。 */
+#define UI_FLUSH_SPIN_US 2000     /* これを超えたら CPU を返す */
+#define UI_FLUSH_MAX_US  200000   /* これを超えたら諦める (通常の 100 倍) */
+static void ui_flush_wait(lv_display_t *d)
+{
+    int64_t t0 = esp_timer_get_time();
+    while (d->flushing) {
+        int64_t dt = esp_timer_get_time() - t0;
+        if (dt > UI_FLUSH_MAX_US) {
+            s_flush_timeouts++;
+            return; /* LVGL が flushing を落として先へ進む */
+        }
+        if (dt > UI_FLUSH_SPIN_US)
+            vTaskDelay(1);
+    }
+}
 
 static void prof_event(lv_event_t *e)
 {
@@ -3932,6 +3989,31 @@ extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
  * あとで同じ領域を描いても同じ画素になる。破れるのは「キャンバスに無い
  * ものが画面にある」= 何かが上に載っているときだけ。そのときは従来経路へ。
  * ===================================================================== */
+/* **既定オフ。実機で LVGL の flush をデッドロックさせた (2026-08-26)。**
+ *
+ *   task_wdt: IDLE1 (CPU 1) / CPU 1: taskLVGL
+ *   MEPC 0x400fccca  RA 0x400fcca4   <- ほぼ同じ番地 = 密なループ
+ *
+ * taskLVGL が `while(disp->flushing);` (lv_refr.c:1442、esp_lvgl_port は
+ * flush_wait_cb を設定しないので busy-spin) を回り続け、flush が永久に
+ * 完了しなかった。横画面でスクロールした瞬間に再現。
+ *
+ * 原因の見立て (**未確定**): PPA SRM と esp_async_fbcpy は **同じ DMA2D の
+ * チャネルを奪い合う** (ppa_srm.c は tx1/rx1、fbcpy も DMA2D)。こちらは
+ * edit_task から PPA_TRANS_MODE_BLOCKING で投げており、LVGL が待っている
+ * fbcpy と噛み合った。エンジン (SRM/BLEND) が別でもチャネルは別ではない。
+ *
+ * 測定は生きている: キャンバス→FB は 46 ns/px、横の全画面 37.2 ms 対
+ * LVGL 経路 74.6 ms。**取り分は本物だが、この統合の仕方が間違っている。**
+ * 再挑戦するなら先に決めること —— 非ブロッキング + 完了待ちにするのか、
+ * LVGL の flush と同じ経路 (fbcpy) に相乗りするのか、そもそも LVGL の
+ * flush が走っていない瞬間にだけ撃つのか。DMA2D の共有を理解する前に
+ * 1 に戻してはいけない。 */
+/* **1 に戻した (2026-08-26)。** 一度 0 にしたのは「これがハングの原因」と
+   判断したためだが、**無効化しても同じ場所で固まった**ので犯人ではない。
+   加えて ui_flush_wait が入り、flush の完了待ちに 200ms の上限がついた ——
+   完了が来なくても LVGL は先へ進む (固まる代わりに 1 フレーム崩れる)。
+   横の全画面 74.6ms が 37.2ms になるかを実測する。 */
 #ifndef UI_DIRECT_PRESENT
 #define UI_DIRECT_PRESENT 1
 #endif
@@ -3945,30 +4027,72 @@ extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
 
 #if UI_DIRECT_PRESENT
 static ppa_client_handle_t s_ppa_srm_direct;
-static int64_t  s_direct_us;   /* 直接経路で使った時間 */
-static uint32_t s_direct_n;    /* その回数 (ui_prof に出す) */
 
-/* キャンバスの上に何か載っていないか。載っていたら直接書きは
-   その画素を消すので、従来経路に落とす。 */
-static bool canvas_is_clear(void)
+/* この矩形の上に何か載っていないか。
+ *
+ * **存在ではなく交差を見る。** 最初の版は「lv_layer_top() に見えている子が
+ * 1 つでもあれば従来経路へ」にしていたが、**ステータスバーが常にそこに居る**
+ * (ui_tab5.cpp:1274 が lv_layer_top() に作る) ので、直接経路は一度も通れて
+ * いなかった —— 実機で `direct 0 x 0 us` が全窓に出て発覚した。しかも
+ * ステータスバーはキャンバス (y = UI_STATUSBAR_H の下) と重ならない。
+ *
+ * LVGL のツリーを edit_task から読むので、幾何を取る間だけロックを持つ。
+ * ロックを離してから PPA を撃つ (37 ms を握ったままにしない)。その隙に
+ * 何かが現れたら、その 1 フレームだけ上書きされて次の再描画で戻る —— 
+ * 自己修復するので、ロックを長く持つより安い。 */
+static bool rects_overlap(const lv_area_t *a, const lv_area_t *b)
 {
+    return !(a->x2 < b->x1 || b->x2 < a->x1 || a->y2 < b->y1 || b->y2 < a->y1);
+}
+
+static bool canvas_area_clear(int x, int y, int w, int h, lv_area_t *out_abs)
+{
+    if (!lvgl_port_lock(20))
+        return false; /* 取れないなら諦めて従来経路へ */
+    bool clear = true;
+    lv_area_t cv;
+    lv_obj_get_content_coords(s_js_canvas, &cv);
+    lv_area_t a = { (int32_t)(cv.x1 + x), (int32_t)(cv.y1 + y),
+                    (int32_t)(cv.x1 + x + w - 1), (int32_t)(cv.y1 + y + h - 1) };
+    *out_abs = a;
+
     lv_obj_t *top = lv_layer_top();
     if (top) {
         uint32_t n = lv_obj_get_child_count(top);
-        for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t i = 0; i < n && clear; i++) {
             lv_obj_t *c = lv_obj_get_child(top, i);
-            if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
-                return false; /* ピッカー・電源スクリム・カメラ・IME フロート */
+            if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+                continue;
+            lv_area_t o;
+            lv_obj_get_coords(c, &o);
+            if (rects_overlap(&o, &a))
+                clear = false;
         }
     }
-    for (int i = 0; i < UI_OVERLAY_SLOTS; i++)
-        if (s_ovl[i].box && !lv_obj_has_flag(s_ovl[i].box, LV_OBJ_FLAG_HIDDEN))
-            return false;
-    if (s_kb_row[0] && !lv_obj_has_flag(s_kb_row[0], LV_OBJ_FLAG_HIDDEN))
-        return false;
-    if (s_cbar && !lv_obj_has_flag(s_cbar, LV_OBJ_FLAG_HIDDEN))
-        return false;
-    return true;
+    for (int i = 0; i < UI_OVERLAY_SLOTS && clear; i++) {
+        if (!s_ovl[i].box || lv_obj_has_flag(s_ovl[i].box, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t o;
+        lv_obj_get_coords(s_ovl[i].box, &o);
+        if (rects_overlap(&o, &a))
+            clear = false;
+    }
+    for (int r = 0; r < KB_ROWS && clear; r++) {
+        if (!s_kb_row[r] || lv_obj_has_flag(s_kb_row[r], LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t o;
+        lv_obj_get_coords(s_kb_row[r], &o);
+        if (rects_overlap(&o, &a))
+            clear = false;
+    }
+    if (clear && s_cbar && !lv_obj_has_flag(s_cbar, LV_OBJ_FLAG_HIDDEN)) {
+        lv_area_t o;
+        lv_obj_get_coords(s_cbar, &o);
+        if (rects_overlap(&o, &a))
+            clear = false;
+    }
+    lvgl_port_unlock();
+    return clear;
 }
 
 /* true を返したら「もう画面に出した」。false なら呼び出し側が
@@ -3992,7 +4116,8 @@ static bool canvas_present_direct(int x, int y, int w, int h)
         return false;
     if (h < UI_DIRECT_MIN_H)
         return false;
-    if (!canvas_is_clear())
+    lv_area_t abs_unused;
+    if (!canvas_area_clear(x, y, w, h, &abs_unused))
         return false;
 
     /* RGB565 の SRM は幅・オフセットが偶数であることを要求する
@@ -4367,6 +4492,9 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     }
     s_disp = disp; /* ui_tab5_set_landscape rotates this display */
     prof_attach(disp); /* presentation breakdown, always on (spec §F #13) */
+    /* flush の完了待ちに上限を入れる。既定の while(disp->flushing); は
+       完了が来なければ core 1 を丸ごと殺す —— 実機で再現済み。 */
+    lv_display_set_flush_wait_cb(disp, ui_flush_wait);
 
     /* JS-visible canvas resolution (everything below the status bar);
        published before js_task starts, so ui.size() is always valid */

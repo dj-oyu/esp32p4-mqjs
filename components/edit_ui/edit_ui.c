@@ -1067,13 +1067,45 @@ bool edit_ui_start(const edit_ui_config_t *cfg)
     }
 
     /* PPA の blend クライアントは自前 (エンジンは共有、キューは別、§A.3)。
-       取れなくても止めない —— cells_draw が CPU 経路へ落ちるだけ。 */
+       取れなくても止めない —— cells_draw が CPU 経路へ落ちるだけ。
+
+       **既定オフ (2026-08-26)。** 実機でスクロール中に LVGL が
+       `wait_for_flushing` (lv_refr.c:1442) から永久に戻らなくなる。
+       バックトレースで確定:
+         wait_for_flushing <- refr_configured_layer <- refr_area
+                           <- lv_display_refr_timer <- lvgl_port_task
+       flush の完了 (esp_async_fbcpy -> DMA2D の ISR) が来ない。
+
+       見立て: **DMA2D のチャネルは PPA と esp_async_fbcpy で共有**される
+       (ppa_srm=tx1/rx1、fill=tx0/rx1、blend=tx2/rx1)。JS の ui.cells は
+       UI タスク自身が叩くので flush と自然に直列化するが、**edit_task は
+       LVGL の flush と別タスクから同時に PPA を使う最初の利用者**だった。
+       スクロールでだけ出るのは、26 段を一度に描いて PPA を連射する唯一の
+       場面だから。
+
+       CPU 経路は遅い (1 段の blend が PPA なしでどれだけかかるかは未測) が、
+       **固まらない方を取る**。戻すなら DMA2D の共有を理解してから ——
+       非ブロッキング + 完了待ち、UI タスクへ描画を移す、flush と排他する、
+       のどれかを決めること。 */
+/* **1 に戻した。** CPU 描画は遅すぎて試す価値が無い (ユーザ判断)。
+   代わりに ui_tab5 の flush 完了待ちへ上限を入れた —— 固まる代わりに
+   1 フレーム崩れて先へ進む。原因 (DMA2D の共有) はまだ特定できていないが、
+   **完了待ちに上限が無いこと自体が設計の穴**なので、そちらを塞ぐのが筋。 */
+#ifndef EDIT_USE_PPA
+#define EDIT_USE_PPA 1
+#endif
+#if EDIT_USE_PPA
     memset(&pc, 0, sizeof(pc));
     pc.oper_type = PPA_OPERATION_BLEND;
     if (ppa_register_client(&pc, &s_ppa) != ESP_OK) {
         s_ppa = NULL;
         ESP_LOGW(TAG, "PPA blend unavailable, cells stay on CPU");
     }
+#else
+    (void)pc;
+    s_ppa = NULL;
+    ESP_LOGW(TAG, "PPA disabled for edit_task (flush deadlock); cells on CPU");
+#endif
 
     memset(&ta, 0, sizeof(ta));
     ta.callback = tick_cb;
