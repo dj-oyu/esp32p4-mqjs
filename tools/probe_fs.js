@@ -163,14 +163,23 @@ var run = function () {
             }
         }
 
-        /* ---- 7. 内蔵はフォーマットできないこと -------------------- */
-        var refused = "NOT-THROWN";      // これが出たら穴
-        try {
-            fs.format(g, "internal", function () {});
-        } catch (e6) {
-            refused = "" + e6;
-        }
-        out("format_internal", { got: refused });
+        /* ---- 7. fs.mount / fs.unmount / fs.format はもう無いこと ------
+           docs/native-editor-design.md §5: 3 つとも JS から削除された
+           (ブロッキング C 呼び出しを JS から呼べると誰でも全アプリを
+           止められる / epoch を進めて他ワーカーの grant を失効できる
+           ため)。以前の版はここで「内蔵はフォーマットを拒否する」を
+           試していたが、その C 側の拒否ロジックごと binding が消える
+           ので、確かめるべきことは「呼べるかどうか」自体に変わった。
+           gone=false が出たら、削除が実機まで届いていない。 */
+        var gone = typeof fs.mount !== "function" &&
+                   typeof fs.unmount !== "function" &&
+                   typeof fs.format !== "function";
+        out("mount_unmount_format_removed", {
+            gone: gone,
+            mount: typeof fs.mount,
+            unmount: typeof fs.unmount,
+            format: typeof fs.format
+        });
 
         out("done", {});
         sys.stop("fsprobe");

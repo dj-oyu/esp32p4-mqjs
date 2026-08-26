@@ -9,6 +9,14 @@
 //
 // 画面は常に 1 枚 (retain 深さ 3 の枠内) にして、階層は JS 側の cwd で
 // 持つ。ディレクトリを降りるたびに画面を積むと、5 階層で枠を割る。
+//
+// ネイティブファイラ移行の基準 (docs/native-editor-spec.md §C.6,
+// tools/tests/filer_diff.sh): mkdir/write/copy/move/rename/remove/list の
+// 操作列で、ネイティブ版が同じ結果を出すことを条件にする。fs.mount /
+// fs.unmount / fs.format は docs/native-editor-design.md §5 で削除が決まり
+// (JS から呼べるブロッキング呼び出しは他アプリを止めるレバーになる)、
+// このファイルからも削った — 取り出し/フォーマット/抜き差し後の再マウント
+// は今このアプリからは出せない (ネイティブ fs_picker/fs_filer 側の仕事)。
 "use strict";
 sys.setAppName("files");
 
@@ -140,15 +148,16 @@ volumesPage = function () {
             else if (v.state === "absent")
                 line += "入っていません";
             else
-                line += "タップして読み込む";
+                line += "マウントされていません";
             list.add(line, function () {
                 if (!v.mounted) {
-                    /* マウントは何も壊さないので grant 不要 */
-                    try {
-                        fs.mount(v.id);
-                    } catch (e) {
-                        msg = "" + e;
-                    }
+                    /* fs.mount は削除された (design §5: JS から呼べる
+                       150ms 級のブロッキング呼び出しは、それだけで
+                       他アプリを全部止められるレバーになる)。抜き差し後の
+                       再マウントを JS から起こす経路は今は無い —
+                       ネイティブ fs_picker 側に来る想定
+                       (native-editor-plan の M1、未実装。§A.4)。 */
+                    msg = v.label + " は今ここからは読み込めません";
                     render();
                     return;
                 }
@@ -157,69 +166,12 @@ volumesPage = function () {
             });
         })(vols[i]);
     }
-    /* 読めないカードを使えるようにする道。ここからしか到達できない ——
-       一覧の常設ボタンにすると、押し間違いで戻せないものを消せてしまう。
-       ランチャーが確認ページを置かないのは「停止は 1 タップで戻せる」
-       からで、フォーマットは戻せないので逆の結論になる。 */
-    for (var f0 = 0; f0 < vols.length; f0++) {
-        (function (v) {
-            if (v.state !== "unreadable")
-                return;
-            s.button(v.label + " をフォーマットして使えるようにする",
-                     function () { formatPage(v); });
-        })(vols[f0]);
-    }
-    for (var j = 0; j < vols.length; j++) {
-        (function (v) {
-            if (!v.removable || !v.mounted)
-                return;
-            /* 取り出しは書き込みと同じ重さ (他アプリの書き込み中に
-               外せる) なので、そのボリュームの grant を要求する。 */
-            s.button(v.label + " を取り出す", function () {
-                withGrant(v.id, "安全に取り出す", function (g) {
-                    fs.unmount(g, v.id);
-                    grants[v.id] = 0;
-                    msg = v.label + " を取り出しました";
-                });
-            });
-        })(vols[j]);
-    }
+    /* fs.unmount / fs.format も削除された (design §5)。「取り出す」と
+       「フォーマットして使えるようにする」はネイティブ側 (fs_picker /
+       fs_filer、M1/M2) が引き取るまで、このアプリからは出せない。 */
     if (clip)
         s.label("保留中: " + (clip.op === "copy" ? "コピー" : "移動") +
                 " " + clip.name);
-};
-
-/* 取り消せない操作なので、タップだけでは実行しない。FORMAT と打たせる
-   のは 2 段確認より誤爆に強いから (誤タップは連続しても文字にならない)。 */
-var formatPage = function (v) {
-    var s = ui.screen("フォーマット: " + v.label);
-    s.label("このカードの中身はすべて消えます。取り消せません。");
-    if (v.mounted)
-        s.label("使用中: " + fmtSize(v.total - v.free) + " / " +
-                fmtSize(v.total));
-    else
-        s.label("中身は読めていないので、何が入っているかは分かりません。");
-    s.label("別の機器で使っているカードなら、先に中身を確認してください。");
-    var f = s.field("実行するには FORMAT と入力");
-    s.button("フォーマットする", function () {
-        if (f.value() !== "FORMAT") {
-            msg = "FORMAT と入力されていません";
-            render();
-            return;
-        }
-        withGrant(v.id, v.label + " をフォーマットする", function (g) {
-            /* 大容量カードでは FAT テーブルだけで数十 MB 書く。C 側が
-               専用タスクへ逃がすので、ここは終わりを待つだけ。 */
-            msg = "フォーマット中... しばらくかかります";
-            fs.format(g, v.id, function (ok) {
-                msg = ok ? v.label + " を初期化しました"
-                         : "フォーマットに失敗しました";
-                grants[v.id] = 0;   /* 成功しても epoch が進んで失効する */
-                render();
-            });
-        });
-    });
-    s.button("やめる", function () { render(); });
 };
 
 /* ---- ディレクトリ ------------------------------------------------ */

@@ -607,8 +607,12 @@ static const JSPropDef js_fs[] = {
     JS_CFUNC_DEF("list", 2, js_fs_list),
     JS_CFUNC_DEF("stat", 1, js_fs_stat),
     JS_CFUNC_DEF("read", 2, js_fs_read),
-    JS_CFUNC_DEF("mount", 1, js_fs_mount),
-    /* 以下は grant が第 1 引数 */
+    /* 権限の主たる入口 (docs/native-editor-design.md §4.2)。ネイティブ
+       モーダルで 1 本選ばせ、その 1 本だけの grant を cb(grant, path) で
+       返す。mount / unmount / format は §5 で削除した。 */
+    JS_CFUNC_DEF("pick", 2, js_fs_pick),
+    /* 以下は grant が第 1 引数。0 を渡すと「トークン無し」で、
+       /internal/data/<app> だけが暗黙 grant で通る (§4.3)。 */
     JS_CFUNC_DEF("request", 2, js_fs_request),
     JS_CFUNC_DEF("release", 1, js_fs_release),
     JS_CFUNC_DEF("write", 4, js_fs_write),
@@ -616,10 +620,6 @@ static const JSPropDef js_fs[] = {
     JS_CFUNC_DEF("remove", 3, js_fs_remove),
     JS_CFUNC_DEF("rename", 3, js_fs_rename),
     JS_CFUNC_DEF("copy", 3, js_fs_copy),
-    JS_CFUNC_DEF("unmount", 2, js_fs_unmount),
-    /* 中身を捨てる。専用タスクで走るので cb(ok) が終わりを知らせる。
-       内蔵ボリュームには使えない (C 側で拒否)。 */
-    JS_CFUNC_DEF("format", 3, js_fs_format),
     JS_PROP_END,
 };
 
@@ -714,9 +714,9 @@ static const JSPropDef js_sys[] = {
        returns 0 at once, so the caller's "about to panic" MQTT publish can
        leave the device first. Off-device it is inert and returns -1. */
     JS_CFUNC_DEF("panic", 0, js_sys_panic),
-    /* fs.request の同意画面を出したアプリだけが返事できる口
-       (docs/filer-storage-design.md §7)。ランチャーが使う。 */
-    JS_CFUNC_DEF("fsConsent", 2, js_sys_fs_consent),
+    /* sys.fsConsent は削除 (docs/native-editor-design.md §4.4/§5)。
+       同意画面はランチャー JS ではなくネイティブモーダルが描くので、
+       JS 側の返事の口は要らない。 */
     JS_PROP_END,
 };
 

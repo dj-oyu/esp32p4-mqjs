@@ -100,6 +100,15 @@
 /* ボリューム登録簿。fs.* はこの層の仮想パスしか知らない
    (docs/filer-storage-design.md §3)。 */
 #include "fs_core.h"
+/* grant の**判定**。範囲一致・操作ビット・暗黙 grant・予約サブツリーの
+   合成はすべてここ (純 C99、ホストで 94 チェック + fuzz 済み)。この
+   ファイルは表とトークンの寿命だけを持ち、判定は 1 行も持たない
+   (docs/native-editor-design.md §4.2)。fs_core.h の後に置くこと:
+   FS_PATH_MAX が見えていれば _Static_assert が食い違いを落とす。 */
+#include "fs_grant.h"
+/* ネイティブモーダル (ピッカー + 同意)。ランチャー JS の同意画面を
+   置き換える (design §4.4)。 */
+#include "fs_picker.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -184,8 +193,7 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
                EV_TERM_REPLY, /* term.onReply: a DSR/DA answer, inline */
                EV_NET, /* broadcast: release the net.onReady wait queue */
-               EV_FSGRANT, /* fs.request: the consent answer came back */
-               EV_FSOP /* a long fs job (format) finished on its own task */
+               EV_FSGRANT /* fs.request: the consent answer came back */
              } MqjsEventType;
 
 typedef struct {
@@ -203,7 +211,6 @@ typedef struct {
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
         struct { uint32_t id; uint8_t ok; } fsgrant; /* fs.request answer */
-        struct { uint8_t ok; } fsop;                 /* fs.format result */
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
@@ -282,7 +289,9 @@ typedef struct {
     uint16_t gen;             /* bumped on every start: stale-event filter */
     char name[32];
     char vault_id[32];        /* immutable source identity; setAppName cannot
-                                 impersonate another app's vault */
+                                 impersonate another app's vault — nor, since
+                                 fs_cur_app_id(), another app's private
+                                 /internal/data/<app> directory */
     bool trusted_system;       /* immutable: only firmware registry can set */
     uint8_t *mem;             /* fixed arena (design §3.6) */
     size_t mem_size;
@@ -318,8 +327,6 @@ typedef struct {
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
     bool fsreq_used; JSGCRef fsreq_cb; /* fs.request one-shot: fires with the
                                           grant token, or 0 when refused */
-    bool fsop_used;  JSGCRef fsop_cb;  /* fs.format one-shot: fires with the
-                                          result once its task is done */
     bool net_used;  JSGCRef net_cb;  /* net.onReady one-shot: the app's ticket
                                         in the network wait queue (fires once
                                         the link is up, then auto-releases) */
@@ -3008,32 +3015,77 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 
 #ifdef ESP_PLATFORM
 
+/* 器の大きさは fs_grant.h と共有する。ずれると fs_grant_in_scope が
+   「root が器の中で終端していない」を見て拒否側へ倒れる (黙って通る道は
+   無い) が、それは事故の受け皿であって設計ではないので、ここで落とす。 */
+_Static_assert(MQJS_FS_SCOPE_MAX == FS_GRANT_ROOT_MAX,
+               "MQJS_FS_SCOPE_MAX != FS_GRANT_ROOT_MAX");
+
+/* 判定に要る 3 つ (kind/ops/root) は fs_grant_scope_t を**埋め込む**。
+   平らに持って呼ぶたびに詰め替えると、詰め替えを 1 箇所忘れたときに
+   古い ops で通ってしまう。fs_grant.h も埋め込みを前提に書いてある。 */
 typedef struct {
-    uint32_t       token;    /* 0 = 空き */
-    uint8_t        worker;
-    uint16_t       gen;
-    bool           write;
-    uint32_t       epoch;    /* 発行時のボリュームのマウント世代 */
-    const fsvol_t *vol;
-    char           root[MQJS_FS_SCOPE_MAX];
+    uint32_t         token;    /* 0 = 空き */
+    uint8_t          worker;
+    uint16_t         gen;
+    uint32_t         epoch;    /* 発行時のボリュームのマウント世代 */
+    const fsvol_t   *vol;
+    fs_grant_scope_t sc;       /* kind / ops / root */
 } FsGrant;
 
 static FsGrant  s_fs_grants[MQJS_FS_GRANTS];
 static uint32_t s_fs_token_seq;
 
-/* 同意待ちの要求。ランチャーが sys.fsConsent(id, ok) で返事するまで
+/* 返事待ちの要求。ネイティブモーダル (fs_pick_begin) が返事を返すまで
    ここに置く。要求 1 件がアプリ 1 つに対応する (fsreq_cb が一発限りの
-   ハンドラなので、同じアプリからの二重要求は後勝ちで潰す)。 */
+   ハンドラなので、同じアプリからの二重要求は後勝ちで潰す)。
+   **JS タスクだけが触る。** ピッカーの cb は UI タスクの上なので、
+   そこからここへは書かない (下の landing を経由する)。 */
 typedef struct {
     uint32_t id;             /* 0 = 空き */
     uint8_t  worker;
     uint16_t gen;
-    bool     write;
+    uint8_t  kind;           /* mint する grant の FS_SCOPE_* */
+    uint8_t  ops;            /* mint する grant の FS_OP_* */
+    bool     from_pick;      /* true = root は landing から来る (fs.pick) */
+    bool     modal;          /* true = ネイティブモーダルが開いている */
     char     root[MQJS_FS_SCOPE_MAX];
 } FsPending;
 
 static FsPending s_fs_pending[MQJS_FS_GRANTS];
 static uint32_t  s_fs_req_seq;
+
+/* ピッカーの答えの受け皿。モーダルは同時に 1 件なので 1 枠でよい。
+ *
+ * **欄ごとに書き手は 1 つだけ。** ロックが無いので、これが崩れると
+ * 「誰が何を守っているか」を言えなくなる:
+ *
+ *   worker / gen  … JS タスクだけが書く (fs_pick_open、モーダルを開く前)。
+ *                   UI タスクは読むだけ。答えの宛先を作るのに使う。
+ *   ok / vpath / id … UI タスク (fs_pick_cb) だけが書く。JS タスクは
+ *                   読むだけ —— 「使い終わった印」に id を 0 で潰しに
+ *                   行かない。一度きりは FsPending 表が保証している
+ *                   (答えを配ると要求の席が空き、同じ id は二度と現れない)。
+ *
+ * 順序はキューが保証する: cb は「landing を埋める → ev_post」の順、JS 側は
+ * 「イベントを受け取る → landing を読む」の順で、xQueueSend / xQueueReceive
+ * の間にメモリバリアが入る。id が一致しない landing は使わない (要求 id は
+ * 使い回さないので、古い答えが今の要求の id と一致することはない)。
+ *
+ * 守れていないもの: worker / gen は JS タスクが**次の**要求のために書き
+ * 換えうるので、UI タスクが古い答えを新しい宛先へ投げることがある。その
+ * 配送違いは dispatch_fsgrant の id+worker+gen 照合が落とす (S3)。 */
+typedef struct {
+    /* JS タスクが fs_pick_begin を呼ぶ前に埋める (UI タスクは読むだけ) */
+    uint8_t  worker;
+    uint16_t gen;
+    /* UI タスクが埋める (JS タスクは読むだけ)。id は最後に立てる */
+    bool     ok;
+    char     vpath[MQJS_FS_SCOPE_MAX];
+    uint32_t id;                 /* 答えの届いた要求の id。0 = まだ */
+} FsPickLanding;
+
+static FsPickLanding s_fs_pick_land;
 
 /* パス引数をスタックへ写す。JS の文字列は以降の割り当てで動きうるので、
    触る前に必ずコピーを取る (store_key と同じ理由)。 */
@@ -3061,12 +3113,33 @@ static JSValue fs_throw(JSContext *ctx, const char *what, esp_err_t err)
 
 /* grant を引き当てる。持ち主・世代・マウント世代がすべて一致したものだけ
    が生きている: アプリが止まればその grant は使えなくなり、カードを
-   抜き差しすれば epoch がずれて死ぬ。掃除の常駐処理は要らない (§7)。 */
-static FsGrant *fs_grant_get(JSContext *ctx, JSValue v, bool need_write)
+   抜き差しすれば epoch がずれて死ぬ。掃除の常駐処理は要らない (§7)。
+ *
+ * 第 1 引数が 0 / undefined / null なら「トークンを持っていない」。それは
+ * 誤りではない —— 暗黙 grant (/internal/data/<app>) はトークンを配らない
+ * (design §4.3)。呼び出し元が区別できるよう *no_token に書き分ける。
+ *
+ *   戻り値 != NULL         生きている grant
+ *   NULL かつ *no_token    トークン無し。判定は暗黙 grant に委ねる
+ *   NULL かつ !*no_token   例外を投げ済み */
+static FsGrant *fs_grant_lookup(JSContext *ctx, JSValue v, bool *no_token)
 {
+    *no_token = false;
+    if (JS_IsUndefined(v) || JS_IsNull(v)) {
+        *no_token = true;
+        return NULL;
+    }
     int token = 0;   /* JS_ToInt32 は int* を取る (riscv32) */
-    if (JS_ToInt32(ctx, &token, v) || token <= 0) {
-        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request(...)");
+    if (JS_ToInt32(ctx, &token, v)) {
+        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request/fs.pick");
+        return NULL;
+    }
+    if (token == 0) {
+        *no_token = true;
+        return NULL;
+    }
+    if (token < 0) {
+        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request/fs.pick");
         return NULL;
     }
     for (int i = 0; i < MQJS_FS_GRANTS; i++) {
@@ -3079,37 +3152,51 @@ static FsGrant *fs_grant_get(JSContext *ctx, JSValue v, bool need_write)
             g->token = 0;              /* 抜かれたカードの権限 */
             break;
         }
-        if (need_write && !g->write) {
-            JS_ThrowTypeError(ctx, "fs: this grant is read-only");
-            return NULL;
-        }
         return g;
     }
     JS_ThrowTypeError(ctx, "fs: grant expired or not yours");
     return NULL;
 }
 
-/* path が grant の範囲に入っているか。root そのものか root + '/'。 */
-static bool fs_in_scope(const FsGrant *g, const char *path)
+/* 暗黙 grant の主体 (/internal/data/<app> の <app>)。
+ *
+ * **名前ではなく vault_id を返す。** name は sys.setAppName で後から
+ * 名乗り変えられる ── 止まっているアプリの名前は空いているので、押し込んだ
+ * 未署名アプリが sys.setAppName("reading") と名乗るだけで、同意画面を一度も
+ * 出さずに他アプリの記録を書き換え・削除できた (トークン 0 = 暗黙 grant)。
+ * vault_id は起動時に一度だけ決まって以後不変で、vault.* が既にこれを
+ * 隔離の鍵に使っている。fs の私有ディレクトリだけが可変な名前を主体に
+ * していたので、鍵を 1 本に揃える (design §4.1 の 2 点目)。
+ *
+ * 空なら NULL —— 主体の無いアプリに私有ディレクトリは無い (vault_key が
+ * app[0] == '\0' を拒むのと同じ規則)。'/' や制御文字が混じっていても
+ * fs_grant_name_ok が拒否側へ倒すので、ここでは形を見ない (判定を 2 箇所に
+ * 持たせない。長さも FS_GRANT_NAME_MAX=256 > sizeof vault_id=32 なので、
+ * 器で落ちることはない)。 */
+static const char *fs_cur_app_id(void)
 {
-    size_t n = strlen(g->root);
-    if (strncmp(path, g->root, n))
-        return false;
-    return path[n] == '\0' || path[n] == '/';
+    return (s_cur_wk && s_cur_wk->vault_id[0]) ? s_cur_wk->vault_id : NULL;
 }
 
-static FsGrant *fs_grant_for(JSContext *ctx, JSValue gv, const char *path,
-                             bool need_write)
+/* 「この操作を、このパスに対して、この grant で行ってよいか」。
+   判定そのものは fs_grant_check() —— ここは表から scope を取り出して
+   渡し、拒否の理由を例外の文言にするだけ。判定を 2 箇所に持たせない。 */
+static bool fs_grant_allow(JSContext *ctx, JSValue gv, const char *path,
+                           uint8_t need_ops, const char *what)
 {
-    FsGrant *g = fs_grant_get(ctx, gv, need_write);
-    if (!g)
-        return NULL;
-    if (!fs_in_scope(g, path)) {
-        JS_ThrowTypeError(ctx, "fs: '%s' is outside the granted scope '%s'",
-                          path, g->root);
-        return NULL;
+    bool no_token = false;
+    FsGrant *g = fs_grant_lookup(ctx, gv, &no_token);
+    if (!g && !no_token)
+        return false;                  /* 例外は投げ済み */
+
+    fs_grant_verdict_t v = fs_grant_check(g ? &g->sc : NULL,
+                                          fs_cur_app_id(), path, need_ops);
+    if (v != FS_GRANT_OK) {
+        JS_ThrowTypeError(ctx, "fs.%s: '%s': %s", what, path,
+                          fs_grant_verdict_str(v));
+        return false;
     }
-    return g;
+    return true;
 }
 
 /* 一番古い grant を潰して席を空ける (4 席、LRU ですらない単純な使い回し:
@@ -3124,6 +3211,110 @@ static FsGrant *fs_grant_slot(void)
         if (s_fs_grants[i].token < oldest->token)
             oldest = &s_fs_grants[i];
     return oldest;
+}
+
+/* ---- ネイティブモーダル (fs_picker) との継ぎ手 -------------------- *
+ *
+ * ピッカーは grant を知らない。「ユーザがこの道をこの意図で選んだ」しか
+ * 返さず、mint は今までどおり JS タスク (dispatch_fsgrant) がやる
+ * (spec §A.4)。モーダルは同時に 1 件なので、開いている要求も 1 件。
+ *
+ * cb は **UI タスクの上**で呼ばれる。そこから権限表にも FsPending にも
+ * 触らない —— 単一所有者を崩すと、この 2 つの表からロックが消えている
+ * 理由がなくなる (spec §B.2)。答えは landing に置いてイベントを 1 本
+ * 投げるだけ。
+ *
+ * 文字列は要求が閉じるまで生きていなければならない (fs_pick_req_t は
+ * const char * を持つだけで、写しを取るとは言っていない)。モーダルが
+ * 1 件なので静的な器 1 組で足りる。 */
+static char        s_fs_pick_title[64];
+static char        s_fs_pick_start[MQJS_FS_SCOPE_MAX];
+static char        s_fs_pick_name[64];
+static char        s_fs_pick_scope[MQJS_FS_SCOPE_MAX];
+#define MQJS_FS_PICK_EXTS 4
+static char        s_fs_pick_ext[MQJS_FS_PICK_EXTS][16];
+static const char *s_fs_pick_extp[MQJS_FS_PICK_EXTS];
+
+static void fs_pick_cb(void *cbctx, const fs_pick_result_t *r)
+{
+    uint32_t id = (uint32_t)(uintptr_t)cbctx;
+    bool ok = (r != NULL) && r->ok;
+
+    s_fs_pick_land.id = 0;      /* 埋め終わるまで「答え未着」のまま */
+    s_fs_pick_land.vpath[0] = '\0';
+    if (ok) {
+        /* grant の root は MQJS_FS_SCOPE_MAX で終端しなければならない。
+           入らない道は「拒否」に倒す: 切り詰めて別の道の権限を出すより
+           良い (切り詰めた先が実在してしまう可能性がある)。 */
+        int n = snprintf(s_fs_pick_land.vpath, sizeof s_fs_pick_land.vpath,
+                         "%s", r->vpath);
+        if (n < 0 || (size_t)n >= sizeof s_fs_pick_land.vpath) {
+            s_fs_pick_land.vpath[0] = '\0';
+            ok = false;
+        }
+    }
+    s_fs_pick_land.ok = ok;
+    /* id は最後。この後の ev_post は外部呼び出しなので、上の書き込みが
+       キューへの送信を越えて後ろへ動くことはない。読み手 (JS タスク) は
+       xQueueReceive の後で読む。 */
+    s_fs_pick_land.id = id;
+
+    MqjsEvent ev = { .type = EV_FSGRANT,
+                     .worker = s_fs_pick_land.worker,
+                     .gen = s_fs_pick_land.gen };
+    ev.u.fsgrant.id = id;
+    ev.u.fsgrant.ok = ok ? 1 : 0;
+    ev_post(&ev, 0);
+}
+
+/* 開いているモーダルがこの要求のものなら閉じる。JS タスクから呼ぶ。 */
+static void fs_pick_drop(FsPending *p)
+{
+    if (p->modal) {
+        p->modal = false;
+        fs_pick_cancel();
+    }
+}
+
+/* fs.request / fs.pick の共通後半: 空き枠を取り、モーダルを開く。
+   開けなければ枠を返して false (cb の登録解除は呼び出し元)。 */
+static FsPending *fs_pending_take(void)
+{
+    FsPending *p = NULL;
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        /* 同じアプリの前の要求は捨てる (ハンドラは一発限りなので、返事が
+           二度来ると片方が宙に浮く)。開きっぱなしのモーダルも畳む。 */
+        if (s_fs_pending[i].id && s_fs_pending[i].worker == s_cur_wk->idx) {
+            fs_pick_drop(&s_fs_pending[i]);
+            s_fs_pending[i].id = 0;
+        }
+        if (!s_fs_pending[i].id && !p)
+            p = &s_fs_pending[i];
+    }
+    if (!p)
+        p = &s_fs_pending[0];
+    memset(p, 0, sizeof *p);
+    if (++s_fs_req_seq == 0)
+        s_fs_req_seq = 1;
+    p->id     = s_fs_req_seq;
+    p->worker = s_cur_wk->idx;
+    p->gen    = s_cur_wk->gen;
+    return p;
+}
+
+static bool fs_pick_open(FsPending *p, const fs_pick_req_t *req)
+{
+    /* UI タスクが読む欄 (worker/gen) は、モーダルを開く前に揃えておく。
+       答えの欄 (ok/vpath/id) には**触らない** —— あれは UI タスクの持ち物で、
+       ここから消しに行くと 1 つの欄を 2 つのタスクが書くことになる (前の
+       要求の cb がまだ走っている隙がある)。古い答えが残っていても害は無い:
+       要求 id は使い回さないので、この要求の id とは一致しない。 */
+    s_fs_pick_land.worker = p->worker;
+    s_fs_pick_land.gen    = p->gen;
+    if (!fs_pick_begin(req, fs_pick_cb, (void *)(uintptr_t)p->id))
+        return false;
+    p->modal = true;
+    return true;
 }
 
 #endif /* ESP_PLATFORM */
@@ -3385,29 +3576,15 @@ JSValue js_fs_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #endif
 }
 
-/* JSON 文字列リテラルへ安全に埋める。reason はアプリが自由に書ける
-   ので、素で連結すると引用符を閉じて別の op を注入できてしまう
-   (ランチャーはこの JSON を JSON.parse する)。 */
-static void fs_json_escape(char *dst, size_t cap, const char *src)
-{
-    size_t o = 0;
-    for (; *src && o + 7 < cap; src++) {
-        unsigned char c = (unsigned char)*src;
-        if (c == '"' || c == '\\') {
-            dst[o++] = '\\';
-            dst[o++] = (char)c;
-        } else if (c < 0x20) {
-            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
-        } else {
-            dst[o++] = (char)c;
-        }
-    }
-    dst[o] = '\0';
-}
-
 /* fs.request({path, write, reason}, cb) -> bool
-   同意を求め、返事が出たら cb(grant) を呼ぶ (拒否なら cb(0))。grant は
-   ここでしか手に入らないので、トップレベルでの書き込みは書けない。 */
+   同意を求め、返事が出たら cb(grant, path) を呼ぶ (拒否なら cb(0, ""))。
+   grant はここと fs.pick でしか手に入らないので、トップレベルでの
+   書き込みは書けない。
+
+   同意画面は**ネイティブモーダル** (fs_picker) が描く。ランチャー JS に
+   描かせるのをやめた理由は design §4.4: ランチャーは JS 協調タスクの上の
+   アプリなので、他アプリが長い C 呼び出しをしている間は画面を描けない
+   (カタログ検証で 1.8 秒フリーズを実測した)。 */
 JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
@@ -3436,28 +3613,20 @@ JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
     if (err != ESP_OK)
         return fs_throw(ctx, "request", err);
 
+    /* 求める操作。write:false は読みだけの範囲 grant (バルク走査アプリ)。
+       write:true はサブツリー全部 —— 旧 bool write と同じ意味を、
+       op ビットで書き直しただけ。 */
+    uint8_t ops = write ? (uint8_t)FS_OP_ALL : (uint8_t)FS_OP_READ;
+
     JSValue r = register_cb(ctx, argv[1], &s_cur_wk->fsreq_used,
                             &s_cur_wk->fsreq_cb);
     if (JS_IsException(r))
         return r;
 
-    /* 同じアプリの前の要求は捨てる (ハンドラは一発限りなので、返事が
-       二度来ると片方が宙に浮く)。 */
-    FsPending *p = NULL;
-    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
-        if (s_fs_pending[i].id && s_fs_pending[i].worker == s_cur_wk->idx)
-            s_fs_pending[i].id = 0;
-        if (!s_fs_pending[i].id && !p)
-            p = &s_fs_pending[i];
-    }
-    if (!p)
-        p = &s_fs_pending[0];
-    if (++s_fs_req_seq == 0)
-        s_fs_req_seq = 1;
-    p->id     = s_fs_req_seq;
-    p->worker = s_cur_wk->idx;
-    p->gen    = s_cur_wk->gen;
-    p->write  = write;
+    FsPending *p = fs_pending_take();
+    p->kind      = FS_SCOPE_SUBTREE;
+    p->ops       = ops;
+    p->from_pick = false;
     snprintf(p->root, sizeof p->root, "%s", root);
 
     /* dev スロットは同意を経ずに通す。camera.scanQr / sys.blackbox /
@@ -3476,46 +3645,29 @@ JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
         return JS_NewBool(1);
     }
 
-    /* ランチャーへ同意要求を送る。届かない (ランチャーが居ない = UI の
-       無いボードや起動直後) ときは黙って拒否 — 誰も尋ねられないなら
-       書かせない、が既定。 */
-    MqjsWorker *ui = &s_workers[MQJS_WORKER_LAUNCHER];
-    if (!ui->used) {
-        MqjsEvent ev = { .type = EV_FSGRANT, .worker = s_cur_wk->idx,
-                         .gen = s_cur_wk->gen };
-        ev.u.fsgrant.id = p->id;
-        ev.u.fsgrant.ok = 0;
-        ev_post(&ev, 0);
-        return JS_NewBool(1);
-    }
+    /* reason はまだ画面に出ない: fs_pick_req_t (spec §A.4) に理由を運ぶ
+       欄が無い。引数としては受け取り続ける (アプリ側の JS を今ここで
+       壊さないため) が、モーダルには渡らない。 */
+    snprintf(s_fs_pick_title, sizeof s_fs_pick_title, "%s", s_cur_wk->name);
+    snprintf(s_fs_pick_scope, sizeof s_fs_pick_scope, "%s", root);
+    fs_pick_req_t req = {
+        .mode         = FS_PICK_CONSENT,
+        .title        = s_fs_pick_title,
+        .start_vpath  = NULL,
+        .exts         = NULL,
+        .n_exts       = 0,
+        .suggest_name = NULL,
+        .scope_vpath  = s_fs_pick_scope,
+        .ops          = ops,
+    };
 
-    char e_app[72], e_root[MQJS_FS_SCOPE_MAX * 2 + 8];
-    char e_vol[72], e_reason[MQJS_FS_REASON_MAX * 2 + 8];
-    fs_json_escape(e_app, sizeof e_app, s_cur_wk->name);
-    fs_json_escape(e_root, sizeof e_root, root);
-    fs_json_escape(e_vol, sizeof e_vol, vol->label ? vol->label : vol->id);
-    fs_json_escape(e_reason, sizeof e_reason, reason);
-
-    size_t jcap = sizeof e_app + sizeof e_root + sizeof e_vol +
-                  sizeof e_reason + 128;
-    char *json = malloc(jcap);
-    if (!json) {
+    if (!fs_pick_open(p, &req)) {
+        /* 先客のモーダルが出ている。要求は成立しなかったので、一発限りの
+           ハンドラも返しておく (握ったままだと次の fs.request が
+           「前の要求」として自分を潰す)。 */
         p->id = 0;
-        return JS_ThrowOutOfMemory(ctx);
-    }
-    snprintf(json, jcap,
-             "{\"op\":\"fs-consent\",\"id\":%u,\"app\":\"%s\","
-             "\"path\":\"%s\",\"write\":%s,\"vol\":\"%s\","
-             "\"reason\":\"%s\"}",
-             (unsigned)p->id, e_app, e_root, write ? "true" : "false",
-             e_vol, e_reason);
-
-    MqjsEvent sig = { .type = EV_SIGNAL, .worker = ui->idx, .gen = ui->gen };
-    sig.u.signal.value = json;
-    snprintf(sig.u.signal.from, sizeof sig.u.signal.from, "system");
-    if (!ev_post(&sig, 0)) {
-        free(json);
-        p->id = 0;
+        s_cur_wk->fsreq_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->fsreq_cb);
         return JS_NewBool(0);
     }
     return JS_NewBool(1);
@@ -3525,13 +3677,122 @@ JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 #endif
 }
 
+/* fs.pick({mode, title, start, exts, name}, cb) -> bool
+   権限の主たる入口 (design §4.2)。ユーザが 1 本のファイルを選び、その
+   1 本だけの grant (kind = FILE、完全一致) が出る。
+
+     mode "open" -> READ           mode "save" -> CREATE|WRITE
+
+   返るのは cb(grant, path): 道は表示と fs.write の第 2 引数のためで、
+   権威は grant の方にある —— 道を権威にすると、モーダルを閉じた後も
+   「名前を知っている道」に書ける ambient authority になる。 */
+JSValue js_fs_pick(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char mode[8];
+
+    if (argc < 2 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+        return JS_ThrowTypeError(ctx, "fs.pick({mode, ...}, cb)");
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "mode"),
+                     mode, sizeof mode))
+        return JS_EXCEPTION;
+
+    fs_pick_mode_t pmode;
+    uint8_t ops;
+    if (!strcmp(mode, "save")) {
+        pmode = FS_PICK_SAVE;
+        ops   = (uint8_t)(FS_OP_CREATE | FS_OP_WRITE);
+    } else if (!mode[0] || !strcmp(mode, "open")) {
+        pmode = FS_PICK_OPEN;
+        ops   = (uint8_t)FS_OP_READ;
+    } else {
+        /* "dir" は出さない: ディレクトリを 1 つ選ばせたときにどの op を
+           付けるかが決まっていない (spec §A.5 は open/save しか書いて
+           いない)。決まるまで、範囲 grant の入口は fs.request のまま。 */
+        return JS_ThrowTypeError(ctx, "fs.pick: mode must be 'open' or 'save'");
+    }
+
+    s_fs_pick_title[0] = '\0';
+    s_fs_pick_start[0] = '\0';
+    s_fs_pick_name[0]  = '\0';
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "title"),
+                     s_fs_pick_title, sizeof s_fs_pick_title) ||
+        uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "start"),
+                     s_fs_pick_start, sizeof s_fs_pick_start) ||
+        uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "name"),
+                     s_fs_pick_name, sizeof s_fs_pick_name))
+        return JS_EXCEPTION;
+
+    /* 拡張子フィルタ。表示の都合であって権限ではないので、読めない形は
+       黙って「フィルタ無し」に落とす。 */
+    int n_exts = 0;
+    JSValue exts_v = JS_GetPropertyStr(ctx, argv[0], "exts");
+    if (!JS_IsUndefined(exts_v) && !JS_IsNull(exts_v)) {
+        int len = 0;
+        JSValue lv = JS_GetPropertyStr(ctx, exts_v, "length");
+        if (JS_IsNumber(ctx, lv) && !JS_ToInt32(ctx, &len, lv)) {
+            if (len > MQJS_FS_PICK_EXTS)
+                len = MQJS_FS_PICK_EXTS;
+            for (int i = 0; i < len; i++) {
+                JSValue it = JS_GetPropertyUint32(ctx, exts_v, (uint32_t)i);
+                if (uiw_copy_str(ctx, it, s_fs_pick_ext[n_exts],
+                                 sizeof s_fs_pick_ext[0]))
+                    return JS_EXCEPTION;
+                if (s_fs_pick_ext[n_exts][0]) {
+                    s_fs_pick_extp[n_exts] = s_fs_pick_ext[n_exts];
+                    n_exts++;
+                }
+            }
+        }
+    }
+
+    JSValue r = register_cb(ctx, argv[1], &s_cur_wk->fsreq_used,
+                            &s_cur_wk->fsreq_cb);
+    if (JS_IsException(r))
+        return r;
+
+    FsPending *p = fs_pending_take();
+    p->kind      = FS_SCOPE_FILE;   /* 1 本だけ。完全一致 */
+    p->ops       = ops;
+    p->from_pick = true;            /* 道は landing から来る */
+    p->root[0]   = '\0';
+
+    fs_pick_req_t req = {
+        .mode         = pmode,
+        .title        = s_fs_pick_title[0] ? s_fs_pick_title : s_cur_wk->name,
+        .start_vpath  = s_fs_pick_start[0] ? s_fs_pick_start : NULL,
+        .exts         = n_exts ? s_fs_pick_extp : NULL,
+        .n_exts       = n_exts,
+        .suggest_name = s_fs_pick_name[0] ? s_fs_pick_name : NULL,
+        .scope_vpath  = NULL,
+        .ops          = ops,
+    };
+    if (!fs_pick_open(p, &req)) {
+        p->id = 0;
+        s_cur_wk->fsreq_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->fsreq_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.pick: no filesystem on this build");
+#endif
+}
+
 /* fs.release(grant) -> bool: 使い終わった権限を自分から返す。 */
 JSValue js_fs_release(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
-    FsGrant *g = fs_grant_get(ctx, argv[0], false);
-    if (!g)
+    bool no_token = false;
+    FsGrant *g = fs_grant_lookup(ctx, argv[0], &no_token);
+    if (!g) {
+        /* トークンを渡していないなら返すものも無い。暗黙 grant は表に
+           入っていないので、release できない (design §4.3)。 */
+        if (no_token)
+            return JS_NewBool(0);
         return JS_EXCEPTION;
+    }
     g->token = 0;
     return JS_NewBool(1);
 #else
@@ -3540,36 +3801,26 @@ JSValue js_fs_release(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv
 #endif
 }
 
-/* sys.fsConsent(id, ok) -> bool: 同意画面を出したアプリだけが呼べる
-   返事の口。ランチャー (組み込みシステムアプリ) 以外は弾く。 */
-JSValue js_sys_fs_consent(JSContext *ctx, JSValue *this_val, int argc,
-                          JSValue *argv)
-{
-#ifdef ESP_PLATFORM
-    if (!system_api_allowed(ctx))
-        return JS_EXCEPTION;
-    int id = 0;
-    if (JS_ToInt32(ctx, &id, argv[0]) || id <= 0)
-        return JS_ThrowTypeError(ctx, "sys.fsConsent(id, ok)");
-    bool ok = uiw_truthy(ctx, argv[1]);
-    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
-        FsPending *p = &s_fs_pending[i];
-        if (p->id != (uint32_t)id)
-            continue;
-        MqjsEvent ev = { .type = EV_FSGRANT, .worker = p->worker,
-                         .gen = p->gen };
-        ev.u.fsgrant.id = p->id;
-        ev.u.fsgrant.ok = ok ? 1 : 0;
-        return JS_NewBool(ev_post(&ev, 0));
-    }
-    return JS_NewBool(0);   /* 期限切れ / 二重返答 */
-#else
-    (void)this_val; (void)argc; (void)argv; (void)ctx;
-    return JS_NewBool(0);
-#endif
-}
+/* sys.fsConsent は削除した (design §5)。同意はネイティブモーダルが
+   受け持ち、返事は fs_pick_cb → EV_FSGRANT で JS タスクへ戻る。
+   ランチャー JS が同意画面を描く経路が無くなったので、返事の口も要らない
+   —— 残しておくと「ランチャーだけが呼べる、任意の要求を承認する関数」が
+   宙に浮いたまま残る。 */
 
-/* ---- grant を要る操作 -------------------------------------------- */
+/* ---- grant を要る操作 --------------------------------------------
+ *
+ * どの op を要求するかは 1 行ずつ明示する。ここを 1 つでも書き漏らすと
+ * 権限の穴になるので、grant を要る関数はすべて fs_grant_allow() を
+ * 通ること (判定そのものは fs_grant_check、spec §A.5)。
+ *
+ *   write        -> CREATE|WRITE    mkdir      -> CREATE
+ *   remove       -> DELETE          copy       -> CREATE|WRITE 先だけ
+ *   rename/move  -> RENAME 両端
+ *
+ * copy の元を見ないのは、読み取りが全開放だから (js_fs_copy のコメント)。
+ * rename/move は別 —— あれは両端とも**書き換える**ので両端を見る。
+ * 両端を取る操作は fs_grant_check を 2 回呼ぶ (この関数は vpath を 1 本
+ * しか取らない)。片方でも通らなければ操作は起きない。 */
 
 JSValue js_fs_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
@@ -3577,7 +3828,15 @@ JSValue js_fs_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     char path[FS_PATH_MAX];
     if (fs_path_arg(ctx, argv[1], path, sizeof path))
         return JS_EXCEPTION;
-    if (!fs_grant_for(ctx, argv[0], path, true))
+
+    /* 常に CREATE|WRITE。「既存なら WRITE だけでよい」と出し分けていた
+       時期があるが、撤去した: WRITE を持つが CREATE を持たない grant を
+       作る経路が存在しない (ピッカーの SAVE も fs.request も CREATE|WRITE
+       を出す) ので、出し分けは**決して結果を変えず**、そのくせ書き込み
+       1 回ごとに fs_stat = flash 読みを 1 回足していた (キャッシュ停止の芽)。
+       WRITE だけの grant を出す経路を作るなら、ここも一緒に戻すこと。 */
+    if (!fs_grant_allow(ctx, argv[0], path,
+                        (uint8_t)(FS_OP_CREATE | FS_OP_WRITE), "write"))
         return JS_EXCEPTION;
 
     bool append = false;
@@ -3603,10 +3862,11 @@ JSValue js_fs_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 JSValue js_fs_mkdir(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
+    (void)argc;
     char path[FS_PATH_MAX];
     if (fs_path_arg(ctx, argv[1], path, sizeof path))
         return JS_EXCEPTION;
-    if (!fs_grant_for(ctx, argv[0], path, true))
+    if (!fs_grant_allow(ctx, argv[0], path, (uint8_t)FS_OP_CREATE, "mkdir"))
         return JS_EXCEPTION;
     esp_err_t err = fs_mkdir(path);
     if (err != ESP_OK)
@@ -3624,7 +3884,7 @@ JSValue js_fs_remove(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     char path[FS_PATH_MAX];
     if (fs_path_arg(ctx, argv[1], path, sizeof path))
         return JS_EXCEPTION;
-    if (!fs_grant_for(ctx, argv[0], path, true))
+    if (!fs_grant_allow(ctx, argv[0], path, (uint8_t)FS_OP_DELETE, "remove"))
         return JS_EXCEPTION;
     bool recursive = argc >= 3 && uiw_truthy(ctx, argv[2]);
     esp_err_t err = fs_remove(path, recursive);
@@ -3637,17 +3897,18 @@ JSValue js_fs_remove(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #endif
 }
 
-/* fs.rename(grant, from, to) — 両端が同じ grant の範囲に無ければ拒否。
-   「読める範囲から書ける範囲へ動かす」ことはできない: 移動は元も消す。 */
+/* fs.rename(grant, from, to) — 両端に RENAME が要る。「読める範囲から
+   書ける範囲へ動かす」ことはできない: 移動は元も消す。 */
 JSValue js_fs_rename(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
+    (void)argc;
     char from[FS_PATH_MAX], to[FS_PATH_MAX];
     if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
         fs_path_arg(ctx, argv[2], to, sizeof to))
         return JS_EXCEPTION;
-    if (!fs_grant_for(ctx, argv[0], from, true) ||
-        !fs_grant_for(ctx, argv[0], to, true))
+    if (!fs_grant_allow(ctx, argv[0], from, (uint8_t)FS_OP_RENAME, "rename") ||
+        !fs_grant_allow(ctx, argv[0], to, (uint8_t)FS_OP_RENAME, "rename"))
         return JS_EXCEPTION;
     esp_err_t err = fs_move(from, to);
     if (err != ESP_OK)
@@ -3659,16 +3920,30 @@ JSValue js_fs_rename(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 #endif
 }
 
-/* fs.copy(grant, from, to) — 読み出し元は誰でも読めるので範囲外でよい。
-   grant が要るのは書き込み先だけ。 */
+/* fs.copy(grant, from, to) — **書き込み先の CREATE|WRITE だけ**を要る。
+ *
+ * 読み出し元に READ を課していた時期があるが、撤去した。安全性が 1 ミリも
+ * 増えないのに、正当な用途だけが死ぬからである:
+ *
+ *   - fs.read / fs.list / fs.stat は grant を要らない (design §5 の決定で
+ *     全開放)。したがって元に READ を課しても、アプリは fs.read + fs.write
+ *     で同じ結果に迂回できる。止まるのは「迂回しない書き方」だけ。
+ *   - 一方 examples/files.js のボリュームまたぎコピー/移動は、片方の
+ *     ボリュームの grant しか持たないので必ず落ちる —— design §5 が移行
+ *     ゲートとして残すと決めた当の機能。
+ *
+ * 次に「元にも READ が要るのでは」と思ったら、まず fs.read が grant 無しで
+ * 通ることを確かめること。そこが閉じたなら、この判断も変わる。 */
 JSValue js_fs_copy(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
 #ifdef ESP_PLATFORM
+    (void)argc;
     char from[FS_PATH_MAX], to[FS_PATH_MAX];
     if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
         fs_path_arg(ctx, argv[2], to, sizeof to))
         return JS_EXCEPTION;
-    if (!fs_grant_for(ctx, argv[0], to, true))
+    if (!fs_grant_allow(ctx, argv[0], to,
+                        (uint8_t)(FS_OP_CREATE | FS_OP_WRITE), "copy"))
         return JS_EXCEPTION;
     esp_err_t err = fs_copy(from, to, NULL, NULL);
     if (err != ESP_OK)
@@ -3682,118 +3957,61 @@ JSValue js_fs_copy(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 
 #ifdef ESP_PLATFORM
 /* フォーマットは専用タスクで走らせる。大容量カードでは FAT テーブル
-   だけで数十 MB 書くので、JS タスク上で回すと MQJS_MAX_RUN_MS (5 秒) の
-   コールバック watchdog に確実に轢かれる。同時に 1 本だけ。 */
-static const fsvol_t *s_fmt_vol;
-static uint8_t        s_fmt_worker;
-static uint16_t       s_fmt_gen;
+   だけで数十 MB 書くので、呼び出し元のタスクで回すと (JS タスクなら
+   MQJS_MAX_RUN_MS の 5 秒コールバック watchdog に) 轢かれる。同時に 1 本。
+ *
+ * JS からは呼べなくなった (design §5: ファイラ専用で、JS に残す用途が
+ * 無い)。タスクは残す —— M2 で fs_io がこれを引き取る (spec §A.7)。
+ * 今の入口は C だけ: mqjs_fs_format_begin()。 */
+static const fsvol_t      *s_fmt_vol;
+static mqjs_fs_format_cb_t s_fmt_cb;
+static void               *s_fmt_ctx;
 
 static void fs_format_task(void *arg)
 {
     (void)arg;
     esp_err_t err = fsvol_format(s_fmt_vol);
-    MqjsEvent ev = { .type = EV_FSOP, .worker = s_fmt_worker,
-                     .gen = s_fmt_gen };
-    ev.u.fsop.ok = (err == ESP_OK) ? 1 : 0;
-    ev_post(&ev, 0);
+    mqjs_fs_format_cb_t cb = s_fmt_cb;
+    void *cbctx = s_fmt_ctx;
     s_fmt_vol = NULL;
+    s_fmt_cb  = NULL;
+    s_fmt_ctx = NULL;
+    if (cb)
+        cb(cbctx, (int)err);   /* このタスクの上。呼ばれた側は投げ直すだけ */
     vTaskDelete(NULL);
 }
-#endif
 
-/* fs.format(grant, volumeId, cb) -> bool (要求を受け付けたか)
-   中身は消える。grant はそのボリュームへの書き込み権限で、フォーマットに
-   成功しても失敗しても epoch が進むのでこの grant はここで死ぬ —— 消えた
-   データへの権限が残らない。cb(ok) は終わってから呼ばれる。 */
-JSValue js_fs_format(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+bool mqjs_fs_format_begin(const char *volume_id, mqjs_fs_format_cb_t cb,
+                          void *cbctx)
 {
-    (void)this_val;
-#ifdef ESP_PLATFORM
-    char id[32];
-    if (uiw_copy_str(ctx, argv[1], id, sizeof id))
-        return JS_EXCEPTION;
-    const fsvol_t *v = fsvol_find(id);
+    if (!volume_id || s_fmt_vol)
+        return false;
+    const fsvol_t *v = fsvol_find(volume_id);
     if (!v)
-        return fs_throw(ctx, "format", ESP_ERR_NOT_FOUND);
+        return false;
     /* 内蔵は消させない。アプリも設定も辞書もそこに在る。 */
     if (v->flags & FSVOL_SYSTEM)
-        return JS_ThrowTypeError(ctx, "fs.format: '%s' is system storage", id);
-    char vroot[40];
-    snprintf(vroot, sizeof vroot, "/%s", id);
-    if (!fs_grant_for(ctx, argv[0], vroot, true))
-        return JS_EXCEPTION;
-    if (s_fmt_vol)
-        return JS_ThrowTypeError(ctx, "fs.format: already running");
-
-    JSValue r = register_cb(ctx, argv[2], &s_cur_wk->fsop_used,
-                            &s_cur_wk->fsop_cb);
-    if (JS_IsException(r))
-        return r;
-    s_fmt_vol    = v;
-    s_fmt_worker = s_cur_wk->idx;
-    s_fmt_gen    = s_cur_wk->gen;
+        return false;
+    s_fmt_vol = v;
+    s_fmt_cb  = cb;
+    s_fmt_ctx = cbctx;
     /* 6KB: f_mkfs は作業バッファを自分で確保するが、VFS/FATFS の呼び出しが
        深いので既定の 4KB では心もとない。 */
     if (xTaskCreate(fs_format_task, "fs_format", 6144, NULL, 4, NULL) != pdPASS) {
         s_fmt_vol = NULL;
-        s_cur_wk->fsop_used = false;
-        JS_DeleteGCRef(ctx, &s_cur_wk->fsop_cb);
-        return JS_NewBool(0);
+        s_fmt_cb  = NULL;
+        s_fmt_ctx = NULL;
+        return false;
     }
-    return JS_NewBool(1);
-#else
-    (void)argc; (void)argv;
-    return JS_ThrowTypeError(ctx, "fs.format: no filesystem on this build");
-#endif
+    return true;
 }
+#endif
 
-/* fs.mount(volumeId) -> bool
-   マウントは何も壊さない (入っているカードを読めるようにするだけ) ので
-   grant を要らない。fs.unmount は別扱い: 他アプリが書いている最中に
-   外せてしまうため、そのボリュームへの書き込み grant を要求する。 */
-JSValue js_fs_mount(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val; (void)argc;
-#ifdef ESP_PLATFORM
-    char id[32];
-    if (uiw_copy_str(ctx, argv[0], id, sizeof id))
-        return JS_EXCEPTION;
-    const fsvol_t *v = fsvol_find(id);
-    if (!v)
-        return fs_throw(ctx, "mount", ESP_ERR_NOT_FOUND);
-    esp_err_t err = fsvol_mount(v);
-    if (err != ESP_OK)
-        return fs_throw(ctx, "mount", err);
-    return JS_NewBool(1);
-#else
-    (void)argv;
-    return JS_ThrowTypeError(ctx, "fs.mount: no filesystem on this build");
-#endif
-}
+/* fs.mount / fs.unmount / fs.format は JS から消した (design §5)。
+   mount は 150ms 級のブロッキング呼び出しで、誰でも呼べると全アプリを
+   止められる。unmount は他アプリの grant を epoch 失効させられる
+   = ワーカー間 DoS のレバー。format はファイラ専用。 */
 
-JSValue js_fs_unmount(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    (void)this_val; (void)argc;
-#ifdef ESP_PLATFORM
-    char id[32];
-    if (uiw_copy_str(ctx, argv[1], id, sizeof id))
-        return JS_EXCEPTION;
-    const fsvol_t *v = fsvol_find(id);
-    if (!v)
-        return fs_throw(ctx, "unmount", ESP_ERR_NOT_FOUND);
-    char vroot[40];
-    snprintf(vroot, sizeof vroot, "/%s", id);
-    if (!fs_grant_for(ctx, argv[0], vroot, true))
-        return JS_EXCEPTION;
-    esp_err_t err = fsvol_unmount(v);
-    if (err != ESP_OK)
-        return fs_throw(ctx, "unmount", err);
-    return JS_NewBool(1);
-#else
-    (void)argv;
-    return JS_ThrowTypeError(ctx, "fs.unmount: no filesystem on this build");
-#endif
-}
 /* ------------------------------------------------------------------ */
 /* clipboard: typed, system-shared buffer (P4d, ssh-terminal §7).      */
 /* One C-owned value outside every JS context: survives app stops and  */
@@ -4203,50 +4421,97 @@ static void dispatch_fsgrant(MqjsWorker *app, const MqjsEvent *ev)
 #ifdef ESP_PLATFORM
     JSContext *ctx = app->ctx;
     uint32_t token = 0;
+    char granted[MQJS_FS_SCOPE_MAX];
+    granted[0] = '\0';
 
+    /* id **だけでなく持ち主も**照合する。答えの宛先 (ev->worker) は UI
+       タスクが landing から読んだ値で、その隙に別のアプリの fs.pick が
+       landing を上書きしていれば、B のアプリが A の要求を引き当てる。
+       トークンは worker/gen 照合で B には使えないが、**A のユーザが選んだ
+       パス文字列が B へ渡ってしまう**。合わなければ何もしない
+       (ピッカー側の順序も直すが、runtime だけでも配送違いを起こさない)。 */
     FsPending *p = NULL;
     for (int i = 0; i < MQJS_FS_GRANTS; i++)
-        if (s_fs_pending[i].id && s_fs_pending[i].id == ev->u.fsgrant.id) {
+        if (s_fs_pending[i].id && s_fs_pending[i].id == ev->u.fsgrant.id &&
+            s_fs_pending[i].worker == app->idx &&
+            s_fs_pending[i].gen == app->gen) {
             p = &s_fs_pending[i];
             break;
         }
-    if (p && ev->u.fsgrant.ok) {
+    if (!p) {
+        /* 生きている要求のどれでもない = 取り消された要求の答えか、二重の
+           答えか、配送違い。ここで cb を呼んではいけない: 同じアプリが
+           既に**次の**要求を出していれば、その cb を「拒否」で潰してしまう
+           (fs.pick を 2 回続けて呼ぶと必ず起きる)。landing にも触らない
+           —— あれは UI タスクの持ち物 (FsPickLanding のコメント)。 */
+        return;
+    }
+    {
+        /* 返事が届いた = モーダルはもう閉じている。取り消しはしない。
+           要求の席はここで空ける: 以降どの道を通っても席が残らないし、
+           同じ id の二度目の答えは上の照合で落ちる (答えは一度きり)。 */
+        p->modal = false;
+        uint32_t req_id = p->id;
+        p->id = 0;
+
+        /* 受け手が居なければ mint しない。4 席しかない権限表を、誰にも
+           渡らないトークンで 1 席埋めてしまう —— 受け手が消えるのは
+           fs.request の one-shot が既に差し替えられた/解放されたとき。 */
+        if (!app->fsreq_used)
+            return;
+
+        bool ok = ev->u.fsgrant.ok != 0;
+        const char *root = p->root;
+        if (ok && p->from_pick) {
+            /* 道はピッカーから来る。landing は UI タスクが埋め、id を
+               最後に立てる約束 (fs_pick_cb)。id が合わない landing は
+               この要求の答えではないので使わない (id は要求ごとに新しく、
+               使い回さないので、id の一致だけでこの要求の答えと言える)。 */
+            if (s_fs_pick_land.id != req_id || !s_fs_pick_land.ok ||
+                !s_fs_pick_land.vpath[0])
+                ok = false;
+            else
+                root = s_fs_pick_land.vpath;
+        }
+
         /* 同意が出るまでの間にカードが抜かれていることがある。ここで
            解決し直し、通らなければ黙って「拒否」と同じ結果にする。 */
         const fsvol_t *vol = NULL;
-        if (fsvol_resolve(p->root, &vol, NULL, 0) == ESP_OK) {
+        if (ok && root[0] && fsvol_resolve(root, &vol, NULL, 0) == ESP_OK) {
             FsGrant *g = fs_grant_slot();
             s_fs_token_seq = (s_fs_token_seq + 1) & 0x7fffffff;
             if (!s_fs_token_seq)
                 s_fs_token_seq = 1;
-            g->token  = s_fs_token_seq;
-            g->worker = p->worker;
-            g->gen    = p->gen;
-            g->write  = p->write;
-            g->vol    = vol;
-            g->epoch  = fsvol_epoch(vol);
-            snprintf(g->root, sizeof g->root, "%s", p->root);
+            g->token   = s_fs_token_seq;
+            g->worker  = p->worker;
+            g->gen     = p->gen;
+            g->vol     = vol;
+            g->epoch   = fsvol_epoch(vol);
+            g->sc.kind = p->kind;
+            g->sc.ops  = p->ops;
+            snprintf(g->sc.root, sizeof g->sc.root, "%s", root);
             token = g->token;
+            snprintf(granted, sizeof granted, "%s", root);
         }
     }
-    if (p)
-        p->id = 0;
 
-    if (!app->fsreq_used)
-        return;
-    if (JS_StackCheck(ctx, 3)) {
+    if (JS_StackCheck(ctx, 4)) {
         dump_error(ctx);
         return;
     }
+    /* args are pushed in reverse: last-pushed becomes arg0.
+       arg1 は許された道 —— 表示と、fs.write の第 2 引数のため。権威は
+       arg0 の grant の方にある (design §4.2)。拒否なら "" が入る。 */
+    JS_PushArg(ctx, JS_NewString(ctx, granted));         /* arg1 */
     JS_PushArg(ctx, JS_NewInt32(ctx, (int32_t)token));   /* arg0 */
     JS_PushArg(ctx, app->fsreq_cb.val);                  /* func */
     JS_PushArg(ctx, JS_NULL);                            /* this */
     /* 一発限り: 呼ぶ前に解放しておけば、ハンドラの中から次の
-       fs.request を出せる (cam/http と同じ約束)。 */
+       fs.request / fs.pick を出せる (cam/http と同じ約束)。 */
     app->fsreq_used = false;
     JS_DeleteGCRef(ctx, &app->fsreq_cb);
     arm_watchdog();
-    JSValue ret = JS_Call(ctx, 1);
+    JSValue ret = JS_Call(ctx, 2);
     if (JS_IsException(ret))
         dump_error(ctx);
 #else
@@ -4255,26 +4520,9 @@ static void dispatch_fsgrant(MqjsWorker *app, const MqjsEvent *ev)
 #endif
 }
 
-/* fs.format の結果。専用タスクから戻ってきた 1 ビットを渡すだけ。 */
-static void dispatch_fsop(MqjsWorker *app, const MqjsEvent *ev)
-{
-    JSContext *ctx = app->ctx;
-    if (!app->fsop_used)
-        return;
-    if (JS_StackCheck(ctx, 3)) {
-        dump_error(ctx);
-        return;
-    }
-    JS_PushArg(ctx, JS_NewBool(ev->u.fsop.ok));   /* arg0 */
-    JS_PushArg(ctx, app->fsop_cb.val);            /* func */
-    JS_PushArg(ctx, JS_NULL);                     /* this */
-    app->fsop_used = false;
-    JS_DeleteGCRef(ctx, &app->fsop_cb);
-    arm_watchdog();
-    JSValue ret = JS_Call(ctx, 1);
-    if (JS_IsException(ret))
-        dump_error(ctx);
-}
+/* fs.format の結果を JS へ返す経路 (EV_FSOP / dispatch_fsop) は消した:
+   fs.format は JS から呼べなくなり (design §5)、fs_format_task は C の cb を
+   直に呼ぶので、この道に post する者が居なくなっていた。 */
 
 /* ------------------------------------------------------------------ */
 /* audio: Tab5 speaker (audio.start/stop/tone/volume/stats, audio_tab5) */
@@ -8585,20 +8833,19 @@ static void app_reset_bindings(MqjsWorker *app)
         JS_DeleteGCRef(ctx, &app->fsreq_cb);
         app->fsreq_used = false;
     }
-    if (app->fsop_used) {
-        JS_DeleteGCRef(ctx, &app->fsop_cb);
-        app->fsop_used = false;
-        /* 走っているフォーマットは止められない。結果イベントは
-           世代チェックで捨てられる (§3.2)。 */
-    }
 #ifdef ESP_PLATFORM
-    /* 権限は世代で自然に失効するが (fs_grant_get)、席を空けておく方が
-       素直。同意待ちの要求も、返事が来ても行き先が無いので捨てる。 */
+    /* 権限は世代で自然に失効するが (fs_grant_lookup)、席を空けておく方が
+       素直。返事待ちの要求も、返事が来ても行き先が無いので捨てる。
+       出しっぱなしのモーダルはここで畳む —— 畳まないと、死んだアプリの
+       ために開いたピッカーが画面に残って誰も閉じられなくなる。 */
     for (int i = 0; i < MQJS_FS_GRANTS; i++) {
         if (s_fs_grants[i].worker == app->idx)
             s_fs_grants[i].token = 0;
-        if (s_fs_pending[i].worker == app->idx)
+        if (s_fs_pending[i].worker == app->idx) {
+            if (s_fs_pending[i].id)
+                fs_pick_drop(&s_fs_pending[i]);
             s_fs_pending[i].id = 0;
+        }
     }
 #endif
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
@@ -8926,7 +9173,6 @@ static MqjsWorker *event_owner(const MqjsEvent *ev)
     case EV_CAM:
     case EV_HTTP:
     case EV_FSGRANT:
-    case EV_FSOP:
     case EV_TERM_REPLY: {
         MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
@@ -8967,7 +9213,6 @@ static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
     case EV_FSGRANT:        dispatch_fsgrant(app, ev);       break;
-    case EV_FSOP:           dispatch_fsop(app, ev);          break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
     case EV_TERM_REPLY:     dispatch_term_reply(app, ev);    break;
     }

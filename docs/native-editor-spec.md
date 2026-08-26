@@ -31,7 +31,7 @@ dev スロット再実行 / `key_to_app` / `dump_error`, `ui_tab5.cpp` の
 | キー経路 | ISR(GPIO50) → sem → kbd_task が I2C 読み → `mqjs_post_key(seq)` → (IME want なら `s_ime_q` → IME 所有タスク) → `key_to_app` → field or JS の EV_KEY | `kbd_tab5.c:22`, `mqjs_runtime.c:7395` |
 | 既存の打鍵計測 | `t_post` を `mqjs_post_key` で刻み、所有タスクで hop を出す。avg/max のみ、p99 無し | `ImeMeter` |
 | grant 表 | `FsGrant{token,worker,gen,write,epoch,vol,root}` ×4、**JS タスクだけが触る** (`dispatch_fsgrant`) | `mqjs_runtime.c:2997` |
-| 同意 | C が EV_SIGNAL → launcher が `sys.fsConsent` → EV_FSGRANT で JS タスクが mint | `mqjs_runtime.c:3499/3529` |
+| 同意 | ~~C が EV_SIGNAL → launcher が `sys.fsConsent` → EV_FSGRANT で JS タスクが mint~~ **M1 で `sys.fsConsent` を削除済み (design §5)。今はネイティブモーダル `fs_picker` (`FS_PICK_CONSENT`) が `fs_pick_cb` → EV_FSGRANT で JS タスクへ返す** | `mqjs_runtime.c:3567` (`js_fs_request`)、`:3217` (`fs_pick_cb`) |
 | dev の再実行 | `s_dev_retry_at = s_stop_req ? 0 : now+1000`。**明示 stop が来ると `dev_held()` で止まる** | `mqjs_runtime.c:9020, 9234` |
 | 例外 | `dump_error` は `JS_PrintValueF(e, JS_DUMP_LONG)` で文字列にするだけ。**行と桁はエンジンが持っている** (`get_pc2line(&line, &col, …)`、既定で桁入り — `JS_EVAL_STRIP_COL` は削るためのフラグ)。実機で `at mqtt-task:152:28` を観測済み。無いのは**数値として取り出す C の経路**だけ | `mqjs_runtime.c:714`, `mquickjs.c:3924`, `mquickjs.h:296` |
 | 構文解析のみ | `JS_Parse(ctx, src, len, name, 0)` がある。ホストは 8MB のコンテキストで呼ぶ | `compile_task.c:63` |
@@ -343,7 +343,15 @@ typedef struct {
 
 - `fs_in_scope`: SUBTREE は前置一致 (現状)、FILE は**完全一致**、APPDIR は前置一致。
 - `fs_grant_for(ctx, gv, path, need_ops)`: `need_write` を op ビットに置換。各 `js_fs_*` が自分の op を渡す
-  (`write` 既存→WRITE、`write` 新規→CREATE|WRITE、`mkdir`→CREATE、`remove`→DELETE、`rename`/`move`→RENAME 両端、`copy`→READ 元 + CREATE|WRITE 先)。
+  (`write` 既存→WRITE、`write` 新規→CREATE|WRITE、`mkdir`→CREATE、`remove`→DELETE、
+  `rename`/`move`→**両端**を RENAME で検査、`copy`→**先だけ** CREATE|WRITE を検査)。
+- **`copy` は元に `READ` を課さない (訂正、2026-08-26)。** 当初案は「元に READ、
+  先に CREATE|WRITE」だったが、`fs.read` は design §5 で全アプリに開放済みなので、
+  元に READ を要求してもアプリは `fs.read` + `fs.write` で迂回でき安全性は増えず、
+  一方で `examples/files.js` のボリュームまたぎコピー (grant は貼り付け先の
+  ボリュームにしか出ない) は元の READ 判定で必ず落ちていた。**`rename`/`move` は
+  両端とも書き換えるので両端の検査を残す** ── こちらは迂回しても安全性が変わらない
+  話ではない (RENAME は元を消す)。
 - **暗黙 grant**: `gv` が 0 で `path` が `/internal/data/<appname>/` 配下なら APPDIR とみなして通す。
   `<appname>` は App record の名前 (`sys.setAppName` 済み、サニタイズ済み)。表には入れない (mint 不要)。
 - `fs.pick(opts, cb)`: `fs_pick_begin` を呼び、cb で `EV_FSGRANT` を kind=FILE、ops = mode に応じて
@@ -553,14 +561,28 @@ stalls=3605  typing=0  total=213ms  max=5244us  avg=59us
 hist us  <64:2990  <128:552  <256:48  <512:11  <1k:1  <2k:0  <4k:0  <8k:3  <16k:0  16k+:0
 ```
 
-読み方:
-- **停止は頻繁だが極小**。120 回/秒、83% が 64 µs 未満、合計は壁時計の **0.7%**。
-- 回数が多いのは、**auto-suspend 無しでは書き込みだけでなく読みを含む全ての SPI1 ドライバ操作が
-  キャッシュを落とす**から (IDF: 短い読みはキャッシュが完了を待つ)。3,605 回の大半は littlefs / NVS の読み。
-- **尾は 5.2 ms** (4〜8 ms のバケツに 3 件)。打鍵に重なれば見えるが、予算 30 ms に対して致命ではない。
-- **設計文書 §6.1 の「core 1 スループット −38%」とは条件が違う。** あれは 150 回連続の littlefs 書き込み
-  = 意図的な酷使での値。通常動作の停止コストはこの 0.7% であって、**−38% を XIP の根拠に使ってはいけない**。
-  XIP の根拠になり得るのは §F #2 (`opsTyping`) と M4 の `keysStalled` だけ。
+**読み方の訂正 (2026-08-26)。** 初版はここで「3,605 / 30s = 120 回/秒、合計 213ms /
+30,000ms = 壁時計の 0.7%」と読み、そう書いていた。これは誤り。`meter_task` は
+30 秒おきに**ブートからの累計**を報告するだけで `flash_stall_meter_reset()` は
+どこからも呼ばれておらず (`main/flash_stall_meter.c:136,151-156`)、上のログの
+`stalls=3605` は「起動後この報告が出るまでの累計」であって「直前 30 秒間の
+回数」ではない ── ログ行に付く `30s:` は報告の間隔を表すだけで集計窓ではない。
+**正しく読むには連続する 2 行の差分を取る必要がある。** このベースライン行
+1 本だけからは「回/秒」も「壁時計に対する割合」も出せない。読み取れるのは
+「起動直後の littlefs マウント・棚の一覧・NVS 読み出し・Tailscale の鍵読みで
+少なくとも 3,605 回、合計 213ms 分の停止が起きた」という起動時の事実だけ。
+
+回数が多いのは、**auto-suspend 無しでは書き込みだけでなく読みを含む全ての SPI1 ドライバ操作が
+キャッシュを落とす**から (IDF: 短い読みはキャッシュが完了を待つ)。3,605 回の大半は littlefs / NVS の読み。
+**尾は 5.2 ms** (4〜8 ms のバケツに 3 件)。打鍵に重なれば見えるが、予算 30 ms に対して致命ではない。
+
+**設計文書 §6.1 の「core 1 スループット −38%」とは条件が違う。** あれは 150 回連続の littlefs 書き込み
+= 意図的な酷使での値。「−38% を XIP の根拠に使ってはいけない」のは初版どおりだが、
+代わりに置いた「0.7%」も誤読だったので根拠にはならない。**XIP の根拠になり得るのは
+実使用の実測 (§F #2、design §6.4) だけ**: ssh_vt2 19 分 + skk_test の ASCII 4 分 +
+日本語 SKK 変換 4 分半、合計 約 27.5 分の打鍵で**打鍵に重なった停止は 0 回**。停止の
+出所はアプリのロード (1 回あたり 1,000〜2,000 発) で打鍵とは重ならず、**アイドル
+47 分でも停止は 0 回**だった。design §6.4 はこれで XIP をやらないと決着している。
 
 設計 (§C.2 旧版) にあって報告に無いもの — **未実装として扱い、M0b へ** (lead 確認済み):
 `byTask` (タスク別 8 枠)、最悪 16 件のリング、そこから出す `keysStalled` (M4、edit_task が自分の T0..T4 と突き合わせる)、
@@ -611,9 +633,9 @@ depth はタスク別 (再帰ロック)。8 枠のタスク別表に `{name, hol
 |---|---|---|---|
 | **M0a** (実装済み) | `flash_stall_meter` (C.2)。**エディタは無い** | C.2 の `opsTyping` とヒストグラム (ssh_vt で打ちながら)、§F #1 #2 | 実機: 30 秒報告に数字が出る。littlefs 書き込みで ops が増える |
 | **M0b** | lock の wrap (C.4) + IME ヒストグラム (C.5) + `sys.perf()` + affinity 掃除 + boot のタスク一覧ダンプ + `mqjs_parse_request` (arena 計測のため先行) | C.4、C.5、§F #0 #3 #4 #5 #6 | 実機: `sys.perf()` が MQTT で取れる。**core 1 に prio>4 の非住人が 0 本** |
-| **M1** | `fs_picker` (OPEN/SAVE/CONSENT) + grant の kind/ops + `fs.pick` + `sys.fsConsent` 削除 | ピッカーの `fs_dir_open` 所要 (UI タスク上、閾値 50 ms)、ロック保持 (C.4 に picker が出る) | ホスト: `test_reserved` 継続 + `test_grant_scope.c`。実機: 既存 `probe_fs.js` が `fs.pick` 経由で通る |
+| **M1** (進行中) | `fs_picker` (OPEN/SAVE/CONSENT) + grant の kind/ops + `fs.pick` + `sys.fsConsent` 削除 | ピッカーの `fs_dir_open` 所要 (UI タスク上、閾値 50 ms)、ロック保持 (C.4 に picker が出る) | ホスト: `test_reserved` 継続 + `test_grant_scope.c`。実機: 既存 `probe_fs.js` が `fs.pick` 経由で通る |
 | **M2** | `fs_io` + `fs_filer` + `fs.mount/unmount/format` 削除 | コピー中の UI 応答 (C.4 の wait、IME hop)、fs_io のスループット | **`files.js` ゲート** (下記)。実機: 大容量カードのコピーと format が UI を止めない (lock waitP99 ≤ 8 ms) |
-| **M3** | `edit_core` (ホストのみ) | C.3 のホストベンチ、fuzz | ホスト: `run_tests.sh` 全緑、fuzz 1 時間で 0 クラッシュ、`edit_check` 毎 op で緑、ASAN/UBSAN 緑 |
+| **M3** (完了) | `edit_core` (ホストのみ) | C.3 のホストベンチ、fuzz | ホスト: `run_tests.sh` 全緑、fuzz 1 時間で 0 クラッシュ、`edit_check` 毎 op で緑、ASAN/UBSAN 緑 |
 | **M4** | `edit_ui` (edit_task、プレゼンタ、native surface、自前 ime_t、open/save/swap) | **C.1 全段**、C.2 の `keysStalled`、C.3 実機、ステージング後の内部 SRAM largest | 実機: e2e p99 (T0→T5) が idle で **≤ 33 ms**、ssh 通信中・コピー中・Tailscale 再接続中の 3 負荷で **≤ 60 ms**。edit_task の flash ops = **0**。largest ≥ 40 KB (未満なら共有へ) |
 | **M5** | 構文チェック + dev 投入 + エラー位置ジャンプ + エラーシンク | parse 時間 vs サイズ (16/64/128 KB)、JS タスクの停止時間 | 実機: 構文エラーで dev が **再起動ループしない**、行/列に飛ぶ。parse が 128 KB で 50 ms 超なら「明示のみ」へ |
 | **M6** | 実使用 1 週間 | C.2 の `opsTyping`/`keysStalled` の蓄積 | **§6.4 の判断**: `keysStalled / keys` を見て XIP をやるか決める |
@@ -632,10 +654,10 @@ depth はタスク別 (再帰ロック)。8 枠のタスク別表に `{name, hol
 |---|---|---|---|
 | 1 | M0a flash_stall_meter (済) | — | wrap が呼ばれる (littlefs 書き込みで ops が増える) |
 | 2 | M0b lock wrap / IME hist / `sys.perf()` / affinity | `log2` バケットと p99 算出の単体テスト | `sys.perf()` 取得、boot ダンプで core 1 の住人確認 |
-| 3 | M1 grant 判定の純 C 化 + テスト | `test_grant_scope.c` | — |
-| 4 | M1 picker | — | OPEN/SAVE/CONSENT の 3 モードが返る、`probe_fs.js` |
+| 3 | M1 grant 判定の純 C 化 + テスト (進行中) | `test_grant_scope.c` | — |
+| 4 | M1 picker (進行中) | — | OPEN/SAVE/CONSENT の 3 モードが返る、`probe_fs.js` |
 | 5 | M2 fs_io + filer | — | `filer_diff.sh` IDENTICAL、format/コピーで lock waitP99 ≤ 8 ms |
-| 6 | M3 edit_core | 全部 (ASAN/UBSAN/fuzz/bench/`edit_check`) | — |
+| 6 | M3 edit_core (完了) | 全部 (ASAN/UBSAN/fuzz/bench/`edit_check`) | — |
 | 7 | M4 edit_ui | プレゼンタは無理。`edit_view_row` の run 分割はホストで検証済み | C.1 p99、flash ops=0、SRAM largest |
 | 8 | M5 parse/run/jump | `JS_Parse` の位置取得は `run_pc` でホスト検証可 | dev 投入と再起動抑止 |
 | 9 | M6 実使用 | — | `keysStalled` |
@@ -698,8 +720,8 @@ M0 だけは独立に `main` へ入れてよい (エディタ非依存、他の�
 | # | 何を | いつ (M) | 使う判断 |
 |---|---|---|---|
 | 0 | `esp_timer_get_time` 1 回のコスト | M0 | C.0 の「時計 6 回」が妥当か |
-| 1 | キャッシュ停止の分布 (通常動作) | **済 (M0a)**: 120 回/秒、avg 59 µs、max 5.2 ms、壁時計の 0.7%。§C.2 | C.2 のヒストグラム下限 (64 µs のバケツが要る — 確認済み) |
-| 2 | ssh_vt で 10 分打った間の `opsTyping` (`byTask` は M0b) | M0a、**人が打つ待ち** | §6.4 の初期値 |
+| 1 | キャッシュ停止の分布 (通常動作) | **済 (M0a)**: 起動直後 30 秒で累計 stalls=3605、avg 59 µs、max 5.2 ms (§C.2 のログ)。**「120 回/秒」「壁時計の 0.7%」は 2026-08-26 訂正**: カウンタがブートからの累計でリセットされないので 1 行を 30 秒窓として割った値は過大評価。実際の背景率は §F #2 のとおり実質ゼロ | C.2 のヒストグラム下限 (64 µs のバケツが要る — 確認済み) |
+| 2 | ssh_vt で 10 分打った間の `opsTyping` (`byTask` は M0b) | **済**: 実使用 約 27.5 分 (ssh_vt2 19分 + skk_test の ASCII 4分 + 日本語 SKK 変換 4分半、M3 = `edit_core` 完了と同日、2026-08-26)、打鍵中の停止 **0 回**。観測された停止の出所はアプリのロード (1 回あたり 1,000〜2,000 発) で、打鍵とは重ならなかった。**アイドル 47 分でも停止 0 回** | §6.4 の判断材料。design §6.4 はこれで XIP をやらないと決着した。まだ 1 週間 (§F #11) の分ではないが、0 回はここまでで最も強い材料 |
 | 3 | lvgl lock の holdP99 と違反者 (ランチャー idle / ssh_vt / viewfinder) | M0 | B.2 の 8 ms が現実的か |
 | 4 | boot 時のタスク一覧 (core/prio) | M0 | B.1 |
 | 5 | SKK convP99 (松) | M0 | Q3 #8 |
@@ -708,4 +730,4 @@ M0 だけは独立に `main` へ入れてよい (エディタ非依存、他の�
 | 8 | 1 段 (142 セル) の `ui_tab5_cells_draw` 時間、26 段の合計、PPA 待ち | M4 | Q3 #3/#9 |
 | 9 | ステージング確保後の内部 SRAM largest | M4 | A.3 の共有判定 |
 | 10 | e2e 各段の p99 (idle / 3 負荷) | M4 | M4 ゲート |
-| 11 | `keysStalled / keys` 1 週間 | M6 | XIP をやるか |
+| 11 | `keysStalled / keys` 1 週間 | M6。**§F #2 の 27 分サンプル (0 回) は先行シグナルで、この行の代わりにはならない** — 1 週間分はまだ無い | XIP をやるか。今のところ「やらない」側に倒れている |

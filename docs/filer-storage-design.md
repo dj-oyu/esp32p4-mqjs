@@ -330,6 +330,14 @@ LVGL モーダルを注入する形を考えたが、実装してみると
 3. C が `EV_FSGRANT` を要求元へ送り、**JS タスクの上で** grant を発行して
    `cb(grant)` を呼ぶ。権限表を触るのが 1 タスクだけになるのでロックが要らない。
 
+> **ステップ 2 は M1 で削除。理由は design (`native-editor-design.md`) §5。**
+> `sys.fsConsent` とランチャーの同意画面は、ピッカーがネイティブモーダルに
+> なったのに合わせて消した —— ランチャーは JS 協調タスク上のアプリなので、
+> 他アプリが長い C 呼び出しをしている間は同意画面を描けない (カタログ検証で
+> 1.8 秒フリーズを実測、`native-editor-design.md` §4.4)。今はステップ 2 が
+> `fs_picker` の `FS_PICK_CONSENT` に置き換わり、ステップ 3 の「C が
+> `EV_FSGRANT` を送る」だけがそのまま残る (送り主が `fs_pick_cb` に変わっただけ)。
+
 例外はひとつ、**dev スロットは同意を経ずに自動許可**する。
 `camera.scanQr` / `sys.blackbox` / `system.*` と同じ最高権限を既に
 持っており、ここだけ締めても新しい安全性は生まれない一方、MQTT で
@@ -387,7 +395,7 @@ worktree で消える (SDIO 設定で前科あり)。
 | **日本語ファイル名** | `テスト.txt` を書いて一覧に同じ名前で出た。**§8 の判断 (UTF-8 API だけでよい / CP932 不要) が実機で裏取りできた** |
 | ボリューム状態 (§11) | internal `mounted` 1,048,576B / free 843,776B、sd `mounted` 268,402,622,464B (250GB) |
 | **カードの署名検証 (§13.3)** | 偽署名の `.mjsa` を書いて `sys.store()` に出ないことを確認 (`card_apps: 'probefake': signature rejected` / `listed:false`)。**検出器そのものを試した負のテスト** |
-| 内蔵はフォーマット不可 (§12.3) | `fs.format(g, "internal", ...)` → `'internal' is system storage` |
+| 内蔵はフォーマット不可 (§12.3) | `fs.format(g, "internal", ...)` → `'internal' is system storage` (**M1 で `fs.format` は JS から削除。理由は `native-editor-design.md` §5** — この行はその前の実機記録として残す) |
 | 棚の容量実測 (§13.1) | アプリ 7 本で 205KB。1MB に 30 本以上まだ入る = 容量は動機にならない |
 
 まだ確認していないこと:
@@ -476,8 +484,15 @@ SDXC (32GB 超) は工場出荷が exFAT で、Windows は 32GB 超を FAT32 に
 
 250GB のカードを FAT32 にすると FAT テーブルだけで数十 MB 書く。JS の
 コールバック watchdog は `MQJS_MAX_RUN_MS` = 5 秒なので、直接呼べば
-確実に轢かれる。`fs.format(grant, vol, cb)` は専用タスクへ逃がし、
-終わりを `cb(ok)` で知らせる (camera.scan / http.get と同じ形)。
+確実に轢かれる。~~`fs.format(grant, vol, cb)` は専用タスクへ逃がし、
+終わりを `cb(ok)` で知らせる (camera.scan / http.get と同じ形)。~~
+
+> **`fs.format(grant, vol, cb)` という JS 呼び出しは M1 で削除。理由は
+> `native-editor-design.md` §5** ── フォーマットはファイラ専用で、JS に残す
+> 用途が無いと判断した。「専用タスクへ逃がす」という仕組み自体は生き残って
+> いて、C 専用の `mqjs_fs_format_begin()` (`components/mqjs/mqjs_runtime.h`)
+> がその入口になり、呼び出すのは今はネイティブファイラ側
+> (`native-editor-spec.md` §A.7 の `fs_io_submit(FSIO_FORMAT, ...)`)。
 
 ### 12.3 歯止め
 

@@ -175,6 +175,15 @@ bool storage_save_app(const char *name, const char *src, size_t len)
     if (!s_mounted)
         return false;
     mkdir(MOUNT "/apps", 0777); /* EEXIST is fine */
+    /* M1 敵対的レビュー (2026-08-26) が見つけた穴: これが唯一の
+       mkdir なので、`/littlefs/data` (native-editor-design.md §4.3 の
+       「同意不要の暗黙 grant」の親) と `/littlefs/scripts`
+       (native-editor-spec.md §A.7 の固定保存先) は、これを真似て
+       ここで一緒に作らないと永久に存在せず、fs_write/fs_mkdir は
+       親が無くて必ず ENOENT になる。ここに作る 1 つ下の `<app>` は
+       runtime 側 (vault_id ベースの暗黙 grant) の担当なので触らない。 */
+    mkdir(MOUNT "/data", 0777);    /* EEXIST is fine */
+    mkdir(MOUNT "/scripts", 0777); /* EEXIST is fine */
     char path[64];
     snprintf(path, sizeof path, MOUNT "/apps/%s.js", name);
     FILE *f = fopen(path, "wb");

@@ -288,6 +288,25 @@ void mqjs_ime_field_focus(int mode, int x, int y, int h);
 bool mqjs_post_ssh_data(int id, char *data, size_t len);
 void mqjs_post_ssh_closed(int id, const char *reason);
 
+/*
+ * Format a removable volume on a dedicated task (a big card writes tens
+ * of MB of FAT before it returns, so no caller's task may block on it).
+ * One at a time; false when one is already running, the id is unknown,
+ * or the volume is system storage (the internal one is never formatted).
+ *
+ * There is no JS binding any more (docs/native-editor-design.md §5:
+ * formatting is the filer's, and leaving it callable from JS gave every
+ * app a lever to stall the device). The native filer calls this; M2
+ * moves it behind fs_io (spec §A.7).
+ *
+ * `cb` runs ON THE FORMAT TASK when it finishes — post to your own queue
+ * from it and do nothing else. `err` is an esp_err_t widened to int so
+ * this header stays free of ESP-IDF includes. ESP build only.
+ */
+typedef void (*mqjs_fs_format_cb_t)(void *ctx, int err);
+bool mqjs_fs_format_begin(const char *volume_id, mqjs_fs_format_cb_t cb,
+                          void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

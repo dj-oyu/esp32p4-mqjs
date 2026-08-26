@@ -1,0 +1,97 @@
+# tools/tests/filer_ops.txt — fixed operation sequence for the native
+# filer migration gate (docs/native-editor-spec.md §C.6, driven by
+# tools/tests/filer_diff.sh). Same idea as tools/tests/ime_diff.sh's key
+# script: freeze the inputs once, diff the outputs across implementations.
+#
+# FORMAT. One instruction per line. Blank lines and lines starting with
+# '#' are ignored. Fields are whitespace-separated except WRITE's last
+# field, which is the rest of the line verbatim (may contain spaces).
+# Escapes recognized only inside WRITE's text field: "\n" -> newline,
+# "\\" -> a literal backslash. No other escapes exist — a lone "\" before
+# anything else is a driver error, not passed through.
+#
+#   VOL <id>              start a new volume block (internal | sd)
+#   MKDIR <path>
+#   WRITE <path> <text>   text is the rest of the line; see escapes above
+#   COPY <src> <dst>
+#   MOVE <src> <dst>
+#   RENAME <src> <dst>
+#   REMOVE <path> [r]     'r' = recursive (dir + contents). Omit for a
+#                          file, or a directory already known to be empty.
+#   LIST <path>           no side effect of its own; a listing checkpoint
+#
+# WHAT THE DRIVER RECORDS. After EVERY line (including LIST lines, where
+# that IS the line, and MKDIR/WRITE/COPY/MOVE/RENAME/REMOVE lines, where
+# it is the side effect) the driver calls fs.list() on the path given —
+# for MKDIR/WRITE/COPY/MOVE/RENAME/REMOVE that is the *parent* directory
+# of the path(s) touched (every op below stays inside one flat directory
+# per volume, so in practice this is always that directory). It records
+# the sorted {name, dir, size} triples. That is what "同じ操作列で同じ
+# 結果" (spec §C.6) means in practice — not each op's own return value,
+# but the directory state it leaves behind, the same way ls after each
+# step would.
+#
+# VOL sd IS A SEPARATE BLOCK, AND MAY NOT RUN. On a board with no "sd"
+# volume mounted (Stamp-P4 has no card slot at all, and any Tab5 run with
+# no card in it — filer-storage-design.md §2 treats Stamp-P4 as "a Tab5
+# that permanently has no card in", so both cases collapse to one check:
+# is "sd" in fs.volumes() and mounted?) the driver MUST skip the whole sd
+# block and record one SKIP line instead of failing. This file has to run
+# unchanged on every board this project supports; a card-only assertion
+# would make it Tab5-only, which the rest of this codebase treats as a
+# mistake to avoid, not a shortcut to take.
+#
+# Every path is written out in full (never relative to a prior VOL) so a
+# reader does not have to hold driver state in their head to follow this
+# file top to bottom.
+#
+# Each volume's block is self-cleaning: it removes everything it created,
+# in reverse order, ending with the block's own root directory. A run
+# that dies partway through will leave litter under .../filer_diff on
+# that volume — that is a driver bug (or a device that crashed mid-run),
+# not something this file's dependants should route around; delete it by
+# hand and find out why the run did not reach REMOVE.
+
+VOL internal
+MKDIR /internal/filer_diff
+LIST /internal/filer_diff
+WRITE /internal/filer_diff/a.txt hello filer\nline two
+LIST /internal/filer_diff
+COPY /internal/filer_diff/a.txt /internal/filer_diff/b.txt
+LIST /internal/filer_diff
+MOVE /internal/filer_diff/b.txt /internal/filer_diff/c.txt
+LIST /internal/filer_diff
+RENAME /internal/filer_diff/c.txt /internal/filer_diff/d.txt
+LIST /internal/filer_diff
+MKDIR /internal/filer_diff/sub
+LIST /internal/filer_diff
+REMOVE /internal/filer_diff/a.txt
+LIST /internal/filer_diff
+REMOVE /internal/filer_diff/d.txt
+LIST /internal/filer_diff
+REMOVE /internal/filer_diff/sub
+LIST /internal/filer_diff
+REMOVE /internal/filer_diff
+LIST /internal/filer_diff
+
+VOL sd
+MKDIR /sd/filer_diff
+LIST /sd/filer_diff
+WRITE /sd/filer_diff/a.txt hello filer\nline two
+LIST /sd/filer_diff
+COPY /sd/filer_diff/a.txt /sd/filer_diff/b.txt
+LIST /sd/filer_diff
+MOVE /sd/filer_diff/b.txt /sd/filer_diff/c.txt
+LIST /sd/filer_diff
+RENAME /sd/filer_diff/c.txt /sd/filer_diff/d.txt
+LIST /sd/filer_diff
+MKDIR /sd/filer_diff/sub
+LIST /sd/filer_diff
+REMOVE /sd/filer_diff/a.txt
+LIST /sd/filer_diff
+REMOVE /sd/filer_diff/d.txt
+LIST /sd/filer_diff
+REMOVE /sd/filer_diff/sub
+LIST /sd/filer_diff
+REMOVE /sd/filer_diff
+LIST /sd/filer_diff

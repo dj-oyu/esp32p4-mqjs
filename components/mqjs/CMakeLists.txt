@@ -26,6 +26,7 @@ idf_component_register(
     PRIV_REQUIRES driver esp_driver_gpio esp_driver_i2c esp_timer nvs_flash
                   ui_tab5 pwr_tab5 sshc cam_tab5 audio_tab5 esp_http_client esp-tls mbedtls
                   microlink esp_netif skk_core term_core ime_core fs_core
+                  fs_picker
 )
 
 # Vendored engine: uint32_t is 'long unsigned int' on riscv32, so the
