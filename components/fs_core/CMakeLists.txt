@@ -5,5 +5,5 @@
 # だけで表現される — docs/filer-storage-design.md §3。
 # fs_reserved.c は ESP-IDF のヘッダを含まない純粋な述語だけ。ホストの gcc
 # でそのままコンパイルできる形にしてあり、pc_test/ がそれを叩く。
-idf_component_register(SRCS "fs_vol.c" "fs_ops.c" "fs_reserved.c"
+idf_component_register(SRCS "fs_vol.c" "fs_ops.c" "fs_reserved.c" "fs_grant.c"
                        INCLUDE_DIRS "include")

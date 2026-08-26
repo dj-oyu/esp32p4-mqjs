@@ -53,7 +53,7 @@ else
     if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout 60"; fi
 fi
 
-CFLAGS="-std=c99 -O1 -g -Wall -Wextra -I$SRC_DIR -I."
+CFLAGS="-std=c99 -O1 -g -Wall -Wextra -I$SRC_DIR -I$SRC_DIR/include -I."
 
 mkdir -p "$BUILD_DIR" || exit 1
 
@@ -71,7 +71,7 @@ rm -f "$probe.c" "$probe.bin"
 # ---------------------------------------------------------------- sources
 # Only the ESP-free translation units. Listed by name rather than globbed:
 # adding a FreeRTOS-using file to fs_core must not silently break this.
-CORE_SRCS="$SRC_DIR/fs_reserved.c"
+CORE_SRCS="$SRC_DIR/fs_reserved.c $SRC_DIR/fs_grant.c"
 for f in $CORE_SRCS; do
     if [ ! -f "$f" ]; then
         echo "ERROR: $f is missing." >&2
