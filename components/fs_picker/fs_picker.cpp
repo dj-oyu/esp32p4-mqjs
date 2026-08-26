@@ -12,13 +12,36 @@
  *                     resume する。LVGL オブジェクトには一切触らない。
  *   tick_cb()         UI タスク。lv_timer から呼ばれる = lv_timer_handler の
  *                     中 = LVGL ロック保持下。開く / 一覧を作る / 行を叩かれた /
- *                     確定 / 畳む、を 1 tick に 1 段だけ進める。
+ *                     確定 / 畳む、を進める。
  *   LVGL イベント     UI タスク。「何をするか」を p->work に書いて timer を
  *                     起こすだけで、**その場では何も壊さない**。
  *
  * この分け方には理由がある。行のタップで一覧を作り直す = イベント配送中に
  * その行を lv_obj_clean() で消す、になり LVGL が落ちる。1 段の遅延を挟むと
  * 「削除するときイベントスタックは空」が構造で保証される。
+ *
+ * ---- 1 タップ = 1 フレーム (体感レイテンシ) -----------------------
+ *
+ * その 1 段の遅延から先は、**全部同じ tick でやる**。
+ *
+ *   enter_dir (fs_dir_open か親スタック) → build_chunk → 差し替え →
+ *   lv_refr_now
+ *
+ * 以前は enter_dir が lv_obj_clean してから**次の tick で** build して
+ * いた。esp_lvgl_port の loop は「イベント待ち 1 tick 以上 + 末尾
+ * vTaskDelay(1)」(CONFIG_FREERTOS_HZ=100) なので 1 周 10〜20 ms、そこに
+ * CONFIG_LV_DEF_REFR_PERIOD=33 が乗って**描画は実効 40 ms 周期に量子化**
+ * される。つまりあの 2 段構成は、その隙間に空の一覧を 1 フレーム見せた
+ * うえで、10〜60 ms を捨てていた。
+ *
+ * 空フレームを構造で消すために、一覧は **2 枚**持つ (s_lists)。新しい行は
+ * 裏へ作り、揃った瞬間に表と入れ替えて旧行を消す。1 tick に作る行数の
+ * 上限 (FS_PICK_ROWS_PER_TICK) は残してあるので大きなフォルダは複数 tick に
+ * 分かれるが、その間ずっと**旧い一覧が見えている** —— 空にはならない。
+ *
+ * 「上へ」は親スナップショットのスタック (FS_PICK_DEPTH_MAX) から取る。
+ * fs_dir_open をやり直さないので dir_open ぶん (実機で 1.9 ms) が消え、
+ * 降りる前のスクロール位置も戻る。
  *
  * lv_timer を使い、ui_tab5_post_job() を使わないのも理由がある:
  * ui_run_frame_work() はキューを while で**空になるまで**回すので、
@@ -55,19 +78,25 @@
  * ---- 測るための穴 (spec §B.2 / §F #7) ------------------------------
  *
  * 実機で 1 回開けば FS_PICK_ROWS_PER_TICK / SCAN_PER_TICK / ROWS_MAX /
- * TICK_MS は決まる。そのための 1 行ログを 4 か所に置いてある。TAG は
- * すべて "fs_pick":
+ * TICK_MS は決まる。TAG はすべて "fs_pick":
  *
- *   begin ...   呼び出し側 (JS タスク) が止まった時間: ロック待ち / 保持
+ *   begin ...     呼び出し側 (JS タスク) が止まった時間: ロック待ち / 保持
  *   dir_open ...  件数 / truncated / 所要 µs。50 ms 超で行末に印
  *                 (spec §F #7 — 超えるなら M2 の fs_io へ逃がす)
- *   list ...    件数・行数・灰色の行数・チャンク数・合計 µs・
- *               **1 tick の最大ロック保持 µs**・そのときのつまみの値。
- *               8 ms 超で行末に印 (spec §B.2)
- *   open ...    ダイアログが出るまでの所要 = その tick のロック保持
+ *   nav / open …  **タップから画素まで 1 行**。present() を参照:
+ *                 ev / dir / build / draw / px の 5 点で、どの隙間が
+ *                 太いかがそのまま読める
+ *   list ...      1 tick のロック保持が 8 ms 予算を超えたときだけ WARN
+ *                 (つまみの現在値つき、spec §B.2)
+ *   open ...      ダイアログを出す tick のロック保持が 8 ms 超のときだけ
  *
  * さらに 8 ms を超えた tick は "tick work=N held lvgl ... us" を WARN で
  * 1 行出す (毎 tick 出すと一覧の構築でログが溢れるので、超過分だけ)。
+ * lv_refr_now を tick の中で呼ぶので、**この保持は描画のぶん伸びる**
+ * ——ここは監督の判断で受け入れた上で、黙って破らないために出し続ける。
+ *
+ * フラッシュ停止の内訳は fs_dir_open を main/flash_stall_meter.c で
+ * 挟んで見る (FS_PICK_STALL_PROBE)。
  */
 #include "sdkconfig.h"
 
@@ -103,6 +132,18 @@
 
 static const char *TAG = "fs_pick";
 
+/* main/flash_stall_meter.h の 2 本。**include しないで宣言を写している。**
+   main は「全部に依存する」コンポーネントなので、こちらから REQUIRES を
+   張ると循環になる (そもそも main は INCLUDE_DIRS を公開していない)。
+   実体は main/flash_stall_meter.c にあり、app_main.c が
+   flash_stall_meter_start() を呼ぶので必ずリンクに載る。C リンケージ。
+   CONFIG_MQJS_FLASH_STALL_METER が無効なビルドでは中身が空なので、
+   いつ呼んでもよい。呼ぶのは FS_PICK_STALL_PROBE の内側だけなので、
+   そこを 0 にすればリンク上の依存も消える (spec §依存の向き:
+   fs_picker は fs_core と ui_tab5 だけ、を保てる)。 */
+extern "C" void flash_stall_meter_report(const char *why);
+extern "C" void flash_stall_meter_reset(void);
+
 /* ---- 調整つまみ (どれも未測。openQuestions を参照) ---------------- */
 
 /* 1 tick で作る行数の上限。LVGL ロックの保持を切る単位。 */
@@ -137,6 +178,28 @@ static const char *TAG = "fs_pick";
    届かなくなるため —— S4。) */
 #define FS_PICK_LOCK_MS 200
 
+/* 親スナップショットを何段まで残すか。潜るときに今のスナップショットを
+   捨てずに積んでおくと、「上へ」が fs_dir_open (実機で 1 回 1.9 ms) を
+   払わずに済む —— 実機のセッションでは 12 回の dir_open のうち 9 回が
+   親への戻り (/internal を 6 回、/internal/apps を 3 回) だった。
+   スナップショットは fs_core が PSRAM に持っているものをそのまま
+   持ち回るので、内蔵 SRAM は増えない。
+   **上限を超えたら「いちばん浅い段」を捨てる。** 「上へ」が要るのは
+   近い祖先から順なので、遠いほうから手放すのが正しい。捨てた段より上へ
+   戻るときは fs_dir_open へ落ちるだけで (= この変更の前の挙動)、
+   壊れはしない。 */
+#define FS_PICK_DEPTH_MAX 8
+
+/* fs_dir_open の前後に main/flash_stall_meter.c を挟むか。
+   CONFIG_LITTLEFS_MMAP_PARTITION が効いていれば read が memcpy になり、
+   "no flash stalls at all" が出る —— それが「効いた」の証拠そのもの。
+   **判定が済んだら 0 にすること。** 理由は 2 つ:
+     - 計測器は端末で 1 つしかない。ここで reset を打つと main の 30 秒
+       報告の窓も切ってしまう。
+     - report は 3 行を 115200 baud の UART へ同期に吐く (~20 ms)。
+       画素が出たあとに呼んではいるが、LVGL ロックの保持はその分伸びる。 */
+#define FS_PICK_STALL_PROBE 1
+
 /* 色は ui_widgets.cpp と同じ調色 (別コンポーネントなので値で持つ)。 */
 #define PK_COL_BG     0x0B0E11
 #define PK_COL_PANEL  0x1A222C
@@ -156,6 +219,17 @@ enum {
     W_UP,        /* 「上へ」 */
     W_CONFIRM,   /* 「開く/保存/このフォルダ/許可」 */
     W_ABORT,     /* 「キャンセル/拒否」 */
+};
+
+/* 積んである祖先 1 段ぶん。スナップショットは複製せず、fs_core が
+   PSRAM に持っているものの**所有権そのもの**を預かる。 */
+struct PickFrame {
+    char           path[FS_PATH_MAX];
+    fs_dir_t      *dir;
+    const fsvol_t *vol;    /* staleness 判定の相手 (NULL なら判定しない) */
+    uint32_t       epoch;  /* 積んだ時点の fsvol_epoch */
+    int32_t        scroll_y;
+    int            n;
 };
 
 struct Pick {
@@ -187,6 +261,26 @@ struct Pick {
     int64_t   build_us, build_max_us;
     int64_t   open_us;  /* begin から画面が出るまで (UI タスク側の所要) */
     int       hit;      /* 叩かれた行のスナップショット添字 */
+
+    /* --- 一覧の差し替え --- */
+    bool      nav;         /* 作り直しが進行中。表に出ている行は
+                              **古いスナップショットの添字**を持っている
+                              ので、この間の行タップは無視する */
+    bool      to_back;     /* 裏の一覧へ積んでいる (= 差し替える旧行がある)。
+                              初回だけ false で、表へ直に積む */
+    int32_t   pend_scroll; /* 差し替えたあとに戻すスクロール位置 */
+    char      note_pend[192];  /* 差し替えと同じ瞬間に出す注意書き */
+
+    /* --- 親スナップショットのスタック (PSRAM。Pick ごと PSRAM) --- */
+    PickFrame up[FS_PICK_DEPTH_MAX];
+    int       updepth;
+
+    /* --- 1 行トレース用の刻み (esp_timer_get_time) --- */
+    int64_t   t_click;  /* 離した検知 = LV_EVENT_CLICKED / begin の入口 */
+    int64_t   t_work;   /* do_row / W_UP / do_open の入口 */
+    int64_t   t_dir;    /* スナップショットが手に入った (dir_open 込み) */
+    int64_t   t_rows;   /* 直近のチャンクを作り終えた */
+    bool      stall_armed;  /* dir_open を挟んだので、描画後に報告する */
 
     /* 組み立て用の器。**スタックに置かない**: この構造体を触るのは
        lv_timer のコールバック = LVGL タスクで、そのスタックは 7,168 B
@@ -221,7 +315,15 @@ static fs_pick_result_t s_res;
    毎回作り直すと、行のタップで自分を消すことになるのと、
    lv_layer_top の子の並びが picker ごとに変わるのを避けるため。 */
 static lv_obj_t  *s_scrim, *s_dlg, *s_title, *s_path, *s_info, *s_note;
-static lv_obj_t  *s_list, *s_name, *s_kb;
+/* 一覧は **2 枚** 持つ。表 (s_lists[s_front]) が見えているほうで、
+   作り直しは裏へ作ってから差し替える —— 「旧行を消すのは新行が揃った
+   瞬間」を構造で保証するため。以前は lv_obj_clean してから次の tick で
+   作っていたので、その隙間に空の一覧が 1 フレーム描かれえた。
+   2 枚目が内蔵 SRAM を食わないのは、LVGL のヒープ (3MB) が PSRAM だから
+   (components/ui_tab5/CMakeLists.txt の LV_MEM_POOL_ALLOC)。 */
+static lv_obj_t  *s_lists[2];
+static int        s_front;
+static lv_obj_t  *s_name, *s_kb;
 static lv_obj_t  *s_btn_up, *s_btn_ok, *s_lbl_ok, *s_lbl_cancel;
 static lv_timer_t *s_tick;
 
@@ -469,6 +571,12 @@ static void row_event(lv_event_t *e)
     Pick *p = s_p;
     if (!p || p->done || !p->shown)
         return;
+    /* 作り直しの最中は無視する。表に出ている行は**古いスナップショットの
+       添字**を持っているのに p->dir はもう新しいほうなので、ここを通すと
+       別のエントリを開いてしまう (旧行を残す作りにした帰結)。 */
+    if (p->nav)
+        return;
+    p->t_click = esp_timer_get_time();   /* 離した検知 (LV_EVENT_CLICKED) */
     p->hit  = (int)(intptr_t)lv_event_get_user_data(e);
     p->work = W_ROW;
     wake();
@@ -479,6 +587,7 @@ static void btn_event(lv_event_t *e)
     Pick *p = s_p;
     if (!p || p->done || !p->shown)
         return;
+    p->t_click = esp_timer_get_time();
     p->work = (uint8_t)(intptr_t)lv_event_get_user_data(e);
     wake();
 }
@@ -598,12 +707,19 @@ static bool build_ui(void)
     lv_label_set_text(s_note, "");
     lv_obj_add_flag(s_note, LV_OBJ_FLAG_HIDDEN);
 
-    s_list = lv_list_create(s_dlg);
-    lv_obj_set_width(s_list, LV_PCT(100));
-    lv_obj_set_flex_grow(s_list, 1);
-    lv_obj_set_style_bg_color(s_list, lv_color_hex(PK_COL_PANEL), 0);
-    lv_obj_set_style_border_width(s_list, 0, 0);
-    lv_obj_set_style_pad_all(s_list, 4, 0);
+    /* 表と裏。lv_flex は LV_OBJ_FLAG_HIDDEN の子を配置から外す
+       (lv_flex.c:261,394) ので、隠れているほうは場所を取らない。 */
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *L = lv_list_create(s_dlg);
+        lv_obj_set_width(L, LV_PCT(100));
+        lv_obj_set_flex_grow(L, 1);
+        lv_obj_set_style_bg_color(L, lv_color_hex(PK_COL_PANEL), 0);
+        lv_obj_set_style_border_width(L, 0, 0);
+        lv_obj_set_style_pad_all(L, 4, 0);
+        s_lists[i] = L;
+    }
+    s_front = 0;
+    lv_obj_add_flag(s_lists[1], LV_OBJ_FLAG_HIDDEN);
 
     s_name = lv_textarea_create(s_dlg);
     lv_textarea_set_one_line(s_name, true);
@@ -673,6 +789,16 @@ static void kb_place(bool on)
 
 /* ---- 一覧 -------------------------------------------------------- */
 
+static lv_obj_t *front_list(void) { return s_lists[s_front]; }
+static lv_obj_t *back_list(void)  { return s_lists[s_front ^ 1]; }
+
+/* いま行を積んでいる先。差し替える旧行がまだ無い初回だけ表へ直に積む
+   (裏へ作ると、ダイアログが出るまでの間ずっと画面に何も出ない)。 */
+static lv_obj_t *build_list(const Pick *p)
+{
+    return p->to_back ? back_list() : front_list();
+}
+
 static void close_dir(Pick *p)
 {
     if (p->dir) {
@@ -681,20 +807,208 @@ static void close_dir(Pick *p)
     }
 }
 
-/* vpath ("" ならボリューム一覧) を開き、一覧の作り直しを予約する。 */
-static void enter_dir(Pick *p, const char *vpath)
+/* ---- 親スナップショットのスタック --------------------------------
+ *
+ * 「上へ」のたびに fs_dir_open をやり直すと、実機で 1 回 1.9 ms
+ * (littlefs のメタデータ走査 = 両コアのキャッシュ停止) を払う。潜るときに
+ * 今のスナップショットを積んでおけば、戻りはその 0 ms 版になる。
+ * 積むのは**所有権そのもの**で、複製はしない (fs_core の PSRAM のまま)。
+ *
+ * 捨てる条件は fsvol_epoch の変化だけ。ピッカーはモーダルで寿命が短い
+ * ので、抜き差し / フォーマットを跨いだかどうかだけ見れば足りる。
+ * 深さの上限と溢れたときの挙動は FS_PICK_DEPTH_MAX の注記を参照。
+ */
+static void stack_clear(Pick *p)
 {
+    for (int i = 0; i < FS_PICK_DEPTH_MAX; i++) {
+        if (p->up[i].dir) {
+            fs_dir_close(p->up[i].dir);
+            p->up[i].dir = NULL;
+        }
+    }
+    p->updepth = 0;
+}
+
+/* いま見ているスナップショットを親として積む (潜るときに呼ぶ)。
+   呼んだあと p->dir は NULL —— 所有権はスタックにある。 */
+static void stack_push_current(Pick *p)
+{
+    if (p->at_vols || !p->dir) {
+        /* ボリューム一覧は fsvol_count() を読むだけで作り直せるので
+           積む価値が無い。 */
+        close_dir(p);
+        return;
+    }
+    if (p->updepth >= FS_PICK_DEPTH_MAX) {
+        if (p->up[0].dir)
+            fs_dir_close(p->up[0].dir);
+        memmove(&p->up[0], &p->up[1],
+                sizeof p->up[0] * (FS_PICK_DEPTH_MAX - 1));
+        p->updepth = FS_PICK_DEPTH_MAX - 1;
+        /* memmove は最後の段の**複製**を残す。その dir はもう
+           p->up[updepth-1] が持っているので、二重 close を防ぐ。 */
+        p->up[p->updepth].dir = NULL;
+    }
+    PickFrame *f = &p->up[p->updepth++];
+    copy_str(f->path, sizeof f->path, p->cur);
+    f->dir      = p->dir;
+    f->n        = p->n;
+    f->scroll_y = lv_obj_get_scroll_y(front_list());
+    const fsvol_t *v = NULL;
+    /* いま開けたばかりの道なので必ず解決する。戻り値は見ない
+       (見るのは *v が埋まったかどうかだけ)。 */
+    (void)fsvol_resolve(p->cur, &v, NULL, 0);
+    f->vol   = v;
+    f->epoch = v ? fsvol_epoch(v) : 0;
+    p->dir = NULL;
+}
+
+/* 「上へ」。使える親が積んであれば現在地にして true。
+   無い / 古い場合は false —— 呼び出し側が fs_dir_open で開き直す。 */
+static bool stack_pop(Pick *p, int32_t *restore_y)
+{
+    if (p->updepth <= 0)
+        return false;
+    PickFrame *f = &p->up[p->updepth - 1];
+    if (f->vol && fsvol_epoch(f->vol) != f->epoch) {
+        /* 積んである段はすべて同じボリュームなので、まとめて捨てる。 */
+        stack_clear(p);
+        return false;
+    }
+    p->updepth--;
     close_dir(p);
-    copy_str(p->cur, sizeof p->cur, vpath);
-    p->at_vols = (p->cur[0] == '\0');
-    p->n = p->scanned = p->rows = p->blocked = p->chunks = 0;
+    p->dir     = f->dir;
+    f->dir     = NULL;
+    copy_str(p->cur, sizeof p->cur, f->path);
+    p->at_vols = false;
+    p->n       = f->n;
+    *restore_y = f->scroll_y;
+    return true;
+}
+
+/* 揃ったフレームを**今すぐ**画面へ出し、タップから画素までを 1 行残す。
+ *
+ * lv_refr_now() が要るのは、esp_lvgl_port の loop が
+ * 「イベント待ち 1 tick 以上 + 末尾 vTaskDelay(1)」(CONFIG_FREERTOS_HZ=100)
+ * で 1 周 10〜20 ms、そこに CONFIG_LV_DEF_REFR_PERIOD=33 が乗るため。
+ * 待つと 0〜40 ms 遅れる。ui_tab5.cpp:3015 の KB_BENCH_STEP が
+ * UI タスク上・LVGL ロック下で同じことをしている前例。
+ * 引数 NULL = 全ディスプレイ (lv_refr.c:95-101。この機は 1 枚)。
+ * ui_tab5 の s_disp は外へ出ていないが、NULL で足りるので口は要らない。
+ *
+ * **LVGL ロックの保持はこの描画のぶんだけ伸びる。** 監督の判断で受け入れ
+ * (ピッカーはモーダルなので、その間フォアグラウンドのアプリは入力を
+ * 奪われており、§B.2 の 8 ms 予算が守っている相手が居ない)。ただし
+ * 黙って破らない —— 破った量は tick_cb の "held lvgl" 行に出続ける。
+ *
+ * 1 行の読み方 (どの隙間が太いかが一目で分かること):
+ *   ev    離した検知 (LV_EVENT_CLICKED) → do_row/W_UP の入口
+ *   dir   その入口 → スナップショットが手に入るまで (fs_dir_open 込み。
+ *         親スタックに当たれば 0 になるのが狙い)
+ *   build 行の構築 (複数 tick に跨ったぶんの合計)
+ *   draw  差し替え + lv_refr_now = 画素が出るまで
+ *   px    タップから画素まで (= 上の 4 つの合計)
+ * "held lvgl" の値からこの px を引いた残りが、この 1 行自身を UART へ
+ * 吐くのにかかった時間 (115200 baud = 1 文字 ~87 us)。 */
+static void present(Pick *p, const char *what)
+{
+    lv_refr_now(NULL);
+
+    int64_t t1  = esp_timer_get_time();
+    int64_t dir = p->t_dir ? p->t_dir : p->t_work;
+    int64_t row = p->t_rows ? p->t_rows : dir;
+    ESP_LOGI(TAG,
+             "%s n=%d rows=%d blk=%d tk=%d ev=%lld dir=%lld build=%lld "
+             "draw=%lld px=%lld us",
+             what, p->n, p->rows, p->blocked, p->chunks,
+             (long long)(p->t_work - p->t_click), (long long)(dir - p->t_work),
+             (long long)(row - dir), (long long)(t1 - row),
+             (long long)(t1 - p->t_click));
+
+#if FS_PICK_STALL_PROBE
+    if (p->stall_armed) {
+        p->stall_armed = false;
+        /* MMAP (CONFIG_LITTLEFS_MMAP_PARTITION) が効いたなら
+           "no flash stalls at all" が出る。**画素が出たあとに呼ぶ** ——
+           3 行を同期に UART へ吐くので、タップと画素の間に置くと太る。 */
+        flash_stall_meter_report("fs_pick dir_open..drawn");
+    }
+#endif
+}
+
+/* 行が揃った。見出し・注意書き・一覧を**同じ瞬間に**差し替える。 */
+static void finish_rebuild(Pick *p)
+{
+    /* 見出しも一覧と同じ瞬間に変える。先に変えると、複数 tick に跨る
+       作り直しの途中で「新しいパス + 古い一覧」の 1 フレームが出る。 */
+    lv_label_set_text(s_path, p->at_vols ? "ボリューム" : p->cur);
+    note(p->note_pend[0] ? p->note_pend : NULL);
+
+    if (p->to_back) {
+        lv_obj_t *old_l = front_list();
+        lv_obj_t *new_l = back_list();
+        lv_obj_remove_flag(new_l, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(old_l, LV_OBJ_FLAG_HIDDEN);
+        s_front ^= 1;
+        lv_obj_clean(old_l);   /* 旧行を消すのは新行を出したこの瞬間 */
+        lv_obj_scroll_to_y(old_l, 0, LV_ANIM_OFF);
+    }
+    /* スクロールは寸法が決まってからでないと 0 へ丸められる。
+       まだ出ていない (初回) ときは、この直後に do_open がダイアログを
+       出して配置がもう一度汚れるので、ここで走らせるだけ無駄になる ——
+       新品の一覧なので戻す位置も 0 しかない。 */
+    if (p->shown) {
+        lv_obj_update_layout(front_list());
+        lv_obj_scroll_to_y(front_list(), p->pend_scroll, LV_ANIM_OFF);
+    }
+    p->nav = false;
+
+    if (p->shown)
+        present(p, "nav");
+    /* まだ出ていない (初回) ときは do_open が出してから描く —— ここで
+       描くと、ダイアログの無い画面を 1 枚まるごと描いて捨てることになる。 */
+}
+
+/* 新しい一覧を作り始める。**表の一覧には触らない** —— 旧行は新行が
+   揃う瞬間まで見えたままにする (空フレームを構造で消す)。 */
+static void begin_rebuild(Pick *p, int32_t restore_y)
+{
+    p->scanned = p->rows = p->blocked = p->chunks = 0;
     p->build_us = p->build_max_us = 0;
+    p->pend_scroll = restore_y;
+    p->to_back     = p->shown;
+    p->nav         = true;
+    p->t_dir       = esp_timer_get_time();
+    p->t_rows      = 0;
+    lv_obj_clean(build_list(p));   /* 作りかけが残っていたら捨てる */
+    p->work = W_BUILD;
+}
+
+/* vpath ("" ならボリューム一覧) を開き、一覧の作り直しを予約する。
+   keep_parent が真なら、いま見ているスナップショットは捨てずに親スタックへ
+   積む (= 「上へ」が dir_open を払わなくなる)。 */
+static void enter_dir(Pick *p, const char *vpath, bool keep_parent)
+{
+    if (keep_parent)
+        stack_push_current(p);
+    else
+        close_dir(p);
+
+    copy_str(p->cur, sizeof p->cur, vpath);
+    p->at_vols      = (p->cur[0] == '\0');
+    p->n            = 0;
+    p->note_pend[0] = '\0';
 
     if (p->at_vols) {
+        /* 根まで戻った。積んである祖先はもう誰も使わない。 */
+        stack_clear(p);
         p->n = fsvol_count();
-        lv_label_set_text(s_path, "ボリューム");
     } else {
-        int64_t   t0  = esp_timer_get_time();
+        int64_t t0 = esp_timer_get_time();
+#if FS_PICK_STALL_PROBE
+        flash_stall_meter_reset();
+        p->stall_armed = true;
+#endif
         fs_dir_t *d   = NULL;
         esp_err_t err = fs_dir_open(p->cur, &d);
         int64_t   dt  = esp_timer_get_time() - t0;
@@ -703,38 +1017,36 @@ static void enter_dir(Pick *p, const char *vpath)
         ESP_LOGI(TAG, "dir_open %s -> %s n=%d trunc=%d %lld us%s", p->cur,
                  err == ESP_OK ? "ok" : fs_err_str(err), n,
                  fs_dir_truncated(d) ? 1 : 0, (long long)dt,
-                 dt > FS_PICK_DIR_WARN_US
-                     ? "  ** >50ms: move to fs_io (spec A.4/F#7) **"
-                     : "");
+                 dt > FS_PICK_DIR_WARN_US ? "  **>50ms: fs_io (A.4/F#7)**"
+                                          : "");
         if (err != ESP_OK) {
             char shown[128];
             clip_utf8(shown, sizeof shown, p->cur);
             snprintf(p->msg, sizeof p->msg, "%s を開けません: %s", shown,
                      fs_err_str(err));
-            note(p->msg);
+            copy_str(p->note_pend, sizeof p->note_pend, p->msg);
             /* 開けない場所に留まっても出口が無い。ボリューム一覧へ戻す。 */
             copy_str(p->cur, sizeof p->cur, "");
             p->at_vols = true;
-            p->n       = fsvol_count();
-            lv_label_set_text(s_path, "ボリューム");
+            stack_clear(p);
+            p->n = fsvol_count();
         } else {
             p->dir = d;
             p->n   = n;
-            lv_label_set_text(s_path, p->cur);
             if (fs_dir_truncated(d))
-                note("このフォルダは大きすぎるので途中までしか読んでいません");
+                copy_str(p->note_pend, sizeof p->note_pend,
+                         "このフォルダは大きすぎるので途中までしか"
+                         "読んでいません");
         }
     }
 
-    lv_obj_clean(s_list);
-    lv_obj_scroll_to_y(s_list, 0, LV_ANIM_OFF);
-    p->work = W_BUILD;
+    begin_rebuild(p, 0);
 }
 
 static void add_row(Pick *p, int snap_idx, const char *icon, const char *text,
                     bool enabled)
 {
-    lv_obj_t *b = lv_list_add_button(s_list, icon, text);
+    lv_obj_t *b = lv_list_add_button(build_list(p), icon, text);
     if (!b)
         return;
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
@@ -835,6 +1147,7 @@ static void build_chunk(Pick *p)
     if (dt > p->build_max_us)
         p->build_max_us = dt;
     p->chunks++;
+    p->t_rows = esp_timer_get_time();
 
     bool more = (p->scanned < p->n) && (p->rows < FS_PICK_ROWS_MAX);
     if (more) {
@@ -844,26 +1157,33 @@ static void build_chunk(Pick *p)
     if (p->rows >= FS_PICK_ROWS_MAX && p->scanned < p->n) {
         snprintf(p->msg, sizeof p->msg,
                  "%d 件のうち先頭 %d 件だけ表示しています", p->n, p->rows);
-        note(p->msg);
+        copy_str(p->note_pend, sizeof p->note_pend, p->msg);
     }
     /* spec §B.2: 1 チャンクの所要が、この tick で LVGL ロックに上乗せした
-       時間そのもの。監督が実機でこの 1 行を見て
-       FS_PICK_ROWS_PER_TICK / FS_PICK_SCAN_PER_TICK / FS_PICK_ROWS_MAX /
-       FS_PICK_TICK_MS を決める。件数・所要 ms・ロック保持 ms が 1 行に
-       揃っていること。 */
-    ESP_LOGI(TAG,
-             "list %s n=%d rows=%d blocked=%d scanned=%d chunks=%d "
-             "build=%lld us hold_max=%lld us "
-             "[rows/tick=%d scan/tick=%d rows_max=%d tick=%d ms]%s",
-             p->at_vols ? "(vols)" : p->cur, p->n, p->rows, p->blocked,
-             p->scanned, p->chunks, (long long)p->build_us,
-             (long long)p->build_max_us, FS_PICK_ROWS_PER_TICK,
-             FS_PICK_SCAN_PER_TICK, FS_PICK_ROWS_MAX, FS_PICK_TICK_MS,
-             p->build_max_us > FS_PICK_HOLD_WARN_US
-                 ? "  ** >8ms lock hold: lower FS_PICK_ROWS_PER_TICK "
-                   "(spec B.2) **"
-                 : "");
+       時間そのもの。**予算を超えたときだけ** 1 行出す —— 件数と所要は
+       present() の 1 行 (build=) に毎回入っているので、つまみの値まで
+       毎回吐くと 1 文字 87 us の UART がそのままロックの保持になる。 */
+    if (p->build_max_us > FS_PICK_HOLD_WARN_US)
+        ESP_LOGW(TAG,
+                 "list %s hold_max=%lld us > %d: lower FS_PICK_ROWS_PER_TICK "
+                 "(now rows/tick=%d scan/tick=%d rows_max=%d tick=%d ms)",
+                 p->at_vols ? "(vols)" : p->cur, (long long)p->build_max_us,
+                 FS_PICK_HOLD_WARN_US, FS_PICK_ROWS_PER_TICK,
+                 FS_PICK_SCAN_PER_TICK, FS_PICK_ROWS_MAX, FS_PICK_TICK_MS);
     p->work = W_IDLE;
+    finish_rebuild(p);
+}
+
+/* enter_dir を呼んだ tick のうちに 1 チャンク目まで進める。
+   「clean して次の tick で build」の 2 段だと、esp_lvgl_port の 1 周
+   (10〜20 ms) がまるまる余分にかかる。
+   **finish() が走っていないと分かっている呼び出し元からだけ呼ぶこと。** */
+static void kick_build(Pick *p)
+{
+    if (p->work == W_BUILD) {
+        p->work = W_IDLE;
+        build_chunk(p);
+    }
 }
 
 /* ---- モードごとの見た目 ------------------------------------------ */
@@ -908,10 +1228,13 @@ static void apply_mode(Pick *p)
         lv_obj_remove_flag(s_btn_up, LV_OBJ_FLAG_HIDDEN);
     else
         lv_obj_add_flag(s_btn_up, LV_OBJ_FLAG_HIDDEN);
-    if (want_list)
-        lv_obj_remove_flag(s_list, LV_OBJ_FLAG_HIDDEN);
-    else
-        lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
+    if (want_list) {
+        lv_obj_remove_flag(front_list(), LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(back_list(), LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_lists[0], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_lists[1], LV_OBJ_FLAG_HIDDEN);
+    }
     if (want_name) {
         lv_obj_remove_flag(s_name, LV_OBJ_FLAG_HIDDEN);
         lv_textarea_set_text(s_name, p->suggest);
@@ -927,6 +1250,7 @@ static void apply_mode(Pick *p)
 static void do_open(Pick *p)
 {
     int64_t t0 = esp_timer_get_time();
+    p->t_work  = t0;
 
     if (!build_ui()) {
         p->work = W_ABORT;
@@ -959,13 +1283,20 @@ static void do_open(Pick *p)
            そこに許可を出しても fs_core が跳ね返すので、先に言う。 */
         if (p->scope[0] && fs_path_reserved(p->scope))
             note("この範囲は書き換えできません (署名済みアプリの置き場)");
-        p->work = W_IDLE;
+        p->work  = W_IDLE;
+        p->t_dir = p->t_rows = esp_timer_get_time();
     } else {
         lv_label_set_text(s_title, p->title[0] ? p->title
                                                : (p->mode == FS_PICK_SAVE
                                                       ? "保存先を選ぶ"
                                                       : "ファイルを選ぶ"));
-        enter_dir(p, p->start);
+        enter_dir(p, p->start, false);
+        /* 1 チャンク目をこの tick で作る。p->shown はまだ false なので
+           finish_rebuild は描かずに戻る (出す前に描くと、ダイアログの
+           無い画面を 1 枚まるごと描いて捨てることになる)。
+           大きなフォルダで 1 チャンクに収まらなくても、**空ではない**
+           一覧と一緒にダイアログが出る。 */
+        kick_build(p);
     }
 
     lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
@@ -975,17 +1306,13 @@ static void do_open(Pick *p)
     p->shown  = true;
     p->open_us = esp_timer_get_time() - t0;
 
-    /* 「起動時」の 1 行 (spec §B.2 / §F #7)。この tick で LVGL ロックに
-       上乗せした時間 = そのまま open の所要。fs_dir_open の内訳は直前の
-       dir_open 行にある。 */
-    ESP_LOGI(TAG,
-             "open mode=%d n=%d open=%lld us (lock hold) [idle=%d ms "
-             "tick=%d ms budget=%d us]%s",
-             (int)p->mode, p->n, (long long)p->open_us, FS_PICK_IDLE_MS,
-             FS_PICK_TICK_MS, FS_PICK_HOLD_WARN_US,
-             p->open_us > FS_PICK_HOLD_WARN_US
-                 ? "  ** >8ms lock hold at open (spec B.2) **"
-                 : "");
+    /* 「起動時」の 1 行 (spec §B.2 / §F #7)。内訳 (ev/dir/build/draw) は
+       present() が同じ書式で出す —— ここは予算超過だけを見る。 */
+    if (p->open_us > FS_PICK_HOLD_WARN_US)
+        ESP_LOGW(TAG, "open mode=%d held %lld us > %d (spec B.2)",
+                 (int)p->mode, (long long)p->open_us, FS_PICK_HOLD_WARN_US);
+
+    present(p, "open");
 }
 
 /* ---- 確定と後始末 ------------------------------------------------ */
@@ -1017,10 +1344,16 @@ static void finish(Pick *p, bool ok, const char *vpath)
         lv_obj_add_flag(s_dlg, LV_OBJ_FLAG_HIDDEN);
     if (s_scrim)
         lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
-    if (s_list)
-        lv_obj_clean(s_list);
+    if (s_lists[0]) {
+        lv_obj_clean(s_lists[0]);
+        lv_obj_clean(s_lists[1]);
+    }
     close_dir(p);
+    /* 積んである親スナップショットも手放す。ここで忘れると、
+       ピッカーを閉じるたびに PSRAM が深さぶん残る。 */
+    stack_clear(p);
     p->shown = false;
+    p->nav   = false;
     p->work  = W_IDLE;
 
     s_res.ok = ok;
@@ -1058,14 +1391,16 @@ static void too_long_note(Pick *p)
 
 static void do_row(Pick *p)
 {
-    p->work = W_IDLE;
+    p->work   = W_IDLE;
+    p->t_work = esp_timer_get_time();
     if (p->at_vols) {
         const fsvol_t *v = fsvol_at(p->hit);
         if (!v)
             return;
         snprintf(p->scratch, sizeof p->scratch, "/%s", v->id);
-        note(NULL);
-        enter_dir(p, p->scratch);
+        /* ボリューム一覧は積まない (作り直しが fsvol_count() だけ)。 */
+        enter_dir(p, p->scratch, false);
+        kick_build(p);
         return;
     }
     fs_entry_t e;
@@ -1074,8 +1409,9 @@ static void do_row(Pick *p)
 
     join_path(p->scratch, sizeof p->scratch, p->cur, e.name);
     if (e.is_dir) {
-        note(NULL);
-        enter_dir(p, p->scratch);
+        /* 潜る = いまのスナップショットを親として積む。 */
+        enter_dir(p, p->scratch, true);
+        kick_build(p);
         return;
     }
     switch (p->mode) {
@@ -1187,15 +1523,25 @@ static void tick_step(lv_timer_t *t)
     case W_ROW:
         do_row(p);
         break;
-    case W_UP:
+    case W_UP: {
         p->work = W_IDLE;
-        if (!p->at_vols) {
+        if (p->at_vols)
+            break;
+        p->t_work = esp_timer_get_time();
+        int32_t y = 0;
+        if (stack_pop(p, &y)) {
+            /* 積んであった = fs_dir_open を払わない道。スクロール位置も
+               一緒に積んであるので、降りる前に見ていた場所へ戻す。 */
+            p->note_pend[0] = '\0';
+            begin_rebuild(p, y);
+        } else {
             copy_str(p->scratch, sizeof p->scratch, p->cur);
             parent_path(p->scratch);
-            note(NULL);
-            enter_dir(p, p->scratch);
+            enter_dir(p, p->scratch, false);
         }
+        kick_build(p);
         break;
+    }
     case W_CONFIRM:
         do_confirm(p);
         break;
@@ -1274,6 +1620,9 @@ bool fs_pick_begin(const fs_pick_req_t *req, fs_pick_cb_t cb, void *ctx)
         s_p = p;
     }
     memset(p, 0, sizeof *p);
+    /* 1 行トレースの起点。タップの前の「begin から画素まで」も同じ
+       物差しで読めるようにする (esp_timer は全タスク共通)。 */
+    p->t_click = esp_timer_get_time();
 
     /* 要求の文字列は呼び出し側の寿命なので、ここで複製し切る。 */
     p->mode = req->mode;

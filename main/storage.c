@@ -67,6 +67,21 @@ bool storage_init(void)
     }
     s_mounted = true;
     ESP_LOGI(TAG, "littlefs mounted at %s", MOUNT);
+
+    /* 暗黙 grant とエディタの保存先の親を、**マウント直後に**作る。
+       `fs_write` / `fs_mkdir` は親を作らないので、これが無いと
+       `/internal/data/<app>` (native-editor-design.md §4.3 の「同意不要の
+       逃がし弁」) と `/internal/scripts` (native-editor-spec.md §A.7 の
+       固定保存先) はどちらも永久に ENOENT になる。
+
+       storage_save_app() の中ではなくここに置く理由: あちらはアプリを
+       インストールしたときにしか走らないので、1 本も入れない機体では
+       ディレクトリが 1 度も作られない。M1 の敵対的レビューが「暗黙 grant
+       はそもそも動かない」と指摘した穴で、最初の修正はまさに
+       storage_save_app() 側に入れて実機で外した。
+       下の `<app>` は runtime (vault_id ベース) の担当なので触らない。 */
+    mkdir(MOUNT "/data", 0777);    /* EEXIST is fine */
+    mkdir(MOUNT "/scripts", 0777); /* EEXIST is fine */
     /* ファイラから見える "internal" ボリュームとして公開する。ここより
        上の層 (fs.* バインディングも files.js も) は /littlefs という実パスを
        一度も知らない — docs/filer-storage-design.md §4。 */
@@ -175,15 +190,6 @@ bool storage_save_app(const char *name, const char *src, size_t len)
     if (!s_mounted)
         return false;
     mkdir(MOUNT "/apps", 0777); /* EEXIST is fine */
-    /* M1 敵対的レビュー (2026-08-26) が見つけた穴: これが唯一の
-       mkdir なので、`/littlefs/data` (native-editor-design.md §4.3 の
-       「同意不要の暗黙 grant」の親) と `/littlefs/scripts`
-       (native-editor-spec.md §A.7 の固定保存先) は、これを真似て
-       ここで一緒に作らないと永久に存在せず、fs_write/fs_mkdir は
-       親が無くて必ず ENOENT になる。ここに作る 1 つ下の `<app>` は
-       runtime 側 (vault_id ベースの暗黙 grant) の担当なので触らない。 */
-    mkdir(MOUNT "/data", 0777);    /* EEXIST is fine */
-    mkdir(MOUNT "/scripts", 0777); /* EEXIST is fine */
     char path[64];
     snprintf(path, sizeof path, MOUNT "/apps/%s.js", name);
     FILE *f = fopen(path, "wb");
