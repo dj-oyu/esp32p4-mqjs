@@ -60,6 +60,7 @@ extern "C" void mqjs_post_touch(int x, int y, int kind);
 extern "C" void mqjs_post_key(const char *utf8, size_t len);
 extern "C" void mqjs_focus(int slot);
 extern "C" void mqjs_request_open(const char *name);
+extern "C" bool mqjs_native_fg_active(void);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -154,11 +155,28 @@ static ppa_client_handle_t s_ppa_fill;
    ui_blend565's a/15 math exactly. One full text row max. */
 #define UI_PPA_CELLS_MIN_CELLS 6
 static ppa_client_handle_t s_ppa_blend;
+
+/* A SECOND fill client, used only by the native-surface entry points
+   (ui_tab5_cells_draw / ui_tab5_canvas_fill, spec §A.3) — they run on
+   the caller's task, concurrently with the UI task's own drawing.
+   Sharing one client would not corrupt anything: ppa_register_client
+   gives a client max(1, max_pending_trans_num) transaction elements
+   (ppa_core.c:271) and ppa_do_fill takes one with xQueueReceive(...,0)
+   (ppa_fill.c:124), so the loser of a race just gets ESP_FAIL and falls
+   back to the CPU loop. A client of its own costs one queue plus one
+   descriptor and removes that coin flip. The blending ENGINE still
+   serialises the two clients (per-engine semaphore + spinlock,
+   ppa_core.c:120-132) — that is the driver's job, not ours. */
+static ppa_client_handle_t s_ppa_fill_nat;
 /* 720px = 80 cells: the max PPA segment (cells_run splits longer runs,
    e.g. 142-cell landscape rows); 64B-aligned (and 64B-multiple) for PPA
    cache ops. Deliberately NOT grown for landscape: internal SRAM. */
 static uint8_t s_cells_a8[720 * UI_CELL_H] __attribute__((aligned(64)));
 
+/* pc_test/run_tests.sh cuts between the two markers below and compiles
+   the result, so the host test exercises THIS text and not a copy of
+   it. Move the markers with the functions if they ever move. */
+/* >>> host-testable cell helpers begin <<< */
 /* Columns one glyph is allowed to paint, per the shared ui_cell_width()
    table. Width 0 (combining marks) is clamped UP to 1 rather than
    skipped: ui.cells is a column-indexed API, so whatever the caller put
@@ -169,18 +187,26 @@ static inline int cells_glyph_cols(uint32_t cp)
     return ui_cell_width(cp) == 2 ? 2 : 1;
 }
 
-/* minimal UTF-8 decode, shared by both cells paths */
-static inline uint32_t cells_utf8_next(const uint8_t *&s)
+/* minimal UTF-8 decode, shared by both cells paths.
+   `e` is the end of the buffer, or nullptr when the text is known to be
+   NUL-terminated (the ui.cells command path, where a truncated sequence
+   stops at the NUL because a NUL is not a continuation byte). The
+   native surface passes a POINTER+LENGTH that need not be terminated
+   (ui_cells_draw_t), so a sequence cut off at the very end must not
+   read the two bytes after it — hence the explicit bound. With
+   e == nullptr every branch is byte-for-byte the old one. */
+static inline uint32_t cells_utf8_next(const uint8_t *&s,
+                                       const uint8_t *e = nullptr)
 {
     uint32_t cp = *s++;
-    if (cp >= 0xF0 && (s[0] & 0xC0) == 0x80) {
+    if (cp >= 0xF0 && (!e || s + 3 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x07) << 18) | ((s[0] & 0x3F) << 12) |
              ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
         s += 3;
-    } else if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80) {
+    } else if (cp >= 0xE0 && (!e || s + 2 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F);
         s += 2;
-    } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
+    } else if (cp >= 0xC0 && (!e || s + 1 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x1F) << 6) | (s[0] & 0x3F);
         s += 1;
     }
@@ -197,6 +223,7 @@ static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
     int b = bb + ((fb - bb) * a) / 15;
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
+/* >>> host-testable cell helpers end <<< */
 
 static const char *TAG = "ui_tab5";
 
@@ -430,6 +457,19 @@ extern "C" void ui_tab5_set_fg_apps(const char *cur, const char *prev,
 static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
 static int s_canvas_w, s_canvas_h; /* set once the display is up */
+/* Pixels the canvas allocation actually holds. The buffer is allocated
+   ONCE at the portrait size (720*1192 = 858,240 px) and re-bound with
+   swapped dimensions on rotation (1280*632 = 808,960), so it fits both
+   — but only for a MATCHED pair.
+   This matters because the native surface draws off the LVGL lock
+   (spec §A.3) while ui_tab5_set_landscape changes w and h under it: a
+   draw that reads the old height and the new width would address
+   1191*1280+1279 = 1,525,759 and walk 667,519 pixels past the end of
+   the allocation. The surf_* primitives therefore snapshot both
+   dimensions once and refuse a pair that does not fit here — a dropped
+   frame instead of a corrupted heap. (What the presenter should DO
+   across a rotation is a policy question, not this guard's job.) */
+static size_t s_canvas_px;
 
 /* ---- 差分 invalidate の値打ちを、やる前に測る (docs/native-editor-spec.md §A.3)
  *
@@ -698,6 +738,34 @@ __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
     ESP_LOGI(TAG, "PPA rotation scratch -> PSRAM (%u bytes)",
              (unsigned)in_psram.buffer_size);
     return __real_lvgl_port_ppa_create(&in_psram);
+}
+
+/* How much of a presentation is the ROTATION? (spec §F #13)
+ *
+ * esp_lvgl_port's flush_cb is [PPA rotate] + esp_lcd_panel_draw_bitmap
+ * (esp_lvgl_port_disp.c:663-745) and the LVGL FLUSH_START/FINISH pair
+ * brackets the whole of it, so the profiler below cannot tell the two
+ * apart from events alone. lvgl_port_ppa_rotate lives in lcd_ppa.c —
+ * a different TU from its caller — so --wrap splits it out for the
+ * price of two clock reads per chunk, and only in landscape (portrait
+ * never enters this branch).
+ *
+ * Single writer: flush_cb runs on the LVGL task and nowhere else. The
+ * accumulator is reset at RENDER_START and read at RENDER_READY, both
+ * on that same task. */
+static int64_t s_ppa_rot_us;
+
+extern "C" esp_err_t
+__real_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
+                            lvgl_port_ppa_disp_rotate_t *rotate_cfg);
+extern "C" esp_err_t
+__wrap_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
+                            lvgl_port_ppa_disp_rotate_t *rotate_cfg)
+{
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+    s_ppa_rot_us += esp_timer_get_time() - t0;
+    return err;
 }
 /* Touch sampling period. LVGL's default is LV_DEF_REFR_PERIOD (33 ms),
    which is too coarse to catch a quick tap — see lvgl_port_add_touch. */
@@ -2985,6 +3053,175 @@ void ui_tab5_kb_field(int mode)
     cbar_apply_mods(); /* paints 「あ」's DISABLED flag */
 }
 
+/* ------------------------------------------------------------------ */
+/* 提示 (presentation) の内訳 — 常時計測 (spec §F #13)                 */
+/*                                                                     */
+/* 決めたいのは 1 つ: **1 回の提示の時間はどこへ行くのか**。           */
+/*   draw   LVGL がチャンクを CPU でラスタライズした時間               */
+/*   rot    PPA 回転 (landscape のみ。--wrap=lvgl_port_ppa_rotate)     */
+/*   flush  flush_cb 全体 = rot + esp_lcd_panel_draw_bitmap の投入     */
+/*   wait   前のチャンクの DSI DMA が終わるのを待った時間              */
+/* これが要るのは、スクロールが全段 dirty になって面積 invalidate で   */
+/* は救えないから (ssh_vt で 26 段中 22 段が dirty)。救う道は「PPA/    */
+/* DMA2D でキャンバスをブリットする」か「DSI のフレームバッファを直接  */
+/* 動かす」かだが、**内訳が分からないとどちらが効くか決められない**。  */
+/*   rot が支配的  -> sw_rotate とスクラッチと 50 段バッファが本題     */
+/*   wait が支配的 -> フレームバッファ直接操作が効く                   */
+/*   draw が支配的 -> 生成側 (LVGL に渡す前) の話                      */
+/*                                                                     */
+/* 計測器が計測対象を太らせないための約束 (と、その代金):              */
+/*  - 時計読みは 1 提示あたり **2 + 4×チャンク** 回 (landscape では     */
+/*    回転の 2×チャンクが増える)。26 チャンクなら 106 / 158 回。       */
+/*    「6 回」ではない —— flush と flush-wait が 1 チャンクにつき       */
+/*    2 対のイベントを出すため。1 回の値段は spec §F #0 が「測る」と    */
+/*    している未測の数字なので、**ここに見積もりは書かない**。         */
+/*    どれも LVGL タスクの上でしか走らない = 単一書き手、ロック 0。    */
+/*  - 書式化は窓に 1 回。しかも **RENDER_READY** で出す —— その提示の  */
+/*    画素はもう出ている (fs_picker が今日置いた作法と同じ)。          */
+/*    1 行はログの前置きを入れて ~150 B、115200 baud なら ~13 ms を    */
+/*    その場のタスク (= LVGL タスク) が払う。無料ではないので窓は      */
+/*    5 秒、動きが無ければ 1 行も出ない。                              */
+/*  - 妥当性の上限を持つ (C.0 規則 7): 1 提示 > 1 秒は外れ値として     */
+/*    捨て、捨てた数を drop= で報告する。黙って捨てない。              */
+/* ------------------------------------------------------------------ */
+/* >>> host-testable presentation meter begin <<< */
+#define UI_PROF_WINDOW_US   5000000  /* 報告の窓 */
+#define UI_PROF_SANE_US     1000000  /* 1 提示の上限。超えたら外れ値 */
+
+/* 「この提示はキャンバスのものか」。ui.cells のバッチ末尾と
+   ui_tab5_canvas_invalidate が、どちらも LVGL ロックの内側で立てる。
+   読むのは RENDER_START (LVGL タスク、同じロックの内側) なので、
+   排他は既にある。取りこぼす形は 1 つだけ: 描画中に着いた invalidate
+   が今の提示に数えられる —— 数の分類が 1 件ずれるだけで、時間には
+   影響しない。 */
+static bool s_prof_canvas_mark;
+
+/* 窓の集計。書き手は LVGL タスクだけ。 */
+static struct {
+    uint32_t refr, refr_cv;      /* 提示の数 / うちキャンバス由来 */
+    uint32_t chunks;
+    int64_t  draw, rot, flush, wait;
+    int      w_chunks;           /* この窓で最もチャンクの多かった提示 */
+    int64_t  w_draw, w_rot, w_flush, w_wait;
+    uint32_t dropped;
+    int64_t  t_report;
+} s_pm;
+
+/* Where a repaint actually goes. LVGL brackets a refresh with
+   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
+   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
+   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
+   PPA rotation in landscape (which --wrap now splits out separately);
+   wait is time blocked on the previous chunk's DMA, which is exactly
+   what a second draw buffer would hide.
+   These four are ONE presentation: RENDER_START zeroes them, so
+   kb_bench (which memsets and then forces a single lv_refr_now) reads
+   exactly what it always read. */
+static struct {
+    int64_t t_render, t_flush, t_wait;
+    int64_t render, flush, wait;
+    int flushes;
+    bool canvas;
+} s_prof;
+
+static bool s_prof_emit_pending = false;
+
+static void prof_report(int64_t now)
+{
+    /* 呼ばれるのは RENDER_READY —— この提示の画素はもう出ている。 */
+    ESP_LOGW("ui_prof",
+             "%s %lu refr(cv %lu) %lu ch | draw=%lld rot=%lld flush=%lld "
+             "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu",
+             s_landscape ? "L" : "P", (unsigned long)s_pm.refr,
+             (unsigned long)s_pm.refr_cv, (unsigned long)s_pm.chunks,
+             (long long)s_pm.draw, (long long)s_pm.rot,
+             (long long)s_pm.flush, (long long)s_pm.wait, s_pm.w_chunks,
+             (long long)s_pm.w_draw, (long long)s_pm.w_rot,
+             (long long)s_pm.w_flush, (long long)s_pm.w_wait,
+             (unsigned long)s_pm.dropped);
+    memset(&s_pm, 0, sizeof s_pm);
+    /* 出力そのものに ~10 ms かかるので、窓の起点は書いた後で読む。 */
+    s_pm.t_report = esp_timer_get_time();
+    (void)now;
+}
+
+/* 1 提示ぶんを窓へ畳む。時計読み 0 回 (now は呼び出し側が持っている)。 */
+static void prof_fold(int64_t now)
+{
+    int64_t total = s_prof.render;
+    int64_t draw = total - s_prof.flush - s_prof.wait;
+    if (total > UI_PROF_SANE_US || draw < 0) {
+        /* C.0 規則 7: 黙って捨てない。draw < 0 は「イベントの対が
+           揃わなかった」で、時間ではなく計測器の話。 */
+        s_pm.dropped++;
+        return;
+    }
+    s_pm.refr++;
+    if (s_prof.canvas)
+        s_pm.refr_cv++;
+    s_pm.chunks += (uint32_t)s_prof.flushes;
+    s_pm.draw += draw;
+    s_pm.rot += s_ppa_rot_us;
+    s_pm.flush += s_prof.flush;
+    s_pm.wait += s_prof.wait;
+    if (s_prof.flushes > s_pm.w_chunks) {
+        s_pm.w_chunks = s_prof.flushes;
+        s_pm.w_draw = draw;
+        s_pm.w_rot = s_ppa_rot_us;
+        s_pm.w_flush = s_prof.flush;
+        s_pm.w_wait = s_prof.wait;
+    }
+    if (!s_pm.t_report) {
+        s_pm.t_report = now;
+        return;
+    }
+    /* **書式化はここでやらない。** 呼ばれているのは RENDER_READY で、
+       ~150B を 115200 baud へ同期に吐くと ~13 ms を LVGL タスクが払う。
+       その 13 ms は次のフレームを押し出し、まさに測ろうとしている
+       flush/wait を揺らす —— 計測器が計測対象を太らせる形になる。
+       印だけ立てて、コマンド掃きの先頭 (描画の外) で吐く。 */
+    if (now - s_pm.t_report >= UI_PROF_WINDOW_US)
+        s_prof_emit_pending = true;
+}
+
+static void prof_event(lv_event_t *e)
+{
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_RENDER_START:
+        s_prof.t_render = now;
+        s_prof.render = s_prof.flush = s_prof.wait = 0;
+        s_prof.flushes = 0;
+        s_prof.canvas = s_prof_canvas_mark;
+        s_prof_canvas_mark = false;
+        s_ppa_rot_us = 0;
+        break;
+    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render;
+                                     prof_fold(now); break;
+    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
+    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
+                                     s_prof.flushes++; break;
+    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
+    default: break;
+    }
+}
+
+/* Register the six events on the display. Called once, from
+   ui_tab5_start, right after the display exists — so kb_bench must NOT
+   register them again (double registration would double every time). */
+static void prof_attach(lv_display_t *disp)
+{
+    static const lv_event_code_t prof_codes[] = {
+        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
+        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
+        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
+    };
+    for (auto code : prof_codes)
+        lv_display_add_event_cb(disp, prof_event, code, nullptr);
+}
+/* >>> host-testable presentation meter end <<< */
+
 /* Temporary instrumentation: what does each kind of keyboard repaint
    actually cost on this panel? (single draw buffer, 25-line chunks,
    PPA rotate per flush). Times the render+flush by forcing it. */
@@ -3036,43 +3273,11 @@ void ui_tab5_kb_field(int mode)
 #define UI_KB_BENCH 0
 #endif
 #if UI_KB_BENCH
-/* Where a repaint actually goes. LVGL brackets a refresh with
-   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
-   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
-   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
-   PPA rotation in landscape; wait is time blocked on the previous
-   chunk's DMA, which is exactly what a second draw buffer would hide. */
-static struct {
-    int64_t t_render, t_flush, t_wait;
-    int64_t render, flush, wait;
-    int flushes;
-} s_prof;
-
-static void prof_event(lv_event_t *e)
-{
-    int64_t now = esp_timer_get_time();
-    switch (lv_event_get_code(e)) {
-    case LV_EVENT_RENDER_START:      s_prof.t_render = now; break;
-    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render; break;
-    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
-    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
-                                     s_prof.flushes++; break;
-    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
-    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
-    default: break;
-    }
-}
-
 static void kb_bench(void)
 {
     int64_t t0;
-    static const lv_event_code_t prof_codes[] = {
-        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
-        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
-        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
-    };
-    for (auto code : prof_codes)
-        lv_display_add_event_cb(s_disp, prof_event, code, nullptr);
+    /* prof_event is already attached (prof_attach, from ui_tab5_start):
+       registering it a second time would count every event twice. */
 
 #define KB_BENCH_STEP(label, body)                                        \
     do {                                                                  \
@@ -3163,6 +3368,8 @@ static void kb_bench(void)
 }
 #endif
 
+#include "ui_tab5_surf.inc"
+
 /* Phase 2: JS-drawable canvas over the console area. Hidden until the
    running script issues its first ui.* command; hides again (and
    clears) when a different task takes over, so console-only tasks get
@@ -3185,6 +3392,9 @@ public:
                      (unsigned)bytes);
             return;
         }
+        /* what the allocation really holds, for surf_geom's guard —
+           published before anything can draw */
+        s_canvas_px = bytes / 2;
         if (!s_ppa_fill) {
             ppa_client_config_t cfg = {};
             cfg.oper_type = PPA_OPERATION_FILL;
@@ -3199,6 +3409,18 @@ public:
             if (ppa_register_client(&cfg, &s_ppa_blend) != ESP_OK) {
                 s_ppa_blend = nullptr; /* cells runs stay on the CPU */
                 ESP_LOGW(TAG, "PPA blend unavailable, cells stay on CPU");
+            }
+        }
+        /* the native surface's own fill client (see s_ppa_fill_nat).
+           Registered HERE, on the UI task at startup, because
+           ppa_register_client allocates and the native presenter's task
+           is not allowed to (spec §A.2, "edit_task の禁止事項"). */
+        if (!s_ppa_fill_nat) {
+            ppa_client_config_t cfg = {};
+            cfg.oper_type = PPA_OPERATION_FILL;
+            if (ppa_register_client(&cfg, &s_ppa_fill_nat) != ESP_OK) {
+                s_ppa_fill_nat = nullptr; /* native fills stay on the CPU */
+                ESP_LOGW(TAG, "PPA fill (native) unavailable, CPU fallback");
             }
         }
         fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
@@ -3221,6 +3443,10 @@ public:
         track_task_switch();
 
         ui_cmd_t cmd;
+        if (s_prof_emit_pending) {
+            s_prof_emit_pending = false;
+            prof_report(esp_timer_get_time());
+        }
         bool drew = false;
         /* このバッチが実際に触った矩形 (面積の計測用。§A.3)。 */
         int  bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
@@ -3306,6 +3532,7 @@ public:
                **残像が出る**形で壊れるのを避けるため。
                隠れていたキャンバスを今出したときは、まだ一度も描かれて
                いない領域があるので全体を無効にする。 */
+            s_prof_canvas_mark = true; /* attribute the next refresh */
             if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
                 lv_area_t cv;
                 lv_obj_get_content_coords(_canvas, &cv);
@@ -3337,6 +3564,15 @@ private:
         if (gen == _seen_gen)
             return;
         _seen_gen = gen;
+        /* native 面 (エディタ・ファイラ) が前面のときは消さない。
+           ここは「タスクが替わったら古い画素を残さない」ための掃除だが、
+           native 面は JS ワーカーではないので、その面が描いた画素まで
+           消してしまう —— しかも面は気づけない (cells_draw は true を
+           返し続ける) ので、次の打鍵で背景が空のまま 1 行だけ文字が出る
+           絵になる。UI_CMD_RESET 側の 3 経路には同じガードが入っている
+           のに、ここだけ抜けていた (M4 Phase 1 の敵対的レビューが発見)。 */
+        if (mqjs_native_fg_active())
+            return;
         if (strcmp(tn, _task) != 0 || strcmp(to, _origin) != 0) {
             memcpy(_task, tn, sizeof _task);
             memcpy(_origin, to, sizeof _origin);
@@ -3354,38 +3590,7 @@ private:
 
     void fill_rect(int x, int y, int w, int h, uint16_t px)
     {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w, y1 = y + h;
-        if (x1 > s_canvas_w)
-            x1 = s_canvas_w;
-        if (y1 > s_canvas_h)
-            y1 = s_canvas_h;
-        if (s_ppa_fill && x1 - x0 > 0 && y1 - y0 > 0 &&
-            (x1 - x0) * (y1 - y0) >= UI_PPA_FILL_MIN_PX) {
-            ppa_fill_oper_config_t op = {};
-            op.out.buffer = _buf;
-            op.out.buffer_size =
-                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
-            op.out.pic_w = (uint32_t)s_canvas_w;
-            op.out.pic_h = (uint32_t)s_canvas_h;
-            op.out.block_offset_x = (uint32_t)x0;
-            op.out.block_offset_y = (uint32_t)y0;
-            op.out.fill_cm = PPA_FILL_COLOR_MODE_RGB565;
-            op.fill_block_w = (uint32_t)(x1 - x0);
-            op.fill_block_h = (uint32_t)(y1 - y0);
-            /* 565 -> 888 by zero-extend; PPA truncates back, lossless */
-            op.fill_argb_color.a = 0xFF;
-            op.fill_argb_color.r = (uint32_t)(((px >> 11) & 0x1F) << 3);
-            op.fill_argb_color.g = (uint32_t)(((px >> 5) & 0x3F) << 2);
-            op.fill_argb_color.b = (uint32_t)((px & 0x1F) << 3);
-            op.mode = PPA_TRANS_MODE_BLOCKING;
-            if (ppa_do_fill(s_ppa_fill, &op) == ESP_OK)
-                return;
-            /* any PPA error: fall through to the CPU loop */
-        }
-        for (int yy = y0; yy < y1; yy++)
-            for (int xx = x0; xx < x1; xx++)
-                _buf[(size_t)yy * s_canvas_w + xx] = px;
+        surf_fill_rect(_buf, x, y, w, h, px, s_ppa_fill);
     }
 
     void put_pixel(int x, int y, uint16_t px)
@@ -3433,274 +3638,20 @@ private:
         lv_canvas_finish_layer(_canvas, &layer);
     }
 
-    /* Blit one monospace glyph, fg blended over whatever bg is already in
-       the cell, clipped to its cell box — one cell wide, two for a
-       width-2 codepoint (no lv_draw_label, no layer).
-       `run_right` is the run's right edge in pixels: the CPU path has to
-       honour it for the same reason the PPA path clamps to the A8 buffer
-       (see compose_glyph_a8). Without it the two paths disagree for a
-       width-2 codepoint that ends a run — PPA shears the glyph, the CPU
-       paints its right half into the next column, which fill_rect never
-       cleared, so half a kanji survives until that row is redrawn. Same
-       ui.cells call, two different pictures depending only on the run's
-       length (UI_PPA_CELLS_MIN_CELLS). */
-    void blit_glyph(int cx0, int cy0, uint32_t cp, uint16_t fg, int run_right)
-    {
-        const lv_font_t *font = &font_term_mono;
-        lv_font_glyph_dsc_t g;
-        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
-            return;
-        if (g.box_w == 0 || g.box_h == 0) /* space etc. */
-            return;
-        /* Get the raw A4 bitmap and decode it ourselves. NOTE: the public
-           lv_font_get_glyph_bitmap() force-resets req_raw_bitmap to 0
-           (decoding to A8 into a draw_buf we don't pass -> NULL deref
-           crash). Call the font's method directly so req_raw_bitmap=1
-           sticks and we get the raw glyph_bitmap pointer. Packing is a
-           continuous 4bpp bitstream, MSB nibble first (host-verified in
-           fonts/decode_test.py). */
-        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
-        if (!rf->get_glyph_bitmap)
-            return;
-        g.req_raw_bitmap = 1;
-        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
-        if (!bmp)
-            return;
-        /* fmt_txt 4bpp: rows are padded to `stride` bytes if stride>0, else
-           the glyph is a continuous bitstream (no per-row padding). */
-        const int bpp = 4;
-        int baseline = cy0 + (UI_CELL_H - font->base_line);
-        int gx0 = cx0 + g.ofs_x;
-        int gy0 = baseline - g.ofs_y - g.box_h;
-        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
-        if (clipR > run_right) {
-            clipR = run_right;
-            cells_note_clip();
-        }
-        int clipB = cy0 + UI_CELL_H;
-        for (int py = 0; py < g.box_h; py++) {
-            int y = gy0 + py;
-            if (y < cy0 || y >= clipB || y < 0 || y >= s_canvas_h)
-                continue;
-            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
-            for (int px = 0; px < g.box_w; px++) {
-                int x = gx0 + px;
-                if (x < cx0 || x >= clipR || x < 0 || x >= s_canvas_w)
-                    continue;
-                int bitpos = rowbit + px * bpp;
-                uint8_t byte = bmp[bitpos >> 3];
-                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
-                if (!a)
-                    continue;
-                size_t idx = (size_t)y * s_canvas_w + x;
-                _buf[idx] = a == 15 ? fg : ui_blend565(_buf[idx], fg, a);
-            }
-        }
-    }
-
-    /* Compose one glyph's coverage into the run's A8 buffer (no canvas
-       access, no blending — just alpha bytes). Mirrors blit_glyph's
-       positioning/clipping; a4*17 so 15 -> 255 = fully opaque. */
-    void compose_glyph_a8(uint8_t *dst, int dst_w, int cx0, uint32_t cp)
-    {
-        const lv_font_t *font = &font_term_mono;
-        lv_font_glyph_dsc_t g;
-        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
-            return;
-        if (g.box_w == 0 || g.box_h == 0)
-            return;
-        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
-        if (!rf->get_glyph_bitmap)
-            return;
-        g.req_raw_bitmap = 1;
-        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
-        if (!bmp)
-            return;
-        const int bpp = 4;
-        int baseline = UI_CELL_H - font->base_line;
-        int gx0 = cx0 + g.ofs_x;
-        int gy0 = baseline - g.ofs_y - g.box_h;
-        int clipL = cx0 < 0 ? 0 : cx0;
-        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
-        /* Clamp to the A8 buffer, i.e. to the run's right edge. This is
-           NOT just a last line of defence: cells()'s straddle guard only
-           runs inside the `while (n > seg_max)` splitting loop, so every
-           run of <= seg_max cells (which is nearly every run ssh_vt's
-           drawRow emits) and the final segment of a long one can still
-           END on a width-2 codepoint — a selection dragged to the left
-           half of a full-width character does exactly that. The CPU path
-           clamps to the same edge (blit_glyph's run_right) so the two
-           paths agree; without that they diverge on run length alone. */
-        if (clipR > dst_w) {
-            clipR = dst_w;
-            cells_note_clip();
-        }
-        for (int py = 0; py < g.box_h; py++) {
-            int y = gy0 + py;
-            if (y < 0 || y >= UI_CELL_H)
-                continue;
-            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
-            uint8_t *drow = dst + (size_t)y * dst_w;
-            for (int px = 0; px < g.box_w; px++) {
-                int x = gx0 + px;
-                if (x < clipL || x >= clipR)
-                    continue;
-                int bitpos = rowbit + px * bpp;
-                uint8_t byte = bmp[bitpos >> 3];
-                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
-                if (a)
-                    drow[x] = (uint8_t)(a * 17);
-            }
-        }
-    }
-
-    /* Draw a run of cells (one fg/bg) starting at (col,row) using the
-       monospace grid font. UTF-8 decoded to codepoints. Long runs that
-       sit fully on the grid go compose-then-one-PPA-blend; short runs
-       and any PPA failure use the per-glyph CPU blit. Runs wider than
-       the A8 compose buffer (80 cells = the portrait width; landscape
-       rows are 142) are split into segments so the PPA path keeps
-       winning instead of falling back to the CPU wholesale. */
+    /* Draw a run of cells (one fg/bg) starting at (col,row). The work
+       lives in surf_cells (spec §A.3); this is the ui.cells command's
+       binding to it: the JS canvas's own buffer, the shared A8 staging
+       buffer in internal SRAM, and the UI task's PPA clients. The
+       column count comes from the text (ncells = 0) because that is
+       what the ui_cmd_t carries. */
     void cells(const ui_cmd_t &cmd)
     {
         if (!cmd.text)
             return;
-        int col = cmd.x, row = cmd.y;
-        uint16_t fg = lv_color_to_u16(lv_color_hex(cmd.color));
-        uint16_t bg = lv_color_to_u16(lv_color_hex(cmd.bg));
-        const uint8_t *s = (const uint8_t *)cmd.text;
-        /* the run has a single bg: clear it in one rect (instead of one
-           9x24 fill per cell) — row-contiguous, and long runs clear the
-           PPA threshold. Columns == codepoints (the CONT contract at the
-           top of this file), so counting UTF-8 lead bytes gives the run's
-           width. Deliberately NOT sum(ui_cell_width): the caller already
-           spent a column on the filler cell, and counting the wide
-           glyph's second column here as well would overshoot the fill by
-           one cell per CJK character and eat the head of the next run. */
-        int n = 0;
-        for (const uint8_t *p = s; *p; p++)
-            if ((*p & 0xC0) != 0x80)
-                n++;
-        fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W,
-                  UI_CELL_H, bg);
-        const int run_col = col, run_cells = n;
-
-        const int seg_max = (int)(sizeof(s_cells_a8) /
-                                  ((size_t)UI_CELL_W * UI_CELL_H));
-        while (n > seg_max) {
-            /* Fill a segment, but never let one END on a width-2 glyph:
-               its right half belongs to the next segment's first cell,
-               which is outside the A8 buffer, so compose_glyph_a8 would
-               shear it — and only on the PPA path, since the CPU blit
-               writes straight to the canvas and would not. Hand the
-               straddling glyph to the next segment instead. */
-            const uint8_t *p = s;
-            int take = 0;
-            while (take < seg_max) {
-                const uint8_t *q = p;
-                if (take + cells_glyph_cols(cells_utf8_next(p)) > seg_max) {
-                    p = q; /* rewind over the straddling glyph */
-                    break;
-                }
-                take++; /* one column per codepoint, wide or not */
-            }
-            if (take == 0) { /* unreachable at seg_max=80; no stuck loop */
-                cells_utf8_next(p);
-                take = 1;
-            }
-            cells_run(col, row, s, p, take, fg);
-            s = p;
-            col += take;
-            n -= take;
-        }
-        cells_run(col, row, s, nullptr, n, fg);
-        cells_rules(run_col, row, run_cells, fg, (unsigned)cmd.w);
-    }
-
-    /* §6's "1 本線描画": underline and strike-through, the only two SGR
-       attributes the cell contract does not fold into fg/bg. One
-       fill_rect per rule for the WHOLE run — not per cell — so a fully
-       underlined 142-column row costs two rect writes, and a run with no
-       attributes costs one compare. Drawn after the glyphs so the rule
-       sits on top of a descender rather than under it, which is what a
-       terminal looks like. */
-    void cells_rules(int col, int row, int n, uint16_t fg, unsigned attrs)
-    {
-        if (!(attrs & (UI_CELL_ATTR_UNDERLINE | UI_CELL_ATTR_STRIKE)) || n <= 0)
-            return;
-        int y0 = row * UI_CELL_H;
-        int x0 = col * UI_CELL_W, w = n * UI_CELL_W;
-        if (attrs & UI_CELL_ATTR_UNDERLINE) {
-            /* One pixel below the baseline (blit_glyph's own baseline
-               arithmetic), kept inside the cell so consecutive underlined
-               rows never touch. */
-            int y = y0 + (UI_CELL_H - (int)font_term_mono.base_line) + 1;
-            if (y > y0 + UI_CELL_H - 1)
-                y = y0 + UI_CELL_H - 1;
-            fill_rect(x0, y, w, 1, fg);
-        }
-        if (attrs & UI_CELL_ATTR_STRIKE)
-            fill_rect(x0, y0 + UI_CELL_H / 2, w, 1, fg);
-    }
-
-    /* One ≤80-cell segment: PPA compose+blend when it qualifies, else
-       per-glyph CPU blit. `e` bounds the UTF-8 walk (nullptr = NUL). */
-    void cells_run(int col, int row, const uint8_t *s, const uint8_t *e,
-                   int n, uint16_t fg)
-    {
-        int x0 = col * UI_CELL_W, y0 = row * UI_CELL_H, bw = n * UI_CELL_W;
-
-        if (s_ppa_blend && n >= UI_PPA_CELLS_MIN_CELLS && x0 >= 0 &&
-            y0 >= 0 && x0 + bw <= s_canvas_w &&
-            y0 + UI_CELL_H <= s_canvas_h &&
-            (size_t)bw * UI_CELL_H <= sizeof(s_cells_a8)) {
-            memset(s_cells_a8, 0, (size_t)bw * UI_CELL_H);
-            const uint8_t *p = s;
-            for (int c = 0; *p && (!e || p < e); c++)
-                compose_glyph_a8(s_cells_a8, bw, c * UI_CELL_W,
-                                 cells_utf8_next(p));
-            ppa_blend_oper_config_t op = {};
-            op.in_bg.buffer = _buf;
-            op.in_bg.pic_w = (uint32_t)s_canvas_w;
-            op.in_bg.pic_h = (uint32_t)s_canvas_h;
-            op.in_bg.block_w = (uint32_t)bw;
-            op.in_bg.block_h = UI_CELL_H;
-            op.in_bg.block_offset_x = (uint32_t)x0;
-            op.in_bg.block_offset_y = (uint32_t)y0;
-            op.in_bg.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
-            op.in_fg.buffer = s_cells_a8;
-            op.in_fg.pic_w = (uint32_t)bw;
-            op.in_fg.pic_h = UI_CELL_H;
-            op.in_fg.block_w = (uint32_t)bw;
-            op.in_fg.block_h = UI_CELL_H;
-            op.in_fg.blend_cm = PPA_BLEND_COLOR_MODE_A8;
-            op.out.buffer = _buf;
-            op.out.buffer_size =
-                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
-            op.out.pic_w = (uint32_t)s_canvas_w;
-            op.out.pic_h = (uint32_t)s_canvas_h;
-            op.out.block_offset_x = (uint32_t)x0;
-            op.out.block_offset_y = (uint32_t)y0;
-            op.out.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
-            op.bg_alpha_update_mode = PPA_ALPHA_FIX_VALUE;
-            op.bg_alpha_fix_val = 255;
-            op.fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
-            op.fg_fix_rgb_val.r = (uint32_t)(((fg >> 11) & 0x1F) << 3);
-            op.fg_fix_rgb_val.g = (uint32_t)(((fg >> 5) & 0x3F) << 2);
-            op.fg_fix_rgb_val.b = (uint32_t)((fg & 0x1F) << 3);
-            op.mode = PPA_TRANS_MODE_BLOCKING;
-            if (ppa_do_blend(s_ppa_blend, &op) == ESP_OK)
-                return;
-            /* any PPA error: fall through to the per-glyph CPU path */
-        }
-
-        int c = col;
-        int run_right = (col + n) * UI_CELL_W;
-        while (*s && (!e || s < e)) {
-            uint32_t cp = cells_utf8_next(s);
-            blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg, run_right);
-            c++;
-        }
+        surf_cells(_buf, cmd.x, cmd.y, (const uint8_t *)cmd.text, nullptr, 0,
+                   lv_color_to_u16(lv_color_hex(cmd.color)),
+                   lv_color_to_u16(lv_color_hex(cmd.bg)), (unsigned)cmd.w,
+                   s_cells_a8, sizeof s_cells_a8, s_ppa_blend, s_ppa_fill);
     }
 
     /* Scroll cell-rows [top,bot] by n (n>0 up, n<0 down) in the buffer
@@ -3773,6 +3724,93 @@ private:
     char _task[sizeof(ui_status_t::task_name)] = "";
     char _origin[sizeof(ui_status_t::task_origin)] = "";
 };
+
+/* ------------------------------------------------------------------ */
+/* Native surface entry points (spec §A.3)                             */
+/*                                                                     */
+/* The native editor/filer presenter runs on ITS OWN task (edit_task,   */
+/* core 1, prio 5) and draws straight into the same canvas the JS       */
+/* ui.* commands use. Three calls, and the split between them is the    */
+/* whole point:                                                        */
+/*                                                                     */
+/*   ui_tab5_cells_draw / ui_tab5_canvas_fill   pixels, NO LVGL lock   */
+/*   ui_tab5_canvas_invalidate                  lock, held for µs      */
+/*                                                                     */
+/* so a 26-row repaint pays the lock once instead of 26 times, and the  */
+/* presenter's own budget (spec §C.4: edit_task's max hold > 100 µs is  */
+/* a design violation) stays inside one short critical section.        */
+/*                                                                     */
+/* The canvas belongs to CanvasApp; these functions reach it through    */
+/* s_js_canvas / s_js_canvas_buf, which CanvasApp::onCreate publishes   */
+/* and ui_tab5_set_landscape re-binds with swapped dimensions. Before   */
+/* the UI is up (or on a build without it) they are no-ops / false.     */
+/* ------------------------------------------------------------------ */
+
+/* >>> host-testable native surface begin <<< */
+extern "C" bool ui_tab5_cells_draw(const ui_cells_draw_t *d)
+{
+    if (!d || !d->utf8 || d->ncells <= 0)
+        return false;
+    if (!s_js_canvas_buf || !s_canvas_w || !s_canvas_h)
+        return false; /* no canvas: caller keeps its model, draws later */
+    surf_cells(s_js_canvas_buf, d->col, d->row, (const uint8_t *)d->utf8,
+               (const uint8_t *)d->utf8 + d->len, d->ncells,
+               lv_color_to_u16(lv_color_hex(d->fg)),
+               lv_color_to_u16(lv_color_hex(d->bg)), d->attrs, d->a8,
+               d->a8_len, (ppa_client_handle_t)d->ppa, s_ppa_fill_nat);
+    return true;
+}
+
+extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
+{
+    if (!s_js_canvas_buf || !s_canvas_w || !s_canvas_h)
+        return;
+    surf_fill_rect(s_js_canvas_buf, x, y, w, h,
+                   lv_color_to_u16(lv_color_hex(rgb)), s_ppa_fill_nat);
+}
+
+extern "C" void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
+{
+    if (!s_js_canvas || !s_canvas_w || !s_canvas_h)
+        return;
+    /* clamp to the canvas before anything else: LVGL would clip an
+       out-of-range area anyway, but an inverted one (x2 < x1) is
+       undefined and the caller's row arithmetic is exactly where an
+       off-by-one shows up */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s_canvas_w)
+        w = s_canvas_w - x;
+    if (y + h > s_canvas_h)
+        h = s_canvas_h - y;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (!lvgl_port_lock(0))
+        return;
+    /* Everything below is O(1) and touches no pixels — this is the µs
+       the whole split exists to keep short. */
+    s_prof_canvas_mark = true; /* the next refresh is a canvas one */
+    /* The presenter drew: show the canvas. CanvasApp does the same at
+       the end of a JS drawing batch, and hides it again when the
+       foreground TASK changes — that hide is the ownership gate, and
+       leaving it in place is deliberate. */
+    lv_obj_remove_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
+    /* Absolute coords, and CONTENT coords rather than lv_obj_get_coords:
+       the day the canvas gets padding or a border, (0,0) shifts and the
+       bug is a silent AFTERIMAGE — invalidated rectangle next to the
+       rows that actually changed — not a crash. */
+    lv_area_t cv;
+    lv_obj_get_content_coords(s_js_canvas, &cv);
+    lv_area_t a;
+    a.x1 = (int32_t)(cv.x1 + x);
+    a.y1 = (int32_t)(cv.y1 + y);
+    a.x2 = (int32_t)(cv.x1 + x + w - 1);
+    a.y2 = (int32_t)(cv.y1 + y + h - 1);
+    lv_obj_invalidate_area(s_js_canvas, &a);
+    lvgl_port_unlock();
+}
+/* >>> host-testable native surface end <<< */
 
 /* ------------------------------------------------------------------ */
 /* Landscape rotation (keyboard dock). Callable from any task; takes   */
@@ -3985,6 +4023,7 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         return;
     }
     s_disp = disp; /* ui_tab5_set_landscape rotates this display */
+    prof_attach(disp); /* presentation breakdown, always on (spec §F #13) */
 
     /* JS-visible canvas resolution (everything below the status bar);
        published before js_task starts, so ui.size() is always valid */

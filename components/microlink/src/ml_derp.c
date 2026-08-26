@@ -401,7 +401,7 @@ static int poll_derp_read(microlink_t *ml) {
         n = mbedtls_ssl_read(&ml->derp.ssl, buf + total_read, len - total_read);
         if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
             n == MBEDTLS_ERR_SSL_TIMEOUT) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(1); /* pdMS_TO_TICKS(5) は HZ=100 で 0 に丸まる */
             continue;
         }
         if (n <= 0) {
@@ -627,7 +627,18 @@ void ml_derp_tx_task(void *arg) {
         }
 
         /* Yield briefly */
-        vTaskDelay(pdMS_TO_TICKS(1));
+        /* **1 tick を明示する。** pdMS_TO_TICKS(1) は
+           CONFIG_FREERTOS_HZ=100 では (1*100)/1000 = **0** に丸められ、
+           vTaskDelay(0) は下位優先度へ譲らない —— この遅延は書かれた
+           時点から一度も効いていなかった。実測 (2026-08-26): 接続中の
+           このループは **毎秒 10,800 回転**し、5 秒で受信 1 パケット・
+           送信 0 の間も全力で回って core 0 を食い潰し、IDLE0 の
+           task_wdt を 15 回鳴らしていた。画面が固まったのはその隣で
+           taskLVGL が flush 完了を busy-spin していたため。
+           1 tick = 10 ms。DERP は中継経路 (実測 RTT 50-170 ms) なので
+           この遅延は見えない。RX を即応させたいなら select() で待つ
+           作りに変えること —— それは別の工事。 */
+        vTaskDelay(1);
     }
 
     ESP_LOGI(TAG, "DERP I/O task exiting");

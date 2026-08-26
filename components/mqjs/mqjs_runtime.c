@@ -47,6 +47,7 @@
 #include "cutils.h"
 #include "mquickjs.h"
 #include "mqjs_runtime.h"
+#include "mqjs_native.h"
 #include "mqjs_classes.h"
 #include "mqjs_power.h"
 #include "system_vault.h"
@@ -400,6 +401,85 @@ static void dev_rearm(void)
    (a relaunch may land in a different slot) */
 static char s_prev_name[32];
 
+/* ---- native surface (mqjs_native.h / spec §A.6, 判断 §E #1) ----------
+ *
+ * エディタとファイラは JS ワーカーではないが fg にはなる。表はここに置き、
+ * 「fg = JS ワーカー 1 本」という前提を **1 変数だけ** 増やして解く:
+ *
+ *   s_fg_native >= 0  ==>  どの JS ワーカーも fg ではない。
+ *                          s_fg_worker は「戻り先」を憶えているだけ。
+ *   s_fg_native <  0  ==>  従来どおり s_workers[s_fg_worker] が fg。
+ *
+ * 表は起動時に埋めきる (mqjs_native_register の規約)。以後は読み取り専用
+ * なのでロックを持たない —— 打鍵の経路で mutex を取るのは、この campaign が
+ * いちばん避けたいこと。s_fg_native は JS タスクだけが書き、poster
+ * (kbd / LVGL / IME 所有) は読むだけ: int 1 個の読みで足りる。 */
+typedef struct {
+    bool used;
+    mqjs_native_surface_t s;   /* 記述子の複製。文字列は呼び出し側が永続で持つ */
+} NativeSurface;
+static NativeSurface s_native[MQJS_MAX_NATIVE];
+static int s_native_n;
+static volatile int s_fg_native = -1;
+
+/* 名前引き。表は起動後に変わらないので、打鍵経路の外から呼ぶぶんには
+   これで足りる (sys.open / チップのタップ / 通知のタップ)。 */
+int mqjs_native_find(const char *name)
+{
+    if (!name || !name[0])
+        return -1;
+    for (int i = 0; i < s_native_n; i++)
+        if (s_native[i].used && !strcmp(s_native[i].s.name, name))
+            return i;
+    return -1;
+}
+
+int mqjs_native_register(const mqjs_native_surface_t *s)
+{
+    if (!s || !s->name || !s->name[0])
+        return -1;
+    /* 31 バイト: ステータスバーの _chip_target が char[32] で、名前は
+       そこを通って mqjs_request_open へ戻ってくる (ui_tab5.cpp:1538)。 */
+    if (strlen(s->name) > 31)
+        return -1;
+    if (mqjs_native_find(s->name) >= 0)
+        return -1;                       /* 名前は住所: 重複は登録させない */
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        if (s_workers[i].used && !strcmp(s_workers[i].name, s->name))
+            return -1;                   /* JS アプリと同名も同じ理由で不可 */
+    if (s_native_n >= MQJS_MAX_NATIVE)
+        return -1;
+    int id = s_native_n;
+    s_native[id].s = *s;
+    s_native[id].used = true;
+    s_native_n = id + 1;   /* 読み手は s_native_n までしか見ない。バリアは
+                              張らない —— 成立の条件は「入力が動き出す前に
+                              登録しきる」という規約の側 (mqjs_native.h) */
+    return id;
+}
+
+bool mqjs_native_is_fg(int id)
+{
+    return id >= 0 && id == s_fg_native;
+}
+
+bool mqjs_native_fg_active(void)
+{
+    return s_fg_native >= 0;
+}
+
+/* 打鍵/タッチを fg の native 面へ配る。呼び出しは poster のタスク上で、
+   面の実装は「自分のキューへ投げるだけ」という契約 (mqjs_native.h)。
+   fg かどうかを読むのは 1 回だけ: 2 回読むと、その隙に切り替わったとき
+   別の面へ配ることになる。 */
+static const mqjs_native_surface_t *native_fg(void)
+{
+    int id = s_fg_native;
+    return (id >= 0 && id < MQJS_MAX_NATIVE && s_native[id].used)
+               ? &s_native[id].s
+               : NULL;
+}
+
 /* Network readiness as a capability (event-driven Wi-Fi, see wifi.c). The
    token is the ONLY proof the link is up: net.onReady hands it to its callback
    and mqtt.connect demands it, so there is no token to pass at top level — a
@@ -504,13 +584,23 @@ static void bar_update(void)
 {
 #ifdef ESP_PLATFORM
     MqjsWorker *fg = &s_workers[s_fg_worker];
+    /* native 面が fg のときは、どの JS ワーカーも fg ではない (§A.6)。
+       チップに出すのは **name** で title ではない: prev は
+       ui_tab5.cpp の _chip_target になり、タップで
+       mqjs_request_open(name) に戻ってくる (:1438/:1538)。表示用の
+       別名を入れると、そのタップが誰にも解決しなくなる。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    const char *cur = ns ? ns->name : (fg->used ? fg->name : "");
     bool prev_running = false;
     for (int i = 0; i < MQJS_MAX_WORKERS; i++)
         if (s_workers[i].used && !strcmp(s_workers[i].name, s_prev_name)) {
             prev_running = true;
             break;
         }
-    ui_tab5_set_fg_apps(fg->used ? fg->name : "", s_prev_name, prev_running);
+    /* native 面は止められない = 常に「走っている」(mqjs_native.h の 3) */
+    if (!prev_running && mqjs_native_find(s_prev_name) >= 0)
+        prev_running = true;
+    ui_tab5_set_fg_apps(cur, s_prev_name, prev_running);
 #endif
 }
 
@@ -1316,7 +1406,15 @@ typedef enum {
    stack = runtime-internal call: allowed.) */
 static bool ui_is_fg(void)
 {
-    return !s_cur_wk || s_cur_wk->idx == s_fg_worker;
+    if (!s_cur_wk)
+        return true;         /* runtime 内部の呼び出し */
+    /* native 面が fg の間、JS アプリは 1 本も fg ではない (§A.6)。ここを
+       素通しにすると、エディタが直接描いているキャンバスへ裏のアプリの
+       ui.* が混ざる —— 面は UI キューを通らないので、混ざった側は
+       自分が上書きされたことにも気づけない。 */
+    if (s_fg_native >= 0)
+        return false;
+    return s_cur_wk->idx == s_fg_worker;
 }
 
 /* Put one command on the UI queue, unconditionally. Takes ownership of
@@ -1594,6 +1692,14 @@ void mqjs_post_touch(int x, int y, int kind)
        tap wakes even when the foreground app has no touch handler). */
     if (mqjs_power_note_input(kind))
         return;
+    /* fg が native 面なら、そこで終わり (§A.6)。電源ゲートの後ろに置くのは
+       JS と同じ理由: 画面を起こしただけのタップは誰にも配らない。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    if (ns) {
+        if (ns->touch)
+            ns->touch(ns->ctx, x, y, kind);
+        return;
+    }
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* touch always goes to the fg app */
     if (!s_event_queue || !fg->used || !fg->touch_used)
         return;
@@ -1930,14 +2036,25 @@ static bool ime_route_key(const char *utf8, size_t len);
 /* 打鍵を fg アプリの ui.onKey へ流す、唯一の出口。IME を通した後の配達も
    ここなので IME 所有タスクからも呼ばれる — どのタスクから来ても触るのは
    s_event_queue だけなので、それで足りる。 */
-static void key_to_app(const char *utf8, size_t len)
+static void key_to_app(const char *utf8, size_t len,
+                       uint32_t t_post, uint32_t t_isr)
 {
-    /* シンクの振り分け (§7): widget の field にフォーカスがあれば行き先は
-       その textarea、無ければ従来どおり JS アプリ。ここに置くのは、素通しの
-       打鍵も IME の確定文字列も必ずこの 1 か所を通るから — 分配の手前に
-       置くと「英字は field に入るが日本語は入らない」になる。 */
+    /* シンクの振り分け (§7 + spec §A.6): field → **native fg** → JS fg の
+       3 段。ここに置くのは、素通しの打鍵も IME の確定文字列も必ずこの
+       1 か所を通るから — 分配の手前に置くと「英字は field に入るが
+       日本語は入らない」になる。 */
     if (ui_tab5_field_key(utf8, len))
         return;
+    /* 2 段目: native 面 (エディタ / ファイラ)。JS のイベントキューは
+       通らない —— 面は自分のタスクに自分のキューを持っており、そこへ
+       投げるのが面の側の契約。t_post/t_isr をそのまま渡すので、面は
+       「入力面 → 画面」の端対端を自分で刻める (§C)。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    if (ns) {
+        if (ns->key)
+            ns->key(ns->ctx, utf8, len, t_post, t_isr);
+        return;
+    }
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
     if (!s_event_queue || !fg->used || !fg->key_used)
         return;
@@ -1975,6 +2092,13 @@ int64_t mqjs_now_us(void)      { return time_us(); }
 
 void mqjs_post_key(const char *utf8, size_t len)
 {
+    mqjs_post_key_ts(utf8, len, 0);
+}
+
+/* ISR 時刻つきの入口 (mqjs_native.h)。入力面がまだ ISR 時刻を刻んで
+   いないので、今はどの呼び出しも t_isr = 0 で入ってくる。 */
+void mqjs_post_key_ts(const char *utf8, size_t len, uint32_t t_isr)
+{
 #ifdef ESP_PLATFORM
     /* keys feed the device idle clock like touch does (matters for the
        keyboard dock: typing must keep the screen awake). kind 2 = a
@@ -1982,9 +2106,17 @@ void mqjs_post_key(const char *utf8, size_t len)
        blanked screen is swallowed here, exactly like the wake tap. */
     if (mqjs_power_note_input(2))
         return;
-    MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
-    if (!s_event_queue || !fg->used || !utf8 || len == 0)
+    if (!utf8 || len == 0)
         return;
+    /* native 面が fg なら、JS ワーカーの生死は行き先に関係しない。
+       この判定を 1 回だけ読んで下まで使う (2 回読むと、その隙に
+       切り替わったとき IME の判定と配達先が食い違う)。 */
+    bool native = s_fg_native >= 0;
+    if (!native) {
+        MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys go to the fg app */
+        if (!s_event_queue || !fg->used)
+            return;
+    }
 
     /* IME はここ (docs/keyboard-ime-unification.md §7)。両側とも理由がある。
        復帰キーの握り潰しの「後」: 画面を起こしただけのキーで変換を始めない。
@@ -1997,13 +2129,23 @@ void mqjs_post_key(const char *utf8, size_t len)
        IME に吸われた打鍵は打鍵として数えたい。 */
     s_last_key_us = time_us();
 
-    if (ime_route_key(utf8, len))
+    /* native fg のとき IME の判定は want=false (spec §E-2)。エディタは
+       自前の ime_t を持っており、ここを通すと打鍵が IME 所有タスクへ
+       吸われて面には 1 バイトも届かない。**これを外すと「打てない
+       エディタ」になる。**
+
+       残る競合は 1 つだけ: 切替の直前に IME キューへ入っていた打鍵は、
+       所有タスクが後から key_to_app へ配るので native 面に着く。落とすと
+       入力が黙って消えるので、着かせる方を採った (前のアプリ宛ての確定
+       文字列が 1 つエディタに入りうる、という値段)。 */
+    if (!native && ime_route_key(utf8, len))
         return;   /* この打鍵の行き先は所有タスクが決める */
 
-    key_to_app(utf8, len);
+    key_to_app(utf8, len, (uint32_t)s_last_key_us, t_isr);
 #else
     (void)utf8;
     (void)len;
+    (void)t_isr;
 #endif
 }
 
@@ -5112,6 +5254,13 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         char name[32];
         if (uiw_copy_str(ctx, argv[0], name, sizeof name))
             return JS_EXCEPTION;
+        /* native 面を先に引く (§A.6): エディタもファイラも sys.focus で
+           前へ出せる。ランチャーの一覧の行タップがこの道を通る。 */
+        int nid = mqjs_native_find(name);
+        if (nid >= 0) {
+            mqjs_native_focus(nid);
+            return JS_NewBool(1);
+        }
         slot = app_slot_by_name(name);
         if (slot < 0)
             return JS_NewBool(0);
@@ -5152,6 +5301,11 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
        could take that name could put a forged permission prompt in front
        of the launcher, so the name is reserved. */
     if (!strcmp(name, "system"))
+        return JS_NewBool(0);
+    /* native 面の名前も同じ理由で予約 (§A.6): sys.open / sys.focus /
+       チップのタップは native を先に引くので、同名の JS アプリは名乗った
+       瞬間にどの経路からも開けなくなる。 */
+    if (mqjs_native_find(name) >= 0)
         return JS_NewBool(0);
     for (const char *p = name; *p; p++) {
         /* names travel inside JSON open requests: keep them quote-free */
@@ -5212,6 +5366,37 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
            evictable). JS_NewBool is an immediate — no GC hazard. */
         JS_SetPropertyStr(ctx, obj_ref.val, "evictable",
             JS_NewBool(rec && (rec->policy.flags & MQJS_APP_EVICTABLE) ? 1 : 0));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    /* native 面 (spec §A.6)。ランチャーの一覧はこの配列だけを見るので、
+       ここに出さない限りエディタもファイラも画面に現れない。
+       kind = "native" で、slot は -1: ワーカー番号を持たないものに
+       それらしい番号を与えると、slot で引く古い経路が誤爆する。
+       running は常に true、evictable は false —— 面は止められない
+       (sys.stop は名前を解決できず false を返す)。
+       JS_NewString はいったんローカルへ: 圧縮 GC が obj を動かすので、
+       JS_SetPropertyStr の引数の中に入れ子にしてはいけない (既知の罠)。 */
+    for (int i = 0; i < s_native_n; i++) {
+        if (!s_native[i].used)
+            continue;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        JSValue nm = JS_NewString(ctx, s_native[i].s.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", nm);
+        JSValue ti = JS_NewString(ctx, s_native[i].s.title
+                                           ? s_native[i].s.title
+                                           : s_native[i].s.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "title", ti);
+        JS_SetPropertyStr(ctx, obj_ref.val, "slot", JS_NewInt32(ctx, -1));
+        JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
+        JSValue kind = JS_NewString(ctx, "native");
+        JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
+        JS_SetPropertyStr(ctx, obj_ref.val, "evictable", JS_NewBool(0));
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
     }
@@ -5793,6 +5978,14 @@ JSValue js_sys_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     char arg[96];
     if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
         return JS_EXCEPTION;
+    /* native 面は「起動」の段が無い (常駐で、登録した時点から在る) ので、
+       名前が一致したら focus だけして返す (§A.6)。sys.launch へ回すと
+       ソースを探しに行って落ちる。 */
+    int nid = mqjs_native_find(arg);
+    if (nid >= 0) {
+        mqjs_native_focus(nid);
+        return JS_NewBool(1);
+    }
     int slot = sys_launch_core(arg);
     if (slot < 0)
         return JS_NewBool(0);
@@ -5848,7 +6041,9 @@ JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         app->kill_req = true; /* reaper finishes after this dispatch */
         return JS_NewBool(1);
     }
-    bool was_fg = (slot == s_fg_worker);
+    /* native 面が fg なら、この JS アプリは fg ではない (§A.6): 止めても
+       前面はエディタのままで、ランチャーへ落としてはいけない。 */
+    bool was_fg = (slot == s_fg_worker && s_fg_native < 0);
     app_stop_internal(app);
     if (was_fg && s_workers[MQJS_WORKER_LAUNCHER].used)
         switch_foreground(MQJS_WORKER_LAUNCHER);
@@ -5961,6 +6156,14 @@ JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
    request. */
 void mqjs_request_open(const char *name)
 {
+    /* native の名前を **先に** 引く (spec §A.6)。ランチャーへ回すと
+       sys.launch がソースを探しに行き、見つからず落ちる —— 面には
+       走らせるソースが無い。 */
+    int nid = mqjs_native_find(name);
+    if (nid >= 0) {
+        mqjs_native_focus(nid);
+        return;
+    }
     MqjsWorker *l = &s_workers[MQJS_WORKER_LAUNCHER];
     if (!name || !name[0] || !l->used)
         return;
@@ -7553,7 +7756,11 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
     }
     if (d == IME_TAKEN)
         return;                     /* 変換中: preedit は外へ 1 バイトも出さない */
-    key_to_app(key, len);
+    /* t_isr は 0: IME 経路の打鍵は native 面へは行かない (native fg の間は
+       ime_route_key を迂回する) ので、この 0 を読む相手は居ない。切替の
+       競合で 1 つだけ着きうるが、そのとき t_isr=0 は「刻まれていない」の
+       正しい値でもある。ImeCmd を 4 バイト太らせない方を採った。 */
+    key_to_app(key, len, t_post, 0);
 }
 
 /* コマンドキュー。打鍵は投げっぱなし、ARM/FOLD/STATS だけ ack を待つ。
@@ -8874,8 +9081,11 @@ static void app_reset_bindings(MqjsWorker *app)
     s_cur_wk = prev;
 
     /* the foreground app owned the screen: tear it down. The next
-       foreground app rebuilds in its sys.onForeground. */
-    if (app->idx == s_fg_worker) {
+       foreground app rebuilds in its sys.onForeground.
+       native 面が fg のときは、s_fg_worker が指すのは「戻り先」であって
+       画面の持ち主ではない (§A.6)。ここで RESET を投げると、裏で死んだ
+       アプリの後始末がエディタのキャンバスを消す。 */
+    if (app->idx == s_fg_worker && s_fg_native < 0) {
 #ifdef ESP_PLATFORM
         ui_tab5_w_reset();
         ui_cmd_t c = { .op = UI_CMD_RESET };
@@ -8925,8 +9135,9 @@ static void app_stop_internal_r(MqjsWorker *app, mqjs_app_stop_reason_t reason)
         s_cur_wk = prev;
     }
     /* a dying foreground app becomes the chip target: "tap to bring it
-       back" survives the stop (design §4: open = focus-or-relaunch) */
-    if (app->idx == s_fg_worker)
+       back" survives the stop (design §4: open = focus-or-relaunch).
+       native 面が fg の間はチップの行き先が別に居るので触らない。 */
+    if (app->idx == s_fg_worker && s_fg_native < 0)
         snprintf(s_prev_name, sizeof s_prev_name, "%s", app->name);
     app_reset_bindings(app);
     JS_FreeContext(app->ctx);  /* runs user-object finalizers */
@@ -9046,31 +9257,78 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     return 0;
 }
 
+/* 画面の後始末 (§3.3 の hygiene)。JS ワーカー同士の切替でも native 面への
+   切替でも、これが focus/onForeground の **手前** に 1 回だけ通る。
+   判断 §E #1 が native surface を runtime 側に置いた理由がこれ:
+   UI_CMD_RESET が 1 か所に残る。
+
+   ⚠ UI_CMD_RESET は **非同期**。ui_tab5_cmd は投げっぱなしで、掃くのは
+   UI タスク。ここが返った瞬間にキャンバスが空になっている保証は無く、
+   さらに RESET はキャンバスを HIDDEN にもする。UI キューを通さずに
+   自分のタスクから直接描く native 面 (spec §A.3) は、最初の 1 枚が
+   これに消されうる前提で組むこと (mqjs_native.h の落とし穴 1)。 */
+static void fg_screen_reset(void)
+{
+#ifdef ESP_PLATFORM
+    ui_tab5_w_reset();
+    ui_cmd_t c = { .op = UI_CMD_RESET };
+    ui_tab5_cmd(&c);
+#else
+    pcw_reset();
+#endif
+}
+
+/* いま fg の JS ワーカーを背面へ送る。JS タスク上。 */
+static void fg_worker_to_background(void)
+{
+    MqjsWorker *old = &s_workers[s_fg_worker];
+    if (!old->used)
+        return;
+    if (old->bg_used)
+        app_call0(old, &old->bg_cb); /* may snapshot UI state */
+    /* destroy the outgoing app's screen state (§3.3 / decision 3) */
+    wcb_release_all(old);
+    fg_screen_reset();
+    /* the outgoing app becomes the status-bar chip target */
+    snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
+    mqjs_app_record_set_view(old->name, MQJS_APP_VIEW_BACKGROUND);
+}
+
+/* fg の native 面から降りる。JS タスク上。降りたら true。
+   **fg フラグを先に落としてから blur を呼ぶ** —— 逆にすると、blur の
+   最中に届いた打鍵が「もう畳んだ面」へ流れる (mqjs_ime_field_focus が
+   FOLD の前に s_ime_field を落とすのと同じ順序)。 */
+static bool native_leave(void)
+{
+    const mqjs_native_surface_t *ns = native_fg();
+    if (!ns)
+        return false;
+    s_fg_native = -1;
+    if (ns->blur)
+        ns->blur(ns->ctx);
+    fg_screen_reset();
+    snprintf(s_prev_name, sizeof s_prev_name, "%s", ns->name);
+    return true;
+}
+
 /* Foreground switch protocol (§3.3), synchronous on the JS task so the
    order background-cb -> teardown -> foreground-cb cannot interleave
    with other dispatches. */
 static void switch_foreground(int new_slot)
 {
-    if (new_slot < 0 || new_slot >= MQJS_MAX_WORKERS || new_slot == s_fg_worker ||
+    if (new_slot < 0 || new_slot >= MQJS_MAX_WORKERS ||
         !s_workers[new_slot].used)
         return;
 
-    MqjsWorker *old = &s_workers[s_fg_worker];
-    if (old->used) {
-        if (old->bg_used)
-            app_call0(old, &old->bg_cb); /* may snapshot UI state */
-        /* destroy the outgoing app's screen state (§3.3 / decision 3) */
-        wcb_release_all(old);
-#ifdef ESP_PLATFORM
-        ui_tab5_w_reset();
-        ui_cmd_t c = { .op = UI_CMD_RESET };
-        ui_tab5_cmd(&c);
-#else
-        pcw_reset();
-#endif
-        /* the outgoing app becomes the status-bar chip target */
-        snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
-        mqjs_app_record_set_view(old->name, MQJS_APP_VIEW_BACKGROUND);
+    /* native 面から戻るときは「もう居る」で打ち切ってはいけない: その面が
+       fg だった間、s_fg_worker は行き先を憶えていただけで、そのアプリは
+       fg ではなかった (§A.6 の不変条件)。面は blur が要るし、アプリは
+       消えた画面を onForeground で作り直す必要がある。 */
+    bool from_native = native_leave();
+    if (!from_native) {
+        if (new_slot == s_fg_worker)
+            return;
+        fg_worker_to_background();
     }
 
     s_fg_worker = new_slot;
@@ -9088,10 +9346,50 @@ static void switch_foreground(int new_slot)
     ui_tab5_w_commit();              /* §3.4: anim only after the rebuild */
 }
 
+/* native 面を fg にする。JS タスク上、switch_foreground と同じ順序規約
+   (背面へ送る -> UI_CMD_RESET -> focus)。 */
+static void switch_to_native(int id)
+{
+    if (id < 0 || id >= MQJS_MAX_NATIVE || !s_native[id].used ||
+        id == s_fg_native)
+        return;
+    if (!native_leave())            /* native -> native もここで畳まれる */
+        fg_worker_to_background();  /* JS -> native */
+
+    s_fg_native = id;               /* ここから打鍵とタッチは面へ行く */
+    const mqjs_native_surface_t *ns = &s_native[id].s;
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "foreground -> '%s' (native %d)", ns->name, id);
+#else
+    printf("[sys] foreground -> '%s' (native %d)\n", ns->name, id);
+#endif
+    bar_update();
+    if (ns->focus)
+        ns->focus(ns->ctx);
+    ui_tab5_w_commit();             /* §3.4: 作り直しの後でだけアニメする */
+}
+
+/* EV_FOCUS の target は uint8_t 1 本で JS ワーカーと native 面の両方を
+   運ぶ: [0, MQJS_MAX_WORKERS) がワーカー、それ以上が native の id。
+   もともと focus_apply が `target < MQJS_MAX_WORKERS` で弾いていた
+   範囲をそのまま意味に使うので、イベントは 1 バイトも太らない。 */
 static void focus_apply(int target)
 {
     if (target < MQJS_MAX_WORKERS)
         switch_foreground(target);
+    else
+        switch_to_native(target - MQJS_MAX_WORKERS);
+}
+
+void mqjs_native_focus(int id)
+{
+    if (id < 0 || id >= MQJS_MAX_NATIVE || !s_native[id].used)
+        return;
+    if (id + MQJS_MAX_WORKERS > 255)
+        return;                      /* focus.target は uint8_t */
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = (uint8_t)(MQJS_MAX_WORKERS + id);
+    ev_post(&ev, 0);
 }
 
 /* EV_NET broadcast: release every app parked in the net.onReady wait queue.
@@ -9271,7 +9569,7 @@ static void reap_idle_apps(void)
             app->kill_req ? MQJS_APP_STOP_USER
             : (i == MQJS_WORKER_DEV && s_stop_req) ? MQJS_APP_STOP_UPDATED
             : MQJS_APP_STOP_IDLE;
-        bool was_fg = (i == s_fg_worker);
+        bool was_fg = (i == s_fg_worker && s_fg_native < 0); /* §A.6 */
         app_stop_internal_r(app, reason);
         if (i == MQJS_WORKER_DEV) {
             /* push-replace = ask the provider right away; natural end =

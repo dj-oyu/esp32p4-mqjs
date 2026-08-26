@@ -44,6 +44,16 @@ if(CONFIG_MQJS_TAB5_UI)
                                "${lvgl_port_dir}/src/common/ppa")
     target_link_options(${COMPONENT_LIB} INTERFACE
                         "-Wl,--wrap=lvgl_port_ppa_create")
+    # ... and time the rotation itself. esp_lvgl_port's flush_cb is
+    # [PPA rotate] + esp_lcd_panel_draw_bitmap, and LVGL's FLUSH_START/
+    # FINISH events bracket the whole of it, so the two cannot be told
+    # apart from events alone. lvgl_port_ppa_rotate lives in the same
+    # (separate) TU as lvgl_port_ppa_create, so the same seam works:
+    # __wrap_lvgl_port_ppa_rotate reports "rot" in the ui_prof line,
+    # which is what decides whether rotation or the DSI transfer is
+    # what a full-screen scroll actually pays for (spec §F #13).
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=lvgl_port_ppa_rotate")
 endif()
 
 # W1-1: back the LVGL builtin tlsf pool with PSRAM. lv_mem_init() (called

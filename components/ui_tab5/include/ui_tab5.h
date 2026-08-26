@@ -114,6 +114,38 @@ typedef struct {
                        ui_tab5_cmd() returns false. */
 } ui_cmd_t;
 
+/* One run of cells drawn straight into the canvas by a NATIVE presenter
+ * (the editor/filer, docs/native-editor-spec.md §A.3) — as opposed to
+ * UI_CMD_CELLS, which a JS app posts and the UI task executes.
+ *
+ * Same cell contract as ui.cells (see the top of ui_tab5.cpp): one
+ * codepoint per column, a width-2 codepoint followed by a filler
+ * codepoint. `ncells` is the columns this run OWNS: the background is
+ * filled across all of them, and columns past the end of `utf8` stay
+ * background — that is how a presenter clears the tail of a row in the
+ * same call. `utf8`/`len` need not be NUL-terminated.
+ *
+ * `a8`   caller-owned staging buffer, 64-BYTE ALIGNED, internal SRAM,
+ *        at least UI_CELL_H * ncells * UI_CELL_W bytes rounded up to 64
+ *        (the PPA's cache maintenance works in cache lines). Runs wider
+ *        than it fits are split; a NULL or unusable buffer is not an
+ *        error, it just puts the run on the CPU path.
+ * `ppa`  caller-owned ppa_client_handle_t for PPA_OPERATION_BLEND
+ *        (ppa_register_client). Each client has its own queue, the
+ *        engine serialises them; NULL = CPU path. Register it OFF the
+ *        presenter's task — registering allocates.
+ */
+typedef struct {
+    int col, row, ncells;
+    const char *utf8;
+    size_t len;
+    uint32_t fg, bg;   /* 0xRRGGBB */
+    unsigned attrs;    /* UI_CELL_ATTR_* */
+    uint8_t *a8;
+    size_t a8_len;
+    void *ppa;         /* ppa_client_handle_t */
+} ui_cells_draw_t;
+
 /* Overlay handles per app, and how many items one overlay shows. Both are
    small on purpose: overlays are transient decoration, and the labels are
    allocated up-front per handle on first use. */
@@ -207,6 +239,30 @@ void ui_tab5_set_fg_apps(const char *cur, const char *prev,
 bool ui_tab5_cmd(const ui_cmd_t *cmd);
 /* Logical canvas resolution; 0x0 when the UI is off or init failed. */
 void ui_tab5_canvas_size(int *w, int *h);
+
+/* ---- native presenter surface (docs/native-editor-spec.md §A.3) ----
+ *
+ * The native editor/filer draws into the same canvas as ui.*, but from
+ * its OWN task and without going through the command queue. Splitting
+ * the pixels from the presentation is the point: a 26-row scroll takes
+ * the LVGL lock ONCE, at the end, for microseconds.
+ *
+ * _cells_draw and _canvas_fill run on the CALLING task and take no
+ * LVGL lock at all — they touch a plain RGB565 buffer LVGL only reads.
+ * Two tasks drawing at once tear (a torn cell is one frame old); they
+ * never corrupt. Neither allocates, neither blocks except inside a
+ * blocking PPA operation.
+ *
+ * _canvas_invalidate takes the lock, marks the rectangle dirty and
+ * returns. Coordinates are canvas-relative pixels and are clamped.
+ * Pass the UNION of the rows that changed: LVGL renders in 720x50
+ * chunks, so two adjacent 24px rows often cost one chunk while two
+ * distant ones always cost two — merging them first is free.
+ * It also un-hides the canvas, because the caller has just drawn.
+ */
+bool ui_tab5_cells_draw(const ui_cells_draw_t *d); /* false = no canvas */
+void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb);
+void ui_tab5_canvas_invalidate(int x, int y, int w, int h);
 /* Pixel size of a UTF-8 string in the canvas font (no wrapping; \n makes
  * it multi-line). 0x0 when the UI is off or init failed. Safe from any
  * task: only reads const font tables. */
@@ -403,6 +459,27 @@ static inline void ui_tab5_canvas_size(int *w, int *h)
 {
     *w = 0;
     *h = 0;
+}
+static inline bool ui_tab5_cells_draw(const ui_cells_draw_t *d)
+{
+    (void)d;
+    return false;
+}
+static inline void ui_tab5_canvas_fill(int x, int y, int w, int h,
+                                       uint32_t rgb)
+{
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)rgb;
+}
+static inline void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
+{
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
 }
 static inline void ui_tab5_text_size(const char *utf8, int *w, int *h)
 {

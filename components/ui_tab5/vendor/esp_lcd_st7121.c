@@ -244,7 +244,7 @@ static esp_err_t panel_st7121_init(esp_lcd_panel_t *panel)
         ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(io, init_cmds[i].cmd, init_cmds[i].data, init_cmds[i].data_bytes),
                             TAG, "send command failed");
         vTaskDelay(pdMS_TO_TICKS(init_cmds[i].delay_ms));
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(1); /* pdMS_TO_TICKS(5) は HZ=100 で 0 に丸まる = 整定待ちが消える */
     }
     ESP_LOGD(TAG, "send init commands success");
 
@@ -261,7 +261,7 @@ static esp_err_t panel_st7121_reset(esp_lcd_panel_t *panel)
     // Perform hardware reset
     if (st7121->reset_gpio_num >= 0) {
         gpio_set_level(st7121->reset_gpio_num, !st7121->flags.reset_level);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(1); /* pdMS_TO_TICKS(5) は HZ=100 で 0 に丸まる = 整定待ちが消える */
         gpio_set_level(st7121->reset_gpio_num, st7121->flags.reset_level);
         vTaskDelay(pdMS_TO_TICKS(10));
         gpio_set_level(st7121->reset_gpio_num, !st7121->flags.reset_level);

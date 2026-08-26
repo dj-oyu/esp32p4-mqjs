@@ -41,6 +41,7 @@
 #include "flash_stall_meter.h"
 #include "flash_suspend_test.h"
 #include "sdcard.h"
+#include "edit_ui.h"
 #include "storage.h"
 #include "task_source.h"
 #include "ui_status.h"
@@ -241,6 +242,13 @@ void app_main(void)
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
     mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
+    /* ネイティブ・エディタ (M4 Phase 1)。ui_tab5_start の後・js_task を
+       起こす前に置く: mqjs_native.h が「native 面の登録は入力が動き出す
+       前に済ませる」ことを規約にしている (表にロックを置かない代わり)。
+       Phase 1 はファイル入出力を持たない —— fs_io が M2 で入るまで、
+       開けるのは空バッファだけ。 */
+    edit_ui_start(NULL);
+
     storage_init();            /* mount LittleFS for persisted tasks */
     sdcard_init();             /* "sd" volume, if this board has a slot */
     card_apps_init();          /* signed apps on the card = a 2nd catalogue */
