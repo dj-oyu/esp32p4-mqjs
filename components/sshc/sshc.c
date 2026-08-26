@@ -58,6 +58,11 @@ static const char *TAG = "sshc";
 #define SSH_TASK_PRIO     5
 #define SSH_CONNECT_TMO_S 10
 #define SSH_RECV_TMO_MS   50
+/* How many SSH_RECV_TMO_MS waits the rx sink may stall before the session
+   gives up. 40 x 50 ms = 2 s — far longer than any drain-and-draw pass
+   (the worst measured was 86 ms), so reaching this means the consumer is
+   genuinely wedged and not merely slow. */
+#define SSH_SINK_STALL_MAX 40
 
 typedef struct {
     char host[64];
@@ -354,14 +359,47 @@ static void ssh_session(ssh_sess_t *s, WOLFSSH_CTX *ctx)
         /* read server output (blocks up to SSH_RECV_TMO_MS) */
         int got = wolfSSH_stream_read(ssh, rxbuf, want);
         if (got > 0 && piped) {
-            /* Sized to the space we were promised, and SPSC means that
-               space cannot have shrunk since — a short take is a bug in
-               the sink, not a byte the wire is allowed to lose. */
-            size_t took = sk.write(sk.user, rxbuf, (size_t)got);
-            if (took < (size_t)got) {
-                ESP_LOGE(TAG, "pipe sink took %u of %d", (unsigned)took, got);
-                reason = "pipe overflow";
-                goto done;
+            /* Sized to the space we were promised, so a short take is not a
+             * full ring. It used to be read as "the sink is broken" and the
+             * session was killed on the spot — which is what happened on
+             * 2026-08-26 when `seq 1 2000` printed into the terminal:
+             *
+             *     E sshc: pipe sink took 0 of 671   -> "pipe overflow", gone
+             *
+             * The two sides disagreed about what a short take MEANS.
+             * term_registry_producer_write() returns 0 when it cannot take
+             * the registry lock within its ingest timeout, and says so:
+             * "the producer still owns its bytes" — i.e. re-offer them.
+             * The lock is held by the drain pass, which draws; under a flood
+             * the drawing is what we are contending with, not the ring.
+             *
+             * So: re-offer the remainder until it is all in, and only give up
+             * if the sink stays shut for much longer than any draw could take.
+             * Bytes are never dropped either way — that part of the old
+             * comment was right, and cutting an escape sequence in half is
+             * still not allowed. */
+            size_t off = 0;
+            int    stalls = 0;
+            while (off < (size_t)got) {
+                size_t took = sk.write(sk.user, rxbuf + off, (size_t)got - off);
+                off += took;
+                if (off >= (size_t)got)
+                    break;
+                if (++stalls > SSH_SINK_STALL_MAX) {
+                    ESP_LOGE(TAG, "pipe sink stuck at %u of %d after %d ms",
+                             (unsigned)off, got,
+                             SSH_SINK_STALL_MAX * SSH_RECV_TMO_MS);
+                    reason = "pipe overflow";
+                    goto done;
+                }
+                if (took == 0)
+                    ESP_LOGW(TAG, "pipe sink busy (%u of %d), retry %d",
+                             (unsigned)off, got, stalls);
+                vTaskDelay(pdMS_TO_TICKS(SSH_RECV_TMO_MS));
+                if (s->stop) {
+                    reason = "closed";
+                    goto done;
+                }
             }
         } else if (got > 0) {
             char *copy = malloc(got);

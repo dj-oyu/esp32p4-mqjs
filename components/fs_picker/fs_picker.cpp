@@ -34,10 +34,13 @@
  * される。つまりあの 2 段構成は、その隙間に空の一覧を 1 フレーム見せた
  * うえで、10〜60 ms を捨てていた。
  *
- * 空フレームを構造で消すために、一覧は **2 枚**持つ (s_lists)。新しい行は
- * 裏へ作り、揃った瞬間に表と入れ替えて旧行を消す。1 tick に作る行数の
- * 上限 (FS_PICK_ROWS_PER_TICK) は残してあるので大きなフォルダは複数 tick に
- * 分かれるが、その間ずっと**旧い一覧が見えている** —— 空にはならない。
+ * 空フレームを構造で消すために、一覧は長らく **2 枚**持っていた (s_lists)。
+ * 新しい行を裏へ作り、揃った瞬間に表と入れ替えて旧行を消す作りで、
+ * 「空の一覧を見せない」という狙いは果たしていた —— が、**入れ替えの
+ * たびに一覧の矩形がまるごと無効になる**。実機ではそれが tap→pixel の
+ * 91% で、行ゼロのフォルダでも 57 ms 掛かっていた。いまは一覧は 1 枚で、
+ * 行はプールとして使い回す (s_list の注記を読むこと)。空にならない
+ * 保証は「行を消さない」ことのほうから来ている。
  *
  * 「上へ」は親スナップショットのスタック (FS_PICK_DEPTH_MAX) から取る。
  * fs_dir_open をやり直さないので dir_open ぶん (実機で 1.9 ms) が消え、
@@ -85,7 +88,11 @@
  *                 (spec §F #7 — 超えるなら M2 の fs_io へ逃がす)
  *   nav / open …  **タップから画素まで 1 行**。present() を参照:
  *                 ev / dir / build / draw / px の 5 点で、どの隙間が
- *                 太いかがそのまま読める
+ *                 太いかがそのまま読める。さらに draw の中身が
+ *                 chunks / draw_us / flush_us / wait_us —— **chunks が
+ *                 「無効にした面積」そのもの** (描画バッファは 50 段なので
+ *                 無効矩形の高さ ÷ 50)。行を作り直していた頃はここが
+ *                 ダイアログぶんの 20 数チャンクで張り付いていた。
  *   list ...      1 tick のロック保持が 8 ms 予算を超えたときだけ WARN
  *                 (つまみの現在値つき、spec §B.2)
  *   open ...      ダイアログを出す tick のロック保持が 8 ms 超のときだけ
@@ -146,8 +153,19 @@ extern "C" void flash_stall_meter_reset(void);
 
 /* ---- 調整つまみ (どれも未測。openQuestions を参照) ---------------- */
 
-/* 1 tick で作る行数の上限。LVGL ロックの保持を切る単位。 */
+/* 1 tick で**新しく作る**行数の上限。LVGL ロックの保持を切る単位。
+   実機 (2026-08-26) の build= から逆算すると 1 行の生成は ~0.7 ms
+   (n=7 で build=5037 us、n=4 で 3352 us、n=0 で 72 us) なので、24 行で
+   すでに 17 ms —— §B.2 の 8 ms 予算はここで破れている。下げる根拠は
+   "list ... hold_max=" の WARN。 */
 #define FS_PICK_ROWS_PER_TICK 24
+/* 1 tick で**すでにある行を書き換える**数の上限。作るのと違って、
+   中身が変わらなければ LVGL の呼び出しは 1 本も出ない (strcmp で弾く)
+   ので、同じ 8 ms でずっと多く進める。分けてあるのは、フォルダを
+   行き来する 2 回目以降を 1 tick で終わらせるため —— 複数 tick に
+   跨ると、その間だけ「新しい行と古い行が混ざった一覧」が見える
+   (行を作り直していた頃は、旧一覧がまるごと見えていた)。 */
+#define FS_PICK_REUSE_PER_TICK 128
 /* 1 tick でスナップショットを走査するエントリ数の上限。フィルタで
    落ちる行は作らないので、行数だけで切ると 4096 件の DCIM を 1 tick で
    舐めてしまう。 */
@@ -209,6 +227,16 @@ extern "C" void flash_stall_meter_reset(void);
 #define PK_COL_WARN   0xE5A54B
 #define PK_COL_PRESS  0x2E6BD6
 
+/* 行の左のアイコン。**番号で持ち回る**。行を使い回すには「今そこに
+   出ているアイコン」と比べる必要があり、lv_image_get_src() が返すのは
+   void* なので、それが文字列なのか画像記述子なのかを型で保証できない
+   (strcmp すると壊れた読み方になりうる)。番号なら比較が確実で、
+   1 行 1 バイトしか要らない。 */
+enum { IC_DIR = 0, IC_FILE, IC_VOL, IC_SD, IC_N };
+static const char *const IC_SYM[IC_N] = {
+    LV_SYMBOL_DIRECTORY, LV_SYMBOL_FILE, LV_SYMBOL_DRIVE, LV_SYMBOL_SD_CARD,
+};
+
 /* ---- 状態 -------------------------------------------------------- */
 
 enum {
@@ -266,8 +294,7 @@ struct Pick {
     bool      nav;         /* 作り直しが進行中。表に出ている行は
                               **古いスナップショットの添字**を持っている
                               ので、この間の行タップは無視する */
-    bool      to_back;     /* 裏の一覧へ積んでいる (= 差し替える旧行がある)。
-                              初回だけ false で、表へ直に積む */
+    int       made;        /* この tick で新しく作った行 (プールの伸び) */
     int32_t   pend_scroll; /* 差し替えたあとに戻すスクロール位置 */
     char      note_pend[192];  /* 差し替えと同じ瞬間に出す注意書き */
 
@@ -315,17 +342,122 @@ static fs_pick_result_t s_res;
    毎回作り直すと、行のタップで自分を消すことになるのと、
    lv_layer_top の子の並びが picker ごとに変わるのを避けるため。 */
 static lv_obj_t  *s_scrim, *s_dlg, *s_title, *s_path, *s_info, *s_note;
-/* 一覧は **2 枚** 持つ。表 (s_lists[s_front]) が見えているほうで、
-   作り直しは裏へ作ってから差し替える —— 「旧行を消すのは新行が揃った
-   瞬間」を構造で保証するため。以前は lv_obj_clean してから次の tick で
-   作っていたので、その隙間に空の一覧が 1 フレーム描かれえた。
-   2 枚目が内蔵 SRAM を食わないのは、LVGL のヒープ (3MB) が PSRAM だから
-   (components/ui_tab5/CMakeLists.txt の LV_MEM_POOL_ALLOC)。 */
-static lv_obj_t  *s_lists[2];
-static int        s_front;
+/* 一覧は **1 枚**。行は消さずに使い回す。
+ *
+ * 以前はここに 2 枚持っていた: 新しい行を裏へ作り、揃った瞬間に表と
+ * 入れ替えて旧行を lv_obj_clean() で消していた。「旧行を消すのは新行が
+ * 揃った瞬間」を構造で保証する作りで、その狙い自体は正しかったが、
+ * **入れ替えのたびに一覧の矩形がまるごと無効になる**。実機 (2026-08-26):
+ *
+ *   nav n=7 rows=7 ... build=5037 draw=73656 px=80896 us
+ *   nav n=0 rows=0 ... build=72   draw=57360 px=59596 us   ← 行ゼロでも 57 ms
+ *
+ * draw が tap→pixel の 91% で、しかも**行数にほとんど依存しない**。
+ * ダイアログは 662x1101 px、描画バッファは 720x50 段 (UI_LVGL_BUF_LINES)
+ * なので一覧ぶんで 20 数チャンク、1 チャンク 3 ms 前後 —— 面積で決まって
+ * いて中身で決まっていない、の形をしている。
+ *
+ * そこで一覧は 1 枚にして、行はプールとして持ち回る:
+ *   - i < 新しい件数 の行は**中身が変わったものだけ**書き換える
+ *     (lv_label_set_text は同じ文字列でも invalidate するので strcmp で弾く)
+ *   - i >= 新しい件数 の行は消さずに LV_OBJ_FLAG_HIDDEN で隠す
+ *     (lv_flex は隠れた子を配置から外すので場所も取らない)
+ * こうすると LVGL の差分描画に判断材料が戻り、無効になるのは
+ * 「変わった行の矩形」だけになる。**そうなったかどうかは present() の
+ * chunks= で読む** —— 落ちなければこの見立てが違う。
+ *
+ * 行を貯めたままにする代償は LVGL ヒープで、上限は FS_PICK_ROWS_MAX
+ * (256) 行ぶん。ヒープは PSRAM なので内蔵 SRAM は増えない
+ * (components/ui_tab5/CMakeLists.txt の LV_MEM_POOL_ALLOC)。 */
+static lv_obj_t  *s_list;
+/* いま隠れていない行の数 (= 表に出ている件数)。プールの大きさは
+   lv_obj_get_child_count(s_list) のほうで、こちらとは別。 */
+static int        s_rows_shown;
 static lv_obj_t  *s_name, *s_kb;
 static lv_obj_t  *s_btn_up, *s_btn_ok, *s_lbl_ok, *s_lbl_cancel;
 static lv_timer_t *s_tick;
+/* 行のアイコン番号。プールと添字が揃っている (行は末尾にしか足さない)。 */
+static uint8_t    s_row_icon[FS_PICK_ROWS_MAX];
+
+/* ---- 描画の内訳を測る穴 (この作業の物差し) -----------------------
+ *
+ * present() の draw= は「lv_refr_now が何 us かかったか」でしかない。
+ * 面積で決まっているのか中身で決まっているのかを分けるには、その中を
+ * **チャンク数**まで割る必要がある: 描画バッファは 720x50 段
+ * (UI_LVGL_BUF_LINES) なので、無効になった矩形の高さがそのまま
+ * ceil(h/50) 回の「描画 + PPA 回転 + DSI 転送」になる。
+ *
+ * LVGL は 1 回のリフレッシュを RENDER_START/READY で挟み、チャンクごとに
+ * FLUSH_START/FINISH と FLUSH_WAIT_START/FINISH を出す
+ * (lv_refr.c:755,823,1415,1423,1433,1446)。したがって
+ *   render - flush - wait = CPU が画素を作った時間
+ *   flush                 = flush_cb (PPA 回転 + DSI 転送の投函)
+ *   wait                  = 前のチャンクの DMA 待ち
+ *   flushes               = チャンク数
+ * ui_tab5.cpp:2974 の s_prof が同じことをしている (UI_KB_BENCH の中で、
+ * 既定は 0 なのでビルドに載らない)。あれは ui_tab5 の static なので
+ * 借りられない —— こちらで同じ形を持つ。
+ *
+ * **display のイベントは複数登録できる。** lv_display_add_event_cb() は
+ * lv_event_add() でリストの末尾へ足すだけで (lv_display.c:872)、
+ * lv_event_send() はリストを頭から全部呼ぶ (lv_event.c:112-121)。
+ * ui_tab5 が自分のを張っていても共存する。
+ *
+ * 数える窓は present() の lv_refr_now() ただ 1 回 —— 直前に 0 にして
+ * 直後に読む。こうしておくと、モーダルが出ている間に lvgl_port の
+ * 通常フレームが挟まっても値は濁らない。張る/外すは開いている間だけ
+ * (do_open / finish)。
+ *
+ * 読み方: 一覧を作り直したのに chunks が 20 台のままなら、無効化の
+ * 出所は行ではない (ダイアログの側 = 見出し・注意書き・レイアウトの
+ * 作り直し・スクロール)。行だけになっていれば数行ぶんまで落ちる。 */
+static struct {
+    int64_t t_render, t_flush, t_wait;
+    int64_t render, flush, wait;
+    int     flushes;
+} s_prof;
+static bool s_prof_on;
+
+static void prof_event(lv_event_t *e)
+{
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_RENDER_START:      s_prof.t_render = now; break;
+    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render;
+                                     break;
+    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
+    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
+                                     s_prof.flushes++; break;
+    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
+    default: break;
+    }
+}
+
+/* LV_EVENT_ALL (= 0) で 1 本だけ張る。6 つの符号を別々に張ると外すのも
+   6 回になり、display のイベント表に fs_picker の跡が 6 行残る。 */
+static void prof_attach(void)
+{
+    if (s_prof_on)
+        return;
+    lv_display_t *d = lv_display_get_default();
+    if (!d)
+        return;
+    lv_display_add_event_cb(d, prof_event, LV_EVENT_ALL, NULL);
+    s_prof_on = true;
+}
+
+static void prof_detach(void)
+{
+    if (!s_prof_on)
+        return;
+    lv_display_t *d = lv_display_get_default();
+    /* cb と user_data の組で消す。filter は見ないので 1 回で足りる
+       (lv_display.c:899-912)。 */
+    if (d)
+        (void)lv_display_remove_event_cb_with_user_data(d, prof_event, NULL);
+    s_prof_on = false;
+}
 
 /* ---- 小道具 ------------------------------------------------------ */
 
@@ -576,8 +708,20 @@ static void row_event(lv_event_t *e)
        別のエントリを開いてしまう (旧行を残す作りにした帰結)。 */
     if (p->nav)
         return;
+    /* **どのエントリかは行そのものが持っている。**
+       行を使い回すようになったので、cb の user_data (張った時点の添字)
+       では足りない —— 同じ lv_button が別のフォルダの別の行として
+       出ているから。1 行 1 回だけ張って、添字は毎回 lv_obj_set_user_data で
+       行に書き直す (「タップしたのと違うファイルが開く」= 権限の穴を
+       避ける要はここ)。
+       0 を「押せない」と読めるように **+1 して**しまってある: 添字 0 は
+       正しい行なのに (void*)0 は NULL と区別が付かない。 */
+    lv_obj_t *b = lv_event_get_current_target_obj(e);
+    intptr_t  v = b ? (intptr_t)lv_obj_get_user_data(b) : 0;
+    if (v <= 0)
+        return;                          /* 隠した行 / 押せない行 */
     p->t_click = esp_timer_get_time();   /* 離した検知 (LV_EVENT_CLICKED) */
-    p->hit  = (int)(intptr_t)lv_event_get_user_data(e);
+    p->hit  = (int)(v - 1);
     p->work = W_ROW;
     wake();
 }
@@ -707,19 +851,16 @@ static bool build_ui(void)
     lv_label_set_text(s_note, "");
     lv_obj_add_flag(s_note, LV_OBJ_FLAG_HIDDEN);
 
-    /* 表と裏。lv_flex は LV_OBJ_FLAG_HIDDEN の子を配置から外す
-       (lv_flex.c:261,394) ので、隠れているほうは場所を取らない。 */
-    for (int i = 0; i < 2; i++) {
-        lv_obj_t *L = lv_list_create(s_dlg);
-        lv_obj_set_width(L, LV_PCT(100));
-        lv_obj_set_flex_grow(L, 1);
-        lv_obj_set_style_bg_color(L, lv_color_hex(PK_COL_PANEL), 0);
-        lv_obj_set_style_border_width(L, 0, 0);
-        lv_obj_set_style_pad_all(L, 4, 0);
-        s_lists[i] = L;
-    }
-    s_front = 0;
-    lv_obj_add_flag(s_lists[1], LV_OBJ_FLAG_HIDDEN);
+    /* 一覧は 1 枚だけ。行はこの下にプールとして貯まり、隠すことで
+       出し入れする —— lv_flex は LV_OBJ_FLAG_HIDDEN の子を配置から
+       外す (lv_flex.c:261,394) ので、隠れた行は場所を取らない。 */
+    s_list = lv_list_create(s_dlg);
+    lv_obj_set_width(s_list, LV_PCT(100));
+    lv_obj_set_flex_grow(s_list, 1);
+    lv_obj_set_style_bg_color(s_list, lv_color_hex(PK_COL_PANEL), 0);
+    lv_obj_set_style_border_width(s_list, 0, 0);
+    lv_obj_set_style_pad_all(s_list, 4, 0);
+    s_rows_shown = 0;
 
     s_name = lv_textarea_create(s_dlg);
     lv_textarea_set_one_line(s_name, true);
@@ -789,14 +930,162 @@ static void kb_place(bool on)
 
 /* ---- 一覧 -------------------------------------------------------- */
 
-static lv_obj_t *front_list(void) { return s_lists[s_front]; }
-static lv_obj_t *back_list(void)  { return s_lists[s_front ^ 1]; }
-
-/* いま行を積んでいる先。差し替える旧行がまだ無い初回だけ表へ直に積む
-   (裏へ作ると、ダイアログが出るまでの間ずっと画面に何も出ない)。 */
-static lv_obj_t *build_list(const Pick *p)
+/* プールにいま何行あるか (隠れている行も数える)。 */
+static int pool_len(void)
 {
-    return p->to_back ? back_list() : front_list();
+    return s_list ? (int)lv_obj_get_child_count(s_list) : 0;
+}
+
+/* 行の中身。lv_list_add_button は icon が非 NULL なら
+   [image, label]、NULL なら [label] を作る (lv_list.c:83-104)。
+   ここは必ず非 NULL で作るので前者だが、LV_USE_IMAGE=0 のビルドでも
+   壊れないように件数から引く。 */
+static void row_parts(lv_obj_t *b, lv_obj_t **img, lv_obj_t **lbl)
+{
+    uint32_t nc = lv_obj_get_child_count(b);
+    *img = (nc >= 2) ? lv_obj_get_child(b, 0) : NULL;
+    *lbl = (nc >= 2) ? lv_obj_get_child(b, 1)
+                     : (nc == 1 ? lv_obj_get_child(b, 0) : NULL);
+}
+
+/* 行を「押せない」印にする。隠した行と、長すぎて選べない行の両方で使う。
+   user_data を 0 にしておくと row_event が弾く —— 行を使い回すように
+   なった以上、**隠れているだけの行が古い添字を持ったまま**では、
+   押されたときに別のエントリを開いてしまう。 */
+static void row_disarm(lv_obj_t *b)
+{
+    lv_obj_set_user_data(b, NULL);
+}
+
+/* プールの i 番目を、この内容に**変わっていれば**書き換える。
+   足りなければその場で作る (作った行は隠したまま。出すのは
+   reveal_rows —— 件数が変わるのは作り終えた瞬間だけにする)。
+   icon は IC_* の番号。 */
+static void set_row(Pick *p, int i, int snap_idx, uint8_t icon,
+                    const char *text, bool enabled)
+{
+    if (!s_list || i < 0 || i >= FS_PICK_ROWS_MAX || icon >= IC_N)
+        return;
+    lv_obj_t *b = lv_obj_get_child(s_list, i);
+    if (!b) {
+        /* 作れるのは**末尾のひとつ先だけ**。lv_list_add_button は必ず
+           末尾へ足すので、i がそこと違うとプールの添字と
+           s_row_icon[] の添字がずれる —— ずれると「隠したはずの行が
+           別のエントリを指す」に化けるので、作らずに諦める
+           (呼び出し側は p->rows == pool_len() のときだけここへ来る)。 */
+        if (i != pool_len())
+            return;
+        b = lv_list_add_button(s_list, IC_SYM[icon], text);
+        if (!b)
+            return;
+        /* **作った直後に隠す。** ここまでの無効化は落ちる ——
+           lv_obj_constructor は x2=x1-1 の空の矩形で作る
+           (lv_obj.c:566-569) ので lv_obj_invalidate() が
+           lv_area_intersect で弾かれ (lv_obj_pos.c:900)、隠したあとは
+           LV_OBJ_FLAG_HIDDEN でそもそも入口で弾かれる
+           (lv_obj_pos.c:880)。つまり「裏で行を作る」がタダで手に入る。 */
+        lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PANEL), 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PRESS),
+                                  LV_STATE_PRESSED);
+        lv_obj_set_style_transform_width(b, 0, LV_STATE_PRESSED);
+        lv_obj_set_style_transform_height(b, 0, LV_STATE_PRESSED);
+        /* イベントは行の一生に 1 回だけ張る。どのエントリかは
+           user_data で持ち回るので、張り直しは要らない。 */
+        lv_obj_add_event_cb(b, row_event, LV_EVENT_CLICKED, NULL);
+        s_row_icon[i] = icon;
+        /* 新しい行は既定の状態なので、色と可否は必ず 1 度当てる。 */
+        lv_obj_set_style_text_color(
+            b, lv_color_hex(enabled ? PK_COL_TEXT : PK_COL_DIM), 0);
+        if (!enabled)
+            lv_obj_add_state(b, LV_STATE_DISABLED);
+        p->made++;
+        p->rows++;
+        lv_obj_set_user_data(b, enabled ? (void *)(intptr_t)(snap_idx + 1)
+                                        : NULL);
+        return;
+    }
+
+    lv_obj_t *img = NULL, *lbl = NULL;
+    row_parts(b, &img, &lbl);
+
+    /* 文字。**同じでも lv_label_set_text は invalidate する**
+       (set_text_internal は free/malloc して lv_label_refr_text、
+       lv_label.c:987-1025) ので、ここで弾くのが効き目の本体。
+       行のラベルは LV_LABEL_LONG_MODE_SCROLL_CIRCULAR なので
+       lv_label_get_text() が返すのは「…」を入れる前の元の文字列
+       (DOTS モードだと切り詰めたほうが返るので、この比較は成り立たない)。 */
+    if (lbl) {
+        const char *cur = lv_label_get_text(lbl);
+        if (!cur || strcmp(cur, text) != 0)
+            lv_label_set_text(lbl, text);
+    }
+    /* アイコン。lv_image_set_src も無条件に invalidate する
+       (lv_image.c:163)。 */
+    if (img && s_row_icon[i] != icon) {
+        lv_image_set_src(img, IC_SYM[icon]);
+        s_row_icon[i] = icon;
+    }
+    /* 可否と色。lv_obj_add_state / set_style_* も無条件に効くので、
+       変わったときだけ当てる。 */
+    bool was_en = !lv_obj_has_state(b, LV_STATE_DISABLED);
+    if (was_en != enabled) {
+        lv_obj_set_style_text_color(
+            b, lv_color_hex(enabled ? PK_COL_TEXT : PK_COL_DIM), 0);
+        if (enabled)
+            lv_obj_remove_state(b, LV_STATE_DISABLED);
+        else
+            lv_obj_add_state(b, LV_STATE_DISABLED);
+    }
+    /* 添字は毎回書く (無効化を起こさない)。 */
+    lv_obj_set_user_data(b, enabled ? (void *)(intptr_t)(snap_idx + 1) : NULL);
+    p->rows++;
+}
+
+/* 出す行と隠す行を**この瞬間に**決める。
+   中身は build_chunk が tick を跨いで書き換えているが、件数だけは
+   ここで一度に変える —— 作り直しの途中で一覧が伸び縮みして見えない
+   ように。 */
+static void reveal_rows(Pick *p)
+{
+    /* 触るのは「これから出す件数」と「いま出ている件数」の広いほうまで。
+       その先の行は前回の reveal_rows / clear_rows が隠して押せなくして
+       あり、そこは今回も変わらない —— 256 行のプールを毎回舐めない
+       ためと、不変条件 (s_rows_shown より後ろは必ず隠れていて
+       user_data が 0) をここで一箇所に書いておくため。 */
+    int n  = pool_len();
+    int hi = p->rows > s_rows_shown ? p->rows : s_rows_shown;
+    if (hi > n)
+        hi = n;
+    for (int i = 0; i < hi; i++) {
+        lv_obj_t *b = lv_obj_get_child(s_list, i);
+        if (!b)
+            continue;
+        if (i < p->rows) {
+            lv_obj_remove_flag(b, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            row_disarm(b);
+            lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    s_rows_shown = p->rows;
+}
+
+/* 全部隠す (行は消さない)。ピッカーを畳むときに使う ——
+   次に開いたとき、前の要求の一覧が 1 フレーム見えないように。
+   消さないので、次の pick は同じ行を使い回せる (1 行の生成が ~0.7 ms)。 */
+static void clear_rows(void)
+{
+    int n = pool_len();
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *b = lv_obj_get_child(s_list, i);
+        if (!b)
+            continue;
+        row_disarm(b);
+        lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+    }
+    s_rows_shown = 0;
 }
 
 static void close_dir(Pick *p)
@@ -853,7 +1142,7 @@ static void stack_push_current(Pick *p)
     copy_str(f->path, sizeof f->path, p->cur);
     f->dir      = p->dir;
     f->n        = p->n;
-    f->scroll_y = lv_obj_get_scroll_y(front_list());
+    f->scroll_y = lv_obj_get_scroll_y(s_list);
     const fsvol_t *v = NULL;
     /* いま開けたばかりの道なので必ず解決する。戻り値は見ない
        (見るのは *v が埋まったかどうかだけ)。 */
@@ -912,18 +1201,34 @@ static bool stack_pop(Pick *p, int32_t *restore_y)
  * 吐くのにかかった時間 (115200 baud = 1 文字 ~87 us)。 */
 static void present(Pick *p, const char *what)
 {
+    /* **この 1 回の lv_refr_now だけを数える。** 直前に 0 にするので、
+       モーダルが出ている間に lvgl_port の通常フレームが挟まっても
+       値は濁らない。 */
+    memset(&s_prof, 0, sizeof s_prof);
+
     lv_refr_now(NULL);
 
+    /* chunks はこの作業 (行の使い回し) 全体の物差し。無効になった矩形の
+       高さ ÷ 描画バッファの 50 段が、そのままここに出る。
+       行の入れ替えで一覧をまるごと無効にしていた頃はダイアログぶんの
+       20 数チャンクが毎回出ていた —— **落ちなければ、無効化の出所は
+       行ではない**。draw+flush+wait ≈ draw= になっているかどうかが、
+       この 3 つが同じ 1 回を見ている証拠 (ずれていたら窓が違う)。
+       chunks=0 は「無効な矩形が 1 つも無かった」= 描くものが無かった
+       (lv_refr.c:748 で早戻り)。 */
     int64_t t1  = esp_timer_get_time();
     int64_t dir = p->t_dir ? p->t_dir : p->t_work;
     int64_t row = p->t_rows ? p->t_rows : dir;
     ESP_LOGI(TAG,
              "%s n=%d rows=%d blk=%d tk=%d ev=%lld dir=%lld build=%lld "
-             "draw=%lld px=%lld us",
+             "draw=%lld px=%lld us  chunks=%d draw_us=%lld flush_us=%lld "
+             "wait_us=%lld",
              what, p->n, p->rows, p->blocked, p->chunks,
              (long long)(p->t_work - p->t_click), (long long)(dir - p->t_work),
              (long long)(row - dir), (long long)(t1 - row),
-             (long long)(t1 - p->t_click));
+             (long long)(t1 - p->t_click), s_prof.flushes,
+             (long long)(s_prof.render - s_prof.flush - s_prof.wait),
+             (long long)s_prof.flush, (long long)s_prof.wait);
 
 #if FS_PICK_STALL_PROBE
     if (p->stall_armed) {
@@ -944,22 +1249,18 @@ static void finish_rebuild(Pick *p)
     lv_label_set_text(s_path, p->at_vols ? "ボリューム" : p->cur);
     note(p->note_pend[0] ? p->note_pend : NULL);
 
-    if (p->to_back) {
-        lv_obj_t *old_l = front_list();
-        lv_obj_t *new_l = back_list();
-        lv_obj_remove_flag(new_l, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(old_l, LV_OBJ_FLAG_HIDDEN);
-        s_front ^= 1;
-        lv_obj_clean(old_l);   /* 旧行を消すのは新行を出したこの瞬間 */
-        lv_obj_scroll_to_y(old_l, 0, LV_ANIM_OFF);
-    }
+    /* 余った行を隠し、足りていた行を出す。**中身の書き換えは
+       build_chunk が tick を跨いでやっているが、件数が変わるのは
+       ここだけ** —— 作り直しの途中で一覧が伸び縮みしないように。 */
+    reveal_rows(p);
+
     /* スクロールは寸法が決まってからでないと 0 へ丸められる。
        まだ出ていない (初回) ときは、この直後に do_open がダイアログを
        出して配置がもう一度汚れるので、ここで走らせるだけ無駄になる ——
-       新品の一覧なので戻す位置も 0 しかない。 */
+       clear_rows のあとなので戻す位置も 0 しかない。 */
     if (p->shown) {
-        lv_obj_update_layout(front_list());
-        lv_obj_scroll_to_y(front_list(), p->pend_scroll, LV_ANIM_OFF);
+        lv_obj_update_layout(s_list);
+        lv_obj_scroll_to_y(s_list, p->pend_scroll, LV_ANIM_OFF);
     }
     p->nav = false;
 
@@ -969,18 +1270,18 @@ static void finish_rebuild(Pick *p)
        描くと、ダイアログの無い画面を 1 枚まるごと描いて捨てることになる。 */
 }
 
-/* 新しい一覧を作り始める。**表の一覧には触らない** —— 旧行は新行が
-   揃う瞬間まで見えたままにする (空フレームを構造で消す)。 */
+/* 新しい一覧を作り始める。**行は消さない** —— 0 番から順に上書きして
+   いき、余りは reveal_rows が隠す。作りかけの一覧が残っていても、
+   p->rows を 0 に戻せば次の書き込みがそこから上書きするので捨てる
+   必要がない (捨てる = lv_obj_clean = 一覧まるごとの無効化だった)。 */
 static void begin_rebuild(Pick *p, int32_t restore_y)
 {
     p->scanned = p->rows = p->blocked = p->chunks = 0;
     p->build_us = p->build_max_us = 0;
     p->pend_scroll = restore_y;
-    p->to_back     = p->shown;
     p->nav         = true;
     p->t_dir       = esp_timer_get_time();
     p->t_rows      = 0;
-    lv_obj_clean(build_list(p));   /* 作りかけが残っていたら捨てる */
     p->work = W_BUILD;
 }
 
@@ -1043,36 +1344,15 @@ static void enter_dir(Pick *p, const char *vpath, bool keep_parent)
     begin_rebuild(p, 0);
 }
 
-static void add_row(Pick *p, int snap_idx, const char *icon, const char *text,
-                    bool enabled)
-{
-    lv_obj_t *b = lv_list_add_button(build_list(p), icon, text);
-    if (!b)
-        return;
-    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PANEL), 0);
-    lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PRESS), LV_STATE_PRESSED);
-    lv_obj_set_style_text_color(b, lv_color_hex(enabled ? PK_COL_TEXT
-                                                        : PK_COL_DIM), 0);
-    lv_obj_set_style_transform_width(b, 0, LV_STATE_PRESSED);
-    lv_obj_set_style_transform_height(b, 0, LV_STATE_PRESSED);
-    if (enabled)
-        lv_obj_add_event_cb(b, row_event, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)snap_idx);
-    else
-        lv_obj_add_state(b, LV_STATE_DISABLED);
-    p->rows++;
-}
-
 /* 「選んでも runtime に捨てられる」行を、断る理由を付けて灰色で置く
    (S6)。理由は行そのものに書く —— 押しても何も起きない行の理由は、
    その行の隣にしか置き場が無い。 */
-static void add_blocked_row(Pick *p, const char *icon, const char *name)
+static void add_blocked_row(Pick *p, uint8_t icon, const char *name)
 {
     snprintf(p->row, sizeof p->row,
              "%s  — パスが長すぎて選べません (%d 文字まで)", name,
              (int)FS_PICK_SCOPE_MAX - 1);
-    add_row(p, -1, icon, p->row, false);
+    set_row(p, p->rows, -1, icon, p->row, false);
     p->blocked++;
 }
 
@@ -1082,9 +1362,21 @@ static void build_chunk(Pick *p)
     int     rows0 = p->rows;
     int     scan0 = p->scanned;
 
+    p->made = 0;
+
     while (p->scanned < p->n && p->rows < FS_PICK_ROWS_MAX &&
-           p->rows - rows0 < FS_PICK_ROWS_PER_TICK &&
            p->scanned - scan0 < FS_PICK_SCAN_PER_TICK) {
+        /* 1 tick の予算は「作る」と「書き換える」で別々に持つ。
+           作るのは 1 行 ~0.7 ms、書き換えは中身が同じなら 0 ——
+           同じ上限で切ると、行き来のたびに要らない tick を跨いで
+           一覧が混ざって見える。次の行が作りになるかどうかは、
+           プールがそこまで伸びているかで決まる。 */
+        if (p->rows >= pool_len()) {
+            if (p->made >= FS_PICK_ROWS_PER_TICK)
+                break;
+        } else if (p->rows - rows0 >= FS_PICK_REUSE_PER_TICK) {
+            break;
+        }
         int i = p->scanned++;
         if (p->at_vols) {
             const fsvol_t *v = fsvol_at(i);
@@ -1113,9 +1405,9 @@ static void build_chunk(Pick *p)
                fsvol_mount() の 150 ms 級のブロッキング呼び出しが UI タスクを
                止める (design §5 が fs.mount を JS から削ったのと同じ理由)。
                M2 の fs_io がマウントを持つまでは、状態を出すだけにする。 */
-            add_row(p, i,
-                    (v->flags & FSVOL_REMOVABLE) ? LV_SYMBOL_SD_CARD
-                                                 : LV_SYMBOL_DRIVE,
+            set_row(p, p->rows, i,
+                    (v->flags & FSVOL_REMOVABLE) ? (uint8_t)IC_SD
+                                                 : (uint8_t)IC_VOL,
                     line, st == FSVOL_ST_MOUNTED);
         } else {
             fs_entry_t e;
@@ -1127,7 +1419,7 @@ static void build_chunk(Pick *p)
                 if (!ext_ok(p, e.name))
                     continue;
             }
-            const char *icon = e.is_dir ? LV_SYMBOL_DIRECTORY : LV_SYMBOL_FILE;
+            uint8_t icon = e.is_dir ? (uint8_t)IC_DIR : (uint8_t)IC_FILE;
             /* この行を選んだら答えは何になるか、を先に組み立てて器に
                入るか見る (S6)。フォルダは「入るための行」でもあるので、
                フォルダそのものが答えになる DIR モードでだけ塞ぐ ——
@@ -1138,7 +1430,7 @@ static void build_chunk(Pick *p)
             if (!nav_only && !fits_scope(p->scratch))
                 add_blocked_row(p, icon, e.name);
             else
-                add_row(p, i, icon, e.name, true);
+                set_row(p, p->rows, i, icon, e.name, true);
         }
     }
 
@@ -1151,6 +1443,15 @@ static void build_chunk(Pick *p)
 
     bool more = (p->scanned < p->n) && (p->rows < FS_PICK_ROWS_MAX);
     if (more) {
+        /* まだ出していない (初回) なら、作れたぶんをその場で出す。
+           do_open が clear_rows() で空にしてあるので、ここで見えるのは
+           **必ず今のフォルダの行だけ** —— 古い行と混ざりようがない。
+           出さないと、大きなフォルダを開いた瞬間だけ「空の一覧を持った
+           ダイアログ」が出て、行を作り直していた頃より悪くなる。
+           出したあと (nav) は逆に、件数が動くのは reveal_rows の
+           一瞬だけにする。 */
+        if (!p->shown)
+            reveal_rows(p);
         p->work = W_BUILD;
         return;
     }
@@ -1229,11 +1530,9 @@ static void apply_mode(Pick *p)
     else
         lv_obj_add_flag(s_btn_up, LV_OBJ_FLAG_HIDDEN);
     if (want_list) {
-        lv_obj_remove_flag(front_list(), LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(back_list(), LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_list, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_add_flag(s_lists[0], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_lists[1], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_list, LV_OBJ_FLAG_HIDDEN);
     }
     if (want_name) {
         lv_obj_remove_flag(s_name, LV_OBJ_FLAG_HIDDEN);
@@ -1256,6 +1555,16 @@ static void do_open(Pick *p)
         p->work = W_ABORT;
         return;
     }
+    /* 描画の内訳を数える口を開ける。**ピッカーが出ている間だけ**張る ——
+       閉じている間も数えていると、他の描画を拾って chunks の意味が濁る
+       (数える窓は present() の 1 回だけなので値そのものは濁らないが、
+       display のイベント表に要らない行を残さない)。外すのは finish()。 */
+    prof_attach();
+    /* 前の要求の行が残っていると、ダイアログが出た瞬間にそれが見える。
+       **消さずに隠す** —— 消すと次に開いたとき作り直しで 1 行 ~0.7 ms
+       払い直すことになる。ここはまだ s_dlg が隠れているので、この
+       隠す操作自体は 1 画素も無効にしない。 */
+    clear_rows();
     note(NULL);
     apply_mode(p);
     kb_place(false);
@@ -1344,10 +1653,14 @@ static void finish(Pick *p, bool ok, const char *vpath)
         lv_obj_add_flag(s_dlg, LV_OBJ_FLAG_HIDDEN);
     if (s_scrim)
         lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
-    if (s_lists[0]) {
-        lv_obj_clean(s_lists[0]);
-        lv_obj_clean(s_lists[1]);
-    }
+    /* **行は消さない。** 隠して、押せない印を付けるだけ。
+       消すと次の pick が 1 行 ~0.7 ms 払って作り直すことになる ——
+       行を貯めておくのがこの作り替えの本体で、上限は
+       FS_PICK_ROWS_MAX (256) 行ぶんの LVGL ヒープ (PSRAM)。
+       ここは s_dlg をもう隠したあとなので、1 画素も無効にしない。 */
+    clear_rows();
+    /* 数える口を閉じる。 */
+    prof_detach();
     close_dir(p);
     /* 積んである親スナップショットも手放す。ここで忘れると、
        ピッカーを閉じるたびに PSRAM が深さぶん残る。 */

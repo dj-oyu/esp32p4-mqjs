@@ -431,6 +431,73 @@ static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
 static int s_canvas_w, s_canvas_h; /* set once the display is up */
 
+/* ---- 差分 invalidate の値打ちを、やる前に測る (docs/native-editor-spec.md §A.3)
+ *
+ * 今の ui.cells は描画バッチの末尾で lv_obj_invalidate(_canvas) を呼ぶ ——
+ * キャンバス全体。term_ui_tab5.c は既に dirty 行だけ blit しているのに、
+ * その情報がここで捨てられている。ピッカーの実測 (2026-08-26) が示したのは
+ * 「描画のコストは面積で決まり、描画バッファの 720×50 段に量子化される」で、
+ * ならばこの 1 行が ssh_vt の毎フレームを丸ごと払わせている可能性がある。
+ *
+ * ここで数えるのは 2 つだけ:
+ *   act  実際に無効化した面積 (= キャンバス全体 × バッチ数)
+ *   want dirty な部分だけなら要った面積 (バッチ内の CELLS の外接矩形)
+ * **比が小さければこの工事はやる価値が無い。** 挙動を変えずにそれが分かる。
+ *
+ * 5 秒ごと、動いたときだけ 1 行出す。計測器自身が停止や描画を増やさない
+ * よう、時計は 1 バッチ 1 回、書式化は 5 秒に 1 回。 */
+struct AreaMeter {
+    uint32_t batches;      /* 描画のあったバッチ数 */
+    uint32_t full;         /* 矩形を出せない op が混ざったバッチ数 */
+    uint64_t act_px;       /* Σ キャンバス全体 */
+    uint64_t want_px;      /* Σ 外接矩形 (full のバッチは全体で数える) */
+    uint32_t rows_min, rows_max; /* 外接矩形の高さ [段] の範囲 */
+    int64_t  t_report;
+};
+static AreaMeter s_am;
+
+static void area_meter_batch(bool bbox_ok, int x0, int y0, int x1, int y1)
+{
+    if (!s_canvas_w || !s_canvas_h)
+        return;
+    uint64_t whole = (uint64_t)s_canvas_w * (uint64_t)s_canvas_h;
+    s_am.batches++;
+    s_am.act_px += whole;
+    if (!bbox_ok || x1 <= x0 || y1 <= y0) {
+        s_am.full++;
+        s_am.want_px += whole;
+    } else {
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > s_canvas_w) x1 = s_canvas_w;
+        if (y1 > s_canvas_h) y1 = s_canvas_h;
+        /* 幅は使わない: LVGL が無効領域を段で切るので、値打ちを決めるのは
+           高さ。ただし want_px は面積で持っておく (将来 x 方向も切るなら要る)。 */
+        s_am.want_px += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+        uint32_t rows = (uint32_t)((y1 - y0 + UI_CELL_H - 1) / UI_CELL_H);
+        if (!s_am.rows_min || rows < s_am.rows_min) s_am.rows_min = rows;
+        if (rows > s_am.rows_max) s_am.rows_max = rows;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (!s_am.t_report) {
+        s_am.t_report = now;
+        return;
+    }
+    if (now - s_am.t_report < 5000000)
+        return;
+    ESP_LOGW("ui_area",
+             "5s: batches=%lu full=%lu act=%llu want=%llu px  want/act=%lu%%  "
+             "rows=%lu..%lu of %d",
+             (unsigned long)s_am.batches, (unsigned long)s_am.full,
+             (unsigned long long)s_am.act_px, (unsigned long long)s_am.want_px,
+             (unsigned long)(s_am.act_px ? s_am.want_px * 100 / s_am.act_px : 0),
+             (unsigned long)s_am.rows_min, (unsigned long)s_am.rows_max,
+             s_canvas_h / UI_CELL_H);
+    s_am = AreaMeter{};
+    s_am.t_report = now;
+}
+
 /* Landscape rotation (keyboard dock). The handles below are the few
    fixed-size widgets that ui_tab5_set_landscape must re-size by hand —
    everything else is LV_PCT/flex/align-based and follows the display's
@@ -3155,6 +3222,9 @@ public:
 
         ui_cmd_t cmd;
         bool drew = false;
+        /* このバッチが実際に触った矩形 (面積の計測用。§A.3)。 */
+        int  bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
+        bool bbox_ok = true;
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             if (cmd.op == UI_CMD_KEYBOARD) {
                 /* not a drawing op: must not unhide the canvas */
@@ -3187,14 +3257,68 @@ public:
                 ovl_hide_all();    /* a dead app's float must not survive */
                 continue;
             }
+            /* 面積の計測。**挙動は 1 ビットも変えない** —— 下の
+               lv_obj_invalidate(_canvas) はキャンバス全体のままで、ここでは
+               「dirty な部分だけなら何 px で済んだか」を数えるだけ。
+
+               なぜ要るか (2026-08-26、ピッカーの実測から): 描画のコストは
+               面積で決まり、描画バッファの 720×50 段に量子化される。
+               term_ui_tab5.c は **既に dirty 行だけ blit している**のに、
+               その情報はこの 1 行で捨てられ、1 文字来るたびに 1280×632 が
+               再描画される。差分 invalidate (spec §A.3 の
+               ui_tab5_canvas_invalidate) に置き換える価値があるかを、
+               置き換える前に測る。
+
+               CELLS 以外の描画 op は矩形を出さず「全体」に倒す。端末は
+               全部 CELLS なので測りたいものは測れるし、出せない op を
+               勝手に見積もって過大な期待値を出すより正直。 */
+            if (cmd.op == UI_CMD_CELLS && cmd.text) {
+                int n = 0;
+                for (const uint8_t *q = (const uint8_t *)cmd.text; *q; q++)
+                    if ((*q & 0xC0) != 0x80)
+                        n++;
+                int x0 = cmd.x * UI_CELL_W, y0 = cmd.y * UI_CELL_H;
+                int x1 = x0 + n * UI_CELL_W, y1 = y0 + UI_CELL_H;
+                if (bx0 > x0) bx0 = x0;
+                if (by0 > y0) by0 = y0;
+                if (bx1 < x1) bx1 = x1;
+                if (by1 < y1) by1 = y1;
+            } else {
+                bbox_ok = false;
+            }
+
             apply(cmd);
             free(cmd.text);
             drew = true;
         }
         if (drew) {
-            if (lv_obj_has_flag(_canvas, LV_OBJ_FLAG_HIDDEN))
+            bool unhid = lv_obj_has_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+            if (unhid)
                 lv_obj_remove_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_invalidate(_canvas);
+            /* 触った矩形だけを無効にする (spec §A.3)。
+               描画のコストは面積で決まり、描画バッファの 720×50 段に
+               量子化される —— 1 行だけ変わった打鍵で 1280×632 を全部
+               描き直していた。実測 (2026-08-26) の want/act は 1 行だけ
+               dirty のとき 3%。
+
+               座標は絶対系。lv_obj_get_content_coords を使うのは、
+               キャンバスに padding/border が付いた日に (0,0) がずれて
+               **残像が出る**形で壊れるのを避けるため。
+               隠れていたキャンバスを今出したときは、まだ一度も描かれて
+               いない領域があるので全体を無効にする。 */
+            if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
+                lv_area_t cv;
+                lv_obj_get_content_coords(_canvas, &cv);
+                lv_area_t a;
+                a.x1 = (int32_t)(cv.x1 + bx0);
+                a.y1 = (int32_t)(cv.y1 + by0);
+                a.x2 = (int32_t)(cv.x1 + bx1 - 1);
+                a.y2 = (int32_t)(cv.y1 + by1 - 1);
+                lv_obj_invalidate_area(_canvas, &a);
+            } else {
+                lv_obj_invalidate(_canvas);
+            }
+            area_meter_batch(bbox_ok, bx0, by0, bx1, by1);
         }
     }
 
