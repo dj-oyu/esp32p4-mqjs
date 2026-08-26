@@ -97,7 +97,11 @@ static const char *TAG = "edit_ui";
 
 /* フォアグラウンドに出た直後の描き直し。理由は冒頭の「落とし穴 1」の節。 */
 #define EDIT_FIRST_PAINT_MS  80
-#define EDIT_FOCUS_REPAINTS   4
+/* 0 = 最初の 1 枚だけ。以前は 4 回の描き直しを重ねていた —— UI_CMD_RESET
+   が非同期で、いつ通るか知る口が無かったため。ui_tab5_canvas_reset_sync()
+   が同期になったので保険は要らない。全画面 1 枚は実測 74.6 ms なので、
+   5 枚 = アプリ切替のたびに core 1 が 370 ms 持っていかれていた。 */
+#define EDIT_FOCUS_REPAINTS   0
 
 /* 計測ログの間隔。打鍵経路では**書式化もログもしない** (§C.0 規則 1) ので、
    吐くのは TICK の中だけ。 */

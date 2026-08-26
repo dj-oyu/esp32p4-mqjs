@@ -42,6 +42,7 @@
 #include "flash_suspend_test.h"
 #include "sdcard.h"
 #include "edit_ui.h"
+#include "mqjs_native.h"
 #include "storage.h"
 #include "task_source.h"
 #include "ui_status.h"
@@ -248,6 +249,12 @@ void app_main(void)
        Phase 1 はファイル入出力を持たない —— fs_io が M2 で入るまで、
        開けるのは空バッファだけ。 */
     edit_ui_start(NULL);
+    /* SKK の辞書を繋ぐ。これが無いと「あ」で面だけ かな に変わって
+       入力は ASCII のまま、という嘘の状態になる (実機報告 2026-08-26)。
+       辞書は読み取り専用で共有可能 —— 個人辞書は 2026-07-30 に削除済み
+       (skk_core.h:16)。NULL = jisyo が焼かれていないだけで、その場合は
+       edit_ui 側が日本語入力を出さない。 */
+    edit_ui_attach_dict(mqjs_skk_dict_acquire());
 
     storage_init();            /* mount LittleFS for persisted tasks */
     sdcard_init();             /* "sd" volume, if this board has a slot */

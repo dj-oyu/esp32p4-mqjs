@@ -7470,6 +7470,26 @@ static bool ime_arm_now(void)
     return true;
 }
 
+/* 辞書を 1 本確保して返す (ネイティブ・エディタ用)。
+ *
+ * skk_dict_t は **読み取り専用で共有可能** —— 個人辞書は 2026-07-30 に
+ * 削除済みで (skk_core.h:16 が明言)、書き換わる共有状態が無い。だから
+ * IME 所有タスクと edit_task が同じ辞書を指してよい (spec §A.2 の
+ * 「自前 ime_t が安全である 3 条件」の (1)(3))。
+ *
+ * s_ime_img には触らない —— あれは IME 所有タスクの状態で、別タスクから
+ * 書くと単一所有者が崩れる。こちらは独立に acquire する。
+ * 個人辞書が復活したらこの関数ごと見直すこと (§A.2 の警告)。 */
+const skk_dict_t *mqjs_skk_dict_acquire(void)
+{
+    int err = 0;
+    const char *first = "";
+    int img = skkimg_acquire_best("", &err, &first);
+    if (img < 0)
+        return NULL;
+    return &s_skk_img[img].dict;
+}
+
 /* IME を降りるときの後始末。読みかけは捨てる (確定させない — 誤操作で
    リモートのシェルへ文字列を押し込むより、数文字打ち直す方がまし)。
    メモリの中だけで完結する: この境界に書き戻すものはもう無い。 */
@@ -9271,8 +9291,12 @@ static void fg_screen_reset(void)
 {
 #ifdef ESP_PLATFORM
     ui_tab5_w_reset();
-    ui_cmd_t c = { .op = UI_CMD_RESET };
-    ui_tab5_cmd(&c);
+    /* **同期**でやる。以前はここで UI_CMD_RESET をキューへ投げるだけで、
+       掃くのは UI タスク、完了を知る口が無かった。だから新しい面は
+       「自分の最初の 1 枚が消されるかもしれない」前提で全画面を 4 回
+       描き直す保険を持っていた (全画面 1 枚 = 実測 74.6 ms なので、
+       切替のたびに core 1 が 370 ms)。同期にすればその保険が消える。 */
+    ui_tab5_canvas_reset_sync();
 #else
     pcw_reset();
 #endif

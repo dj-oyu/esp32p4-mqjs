@@ -457,6 +457,9 @@ extern "C" void ui_tab5_set_fg_apps(const char *cur, const char *prev,
 static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
 static int s_canvas_w, s_canvas_h; /* set once the display is up */
+/* DSI パネル。srm_bench (キャンバス→FB を PPA SRM 1 op で出せるか) が
+   esp_lcd_dpi_panel_get_frame_buffer に渡すためだけに持つ。 */
+static esp_lcd_panel_handle_t s_dpi_panel;
 /* Pixels the canvas allocation actually holds. The buffer is allocated
    ONCE at the portrait size (720*1192 = 858,240 px) and re-bound with
    swapped dimensions on rotation (1280*632 = 808,960), so it fits both
@@ -1797,6 +1800,7 @@ static lv_obj_t *s_kb_clip_lbl;
 static lv_obj_t *s_kb_lock_lbl; /* which modifiers are latched, in words */
 static lv_timer_t *s_kb_clip_tmr; /* another app may replace the value */
 static bool s_kb_sym;        /* symbol layer showing */
+static bool s_kb_sym2;       /* ... and which of its two pages */
 static int s_kb_map_shown = -1; /* layer the matrix currently draws;
                                    -1 = none yet (also after a rebuild) */
 /* Where the Shift key currently is. Row as well as id now: the layers
@@ -2576,6 +2580,7 @@ static void kb_collapse(void)
 #define KB_LBL_SHIFT "Aa"
 #define KB_LBL_SYM   "sym"
 #define KB_LBL_ABC   "abc"
+#define KB_LBL_MORE  "#+"  /* 記号の 2 ページ目へ */
 #define KB_SPACE     " " /* the widest key; an empty face is the hint */
 
 /* One map per ROW per layer (see s_kb_row): a row matrix takes a map of
@@ -2603,21 +2608,40 @@ static const char *KB_R2_UPPER[] = { KB_LBL_SHIFT, "Z", "X", "C", "V",
 static const char *KB_R3_ALPHA[] = { KB_LBL_SYM, ",", KB_SPACE,
                                      LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
                                      LV_SYMBOL_COPY, "" };
+/* 記号は 2 ページ。実機報告 2026-08-26:「記号キーボードにボタンが多すぎて
+   押しづらい」—— 直前の版は 1 行に 10〜11 個詰めていた。1 行 8〜9 個に減らし、
+   あふれた分を 2 ページ目へ送る。`#+` で 2 ページ目、`sym` で 1 ページ目、
+   `abc` で英字へ戻る。
+
+   1 ページ目は **JS を書くときに手が伸びるもの**を集めてある: 数字、括弧 6 種、
+   引用符 3 種 (バックティックはテンプレートリテラルに要る)、四則と `=`。
+   Enter は残した —— ユーザの案は「Enter を消してシフトにする」だったが、
+   コードを書いていると `{` の直後に改行したくなるので、Enter を消すより
+   行あたりの個数を減らすほうが効くと判断した。合わなければ動かす。 */
 static const char *KB_R0_SYM[] = { "1", "2", "3", "4", "5",
                                    "6", "7", "8", "9", "0", "" };
-static const char *KB_R1_SYM[] = { "-", "_", "=", "+", "/", "\\",
-                                   "|", ":", ";", LV_SYMBOL_NEW_LINE,
-                                   "" };
-static const char *KB_R2_SYM[] = { "!", "?", "@", "#", "$", "%",
-                                   "&", "*", "~", LV_SYMBOL_BACKSPACE,
-                                   "" };
-static const char *KB_R3_SYM[] = { KB_LBL_ABC, "\"", "'", KB_SPACE,
-                                   ">", "[", "]", "" };
+static const char *KB_R1_SYM[] = { "(", ")", "[", "]", "{", "}",
+                                   "<", ">", LV_SYMBOL_BACKSPACE, "" };
+static const char *KB_R2_SYM[] = { "\"", "'", "`", "=", "+", "-",
+                                   "*", "/", LV_SYMBOL_NEW_LINE, "" };
+static const char *KB_R3_SYM[] = { KB_LBL_ABC, KB_LBL_MORE, KB_SPACE,
+                                   ",", ".", "" };
 
-static const char *const *KB_LAYER[3][KB_ROWS] = {
-    { KB_R0_LOWER, KB_R1_LOWER, KB_R2_LOWER, KB_R3_ALPHA }, /* 0 lower */
-    { KB_R0_UPPER, KB_R1_UPPER, KB_R2_UPPER, KB_R3_ALPHA }, /* 1 upper */
-    { KB_R0_SYM,   KB_R1_SYM,   KB_R2_SYM,   KB_R3_SYM   }, /* 2 sym   */
+/* 2 ページ目: 1 ページ目に載らなかったもの + カーソル移動。 */
+static const char *KB_R0_SYM2[] = { "!", "?", "@", "#", "$", "%",
+                                    "^", "&", "" };
+static const char *KB_R1_SYM2[] = { "_", "|", "\\", ":", ";", "~",
+                                    LV_SYMBOL_NEW_LINE, "" };
+static const char *KB_R2_SYM2[] = { LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
+                                    LV_SYMBOL_COPY, LV_SYMBOL_BACKSPACE, "" };
+static const char *KB_R3_SYM2[] = { KB_LBL_ABC, KB_LBL_SYM, KB_SPACE,
+                                    ",", ".", "" };
+
+static const char *const *KB_LAYER[4][KB_ROWS] = {
+    { KB_R0_LOWER, KB_R1_LOWER, KB_R2_LOWER, KB_R3_ALPHA }, /* 0 lower  */
+    { KB_R0_UPPER, KB_R1_UPPER, KB_R2_UPPER, KB_R3_ALPHA }, /* 1 upper  */
+    { KB_R0_SYM,   KB_R1_SYM,   KB_R2_SYM,   KB_R3_SYM   }, /* 2 sym 1  */
+    { KB_R0_SYM2,  KB_R1_SYM2,  KB_R2_SYM2,  KB_R3_SYM2  }, /* 3 sym 2  */
 };
 /* what each row is actually pointed at, so a layer change only touches
    the rows that differ (lower<->upper leaves row 3 alone), and where
@@ -2683,6 +2707,7 @@ static void kb_row_apply_flags(int r)
            modifier or a layer key it would machine-gun taps and flip
            the lock on and off. */
         if (shift || !strcmp(t, KB_LBL_SYM) || !strcmp(t, KB_LBL_ABC) ||
+            !strcmp(t, KB_LBL_MORE) ||
             !strcmp(t, LV_SYMBOL_NEW_LINE) || !strcmp(t, LV_SYMBOL_COPY))
             lv_buttonmatrix_set_button_ctrl(m, id,
                                             LV_BUTTONMATRIX_CTRL_NO_REPEAT);
@@ -2696,7 +2721,7 @@ static void kb_apply_map(void)
     if (!s_kb_row[0])
         return;
     bool upper = s_ui_mods.shift.lock;
-    int want = s_kb_sym ? 2 : upper ? 1 : 0;
+    int want = s_kb_sym ? (s_kb_sym2 ? 3 : 2) : upper ? 1 : 0;
     if (want == s_kb_map_shown)
         return;
     s_kb_map_shown = want;
@@ -2976,8 +3001,10 @@ static void kb_show(int mode)
                 return;
 
             /* keys that only change the keyboard: nothing is posted */
-            if (!strcmp(txt, KB_LBL_SYM) || !strcmp(txt, KB_LBL_ABC)) {
-                s_kb_sym = !strcmp(txt, KB_LBL_SYM);
+            if (!strcmp(txt, KB_LBL_SYM) || !strcmp(txt, KB_LBL_ABC) ||
+                !strcmp(txt, KB_LBL_MORE)) {
+                s_kb_sym = strcmp(txt, KB_LBL_ABC) != 0;
+                s_kb_sym2 = !strcmp(txt, KB_LBL_MORE);
                 ui_kb_refresh();
                 return;
             }
@@ -3076,6 +3103,8 @@ void ui_tab5_kb_field(int mode)
 /*    2 対のイベントを出すため。1 回の値段は spec §F #0 が「測る」と    */
 /*    している未測の数字なので、**ここに見積もりは書かない**。         */
 /*    どれも LVGL タスクの上でしか走らない = 単一書き手、ロック 0。    */
+static bool canvas_present_direct(int x, int y, int w, int h);
+
 /*  - 書式化は窓に 1 回。しかも **RENDER_READY** で出す —— その提示の  */
 /*    画素はもう出ている (fs_picker が今日置いた作法と同じ)。          */
 /*    1 行はログの前置きを入れて ~150 B、115200 baud なら ~13 ms を    */
@@ -3183,6 +3212,98 @@ static void prof_fold(int64_t now)
     if (now - s_pm.t_report >= UI_PROF_WINDOW_US)
         s_prof_emit_pending = true;
 }
+
+/* ------------------------------------------------------------------ *
+ * srm_bench —— 「キャンバスを LVGL を通さず PPA SRM 1 op で DSI の
+ * フレームバッファへ直接出す」が成立するかを、作る前に測る。
+ *
+ * 今の 1 画素の道はコピー 5 回で、うち 3 回が計測済みの重量物:
+ *   3. キャンバス(PSRAM) →[CPU lv_memcpy]→ 描画バッファ(内部)   draw 27.9ms
+ *   4. 描画バッファ →[PPA SRM]→ 回転スクラッチ(PSRAM)           rot  18.5ms
+ *   5. スクラッチ →[DMA2D]→ DSI FB(PSRAM)                       wait 26.5ms
+ * SRM は回転を畳めるので、3+4+5 を「キャンバス→FB の 1 op」に潰せる**かも**
+ * しれない。**その 1 op が何 ms かは誰も知らない。** それを測る。
+ *
+ * 画面は一瞬乱れる (FB を直接書く)。**それ自体が情報**で、絵が正しい向き
+ * で出れば幾何も合っていることになる。次の提示で LVGL が塗り直す。 */
+#ifndef UI_SRM_BENCH
+#define UI_SRM_BENCH 1
+#endif
+#if UI_SRM_BENCH
+static void srm_bench(void)
+{
+    if (!s_dpi_panel || !s_js_canvas_buf || !s_canvas_w || !s_canvas_h) {
+        ESP_LOGW("srm_bench", "skip: panel=%p canvas=%p %dx%d",
+                 (void *)s_dpi_panel, (void *)s_js_canvas_buf,
+                 s_canvas_w, s_canvas_h);
+        return;
+    }
+    void *fb0 = NULL;
+    esp_err_t e = esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0);
+    if (e != ESP_OK || !fb0) {
+        ESP_LOGE("srm_bench", "get_frame_buffer: %s", esp_err_to_name(e));
+        return;
+    }
+    ppa_client_handle_t cli = NULL;
+    ppa_client_config_t cfg = {};
+    cfg.oper_type = PPA_OPERATION_SRM;
+    cfg.max_pending_trans_num = 1;
+    if (ppa_register_client(&cfg, &cli) != ESP_OK) {
+        ESP_LOGE("srm_bench", "register_client failed");
+        return;
+    }
+
+    /* 回転は「キャンバスの向き」ではなくパネルとの関係で決まる。横のとき
+       だけ 90 度。RGB565 の SRM は幅とオフセットが偶数であることを要求する
+       (ppa_srm.c) —— 1280/720/24 はどれも偶数。 */
+    bool land = s_landscape;
+    struct { const char *tag; int h; } cases[] = {
+        { "full", s_canvas_h },
+        { "band", UI_CELL_H },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ppa_srm_oper_config_t srm = {};
+        srm.in.buffer         = s_js_canvas_buf;
+        srm.in.pic_w          = (uint32_t)s_canvas_w;
+        srm.in.pic_h          = (uint32_t)s_canvas_h;
+        srm.in.block_w        = (uint32_t)s_canvas_w;
+        srm.in.block_h        = (uint32_t)cases[i].h;
+        srm.in.block_offset_x = 0;
+        srm.in.block_offset_y = 0;
+        srm.in.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+        srm.out.buffer        = fb0;
+        srm.out.buffer_size   = (uint32_t)UI_LCD_H_RES * UI_LCD_V_RES * 2;
+        srm.out.pic_w         = UI_LCD_H_RES;
+        srm.out.pic_h         = UI_LCD_V_RES;
+        srm.out.block_offset_x = 0;
+        srm.out.block_offset_y = 0;
+        srm.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+        srm.rotation_angle    = land ? PPA_SRM_ROTATION_ANGLE_90
+                                     : PPA_SRM_ROTATION_ANGLE_0;
+        srm.scale_x = 1.0f;
+        srm.scale_y = 1.0f;
+        srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t r = ppa_do_scale_rotate_mirror(cli, &srm);
+        int64_t dt = esp_timer_get_time() - t0;
+        uint32_t px = (uint32_t)s_canvas_w * (uint32_t)cases[i].h;
+        ESP_LOGW("srm_bench", "%s %s %dx%d rot=%d -> %lld us (%lu px, %s)",
+                 land ? "L" : "P", cases[i].tag, s_canvas_w, cases[i].h,
+                 land ? 90 : 0, (long long)dt, (unsigned long)px,
+                 r == ESP_OK ? "ok" : esp_err_to_name(r));
+    }
+    ppa_unregister_client(cli);
+    /* 乱した画面を戻す。 */
+    lv_obj_invalidate(lv_screen_active());
+}
+
+static void srm_bench_timer(lv_timer_t *t)
+{
+    lv_timer_delete(t);
+    srm_bench();
+}
+#endif /* UI_SRM_BENCH */
 
 static void prof_event(lv_event_t *e)
 {
@@ -3533,7 +3654,18 @@ public:
                隠れていたキャンバスを今出したときは、まだ一度も描かれて
                いない領域があるので全体を無効にする。 */
             s_prof_canvas_mark = true; /* attribute the next refresh */
+            bool presented = false;
             if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
+#if UI_DIRECT_PRESENT
+                /* 大きい damage は LVGL を通さず直接 FB へ。断られたら
+                   (上に何か載っている・小さい・幾何が合わない) 下へ落ちる。 */
+                presented =
+                    canvas_present_direct(bx0, by0, bx1 - bx0, by1 - by0);
+#endif
+            }
+            if (presented) {
+                /* もう画面に出ている */
+            } else if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
                 lv_area_t cv;
                 lv_obj_get_content_coords(_canvas, &cv);
                 lv_area_t a;
@@ -3769,10 +3901,207 @@ extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
                    lv_color_to_u16(lv_color_hex(rgb)), s_ppa_fill_nat);
 }
 
+/* フォアグラウンド切替の掃除を、**同期で**やる。
+ *
+ * これまでは UI_CMD_RESET をキューへ投げるだけだった。掃くのは UI タスク
+ * で、完了を知る口が無い。だから新しい面 (エディタ) は「自分の最初の 1 枚が
+ * RESET に消されるかもしれない」前提で、80ms 間隔で全画面を 4 回描き直す
+ * 保険を持っていた —— 全画面 1 枚が実測 74.6 ms なので、**アプリを切り替える
+ * たびに core 1 が 370 ms 持っていかれていた**。
+ *
+ * ここを同期にすると保険が要らなくなる。ui_tab5_w_reset() が既に
+ * lvgl_port_lock を同期で取っているので、その隣に並べるだけ。
+ * 呼ぶのは JS タスク (fg_screen_reset)。全画面 fill 1 回ぶん待つ。 */
+/* ===================================================================== *
+ * キャンバスを LVGL を通さず DSI のフレームバッファへ直接出す
+ *
+ * 実測 (2026-08-26、横 1280x632):
+ *   LVGL 経路 = draw 27.9 + flush 20.2 + wait 26.5 = **74.6 ms**
+ *   PPA SRM で回転を畳んだ 1 op          = **37.2 ms**
+ * 1 画素あたりでは SRM のほうが遅い (46 vs 34 ns/px) —— 転置しながら書く
+ * ので書き側が strided になる。それでも勝つのは、LVGL 経路が
+ * 「PSRAM→内部→(回転)→PSRAM→PSRAM」と **3 回コピーする**から。
+ * SRM は 1 回で済む。コピー 5 回のうち 3 本が 1 本になる。
+ *
+ * **小さな damage では負ける**: 1 段 (24px) は SRM 2.05 ms、LVGL は 1 チャンク
+ * ~1.5 ms。固定費と strided が効く。だから閾値で切り替える —— 打鍵は
+ * 今までどおり LVGL、スクロールや全面はこちら。
+ *
+ * **キャンバスが真実であり続ける**ので LVGL と矛盾しない: PARTIAL モードの
+ * LVGL は画面のコピーを持たず「無効化された矩形を描き直す」だけなので、
+ * あとで同じ領域を描いても同じ画素になる。破れるのは「キャンバスに無い
+ * ものが画面にある」= 何かが上に載っているときだけ。そのときは従来経路へ。
+ * ===================================================================== */
+#ifndef UI_DIRECT_PRESENT
+#define UI_DIRECT_PRESENT 1
+#endif
+/* 回転の向き。実機で絵が 180 度ずれて出たらこちらを 0 にする (未検証)。 */
+#ifndef UI_DIRECT_ROT_CW
+#define UI_DIRECT_ROT_CW 1
+#endif
+/* この高さ以上の damage でだけ直接経路を使う。キャンバスの半分。
+   交差点は未測なので、SRM が確実に勝つ側に寄せてある。 */
+#define UI_DIRECT_MIN_H (s_canvas_h / 2)
+
+#if UI_DIRECT_PRESENT
+static ppa_client_handle_t s_ppa_srm_direct;
+static int64_t  s_direct_us;   /* 直接経路で使った時間 */
+static uint32_t s_direct_n;    /* その回数 (ui_prof に出す) */
+
+/* キャンバスの上に何か載っていないか。載っていたら直接書きは
+   その画素を消すので、従来経路に落とす。 */
+static bool canvas_is_clear(void)
+{
+    lv_obj_t *top = lv_layer_top();
+    if (top) {
+        uint32_t n = lv_obj_get_child_count(top);
+        for (uint32_t i = 0; i < n; i++) {
+            lv_obj_t *c = lv_obj_get_child(top, i);
+            if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+                return false; /* ピッカー・電源スクリム・カメラ・IME フロート */
+        }
+    }
+    for (int i = 0; i < UI_OVERLAY_SLOTS; i++)
+        if (s_ovl[i].box && !lv_obj_has_flag(s_ovl[i].box, LV_OBJ_FLAG_HIDDEN))
+            return false;
+    if (s_kb_row[0] && !lv_obj_has_flag(s_kb_row[0], LV_OBJ_FLAG_HIDDEN))
+        return false;
+    if (s_cbar && !lv_obj_has_flag(s_cbar, LV_OBJ_FLAG_HIDDEN))
+        return false;
+    return true;
+}
+
+/* true を返したら「もう画面に出した」。false なら呼び出し側が
+   従来の lv_obj_invalidate_area へ落とす。 */
+static bool canvas_present_direct(int x, int y, int w, int h)
+{
+    if (!s_dpi_panel || !s_js_canvas_buf || !s_js_canvas || !s_canvas_w ||
+        !s_canvas_h)
+        return false;
+    if (lv_obj_has_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN))
+        return false;
+    /* **横のときだけ。** 実測 (2026-08-26、全画面):
+         横  LVGL 74.6 ms  /  直接 37.2 ms   -> 直接が 2 倍速い
+         縦  LVGL 36.1 ms  /  直接 39.6 ms   -> **LVGL のほうが速い**
+       直接経路は 46 ns/px で、これは向きに依存しない PPA SRM の素の速度
+       (PSRAM->PSRAM 約 87 MB/s)。**回転はこの経路のコストではなかった** ——
+       当初「転置で strided になるから遅い」と読んだのは誤りで、縦を測って
+       初めて分かった。差がつくのは LVGL 側で、縦は回転もキャッシュ跨ぎの
+       転送も無いので 36.1 ms で済む。横だけが 74.6 ms を払っている。 */
+    if (!s_landscape)
+        return false;
+    if (h < UI_DIRECT_MIN_H)
+        return false;
+    if (!canvas_is_clear())
+        return false;
+
+    /* RGB565 の SRM は幅・オフセットが偶数であることを要求する
+       (ppa_srm.c)。切り下げ / 切り上げで偶数に寄せる。 */
+    if (x & 1) { w += 1; x -= 1; }
+    if (w & 1) w += 1;
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > s_canvas_w) w = s_canvas_w - x;
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > s_canvas_h) h = s_canvas_h - y;
+    if (w <= 0 || h <= 0)
+        return false;
+
+    void *fb = NULL;
+    if (esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb) != ESP_OK || !fb)
+        return false;
+    if (!s_ppa_srm_direct) {
+        ppa_client_config_t cfg = {};
+        cfg.oper_type = PPA_OPERATION_SRM;
+        cfg.max_pending_trans_num = 1;
+        if (ppa_register_client(&cfg, &s_ppa_srm_direct) != ESP_OK)
+            return false;
+    }
+
+    /* キャンバスは LVGL 座標で (0, UI_STATUSBAR_H) に置かれている。
+       パネルは常に 720x1280 (縦) なので、横のときだけ 90 度回す。 */
+    int lx = x, ly = y + UI_STATUSBAR_H;
+    int ox, oy, obw, obh;
+    ppa_srm_rotation_angle_t rot;
+    if (s_landscape) {
+        rot = PPA_SRM_ROTATION_ANGLE_90;
+        obw = h; obh = w;
+#if UI_DIRECT_ROT_CW
+        ox = UI_LCD_H_RES - ly - h;
+        oy = lx;
+#else
+        ox = ly;
+        oy = UI_LCD_V_RES - lx - w;
+#endif
+    } else {
+        rot = PPA_SRM_ROTATION_ANGLE_0;
+        obw = w; obh = h;
+        ox = lx; oy = ly;
+    }
+    if (ox < 0 || oy < 0 || ox + obw > UI_LCD_H_RES || oy + obh > UI_LCD_V_RES)
+        return false; /* 幾何が合っていない。黙って壊すより従来経路へ */
+    if (ox & 1)
+        return false; /* 偶数に寄せられない配置。まれ。 */
+
+    ppa_srm_oper_config_t srm = {};
+    srm.in.buffer          = s_js_canvas_buf;
+    srm.in.pic_w           = (uint32_t)s_canvas_w;
+    srm.in.pic_h           = (uint32_t)s_canvas_h;
+    srm.in.block_w         = (uint32_t)w;
+    srm.in.block_h         = (uint32_t)h;
+    srm.in.block_offset_x  = (uint32_t)x;
+    srm.in.block_offset_y  = (uint32_t)y;
+    srm.in.srm_cm          = PPA_SRM_COLOR_MODE_RGB565;
+    srm.out.buffer         = fb;
+    srm.out.buffer_size    = (uint32_t)UI_LCD_H_RES * UI_LCD_V_RES * 2;
+    srm.out.pic_w          = UI_LCD_H_RES;
+    srm.out.pic_h          = UI_LCD_V_RES;
+    srm.out.block_offset_x = (uint32_t)ox;
+    srm.out.block_offset_y = (uint32_t)oy;
+    srm.out.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+    srm.rotation_angle     = rot;
+    srm.scale_x = 1.0f;
+    srm.scale_y = 1.0f;
+    srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t r = ppa_do_scale_rotate_mirror(s_ppa_srm_direct, &srm);
+    if (r != ESP_OK)
+        return false;
+    s_direct_us += esp_timer_get_time() - t0;
+    s_direct_n++;
+    return true;
+}
+#endif /* UI_DIRECT_PRESENT */
+
+extern "C" void ui_tab5_canvas_reset_sync(void)
+{
+    /* ui_up() は ui_widgets.cpp の static。ここでは同じ条件
+       (ディスプレイが立ってキャンバス寸法が入っている) を直接見る。 */
+    if (!s_disp || !s_canvas_w)
+        return;
+    lvgl_port_lock(0);
+    if (s_js_canvas_buf && s_canvas_w && s_canvas_h)
+        surf_fill_rect(s_js_canvas_buf, 0, 0, s_canvas_w, s_canvas_h,
+                       lv_color_to_u16(lv_color_hex(UI_COL_BG)), s_ppa_fill);
+    if (s_js_canvas)
+        lv_obj_add_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
+    kb_show(0);        /* a new app must not inherit the keyboard */
+    cbar_clear_mods(); /* ... nor an armed one-shot latch */
+    ovl_hide_all();    /* ... nor a dead app's float */
+    lvgl_port_unlock();
+}
+
 extern "C" void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
 {
     if (!s_js_canvas || !s_canvas_w || !s_canvas_h)
         return;
+#if UI_DIRECT_PRESENT
+    /* 大きい damage は LVGL を通さず直接 FB へ (実測 74.6 -> 37.2 ms)。
+       断られたら従来経路へ落ちる —— 上に何か載っているとき、小さいとき、
+       幾何が合わないとき。 */
+    if (canvas_present_direct(x, y, w, h))
+        return;
+#endif
     /* clamp to the canvas before anything else: LVGL would clip an
        out-of-range area anyway, but an inverted one (x2 < x1) is
        undefined and the caller's row arithmetic is exactly where an
@@ -3951,6 +4280,19 @@ extern "C" void ui_tab5_set_landscape(bool on)
     /* tell the foreground app its ui.size() changed (same token channel
        as the control bar; apps that don't care just ignore it) */
     mqjs_post_key("\x00rotate", 7);
+
+#if UI_SRM_BENCH
+    /* 向きが変わるたびに測り直す。横 (rot=90) は 46 ns/px と取れたが、
+       **それが回転税なのか DMA の床なのかが決まっていない**。縦 (rot=0)
+       は転置が無いので書きが連続になる —— 縦が速ければ回転税、同じなら
+       床。ドックの着脱だけで両方の数字が出るようにする。
+       1.2 秒待つのは、回転直後の LVGL の作り直しと重ならないため。 */
+    {
+        lv_timer_t *t = lv_timer_create(srm_bench_timer, 1200, nullptr);
+        if (t)
+            lv_timer_set_repeat_count(t, 1);
+    }
+#endif
 }
 
 extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
@@ -3977,6 +4319,7 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     esp_lcd_panel_handle_t panel = NULL;
     if (display_init(variant, &io, &panel) != ESP_OK)
         return;
+    s_dpi_panel = panel;
 
     /* LVGL task on Core 1, low priority (js_task runs on Core 0) */
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
@@ -4059,6 +4402,16 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     {
         lv_timer_t *t = lv_timer_create(
             [](lv_timer_t *) { kb_bench(); }, 6000, nullptr);
+        lv_timer_set_repeat_count(t, 1);
+    }
+#endif
+
+#if UI_SRM_BENCH
+    /* キャンバスは CanvasApp::onCreate が上で publish 済み。10 秒待つのは
+       Wi-Fi/Tailscale が立ち上がって PSRAM 帯域が定常になってから測るため
+       —— 起動直後の静かな瞬間で測ると、実使用より良い数字が出る。 */
+    {
+        lv_timer_t *t = lv_timer_create(srm_bench_timer, 10000, nullptr);
         lv_timer_set_repeat_count(t, 1);
     }
 #endif

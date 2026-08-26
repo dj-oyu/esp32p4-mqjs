@@ -21,6 +21,7 @@
 #define MQJS_NATIVE_H
 
 #include <stdbool.h>
+#include "skk_core.h" /* skk_dict_t は無名 struct の typedef */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -78,6 +79,11 @@ bool mqjs_native_is_fg(int id);
    native 面にも適用してキャンバスを消してしまうため。他の 3 つの
    reset 経路には既に s_fg_native ガードが入っている。 */
 bool mqjs_native_fg_active(void);
+
+/* SKK 辞書を 1 本確保して返す。NULL = 焼かれていない。
+   読み取り専用で共有可能 (個人辞書は存在しない)。edit_ui がこれを
+   edit_ui_attach_dict() へ渡す。 */
+const skk_dict_t *mqjs_skk_dict_acquire(void);
 
 /* 名前引き。見つからなければ -1。mqjs_request_open / sys.open / sys.focus は
    これを **JS ワーカーより先に** 引く。 */

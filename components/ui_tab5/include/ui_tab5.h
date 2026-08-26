@@ -341,6 +341,11 @@ bool ui_tab5_field_key(const char *utf8, size_t len);
  * task switch). Safe to call when nothing was ever created. */
 void ui_tab5_w_reset(void);
 
+/* フォアグラウンド切替の画面掃除を同期でやる (UI_CMD_RESET の同期版)。
+   完了して戻るので、呼んだ側は「以後この画面は自分のもの」と仮定してよい。
+   任意タスク。lvgl_port_lock を取り、全画面 fill 1 回ぶん待つ。 */
+void ui_tab5_canvas_reset_sync(void);
+
 /* Start the slide-in animation of the most recent ui_tab5_w_screen()
  * (P4a, design §3.4): screens are created WITHOUT loading so the page
  * can be fully built first; the JS runtime calls this at the end of
