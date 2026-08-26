@@ -54,6 +54,18 @@ if(CONFIG_MQJS_TAB5_UI)
     # what a full-screen scroll actually pays for (spec §F #13).
     target_link_options(${COMPONENT_LIB} INTERFACE
                         "-Wl,--wrap=lvgl_port_ppa_rotate")
+
+    # esp_lvgl_port は esp_lcd_panel_draw_bitmap の戻り値を捨てる
+    # (esp_lvgl_port_disp.c:754)。DSI の非 direct モードでは flush_ready が
+    # fbcpy の完了 ISR からしか来ないので、**draw_bitmap がエラーを返した
+    # 瞬間に flushing が永久に 1** —— LVGL は while(disp->flushing); を
+    # 回り続け core 1 が死ぬ。実機で再現し、バックトレースで確定した。
+    # エラーになる経路は esp_lcd_panel_dpi.c:472 の
+    # xSemaphoreTake(draw_sem, 0) 失敗 (前の転送が飛行中)。
+    # __wrap_esp_lcd_panel_draw_bitmap がそれを数えて flush_ready を呼ぶ:
+    # 永久ハングを「数えられる 1 チャンクの欠落」に変える。
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=esp_lcd_panel_draw_bitmap")
 endif()
 
 # W1-1: back the LVGL builtin tlsf pool with PSRAM. lv_mem_init() (called

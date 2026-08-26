@@ -3115,6 +3115,9 @@ static uint32_t s_direct_n;
 /* flush の完了待ちが上限に達した回数 (ui_flush_wait)。0 でないなら
    「固まりかけたが先へ進んだ」が起きている。 */
 static uint32_t s_flush_timeouts;
+/* esp_lcd_panel_draw_bitmap が返したエラーの数 (__wrap_...)。0 でないなら
+   「flush が永久に来なくなる」経路が生きている。 */
+static uint32_t s_draw_errs;
 
 /*  - 書式化は窓に 1 回。しかも **RENDER_READY** で出す —— その提示の  */
 /*    画素はもう出ている (fs_picker が今日置いた作法と同じ)。          */
@@ -3172,7 +3175,7 @@ static void prof_report(int64_t now)
     ESP_LOGW("ui_prof",
              "%s %lu refr(cv %lu) %lu ch | draw=%lld rot=%lld flush=%lld "
              "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu"
-             " | direct %lu x %lld us | flush_tmo=%lu",
+             " | direct %lu x %lld us | flush_tmo=%lu draw_err=%lu",
              s_landscape ? "L" : "P", (unsigned long)s_pm.refr,
              (unsigned long)s_pm.refr_cv, (unsigned long)s_pm.chunks,
              (long long)s_pm.draw, (long long)s_pm.rot,
@@ -3181,7 +3184,8 @@ static void prof_report(int64_t now)
              (long long)s_pm.w_flush, (long long)s_pm.w_wait,
              (unsigned long)s_pm.dropped,
              (unsigned long)s_direct_n, (long long)s_direct_us,
-             (unsigned long)s_flush_timeouts);
+             (unsigned long)s_flush_timeouts,
+             (unsigned long)s_draw_errs);
     s_direct_n = 0;
     s_direct_us = 0;
     memset(&s_pm, 0, sizeof s_pm);
@@ -3348,6 +3352,38 @@ static void srm_bench_timer(lv_timer_t *t)
  * なので、常に譲ると 26 チャンク x 10 ms で桁が変わってしまう)。 */
 #define UI_FLUSH_SPIN_US 2000     /* これを超えたら CPU を返す */
 #define UI_FLUSH_MAX_US  200000   /* これを超えたら諦める (通常の 100 倍) */
+/* esp_lvgl_port が捨てているエラーを拾う。
+ *
+ * esp_lvgl_port_disp.c:754 は esp_lcd_panel_draw_bitmap() の戻り値を見ない。
+ * DSI の非 direct モードでは lv_display_flush_ready が fbcpy の完了 ISR から
+ * しか来ないので、**この呼び出しが失敗した瞬間に disp->flushing は永久に 1**
+ * になる。エラーの出所は esp_lcd_panel_dpi.c:472 —— 前の転送がまだ飛行中だと
+ * xSemaphoreTake(draw_sem, 0) が落ちて ESP_ERR_INVALID_STATE を返す。
+ *
+ * 実機で観測したハングはこの形だった (2026-08-26、横画面でスクロール中):
+ *   wait_for_flushing <- refr_configured_layer <- refr_area
+ *                     <- lv_display_refr_timer <- lvgl_port_task
+ * 原因を 3 回推測して 3 回外し、最後にこの 1 行が見つかった。
+ *
+ * ここで flush_ready を代わりに呼べば、**永久ハングが「1 チャンクの欠落」に
+ * 変わる**。欠けた領域は次の invalidate で埋まる。数えて ui_prof に出す —— 
+ * 0 でないなら、この経路が生きている証拠になる。 */
+extern "C" esp_err_t __real_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
+                                                      int x1, int y1, int x2,
+                                                      int y2, const void *data);
+extern "C" esp_err_t __wrap_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
+                                                      int x1, int y1, int x2,
+                                                      int y2, const void *data)
+{
+    esp_err_t r = __real_esp_lcd_panel_draw_bitmap(p, x1, y1, x2, y2, data);
+    if (r != ESP_OK && s_disp) {
+        s_draw_errs++;
+        /* 転送は始まっていない。LVGL に「終わった」と伝えないと永久に待つ。 */
+        lv_display_flush_ready(s_disp);
+    }
+    return r;
+}
+
 static void ui_flush_wait(lv_display_t *d)
 {
     int64_t t0 = esp_timer_get_time();
@@ -4047,8 +4083,10 @@ static bool rects_overlap(const lv_area_t *a, const lv_area_t *b)
 
 static bool canvas_area_clear(int x, int y, int w, int h, lv_area_t *out_abs)
 {
-    if (!lvgl_port_lock(20))
-        return false; /* 取れないなら諦めて従来経路へ */
+    /* **ロックは呼び出し側が持っている。** 幾何を見てから離して PPA を
+       撃つ形だったが、それでは LVGL の**飛行中の flush** に負ける ——
+       古いスナップショットの転送が、新しい直接書き込みの後に着弾して
+       古い画素を戻す (SKK 確定で黄色い preedit が残った件)。 */
     bool clear = true;
     lv_area_t cv;
     lv_obj_get_content_coords(s_js_canvas, &cv);
@@ -4091,7 +4129,6 @@ static bool canvas_area_clear(int x, int y, int w, int h, lv_area_t *out_abs)
         if (rects_overlap(&o, &a))
             clear = false;
     }
-    lvgl_port_unlock();
     return clear;
 }
 
@@ -4116,9 +4153,32 @@ static bool canvas_present_direct(int x, int y, int w, int h)
         return false;
     if (h < UI_DIRECT_MIN_H)
         return false;
-    lv_area_t abs_unused;
-    if (!canvas_area_clear(x, y, w, h, &abs_unused))
+    /* ここからロックを持つ。離すのは戻る直前。
+       (a) LVGL が render 中でないこと = ロック
+       (b) 飛行中の flush が着地していること = flushing を待つ
+       (a) だけだと最後のチャンクの fbcpy に負け、(b) だけだと render 中の
+       古いスナップショットが後から flush される。両方要る。 */
+    if (!lvgl_port_lock(0))
         return false;
+    lv_area_t abs_unused;
+    if (!canvas_area_clear(x, y, w, h, &abs_unused)) {
+        lvgl_port_unlock();
+        return false;
+    }
+    /* 飛行中の flush を着地させる。**ここで flushing を 0 にしてはいけない**
+       —— fbcpy が生きているかもしれない。諦めたら従来経路へ落とす。 */
+    if (s_disp) {
+        int64_t t0 = esp_timer_get_time();
+        while (s_disp->flushing) {
+            int64_t dt = esp_timer_get_time() - t0;
+            if (dt > UI_FLUSH_MAX_US) {
+                lvgl_port_unlock();
+                return false;
+            }
+            if (dt > UI_FLUSH_SPIN_US)
+                vTaskDelay(1);
+        }
+    }
 
     /* RGB565 の SRM は幅・オフセットが偶数であることを要求する
        (ppa_srm.c)。切り下げ / 切り上げで偶数に寄せる。 */
@@ -4132,14 +4192,18 @@ static bool canvas_present_direct(int x, int y, int w, int h)
         return false;
 
     void *fb = NULL;
-    if (esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb) != ESP_OK || !fb)
+    if (esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb) != ESP_OK || !fb) {
+        lvgl_port_unlock();
         return false;
+    }
     if (!s_ppa_srm_direct) {
         ppa_client_config_t cfg = {};
         cfg.oper_type = PPA_OPERATION_SRM;
         cfg.max_pending_trans_num = 1;
-        if (ppa_register_client(&cfg, &s_ppa_srm_direct) != ESP_OK)
+        if (ppa_register_client(&cfg, &s_ppa_srm_direct) != ESP_OK) {
+            lvgl_port_unlock();
             return false;
+        }
     }
 
     /* キャンバスは LVGL 座標で (0, UI_STATUSBAR_H) に置かれている。
@@ -4162,10 +4226,11 @@ static bool canvas_present_direct(int x, int y, int w, int h)
         obw = w; obh = h;
         ox = lx; oy = ly;
     }
-    if (ox < 0 || oy < 0 || ox + obw > UI_LCD_H_RES || oy + obh > UI_LCD_V_RES)
-        return false; /* 幾何が合っていない。黙って壊すより従来経路へ */
-    if (ox & 1)
-        return false; /* 偶数に寄せられない配置。まれ。 */
+    if (ox < 0 || oy < 0 || ox + obw > UI_LCD_H_RES || oy + obh > UI_LCD_V_RES ||
+        (ox & 1)) {
+        lvgl_port_unlock(); /* 幾何が合っていない。黙って壊すより従来経路へ */
+        return false;
+    }
 
     ppa_srm_oper_config_t srm = {};
     srm.in.buffer          = s_js_canvas_buf;
@@ -4190,10 +4255,13 @@ static bool canvas_present_direct(int x, int y, int w, int h)
 
     int64_t t0 = esp_timer_get_time();
     esp_err_t r = ppa_do_scale_rotate_mirror(s_ppa_srm_direct, &srm);
-    if (r != ESP_OK)
+    if (r != ESP_OK) {
+        lvgl_port_unlock();
         return false;
+    }
     s_direct_us += esp_timer_get_time() - t0;
     s_direct_n++;
+    lvgl_port_unlock();
     return true;
 }
 #endif /* UI_DIRECT_PRESENT */

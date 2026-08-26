@@ -138,6 +138,16 @@ static const char *TAG = "edit_ui";
    「上限 128 B」をこちらで持つ。**両方が動くときは仕様 §A.1 が正**。 */
 #define EDIT_UI_PREEDIT_MAX 128u
 
+/* SKK 確定時のアーティファクト調査用。**既定オフ。**
+   役目は終わった —— 原因はここではなく、フレームバッファへの二重書き込み
+   だった (ui_tab5.cpp の canvas_present_direct)。残してあるのは、段ごとの
+   run を見たくなる日がまた来るため。**1 にするなら、段ごとに無条件で
+   吐かないこと** —— 1 行 ~50B を 115200 baud へ同期に出すと 4.3 ms、
+   26 段で 1 フレーム 113 ms になり、計測器がスクロールを壊す (実際にやった)。 */
+#ifndef EDIT_TRACE_RUNS
+#define EDIT_TRACE_RUNS 0
+#endif
+
 /* ステージング。720 × UI_CELL_H(24) = 17,280 B、80 セルぶん —— ui_tab5.cpp の
    s_cells_a8 と同じ寸法を、こちらのタスク専用にもう 1 枚持つ (§A.3)。
    64B (L1/L2 キャッシュライン) 整列は PPA がキャッシュコヒーレントに
@@ -383,6 +393,9 @@ static void render_row(uint16_t row)
     int n = edit_view_row(s_ed, row, s_runs, EDIT_UI_RUNS_CAP,
                           s_row_utf8, sizeof(s_row_utf8));
     int used_cells = 0;
+#if EDIT_TRACE_RUNS
+    bool trace_this_row = false;
+#endif
     if (n < 0) {
         /* utf8_cap 不足。段を空にして先へ進む —— 1 段が化けるより、
            1 段が空の方が「何が起きたか」が読める。 */
@@ -394,6 +407,36 @@ static void render_row(uint16_t row)
         }
         n = 0;
     }
+
+#if EDIT_TRACE_RUNS
+    /* SKK の確定でアーティファクトが残る件 (2026-08-26)。静的解析では
+       原因が出なかった —— 塗り・順序・ベースライン・dirty の変換はどれも
+       正しい。**実際に何が描かれたか**を記録して読む。
+       preedit が在る段と、その直後の段だけを出す (毎段出すと UART が溢れる)。 */
+    {
+        static int s_trace_left;
+        bool has_pre = false;
+        trace_this_row = false;
+        for (int i = 0; i < n; i++)
+            if (s_runs[i].cls == EDIT_CLS_PREEDIT)
+                has_pre = true;
+        if (has_pre)
+            s_trace_left = 3;      /* 確定後の 2 段ぶんも追う */
+        if (s_trace_left > 0) {
+            s_trace_left--;
+            trace_this_row = true;
+            char b[192];
+            int o = snprintf(b, sizeof b, "row=%d pre=%d runs=%d:", row,
+                             has_pre ? 1 : 0, n);
+            for (int i = 0; i < n && o > 0 && o < (int)sizeof b - 24; i++)
+                o += snprintf(b + o, sizeof b - (size_t)o, " [c%u n%u cls%u]",
+                              (unsigned)s_runs[i].col,
+                              (unsigned)s_runs[i].ncells,
+                              (unsigned)s_runs[i].cls);
+            ESP_LOGW(TAG, "TRACE %s", b);
+        }
+    }
+#endif
 
     for (int i = 0; i < n; i++) {
         const edit_run_t *r = &s_runs[i];
@@ -436,6 +479,14 @@ static void render_row(uint16_t row)
 
     /* 段の右端の余白。§A.3 のとおり fill 1 回。 */
     int x0 = used_cells * s_cell_w;
+#if EDIT_TRACE_RUNS
+    /* **段ごとに無条件で吐いてはいけない。** 1 行 ~50B を 115200 baud へ
+       同期に出すと 4.3 ms、26 段で 1 フレーム 113 ms —— 計測器がスクロールを
+       壊す (実機で「遅くなった」と報告された)。preedit の前後だけに絞る。 */
+    if (trace_this_row)
+        ESP_LOGW(TAG, "TRACE row=%d tail_from_cell=%d px=%d..%d", row,
+                 used_cells, x0, s_canvas_w);
+#endif
     if (x0 < s_canvas_w)
         ui_tab5_canvas_fill(x0, row * s_cell_h, s_canvas_w - x0, s_cell_h,
                             EDIT_COL_BG);
