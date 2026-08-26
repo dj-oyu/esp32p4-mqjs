@@ -88,6 +88,26 @@ menu "mqjs platform"
             Cheap: two counters and a CSR read per stall. Leave it on
             while gathering data; it is not meant to ship.
 
+    config MQJS_PERF_METER
+        bool "Latency histograms and worst-case ring (arithmetic core of sys.perf())"
+        default y
+        help
+            Fixed 12-bucket log2 histograms (native-editor-spec.md section
+            C.0 rule 3), a worst-16 ring per measured pipeline, and a
+            same-core-in/same-core-out span guard for cache-stall-style
+            timers. The guard exists because M0a once subtracted two
+            different cores' cycle-count CSRs and reported a stall of
+            10,177,430 us (section C.0 rule 6) -- perf_span_exit_us()
+            checks the core before computing anything, so that mistake
+            cannot silently reproduce.
+
+            Pure arithmetic, no ESP-IDF calls beyond reading the core id
+            and cycle counter (main/perf_meter.c). Host-testable via
+            tools/tests/test_perf_hist.c.
+
+            Off collapses every perf_meter call to a no-op so call sites
+            never need their own #ifdef.
+
     config MQJS_FLASH_SUSPEND_TEST
         bool "Run the flash auto-suspend acceptance test at boot"
         default n

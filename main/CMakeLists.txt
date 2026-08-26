@@ -23,7 +23,7 @@ configure_file(${MQJS_SCRIPT_PATH} ${CMAKE_CURRENT_BINARY_DIR}/task.js COPYONLY)
 idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                             "board_tab5.c" "ui_status.c" "ppa_bench.c"
                             "jsmem_bench.c" "panic_note.c" "card_apps.c"
-                            "flash_suspend_test.c" "flash_stall_meter.c"
+                            "flash_suspend_test.c" "flash_stall_meter.c" "perf_meter.c"
                        PRIV_REQUIRES mqjs term_core nvs_flash esp_wifi esp_netif esp_event
                                      fs_core sdcard
                                      tweetnacl esp_driver_i2c ui_tab5 cam_tab5
