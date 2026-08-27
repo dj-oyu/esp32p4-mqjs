@@ -3106,7 +3106,63 @@ void ui_tab5_kb_field(int mode)
 /*    2 対のイベントを出すため。1 回の値段は spec §F #0 が「測る」と    */
 /*    している未測の数字なので、**ここに見積もりは書かない**。         */
 /*    どれも LVGL タスクの上でしか走らない = 単一書き手、ロック 0。    */
-static bool canvas_present_direct(int x, int y, int w, int h);
+/* **この定義は前方宣言より前に置くこと。**
+   以前はずっと下 (canvas_present_direct の定義の隣) にあった。すると
+   CanvasApp のバッチ末尾にある `#if UI_DIRECT_PRESENT` は**未定義 = 0**
+   として評価され、端末の呼び出しだけがプリプロセッサで消えていた ——
+   警告は出ない。エディタ (ui_tab5_canvas_invalidate) は定義より後ろに
+   あるので動き、端末だけが直接経路に入れず、拒否理由の内訳まで全部 0
+   だった (= 入口にすら来ていなかった)。 */
+#ifndef UI_DIRECT_PRESENT
+#define UI_DIRECT_PRESENT 1
+#endif
+/* 回転の向き。**実測で決着 (2026-08-27)**: PPA の ANGLE_90 はソース段の
+   先頭行を出力の**低い側の列**に置く。CW を仮定した式 (ox = 720-ly-h) は
+   先頭行が高い側に来る前提なので、丸ごと逆だった。
+
+   全面のときだけ差が小さく (ox が 0 対 88)、絵は 88px ずれるだけなので
+   「少し上にずれている」で済んでいた。部分矩形ではずれ幅が矩形ごとに
+   変わるため画面が崩れる —— 閾値を 3 チャンクに下げて部分矩形が初めて
+   この経路に入った回から症状が出た。
+
+   **全面のケースでは ox=oy=0 に潰れるので、式を検算できない。**
+   「全面は正しく見える」を根拠に 3 回この式を正しいと判断したが、
+   あれは何の証拠にもなっていなかった。決着は FB を読み戻して付けた
+   (FB を読み戻して行と列のチェックサムを突き合わせた)。 */
+#ifndef UI_DIRECT_ROT_CW
+#define UI_DIRECT_ROT_CW 0
+#endif
+/* この高さ以上の damage でだけ直接経路を使う。
+
+   **px ではなくチャンク単位で考える。** LVGL の 1 リフレッシュの値段は
+   px ではなく「描画バッファ何杯ぶんか」で決まり、その 1 杯の高さは
+   バッファ画素数 ÷ 領域の幅 —— 横 (幅 1280) なら 28 px、縦 (幅 720) なら
+   50 px。同じ 144 px の damage が横では 6 杯、縦では 3 杯になる。
+   「キャンバスの半分」という px 固定は、この差を無視していた上に
+   安全側へ寄せすぎていた: 横で 316 px = 13 杯である。
+
+   実測 (2026-08-26 の ui_prof / ui_area):
+     LVGL   26 杯 = 74.6 ms  →  約 2.9 ms/杯
+     直接   キャンバス全体 (632px = 23 杯) = 33.3 ms  →  約 1.5 ms/杯
+   **どちらも面積に比例し、直接のほうが 1 杯あたり倍近く安い。** つまり
+   閾値の役目は「傾きの交差点」ではなく、直接経路の**固定費**
+   (ロック + 飛行中 flush の drain) を回収できない極小 damage を弾くこと
+   だけ。3 杯に置く。
+
+   これで端末が拾えるようになる: ssh_vt の 1 バッチは平均 184,032 px
+   = 横 6 杯で、13 杯の壁に全部弾かれていた (実測 direct 0 x 0 us)。 */
+#define UI_DIRECT_MIN_CHUNKS 3
+/* 宛先の向きは FB を読み戻して決着済み (UI_DIRECT_ROT_CW のコメント)。
+   probe は消した —— 毎秒 1.8MB のキャッシュ無効化を描画経路に残すと、
+   次に速度を測る人が計測器ごと測ってしまう。 */
+/* LVGL のチャンク高 = バッファ画素数 ÷ 領域の幅 (lv_refr.c の get_max_row)。
+   キャンバスは画面幅いっぱいなので s_canvas_w がそのまま領域の幅。 */
+#define UI_LVGL_CHUNK_H \
+    ((UI_LCD_H_RES * UI_LVGL_BUF_LINES) / (s_canvas_w ? s_canvas_w : 1))
+#define UI_DIRECT_MIN_H (UI_DIRECT_MIN_CHUNKS * UI_LVGL_CHUNK_H)
+
+static bool canvas_present_direct(int x, int y, int w, int h,
+                                  int *done_y, int *done_h);
 /* 直接経路 (LVGL を通さず PPA SRM で FB へ) の集計。ui_prof に出す ——
    出さないと「効いているのか、閾値に届かず毎回 LVGL へ落ちているのか」が
    区別できない。定義は canvas_present_direct の隣。 */
@@ -3114,6 +3170,10 @@ static int64_t  s_direct_us;
 /* 窓でリセットしない通し番号。プレゼンタが「この invalidate は直接経路に
    行ったか」を差分で読む (ui_tab5_direct_count)。 */
 static uint32_t s_direct_total;
+/* 直接経路を断った理由の内訳。**「0 回だった」だけでは何も分からない** ——
+   端末が入れない理由を、閾値・重なり・幾何と 3 度当て推量で外した。
+   0 向き/キャンバス無し 1 閾値 2 ロック 3 帯が無い 4 flush 待ち 5 幾何 6 PPA */
+static uint32_t s_direct_rej[7];
 static uint32_t s_direct_n;
 /* flush の完了待ちが上限に達した回数 (ui_flush_wait)。0 でないなら
    「固まりかけたが先へ進んだ」が起きている。 */
@@ -3178,7 +3238,8 @@ static void prof_report(int64_t now)
     ESP_LOGW("ui_prof",
              "%s %lu refr(cv %lu) %lu ch | draw=%lld rot=%lld flush=%lld "
              "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu"
-             " | direct %lu x %lld us | flush_tmo=%lu draw_err=%lu",
+             " | direct %lu x %lld us | rej %lu/%lu/%lu/%lu/%lu/%lu/%lu"
+             " | flush_tmo=%lu draw_err=%lu",
              s_landscape ? "L" : "P", (unsigned long)s_pm.refr,
              (unsigned long)s_pm.refr_cv, (unsigned long)s_pm.chunks,
              (long long)s_pm.draw, (long long)s_pm.rot,
@@ -3187,10 +3248,15 @@ static void prof_report(int64_t now)
              (long long)s_pm.w_flush, (long long)s_pm.w_wait,
              (unsigned long)s_pm.dropped,
              (unsigned long)s_direct_n, (long long)s_direct_us,
+             (unsigned long)s_direct_rej[0], (unsigned long)s_direct_rej[1],
+             (unsigned long)s_direct_rej[2], (unsigned long)s_direct_rej[3],
+             (unsigned long)s_direct_rej[4], (unsigned long)s_direct_rej[5],
+             (unsigned long)s_direct_rej[6],
              (unsigned long)s_flush_timeouts,
              (unsigned long)s_draw_errs);
     s_direct_n = 0;
     s_direct_us = 0;
+    memset(s_direct_rej, 0, sizeof s_direct_rej);
     memset(&s_pm, 0, sizeof s_pm);
     /* 出力そのものに ~10 ms かかるので、窓の起点は書いた後で読む。 */
     s_pm.t_report = esp_timer_get_time();
@@ -3718,19 +3784,69 @@ public:
                CELLS 以外の描画 op は矩形を出さず「全体」に倒す。端末は
                全部 CELLS なので測りたいものは測れるし、出せない op を
                勝手に見積もって過大な期待値を出すより正直。 */
-            if (cmd.op == UI_CMD_CELLS && cmd.text) {
-                int n = 0;
-                for (const uint8_t *q = (const uint8_t *)cmd.text; *q; q++)
-                    if ((*q & 0xC0) != 0x80)
-                        n++;
-                int x0 = cmd.x * UI_CELL_W, y0 = cmd.y * UI_CELL_H;
-                int x1 = x0 + n * UI_CELL_W, y1 = y0 + UI_CELL_H;
+            /* **op ごとに矩形を出す。CELLS だけではない。**
+
+               ここは元々「CELLS 以外は矩形を出さず全体に倒す。端末は全部
+               CELLS なので測りたいものは測れる」と書いていた。**その前提が
+               誤り**だった —— 端末のセルはネイティブが出すが、アプリ側
+               (ssh_vt2.js) がタブバーを RECT/TEXT で描くので、CELLS 以外が
+               毎フレーム混ざる。1 つ混ざるだけでバッチ全体が全面 invalidate
+               へ倒れ、差分にも直接経路にも入れなかった (実測 direct 0、
+               拒否理由の内訳も全部 0 = 入口にすら来ていなかった)。
+
+               矩形を持っている op には矩形を出させる。持っていないもの
+               (CLEAR/FILL = 全面) だけが全体に倒れる。 */
+            int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
+            switch (cmd.op) {
+            case UI_CMD_CELLS:
+                if (!cmd.text) { bbox_ok = false; break; }
+                {
+                    int n = 0;
+                    for (const uint8_t *q = (const uint8_t *)cmd.text; *q; q++)
+                        if ((*q & 0xC0) != 0x80)
+                            n++;
+                    x0 = cmd.x * UI_CELL_W; y0 = cmd.y * UI_CELL_H;
+                    x1 = x0 + n * UI_CELL_W; y1 = y0 + UI_CELL_H;
+                }
+                break;
+            case UI_CMD_RECT:
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + cmd.w; y1 = cmd.y + cmd.h;
+                break;
+            case UI_CMD_LINE:   /* w,h は終点 (大きさではない) */
+                x0 = cmd.x < cmd.w ? cmd.x : cmd.w;
+                y0 = cmd.y < cmd.h ? cmd.y : cmd.h;
+                x1 = (cmd.x > cmd.w ? cmd.x : cmd.w) + 1;
+                y1 = (cmd.y > cmd.h ? cmd.y : cmd.h) + 1;
+                break;
+            case UI_CMD_PIXEL:
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + 1; y1 = cmd.y + 1;
+                break;
+            case UI_CMD_TEXT: {
+                /* text() と同じフォントで測る。取れなければ全体へ。 */
+                int tw = 0, th = 0;
+                if (cmd.text)
+                    ui_tab5_text_size(cmd.text, &tw, &th);
+                if (tw <= 0 || th <= 0) { bbox_ok = false; break; }
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + tw; y1 = cmd.y + th;
+                break;
+            }
+            case UI_CMD_SCROLL:  /* 段 [x,y] を w 行ずらす = その帯全部 */
+                x0 = 0; y0 = cmd.x * UI_CELL_H;
+                x1 = s_canvas_w; y1 = (cmd.y + 1) * UI_CELL_H;
+                break;
+            default:             /* CLEAR / FILL は全面 */
+                bbox_ok = false;
+                break;
+            }
+            if (bbox_ok && x1 > x0 && y1 > y0) {
+                if (x0 < 0) x0 = 0;
+                if (y0 < 0) y0 = 0;
+                if (x1 > s_canvas_w) x1 = s_canvas_w;
+                if (y1 > s_canvas_h) y1 = s_canvas_h;
                 if (bx0 > x0) bx0 = x0;
                 if (by0 > y0) by0 = y0;
                 if (bx1 < x1) bx1 = x1;
                 if (by1 < y1) by1 = y1;
-            } else {
-                bbox_ok = false;
             }
 
             apply(cmd);
@@ -3754,16 +3870,24 @@ public:
                いない領域があるので全体を無効にする。 */
             s_prof_canvas_mark = true; /* attribute the next refresh */
             bool presented = false;
+            int dy = 0, dh = 0;
             if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
 #if UI_DIRECT_PRESENT
-                /* 大きい damage は LVGL を通さず直接 FB へ。断られたら
-                   (上に何か載っている・小さい・幾何が合わない) 下へ落ちる。 */
+                /* 隠れていない帯だけ直接 FB へ。端末はここを一度も通れて
+                   いなかった —— ui.keyboard(2) の制御バーが載っているだけで
+                   全部あきらめていた。残りは下の LVGL 経路が受ける。 */
                 presented =
-                    canvas_present_direct(bx0, by0, bx1 - bx0, by1 - by0);
+                    canvas_present_direct(bx0, by0, bx1 - bx0, by1 - by0,
+                                          &dy, &dh);
 #endif
             }
             if (presented) {
-                /* もう画面に出ている */
+                /* 出せなかった帯だけを LVGL へ回す。 */
+                if (dy > by0)
+                    ui_tab5_canvas_invalidate(bx0, by0, bx1 - bx0, dy - by0);
+                int tail = by1 - (dy + dh);
+                if (tail > 0)
+                    ui_tab5_canvas_invalidate(bx0, dy + dh, bx1 - bx0, tail);
             } else if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
                 lv_area_t cv;
                 lv_obj_get_content_coords(_canvas, &cv);
@@ -4056,53 +4180,6 @@ extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
    加えて ui_flush_wait が入り、flush の完了待ちに 200ms の上限がついた ——
    完了が来なくても LVGL は先へ進む (固まる代わりに 1 フレーム崩れる)。
    横の全画面 74.6ms が 37.2ms になるかを実測する。 */
-#ifndef UI_DIRECT_PRESENT
-#define UI_DIRECT_PRESENT 1
-#endif
-/* 回転の向き。**実測で決着 (2026-08-27)**: PPA の ANGLE_90 はソース段の
-   先頭行を出力の**低い側の列**に置く。CW を仮定した式 (ox = 720-ly-h) は
-   先頭行が高い側に来る前提なので、丸ごと逆だった。
-
-   全面のときだけ差が小さく (ox が 0 対 88)、絵は 88px ずれるだけなので
-   「少し上にずれている」で済んでいた。部分矩形ではずれ幅が矩形ごとに
-   変わるため画面が崩れる —— 閾値を 3 チャンクに下げて部分矩形が初めて
-   この経路に入った回から症状が出た。
-
-   **全面のケースでは ox=oy=0 に潰れるので、式を検算できない。**
-   「全面は正しく見える」を根拠に 3 回この式を正しいと判断したが、
-   あれは何の証拠にもなっていなかった。決着は FB を読み戻して付けた
-   (FB を読み戻して行と列のチェックサムを突き合わせた)。 */
-#ifndef UI_DIRECT_ROT_CW
-#define UI_DIRECT_ROT_CW 0
-#endif
-/* この高さ以上の damage でだけ直接経路を使う。
-
-   **px ではなくチャンク単位で考える。** LVGL の 1 リフレッシュの値段は
-   px ではなく「描画バッファ何杯ぶんか」で決まり、その 1 杯の高さは
-   バッファ画素数 ÷ 領域の幅 —— 横 (幅 1280) なら 28 px、縦 (幅 720) なら
-   50 px。同じ 144 px の damage が横では 6 杯、縦では 3 杯になる。
-   「キャンバスの半分」という px 固定は、この差を無視していた上に
-   安全側へ寄せすぎていた: 横で 316 px = 13 杯である。
-
-   実測 (2026-08-26 の ui_prof / ui_area):
-     LVGL   26 杯 = 74.6 ms  →  約 2.9 ms/杯
-     直接   キャンバス全体 (632px = 23 杯) = 33.3 ms  →  約 1.5 ms/杯
-   **どちらも面積に比例し、直接のほうが 1 杯あたり倍近く安い。** つまり
-   閾値の役目は「傾きの交差点」ではなく、直接経路の**固定費**
-   (ロック + 飛行中 flush の drain) を回収できない極小 damage を弾くこと
-   だけ。3 杯に置く。
-
-   これで端末が拾えるようになる: ssh_vt の 1 バッチは平均 184,032 px
-   = 横 6 杯で、13 杯の壁に全部弾かれていた (実測 direct 0 x 0 us)。 */
-#define UI_DIRECT_MIN_CHUNKS 3
-/* 宛先の向きは FB を読み戻して決着済み (UI_DIRECT_ROT_CW のコメント)。
-   probe は消した —— 毎秒 1.8MB のキャッシュ無効化を描画経路に残すと、
-   次に速度を測る人が計測器ごと測ってしまう。 */
-/* LVGL のチャンク高 = バッファ画素数 ÷ 領域の幅 (lv_refr.c の get_max_row)。
-   キャンバスは画面幅いっぱいなので s_canvas_w がそのまま領域の幅。 */
-#define UI_LVGL_CHUNK_H \
-    ((UI_LCD_H_RES * UI_LVGL_BUF_LINES) / (s_canvas_w ? s_canvas_w : 1))
-#define UI_DIRECT_MIN_H (UI_DIRECT_MIN_CHUNKS * UI_LVGL_CHUNK_H)
 
 #if UI_DIRECT_PRESENT
 static ppa_client_handle_t s_ppa_srm_direct;
@@ -4142,45 +4219,92 @@ static bool layer_blocks(lv_obj_t *parent, uint32_t from, const lv_area_t *a)
     return false;
 }
 
-static bool canvas_area_clear(int x, int y, int w, int h, lv_area_t *out_abs)
+/* この矩形のうち、**上に何も載っていない一番大きい横帯**を返す。
+ *
+ * 以前は「1 つでも重なっていたら false」だった。守りとしては正しいが、
+ * 端末はそれで一度も直接経路に入れなかった —— ui.keyboard(2) が制御バーと
+ * その上の帯を layer_top に出すので、毎フレーム全部あきらめて LVGL に
+ * 落ちていた (実測 direct 0 x 0、1 リフレッシュ 14ms・チャンク 428 本)。
+ *
+ * クロームは画面の上下に張り付くので、遮蔽は縦の帯になる。**隠れている
+ * 帯を避けて残りを直接出し、残余だけ LVGL に渡す**ほうが、全部あきらめる
+ * より常に良い。何も載っていなければ帯 = 矩形そのもので、以前と同じ道。
+ *
+ * 判定は z-order (キャンバスより後ろの兄弟 + layer_top/layer_sys)。列挙は
+ * 足し忘れれば静かに壊れる —— 最初の版はステータスバーが常駐しているせいで
+ * 一度も直接経路を通らなかった。 */
+#define UI_BLOCK_MAX 24
+
+static void band_note(int *n, int (*sp)[2], int a, int b, int y, int y2)
 {
-    /* **ロックは呼び出し側が持っている。**
+    if (a < y)  a = y;
+    if (b > y2) b = y2;
+    if (a >= b || *n >= UI_BLOCK_MAX)
+        return;
+    sp[*n][0] = a; sp[*n][1] = b; (*n)++;
+}
 
-       列挙ではなく **z-order** を見る。守りたい性質は「この矩形の上に、
-       キャンバスより手前で見えるものが無い」で、それは LVGL の z-order
-       そのもの —— キャンバスの上に出られるのは
-         (a) 同じ親でキャンバスより後ろの兄弟
-         (b) 上位の layer (top / sys) の子
-       のどちらかしかない。キャンバスより前 (下) にあるものは遮蔽しない。
+/* この層の可視な子のうち、矩形と交差するものの縦の範囲を集める。 */
+static void layer_spans(lv_obj_t *parent, uint32_t from, const lv_area_t *a,
+                        int *n, int (*sp)[2], int cvy, int y, int y2)
+{
+    if (!parent)
+        return;
+    uint32_t cnt = lv_obj_get_child_count(parent);
+    for (uint32_t i = from; i < cnt; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, i);
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t o;
+        lv_obj_get_coords(c, &o);
+        if (!rects_overlap(&o, a))
+            continue;
+        band_note(n, sp, (int)o.y1 - cvy, (int)o.y2 + 1 - cvy, y, y2);
+    }
+}
 
-       以前は s_ovl[] / s_kb_row[] / s_cbar / layer_top の子を 1 つずつ
-       見ていた。**その列挙は増える一方で、足し忘れれば静かに壊れる** ——
-       実際、最初の版は「layer_top に可視な子があれば従来経路へ」で、
-       ステータスバーが常駐しているせいで一度も直接経路を通らなかった。
-       今の形なら、新しいオーバーレイを足しても登録は要らない: 見えるために
-       は必ずこの走査に引っかかる位置に置かれる。
-       (キーボードもコントロールバーもオーバーレイも ui_chrome_parent()
-        = lv_layer_top() の子なので、(b) が全部さらう。) */
+static bool canvas_free_band(int x, int y, int w, int h, int *fy, int *fh)
+{
     lv_area_t cv;
     lv_obj_get_content_coords(s_js_canvas, &cv);
     lv_area_t a = { (int32_t)(cv.x1 + x), (int32_t)(cv.y1 + y),
                     (int32_t)(cv.x1 + x + w - 1), (int32_t)(cv.y1 + y + h - 1) };
-    *out_abs = a;
+    int y2 = y + h;
+    int n = 0, sp[UI_BLOCK_MAX][2];
 
     lv_obj_t *parent = lv_obj_get_parent(s_js_canvas);
-    uint32_t idx = lv_obj_get_index(s_js_canvas);
-    if (layer_blocks(parent, idx + 1, &a))
-        return false;
-    if (layer_blocks(lv_layer_top(), 0, &a))
-        return false;
-    if (layer_blocks(lv_layer_sys(), 0, &a))
-        return false;
-    return true;
+    layer_spans(parent, lv_obj_get_index(s_js_canvas) + 1, &a, &n, sp,
+                (int)cv.y1, y, y2);
+    layer_spans(lv_layer_top(), 0, &a, &n, sp, (int)cv.y1, y, y2);
+    layer_spans(lv_layer_sys(), 0, &a, &n, sp, (int)cv.y1, y, y2);
+
+    if (n == 0) {
+        *fy = y; *fh = h;
+        return h > 0;
+    }
+    /* 帯を昇順に並べて、いちばん広い隙間を取る。n は 24 が上限なので
+       挿入ソートで十分 (毎フレーム走るが、実際は 0〜3 本)。 */
+    for (int i = 1; i < n; i++) {
+        int a0 = sp[i][0], b0 = sp[i][1], k = i - 1;
+        while (k >= 0 && sp[k][0] > a0) { sp[k+1][0] = sp[k][0];
+                                          sp[k+1][1] = sp[k][1]; k--; }
+        sp[k+1][0] = a0; sp[k+1][1] = b0;
+    }
+    int best_y = y, best_h = 0, cur = y;
+    for (int i = 0; i <= n; i++) {
+        int a0 = (i < n) ? sp[i][0] : y2;
+        if (a0 - cur > best_h) { best_h = a0 - cur; best_y = cur; }
+        if (i < n && sp[i][1] > cur)
+            cur = sp[i][1];
+    }
+    *fy = best_y; *fh = best_h;
+    return best_h > 0;
 }
 
 /* true を返したら「もう画面に出した」。false なら呼び出し側が
    従来の lv_obj_invalidate_area へ落とす。 */
-static bool canvas_present_direct(int x, int y, int w, int h)
+static bool canvas_present_direct(int x, int y, int w, int h,
+                                  int *done_y, int *done_h)
 {
     if (!s_dpi_panel || !s_js_canvas_buf || !s_js_canvas || !s_canvas_w ||
         !s_canvas_h)
@@ -4195,22 +4319,30 @@ static bool canvas_present_direct(int x, int y, int w, int h)
        当初「転置で strided になるから遅い」と読んだのは誤りで、縦を測って
        初めて分かった。差がつくのは LVGL 側で、縦は回転もキャッシュ跨ぎの
        転送も無いので 36.1 ms で済む。横だけが 74.6 ms を払っている。 */
-    if (!s_landscape)
+    if (!s_landscape) {
+        s_direct_rej[0]++;
         return false;
-    if (h < UI_DIRECT_MIN_H)
+    }
+    if (h < UI_DIRECT_MIN_H) {
+        s_direct_rej[1]++;
         return false;
+    }
     /* ここからロックを持つ。離すのは戻る直前。
        (a) LVGL が render 中でないこと = ロック
        (b) 飛行中の flush が着地していること = flushing を待つ
        (a) だけだと最後のチャンクの fbcpy に負け、(b) だけだと render 中の
        古いスナップショットが後から flush される。両方要る。 */
-    if (!lvgl_port_lock(0))
-        return false;
-    lv_area_t abs_unused;
-    if (!canvas_area_clear(x, y, w, h, &abs_unused)) {
-        lvgl_port_unlock();
+    if (!lvgl_port_lock(0)) {
+        s_direct_rej[2]++;
         return false;
     }
+    int fy = y, fh = h;
+    if (!canvas_free_band(x, y, w, h, &fy, &fh) || fh < UI_DIRECT_MIN_H) {
+        s_direct_rej[3]++;
+        lvgl_port_unlock();
+        return false;   /* 隠れていない帯が無い / 小さすぎる */
+    }
+    y = fy; h = fh;     /* 出すのはこの帯だけ。残りは呼び出し側が LVGL へ */
     /* 飛行中の flush を着地させる。**ここで flushing を 0 にしてはいけない**
        —— fbcpy が生きているかもしれない。諦めたら従来経路へ落とす。 */
     if (s_disp) {
@@ -4218,6 +4350,7 @@ static bool canvas_present_direct(int x, int y, int w, int h)
         while (s_disp->flushing) {
             int64_t dt = esp_timer_get_time() - t0;
             if (dt > UI_FLUSH_MAX_US) {
+                s_direct_rej[4]++;
                 lvgl_port_unlock();
                 return false;
             }
@@ -4260,7 +4393,7 @@ static bool canvas_present_direct(int x, int y, int w, int h)
        lv_obj_set_pos(_canvas, 0, UI_STATUSBAR_H) の位置は**親のコンテンツ
        box からの相対**で、画面自体が上に UI_STATUSBAR_H の padding を
        持っている (ui_widgets.cpp)。つまり絶対 y は 2 倍になりうる。
-       同じ関数の中で、重なり判定 (canvas_area_clear) は
+       同じ関数の中で、重なり判定 (canvas_free_band) は
        lv_obj_get_content_coords の絶対座標を使っていたので、
        **「どこを守るか」と「どこへ出すか」が別の座標系だった。**
        ずれた分だけ、直接経路で出した絵だけが縦に動く —— LVGL 経路で
@@ -4300,6 +4433,7 @@ static bool canvas_present_direct(int x, int y, int w, int h)
     }
     if (ox < 0 || oy < 0 || ox + obw > UI_LCD_H_RES || oy + obh > UI_LCD_V_RES ||
         (ox & 1)) {
+        s_direct_rej[5]++;
         lvgl_port_unlock(); /* 幾何が合っていない。黙って壊すより従来経路へ */
         return false;
     }
@@ -4328,12 +4462,15 @@ static bool canvas_present_direct(int x, int y, int w, int h)
     int64_t t0 = esp_timer_get_time();
     esp_err_t r = ppa_do_scale_rotate_mirror(s_ppa_srm_direct, &srm);
     if (r != ESP_OK) {
+        s_direct_rej[6]++;
         lvgl_port_unlock();
         return false;
     }
     s_direct_us += esp_timer_get_time() - t0;
     s_direct_n++;
     s_direct_total++;
+    *done_y = y;
+    *done_h = h;
     lvgl_port_unlock();
     return true;
 }
@@ -4385,11 +4522,19 @@ extern "C" void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
     if (!s_js_canvas || !s_canvas_w || !s_canvas_h)
         return;
 #if UI_DIRECT_PRESENT
-    /* 大きい damage は LVGL を通さず直接 FB へ (実測 74.6 -> 37.2 ms)。
-       断られたら従来経路へ落ちる —— 上に何か載っているとき、小さいとき、
-       幾何が合わないとき。 */
-    if (canvas_present_direct(x, y, w, h))
+    /* 大きい damage は LVGL を通さず直接 FB へ (実測 90.4 -> 32.5 ms)。
+       上に何か載っていたら**全部あきらめず**、隠れていない帯だけ出して
+       残りをこの下の LVGL 経路へ回す。断られるのは小さいとき・幾何が
+       合わないとき・帯が 1 本も取れないとき。 */
+    int dy = 0, dh = 0;
+    if (canvas_present_direct(x, y, w, h, &dy, &dh)) {
+        if (dy > y)
+            ui_tab5_canvas_invalidate(x, y, w, dy - y);
+        int tail = y + h - (dy + dh);
+        if (tail > 0)
+            ui_tab5_canvas_invalidate(x, dy + dh, w, tail);
         return;
+    }
 #endif
     /* clamp to the canvas before anything else: LVGL would clip an
        out-of-range area anyway, but an inverted one (x2 < x1) is
