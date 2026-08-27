@@ -79,3 +79,62 @@ static inline int hist_rows_avail(term_core_t *core, int want)
     }
     return total;
 }
+
+/* 画面 1 枚ぶんの「どの段に何を出すか」を **1 回の走査**で作る。
+ *
+ * hist_row_at を段ごとに呼ぶと走査が段数ぶん重なって O(段数 × 履歴) になる。
+ * 指でドラッグしている間は毎フレーム全段を描き直すので、この重なりが
+ * そのまま体感に出た (実機 2026-08-27「スワイプへの反応が遅い」)。
+ * 位置は下から上へ単調に増えるので、履歴を 1 回下から舐めれば全部埋まる。
+ *
+ * out[k] が pos = pos_lo + k に対応する。
+ *   id == 0        生きているグリッドの seg 行目
+ *   id != 0        履歴の論理行 id の seg セグメント
+ *   seg < 0        履歴の外 (呼び出し側が空段で塗る)
+ * 返り値は埋まった段の数。 */
+typedef struct { uint32_t id; int seg; } hist_ref_t;
+
+static inline int hist_plan(term_core_t *core, int pos_lo, int n,
+                            int grid_rows, hist_ref_t *out)
+{
+    int k, filled = 0, need_lo, need_hi, idx = 0;
+    uint32_t first, id;
+
+    for (k = 0; k < n; k++) {
+        int pos = pos_lo + k;
+        out[k].id = 0;
+        if (pos < grid_rows) {
+            out[k].seg = grid_rows - 1 - pos;   /* 生きている行 */
+            filled++;
+        } else {
+            out[k].seg = -1;                    /* あとで履歴が埋める */
+        }
+    }
+
+    need_hi = pos_lo + n - 1 - grid_rows;       /* 要る履歴の索引の上限 */
+    if (need_hi < 0)
+        return filled;                          /* 全部が生きている行 */
+    need_lo = pos_lo - grid_rows;
+    if (need_lo < 0)
+        need_lo = 0;
+
+    first = term_core_sb_first(core);
+    id = term_core_sb_end(core);
+    while (id > first && idx <= need_hi) {
+        int cnt, sgi;
+        id--;
+        cnt = term_core_line_seg_count(core, id);
+        if (cnt <= 0)
+            continue;                           /* 消えた id */
+        /* 新しい表示行から上へ = セグメントは末尾から先頭へ。 */
+        for (sgi = cnt - 1; sgi >= 0 && idx <= need_hi; sgi--, idx++) {
+            if (idx < need_lo)
+                continue;
+            k = (idx + grid_rows) - pos_lo;
+            out[k].id = id;
+            out[k].seg = sgi;
+            filled++;
+        }
+    }
+    return filled;
+}

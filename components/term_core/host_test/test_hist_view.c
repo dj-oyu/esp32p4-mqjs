@@ -174,6 +174,38 @@ static void case_rows_avail(void)
     tc_free(&t);
 }
 
+
+/* hist_plan は hist_row_at を段ごとに呼んだのと**同じ結果**でなければ
+   ならない。速い方が正しいことを、遅くて素直な方と突き合わせて示す。 */
+static void case_plan_matches_row_at(void)
+{
+    tcore_t t = tc_make(TERM_VT, 10, 3);
+    hist_ref_t plan[64];
+    int i, k, scroll;
+
+    t_case("hist_plan は 1 回の走査で hist_row_at と同じ答えを出す");
+    REQUIRE(t.c != NULL);
+    for (i = 0; i < 8; i++)
+        feed(t.c, "ABCDEFGHIJKLMNOPQRSTUVWXY\r\n");
+
+    for (scroll = 0; scroll < 40; scroll++) {
+        int vis = 3, pos_lo = scroll;
+        hist_plan(t.c, pos_lo, vis, 3, plan);
+        for (k = 0; k < vis; k++) {
+            uint32_t rid = 0;
+            int rseg = 0;
+            int pos = pos_lo + k;
+            if (hist_row_at(t.c, pos, 3, &rid, &rseg)) {
+                CHK_INT((int)plan[k].id, (int)rid);
+                CHK_INT(plan[k].seg, rseg);
+            } else {
+                CHK_INT(plan[k].seg, -1);   /* 履歴の外は印を付ける */
+            }
+        }
+    }
+    tc_free(&t);
+}
+
 int main(void)
 {
     t_suite("hist-view");
@@ -182,5 +214,6 @@ int main(void)
     case_wrapped_lines();
     case_contiguous();
     case_rows_avail();
+    case_plan_matches_row_at();
     return t_summary();
 }

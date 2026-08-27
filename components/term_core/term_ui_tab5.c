@@ -298,21 +298,31 @@ static void visit(term_id_t id, term_core_t *core, const term_view_t *view,
         if (scroll <= 0)
             goto live;               /* 履歴が無い: 生きた画面のまま */
         cp->on = false;              /* 履歴にカーソルは無い */
-        for (r = 0; r < vis_rows; r++) {
-            uint32_t lid = 0;
-            int seg = 0;
-            int pos = (vis_rows - 1 - r) + scroll;
-            if (!hist_row_at(core, pos, grid_rows, &lid, &seg)) {
-                if (!hist_blank(vis_cols, col0, row0 + r))
-                    ok = false;      /* ここへは来ないはず (上で切り詰めた) */
-                continue;
-            }
-            if (lid == 0) {
-                const term_cell_t *cells = term_core_row(core, seg);
-                if (cells && !blit_row(cells, vis_cols, col0, row0 + r))
+        /* **走査は 1 回。** 段ごとに hist_row_at を呼ぶと O(段数 × 履歴) に
+           なり、ドラッグ中は毎フレーム全段を描き直すのでそのまま体感に
+           出る (実機で「スワイプへの反応が遅い」)。 */
+        {
+            static hist_ref_t plan[TERM_MAX_ROWS_DEFAULT];
+            int nplan = vis_rows;
+            if (nplan > (int)(sizeof plan / sizeof plan[0]))
+                nplan = (int)(sizeof plan / sizeof plan[0]);
+            hist_plan(core, scroll, nplan, grid_rows, plan);
+            for (r = 0; r < nplan; r++) {
+                /* plan[k] は下から k 番目 = 画面では下から k 段目。 */
+                int k = vis_rows - 1 - r;
+                if (k < 0 || k >= nplan)
+                    continue;
+                if (plan[k].seg < 0) {
+                    if (!hist_blank(vis_cols, col0, row0 + r))
+                        ok = false;
+                } else if (plan[k].id == 0) {
+                    const term_cell_t *cells = term_core_row(core, plan[k].seg);
+                    if (cells && !blit_row(cells, vis_cols, col0, row0 + r))
+                        ok = false;
+                } else if (!hist_blit(core, plan[k].id, plan[k].seg, vis_cols,
+                                      col0, row0 + r)) {
                     ok = false;
-            } else if (!hist_blit(core, lid, seg, vis_cols, col0, row0 + r)) {
-                ok = false;
+                }
             }
         }
         if (ok)
