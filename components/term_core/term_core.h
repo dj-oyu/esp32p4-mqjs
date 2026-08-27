@@ -460,6 +460,10 @@ void term_core_scroll_region(const term_core_t *c, int *top, int *bot);
  * output was truncated. Never mutates the core: a probe must not perturb
  * what it measures. */
 int term_core_row_utf8(const term_core_t *c, int row, char *out, size_t out_size);
+/* 同じ規則で cells 配列を直す (履歴セグメント用)。規則を 1 か所に保つ ——
+   分かれると、選択した範囲とコピーされた文字列がずれる。 */
+int term_core_cells_utf8(const term_cell_t *cells, int n, char *out,
+                         size_t out_size);
 
 /*
  * A cheap hash of everything the active screen DISPLAYS: every cell's

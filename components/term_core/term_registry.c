@@ -31,6 +31,7 @@
  * the acks are still what lets stage 2 free a block.
  */
 #include "term_registry.h"
+#include "term_hist.h"
 
 #include <string.h>
 
@@ -1606,13 +1607,49 @@ static term_err_t snapshot_locked(term_slot_t *sl, char *out, size_t out_size,
     int r;
     size_t off = 0, total = 0;
     bool trunc = false;
+    /* **画面に出ているものを返す。** さかのぼって見ている間、grid の
+       行 r と画面の行 r は対応しない —— 生きた grid を返すと、選択した
+       範囲とコピーされる文字列が食い違う (実機 2026-08-27: 反転は触った
+       場所に出るのに、貼ると全然違う行が出た)。
+       plan は 1 回の走査。cells の一時置き場はロックの内側でしか触らない
+       ので static でよい (1.7KB をスタックに積まない)。 */
+    hist_ref_t plan[TERM_MAX_ROWS_DEFAULT];
+    static term_cell_t seg_cells[TERM_MAX_COLS_DEFAULT];
+    int scroll = sl->scroll;
+    bool hist = scroll > 0;
+
+    if (hist) {
+        if (rows > (int)(sizeof plan / sizeof plan[0]))
+            rows = (int)(sizeof plan / sizeof plan[0]);
+        hist_plan(sl->core, scroll, rows, term_core_rows(sl->core), plan);
+    }
 
     if (out && out_size)
         out[0] = '\0';
     for (r = 0; r < rows; r++) {
         size_t avail = (!trunc && out && out_size > off) ? out_size - off : 0;
-        int need = term_core_row_utf8(sl->core, r, avail ? out + off : NULL,
-                                      avail);
+        int need;
+        if (hist) {
+            /* plan は下から数えた並び。画面の上から r 段目は
+               下から rows-1-r 番目。 */
+            int k = rows - 1 - r;
+            if (plan[k].seg < 0) {
+                need = 0;                    /* 履歴の外 = 空行 */
+            } else if (plan[k].id == 0) {
+                need = term_core_row_utf8(sl->core, plan[k].seg,
+                                          avail ? out + off : NULL, avail);
+            } else {
+                int nc = term_core_line_segment(
+                    sl->core, plan[k].id, plan[k].seg, seg_cells,
+                    (int)(sizeof seg_cells / sizeof seg_cells[0]));
+                need = (nc < 0) ? 0
+                    : term_core_cells_utf8(seg_cells, nc,
+                                           avail ? out + off : NULL, avail);
+            }
+        } else {
+            need = term_core_row_utf8(sl->core, r,
+                                      avail ? out + off : NULL, avail);
+        }
         if (need < 0)
             need = 0;
         if (avail && (size_t)need + 1 <= avail)
