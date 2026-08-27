@@ -8370,6 +8370,30 @@ JSValue js_term_show(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     return term_err_value(ctx, term_registry_show((term_id_t)id, owner, &view));
 }
 
+/* term.scroll(id, delta) -> 現在の位置 (表示行) か負の term_err_t。
+   正の delta で過去へ。0 は読むだけ。生きている画面に戻すには
+   現在値ぶん引く: `term.scroll(id, -term.scroll(id, 0))`。
+   上限はレンダラが実際にさかのぼれた行数を書き戻すので、履歴の先頭で
+   指を動かし続けても値は育たない (term_registry.h に理由)。 */
+JSValue js_term_scroll(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0, delta = 0, now = 0;
+    term_err_t e;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &delta, argv[1]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    e = term_registry_scroll((term_id_t)id, owner, delta, &now);
+    if (e != TERM_OK)
+        return term_err_value(ctx, e);
+    return JS_NewInt32(ctx, now);
+}
+
 /* term.log(id, str) -> 0 or a negative term_err_t. Line-atomic and
    lossy: a full ring drops the whole line and counts it (§3.2), which
    is why logging can never stall the app that logs. */

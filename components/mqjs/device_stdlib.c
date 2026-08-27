@@ -468,6 +468,7 @@ static const JSClassDef js_ui_obj =
 static const JSPropDef js_term[] = {
     JS_CFUNC_DEF("create", 1, js_term_create),     /* (opts) -> id | -err */
     JS_CFUNC_DEF("show", 2, js_term_show),         /* (id, {x,y,w,h}) */
+    JS_CFUNC_DEF("scroll", 2, js_term_scroll),     /* (id, delta) -> 行 */
     JS_CFUNC_DEF("log", 2, js_term_log),           /* (id, str) line-atomic */
     JS_CFUNC_DEF("feed", 2, js_term_feed),         /* (id, bytes) VT input */
     JS_CFUNC_DEF("pipe", 2, js_term_pipe),         /* (id, sshHandle) */

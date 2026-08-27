@@ -107,6 +107,11 @@ typedef struct {
 
     term_view_t view;
     int         cols, rows;   /* geometry the UI task has actually applied */
+    /* 履歴を何**表示行**さかのぼって見ているか。0 = 生きている画面。
+       上限はレンダラだけが知っている (折り返しは現在の幅で決まり、
+       走ってみるまで何行になるか分からない) ので、要求はここに置いて
+       **届いた値をレンダラが書き戻す**。 */
+    int         scroll;
 
     int64_t detached_since_ms; /* LRU key while DETACHED, else 0 */
     int64_t dying_since_ms;    /* stage-2 deadline base */
@@ -1523,6 +1528,71 @@ term_err_t term_registry_show(term_id_t id, const char *owner,
     }
     unlock();
     return TERM_OK;
+}
+
+/* ---- 履歴スクロール ------------------------------------------------- */
+
+/* delta 表示行ぶんさかのぼる (負で戻る)。新しい位置を *now に返す。
+   0 は「動かさずに現在値を読む」。位置が変わったら全面再描画を予約する
+   —— damage はセルの変化を語るもので、**変わったのはどの画素が硝子の
+   上に居るか**だから (term_registry_show の可視化遷移と同じ理由)。 */
+term_err_t term_registry_scroll(term_id_t id, const char *owner, int delta,
+                                int *now)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    int before;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    before = sl->scroll;
+    sl->scroll += delta;
+    if (sl->scroll < 0)
+        sl->scroll = 0;
+    if (sl->scroll != before)
+        term_core_repaint_all(sl->core);
+    if (now)
+        *now = sl->scroll;
+    unlock();
+    return TERM_OK;
+}
+
+/* ---- 以下 2 本は visit コールバックの中からだけ呼ぶ ------------------
+ *
+ * **ロックを取らない。** term_registry_ui_visit は fn() を**ロックを
+ * 持ったまま**呼ぶので、ここで取り直すと非再帰ミューテックスに自分で
+ * ぶつかる —— 実機では毎フレーム制御タイムアウトぶん待って 0 が返り、
+ * 「表示が遅い・入力が遅い・スクロールしない」が同時に出た。
+ * スロットが生きていることも view が可視であることも visit が保証済み。 */
+
+int term_registry_scroll_rows(term_id_t id)
+{
+    term_slot_t *sl;
+
+    if (!s_ready || slot_lookup(id, NULL, true, &sl) != TERM_OK)
+        return 0;
+    return sl->scroll;
+}
+
+/* レンダラが「実際にさかのぼれた行数」を書き戻す。履歴の先頭で指を
+   動かし続けても、要求だけが際限なく増えていくのを防ぐ。 */
+void term_registry_scroll_reached(term_id_t id, int achieved)
+{
+    term_slot_t *sl;
+
+    if (!s_ready || achieved < 0)
+        return;
+    if (slot_lookup(id, NULL, true, &sl) == TERM_OK && sl->scroll > achieved)
+        sl->scroll = achieved;
 }
 
 /* ===================================================================== */
