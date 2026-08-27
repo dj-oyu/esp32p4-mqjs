@@ -135,6 +135,7 @@ const lv_font_t *ui_tab5_jp_font(void)
  * The C side therefore measures width to size the CLIP, never to
  * advance the column: doing both would double-count and shear every
  * line of CJK to the right. */
+#include "freertos/idf_additions.h"
 #include "driver/ppa.h"
 #include "ui_cell_width.h"
 
@@ -455,7 +456,17 @@ extern "C" void ui_tab5_set_fg_apps(const char *cur, const char *prev,
    Non-blocking by design — a full queue drops the command and bumps a
    counter that the status bar displays (visible backpressure, JS is
    never stalled). */
-#define UI_CMD_QUEUE_DEPTH 128 /* 16B each; static scenes burst >64 */
+/* 1 コマンド 24B。**htop のような画面は 1 フレームで数百 run になる。**
+   128 段では溢れ、溢れた run は ok=false になる —— 内容は失われない
+   (dirty を消さないので次フレームで再送される) が、**取りこぼしが 1 つでも
+   あると term_core_dirty_clear が丸ごとスキップされる**ので、成功した行も
+   含めて毎フレーム全部描き直しになり空回りする。実機で drop カウンタが
+   htop の描画中だけ急増したのはこれ。
+
+   段数を増やす代わりに実体を PSRAM へ置く。ここは ISR から触らない
+   (js_task と UI フレームタスクだけ) ので内部 SRAM である必要が無く、
+   内部は 67KB しか空いていない。 */
+#define UI_CMD_QUEUE_DEPTH 512
 
 static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
@@ -4740,7 +4751,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
                                               MALLOC_CAP_SPIRAM);
     s_log_mtx = s_log ? xSemaphoreCreateMutex() : NULL;
     s_status_mtx = xSemaphoreCreateMutex();
-    s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
+    s_cmd_queue = xQueueCreateWithCaps(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t),
+                                       MALLOC_CAP_SPIRAM);
+    if (!s_cmd_queue) /* PSRAM が無い / 取れない板では内部で妥協する */
+        s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
     s_job_queue = xQueueCreate(UI_JOB_QUEUE_DEPTH, sizeof(ui_job_t));
 
     ui_panel_variant_t variant = panel_reset_and_detect();
