@@ -42,6 +42,7 @@
 #include "flash_suspend_test.h"
 #include "sdcard.h"
 #include "edit_ui.h"
+#include "fs_io.h"
 #include "mqjs_native.h"
 #include "storage.h"
 #include "task_source.h"
@@ -248,6 +249,9 @@ void app_main(void)
        前に済ませる」ことを規約にしている (表にロックを置かない代わり)。
        Phase 1 はファイル入出力を持たない —— fs_io が M2 で入るまで、
        開けるのは空バッファだけ。 */
+    /* ファイル入出力の逃がし先を先に起こす (§A.7)。edit_task が
+       fsio_submit を呼ぶ時点で受け手が居ないと、開くも保存もできない。 */
+    fsio_start();
     edit_ui_start(NULL);
     /* SKK の辞書を繋ぐ。これが無いと「あ」で面だけ かな に変わって
        入力は ASCII のまま、という嘘の状態になる (実機報告 2026-08-26)。

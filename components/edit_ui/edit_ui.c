@@ -73,6 +73,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "fs_io.h"
+#include "fs_picker.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -240,6 +242,10 @@ typedef enum {
     EDIT_CMD_OPEN,
     EDIT_CMD_NEW,
     EDIT_CMD_DICT,
+    EDIT_CMD_SAVE,     /* 明示保存。vpath が空なら既定の置き場へ */
+    EDIT_CMD_SAVE_AS,  /* ピッカーで選んだ先へ保存 */
+    EDIT_CMD_LOADED,   /* fs_io から。buf の所有権が来る */
+    EDIT_CMD_SAVED,    /* fs_io から。結果だけ */
 } edit_cmd_kind_t;
 
 typedef struct {
@@ -259,6 +265,11 @@ typedef struct {
             char vpath[EDIT_VPATH_MAX];
         } open;
         const void *dict;      /* const skk_dict_t * */
+        struct {
+            void  *buf;        /* PSRAM。このタスクが free する */
+            uint32_t len;
+            int32_t err;       /* esp_err_t。0 = 成功 */
+        } io;
     } u;
 } edit_cmd_t;
 
@@ -315,6 +326,14 @@ static edit_run_t s_runs[EDIT_UI_RUNS_CAP];
 static char       s_row_utf8[EDIT_UI_ROW_UTF8];
 static char       s_status[EDIT_UI_MAX_COLS * 2];
 static char       s_vpath[EDIT_VPATH_MAX];   /* 開いている (ことになっている) パス */
+/* 一言の通知。ステータス行の末尾に出して、数秒で消す。**トーストは作らない**
+   —— ui_tab5_set_status は構造体まるごとの差し替えで、他の欄を巻き添えに
+   する。エディタの持ち物はエディタのステータス行に出すのが素直。 */
+static char       s_note[40];
+static int64_t    s_note_until;
+/* 保存の宛先。新規は §E-11 のとおり最初からここに固定する ——
+   あとから動かすとユーザの原稿が迷子になる。 */
+#define EDIT_DEFAULT_DIR "/internal/scripts"
 
 /* 画面の幾何。すべて ui_tab5 から取る —— 横 142×26 / 縦 80×49 は
    max_cols/max_rows の初期値であって、コードのどこにも決め打ちを置かない
@@ -521,14 +540,130 @@ static void render_row(uint16_t row)
 }
 
 /* ステータス行。本文の下 1 段。行/桁/行数/変更フラグ/開いているパス。 */
+/* 一言だけ出して数秒で消す。ステータス行の再描画に乗せるので、
+   ここでは印を付けるだけ (描画は edit_task の上でしか起きない)。 */
+/* 「別名で保存」。書き換えられない場所に当たったときの逃げ道でもある。 */
+static bool s_pick_saving;
+/* 書き換え不可で行き先を差し替えたか。無限に差し替えないための印。 */
+static bool s_redirected;
+static void open_picker(bool for_save);
+
+static void sys_note(const char *msg)
+{
+    snprintf(s_note, sizeof s_note, "%s", msg);
+    s_note_until = esp_timer_get_time() + 4000000;
+}
+
+/*
+ * fs_io からの返事。**fs_io タスクの上で呼ばれるので、投げ直すだけ。**
+ * ここで edit_core を触ると、単一書き手 (§A.2) の前提が壊れる。
+ * LOAD の buf は所有権ごとキューに載せ、edit_task が free する。
+ */
+/*
+ * ピッカーからエディタへ渡す道。**これが無いと、開く口が 1 つも無い。**
+ * fs.pick は JS 束縛で、呼んでいるのは dev スロットの probe だけだった ——
+ * エディタは開けても、そこにファイルを持ち込む手段が存在しなかった。
+ *
+ * 仕様 §A の依存の向きは `edit_ui -> ... fs_io, fs_picker` なので、
+ * エディタが自分でモーダルを出してよい。cb は **UI タスクの上**で呼ばれる
+ * ので、ここでも投げ直すだけにする (§A.2 の単一書き手)。
+ */
+static void pick_done(void *ctx, const fs_pick_result_t *r)
+{
+    edit_cmd_t c;
+
+    (void)ctx;
+    if (!r->ok || !r->vpath[0])
+        return;                     /* 取り消しは何もしない */
+    /* **切り詰めない。** ピッカーの器は 512 B、こちらは 128 B。詰めて入れると
+       別のファイルを開き、そのまま Ctrl+S で**別のファイルを上書きする**。
+       入らない道は断って、断ったと言う。 */
+    if (strlen(r->vpath) >= sizeof c.u.open.vpath) {
+        sys_note("パスが長すぎます");
+        return;
+    }
+    memset(&c, 0, sizeof c);
+    c.kind = s_pick_saving ? EDIT_CMD_SAVE_AS : EDIT_CMD_OPEN;
+    strcpy(c.u.open.vpath, r->vpath);
+    post(&c);
+}
+
+static void open_picker(bool for_save)
+{
+    static const char *const exts[] = { ".js", ".txt", ".json", ".md" };
+    fs_pick_req_t req;
+    const char *base = s_vpath[0] ? strrchr(s_vpath, '/') : NULL;
+
+    memset(&req, 0, sizeof req);
+    s_pick_saving = for_save;
+    req.mode = for_save ? FS_PICK_SAVE : FS_PICK_OPEN;
+    req.title = for_save ? "別名で保存" : "開く";
+    req.start_vpath = EDIT_DEFAULT_DIR;
+    req.exts = exts;
+    req.n_exts = (int)(sizeof exts / sizeof exts[0]);
+    req.suggest_name = base ? base + 1 : "untitled.js";
+    if (!fs_pick_begin(&req, pick_done, NULL))
+        sys_note("ピッカーを出せません");
+}
+
+static void io_done(void *ctx, const fsio_result_t *r)
+{
+    edit_cmd_t c;
+
+    (void)ctx;
+    memset(&c, 0, sizeof c);
+    c.kind = (r->kind == FSIO_LOAD) ? EDIT_CMD_LOADED : EDIT_CMD_SAVED;
+    c.u.io.buf = r->buf;
+    c.u.io.len = (uint32_t)r->len;
+    c.u.io.err = (int32_t)r->err;
+    post(&c);
+    /* post が落としたら buf が漏れる。キューは 32 段あって、返事は
+       打鍵より桁違いに少ないが、漏らさないことは保証しておく。 */
+}
+
+/* 本文を PSRAM へ写して fs_io へ渡す。**edit_core のバッファをそのまま
+   渡さない** —— 書いている間に打鍵が来ると gap が動く。写した時点の
+   スナップショットを保存するのが正しい (保存中の打鍵は次の保存に乗る)。 */
+static void save_now(void)
+{
+    size_t len, got;
+    char *buf;
+
+    if (!s_ed)
+        return;
+    if (!s_vpath[0]) {
+        /* 名前が無い原稿。§E-11 の既定の置き場へ、時刻ではなく固定名で。
+           時刻を使うと「保存するたびに別ファイル」になって迷子になる。 */
+        snprintf(s_vpath, sizeof s_vpath, "%s/untitled.js", EDIT_DEFAULT_DIR);
+    }
+    len = edit_text_len(s_ed);
+    buf = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        sys_note("保存できません (メモリ不足)");
+        return;
+    }
+    got = edit_copy_text(s_ed, 0, buf, len + 1);
+    if (!fsio_submit(FSIO_SAVE, s_vpath, NULL, buf, got, io_done, NULL, NULL)) {
+        free(buf);
+        sys_note("保存できません (I/O 混雑)");
+        return;
+    }
+    sys_note("保存中…");
+}
+
 static void render_status(void)
 {
     edit_pos_t p = edit_cursor(s_ed);
     unsigned lines = (unsigned)edit_line_count(s_ed);
     const char *name = s_vpath[0] ? s_vpath : "(untitled)";
-    int k = snprintf(s_status, sizeof(s_status), " %s%s  %u:%u  %u lines ",
+    /* 通知は期限を過ぎたら自分で消える。tick を待たないのは、tick が
+       止まっていても正しく消えてほしいから (表示の真偽が時計だけで決まる)。 */
+    if (s_note[0] && esp_timer_get_time() > s_note_until)
+        s_note[0] = 0;
+    int k = snprintf(s_status, sizeof(s_status), " %s%s  %u:%u  %u lines %s%s",
                      edit_modified(s_ed) ? "*" : "", name,
-                     (unsigned)p.line1, (unsigned)p.col1, lines);
+                     (unsigned)p.line1, (unsigned)p.col1, lines,
+                     s_note[0] ? " — " : "", s_note);
     if (k < 0)
         k = 0;
     size_t len = (size_t)k < sizeof(s_status) ? (size_t)k : sizeof(s_status) - 1;
@@ -786,6 +921,11 @@ static void key_to_edit(const char *k, size_t len)
         if (c == 0x19) { edit_redo(s_ed); return; }          /* Ctrl+Y */
         if (c == 0x01) { edit_move(s_ed, EDIT_M_HOME, 1); return; }  /* Ctrl+A */
         if (c == 0x05) { edit_move(s_ed, EDIT_M_END, 1); return; }   /* Ctrl+E */
+        /* Ctrl+S = 保存。**保存を呼ぶ口がこれしか無い** —— 画面キーボード
+           には保存キーが無く、ドックが刺さっていない板では保存できない。
+           M5 のコマンド設計で操作バーに出すのが本筋で、それまでの入口。 */
+        if (c == 0x13) { save_now(); return; }               /* Ctrl+S */
+        if (c == 0x0F) { open_picker(false); return; }        /* Ctrl+O */
         if (c < 0x20) return;   /* その他の制御バイトは本文に入れない */
     }
     edit_insert(s_ed, k, len);
@@ -1087,16 +1227,85 @@ static void edit_task_fn(void *arg)
             if (s_fg) paint_dirty();
             break;
         case EDIT_CMD_OPEN:
-            /* **読まない。** §A.2 が edit_task から fs_* を呼ぶことを禁じて
-               おり、逃がし先の fs_io は M2 でまだ無い。パスだけ覚えて
-               ステータス行に出す (「開いたつもりで空だった」を画面から
-               判別できるように、本文はサンプルのままにしない)。 */
+            /* §A.2 が edit_task から fs_* を呼ぶことを禁じているので、
+               読むのは fs_io。ここでやるのはパスを覚えて依頼するまで。
+               本文は「読み込み中」を出さずに空にしておく —— 失敗したときに
+               古い原稿が残っていると、保存で上書きしてしまう。 */
+            s_redirected = false;
             memcpy(s_vpath, c.u.open.vpath, sizeof(s_vpath));
             s_vpath[sizeof(s_vpath) - 1] = '\0';
             edit_set_text(s_ed, "", 0);
             if (s_fg) paint_dirty();
-            ESP_LOGW(TAG, "open(%s): Phase 1 では読み込まない (fs_io は M2)",
-                     s_vpath);
+            if (!fsio_submit(FSIO_LOAD, s_vpath, NULL, NULL, 0,
+                             io_done, NULL, NULL)) {
+                ESP_LOGW(TAG, "open(%s): fs_io のキューが満杯", s_vpath);
+                sys_note("開けません (I/O 混雑)");
+            }
+            break;
+        case EDIT_CMD_SAVE:
+            save_now();
+            break;
+        case EDIT_CMD_SAVE_AS:
+            if (strlen(c.u.open.vpath) < sizeof s_vpath) {
+                memcpy(s_vpath, c.u.open.vpath, sizeof s_vpath);
+                s_vpath[sizeof s_vpath - 1] = 0;
+                save_now();
+            } else {
+                sys_note("パスが長すぎます");
+            }
+            break;
+        case EDIT_CMD_LOADED:
+            if (c.u.io.err == 0 && c.u.io.buf) {
+                edit_err_t e = edit_set_text(s_ed, (const char *)c.u.io.buf,
+                                             c.u.io.len);
+                if (e != EDIT_OK) {
+                    ESP_LOGW(TAG, "set_text: %d", (int)e);
+                    sys_note("読めません (中身が大きすぎる/不正)");
+                }
+            } else {
+                ESP_LOGW(TAG, "load failed: %d", (int)c.u.io.err);
+                sys_note("開けませんでした");
+            }
+            free(c.u.io.buf);          /* 所有権はここで終わる */
+            if (s_fg) repaint_all();
+            break;
+        case EDIT_CMD_SAVED:
+            if (c.u.io.err == 0) {
+                s_redirected = false;
+                edit_mark_saved(s_ed);
+                sys_note("保存しました");
+            } else if (c.u.io.err == ESP_ERR_NOT_ALLOWED && !s_redirected) {
+                /* /internal/apps は「読めるが書き換えられない」領域
+                   (fs_core §4)。棚から入れたアプリは署名付きで置かれて
+                   いるので、ここを上書きできると信用の前提が崩れる。
+                   断るだけでは行き止まりなので、**既定の置き場へ名前を
+                   保って写す**。
+                   **モーダルは出さない。** ピッカーを SAVE モードで
+                   edit_task から開くと、名前入力の鍵盤を出したところで
+                   core 1 が止まった (実機 2026-08-27。UI タスクと
+                   edit_task が両方沈黙し、core 0 は動き続ける)。
+                   ピッカーは JS から呼ばれ、**呼び出し側の JS ワーカーが
+                   返事待ちで止まる**前提で作られている —— エディタは
+                   止まらない。原因を掴むまで、この経路は使わない。
+                   行き先は毎回同じで、どこへ行ったかを画面に出す。 */
+                const char *base = strrchr(s_vpath, '/');
+                char alt[EDIT_VPATH_MAX];
+                int n = snprintf(alt, sizeof alt, "%s/%s", EDIT_DEFAULT_DIR,
+                                 base ? base + 1 : "untitled.js");
+                if (n > 0 && (size_t)n < sizeof alt) {
+                    memcpy(s_vpath, alt, sizeof s_vpath);
+                    s_vpath[sizeof s_vpath - 1] = 0;
+                    s_redirected = true;   /* 二度目は普通に失敗させる */
+                    save_now();
+                    sys_note("元の場所は書き換え不可 → scripts へ保存");
+                } else {
+                    sys_note("保存できません (パスが長すぎる)");
+                }
+            } else {
+                ESP_LOGW(TAG, "save failed: %d", (int)c.u.io.err);
+                sys_note("保存できませんでした");
+            }
+            if (s_fg) paint_dirty();
             break;
         case EDIT_CMD_DICT:
             /* ime_t を触ってよいのはこのタスクだけ。だから attach も
@@ -1343,6 +1552,16 @@ void edit_ui_open(const char *vpath)
     post(&c);
     if (s_native_id >= 0)
         mqjs_native_focus(s_native_id);
+}
+
+/* 明示保存。任意のタスクから。実際の書き込みは fs_io がやる (§A.2)。 */
+void edit_ui_save(void)
+{
+    edit_cmd_t c;
+
+    memset(&c, 0, sizeof c);
+    c.kind = EDIT_CMD_SAVE;
+    post(&c);
 }
 
 void edit_ui_new(void)

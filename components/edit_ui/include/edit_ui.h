@@ -68,6 +68,9 @@ void edit_ui_open(const char *vpath);
 
 /* 任意タスク。空バッファで開いてフォアグラウンドへ。 */
 void edit_ui_new(void);
+/* 今の本文を s_vpath へ保存する (名前が無ければ /internal/scripts へ)。
+   書き込みは fs_io タスクの上。呼んだ側は待たない。 */
+void edit_ui_save(void);
 
 /* ---- 仕様 §A.2 に無い 1 本。足した理由をここに残す -------------------
  *
