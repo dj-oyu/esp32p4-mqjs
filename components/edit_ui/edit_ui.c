@@ -146,6 +146,22 @@ static const char *TAG = "edit_ui";
    26 段で 1 フレーム 113 ms になり、計測器がスクロールを壊す (実際にやった)。 */
 #ifndef EDIT_TRACE_RUNS
 #define EDIT_TRACE_RUNS 0
+/* 2026-08-27 の切り分け用 (回転の宛先が逆だった件)。既定オフ。
+   1 にすると 1 バッチ 1 行、壊れた形は間引かずに出す。 */
+#ifndef EDIT_TRACE_PAINT
+#define EDIT_TRACE_PAINT 0
+#endif
+
+#if EDIT_TRACE_PAINT
+static int s_tp_rows, s_tp_nonempty, s_tp_neg;
+static int s_tp_drawn, s_tp_failed;
+/* 視界を動かしたのは誰か。scr=タッチのドラッグ、gt=タップの edit_goto。
+   どちらも 0 なのに本文が消えるなら、動かしたのは core の追従。 */
+static int s_tp_scr, s_tp_scr_lines, s_tp_gt, s_tp_gt_line;
+static int s_tp_rect_y, s_tp_rect_h, s_tp_rects;
+static int64_t s_tp_last;
+#endif
+
 #endif
 
 /* ステージング。720 × UI_CELL_H(24) = 17,280 B、80 セルぶん —— ui_tab5.cpp の
@@ -378,8 +394,14 @@ static void draw_run(int col, int row, const char *utf8, size_t len,
     d.a8 = s_a8;
     d.a8_len = sizeof(s_a8);
     d.ppa = s_ppa;
-    if (!ui_tab5_cells_draw(&d))
+    if (!ui_tab5_cells_draw(&d)) {
         s_canvas_gone = true;
+#if EDIT_TRACE_PAINT
+        s_tp_failed++;
+    } else {
+        s_tp_drawn++;
+#endif
+    }
 }
 
 /* 1 段。edit_view_row の run をそのまま 1 run 1 blit で出す。
@@ -392,6 +414,11 @@ static void render_row(uint16_t row)
 {
     int n = edit_view_row(s_ed, row, s_runs, EDIT_UI_RUNS_CAP,
                           s_row_utf8, sizeof(s_row_utf8));
+#if EDIT_TRACE_PAINT
+    s_tp_rows++;
+    if (n > 0) s_tp_nonempty++;
+    if (n < 0) s_tp_neg++;
+#endif
     int used_cells = 0;
 #if EDIT_TRACE_RUNS
     bool trace_this_row = false;
@@ -583,6 +610,10 @@ static void render_dirty(void)
 static void invalidate_pending(void)
 {
     if (s_inval_all) {
+#if EDIT_TRACE_PAINT
+        s_tp_rects = 1; s_tp_rect_y = 0;
+        s_tp_rect_h = (s_rows_text + 1) * s_cell_h;
+#endif
         ui_tab5_canvas_invalidate(0, 0, s_canvas_w,
                                   (s_rows_text + 1) * s_cell_h);
     } else if (s_inval_rows) {
@@ -593,6 +624,11 @@ static void invalidate_pending(void)
             int r0 = r;
             while (r < total && (s_inval_rows & ((uint64_t)1 << r)))
                 r++;
+#if EDIT_TRACE_PAINT
+            if (!s_tp_rects) { s_tp_rect_y = r0 * s_cell_h;
+                               s_tp_rect_h = (r - r0) * s_cell_h; }
+            s_tp_rects++;
+#endif
             ui_tab5_canvas_invalidate(0, r0 * s_cell_h, s_canvas_w,
                                       (r - r0) * s_cell_h);
         }
@@ -600,6 +636,77 @@ static void invalidate_pending(void)
     s_inval_rows = 0;
     s_inval_all = false;
 }
+
+/* 「描いて出す」を 1 単位にする。
+
+   **バッチ全体を LVGL ロックの内側でやる。** そうしないと、行を描いて
+   いる途中で LVGL タスクが起きてロックを取り、**描きかけのキャンバスを
+   読んで** flush してしまう —— 半分は新しい白、半分はまだ古い黄色、
+   という裂けたフレームが出る。SKK の確定で黄色い preedit の上端が
+   残ったのはこれで、直接提示の順序を直しても閉じない窓だった
+   (直接提示が正すのは「自分が撃つ瞬間」だけで、裂けた flush が後から
+   着弾すれば古い画素が勝つ)。
+
+   ロックは再帰なので、この下の ui_tab5_canvas_invalidate が内側で
+   もう一度取っても問題ない。取れなくても描く —— 順序が緩むだけ。 */
+/* 実機で 2026-08-27 に出た「改行/行削除で本文が消え、ステータスだけが
+   画面中央に残る」を切り分けるための計測。edit_core はホストで無実が
+   確定した (test_newline_view.c) ので、残るのはこの段から下。
+
+   1 バッチ 1 行、4/s に絞る。**無条件に出してはいけない** —— 段ごとに
+   吐いて 1 フレーム 113 ms にした前科がある (EDIT_TRACE_RUNS)。
+   読みたいのは 3 つだけ:
+     nonempty/rows  本文の段が描かれたか (0 なら view が空)
+     rt / cv        ステータス行の位置と、キャンバスの実寸
+     rect           実際に無効化した矩形 */
+static void paint_dirty(void)
+{
+    bool held = ui_tab5_canvas_batch_begin();
+#if EDIT_TRACE_PAINT
+    s_tp_rows = s_tp_nonempty = s_tp_neg = 0;
+    s_tp_drawn = s_tp_failed = 0;
+    uint32_t d0 = ui_tab5_direct_count();
+    s_tp_rects = 0; s_tp_rect_y = s_tp_rect_h = -1;
+    uint32_t fl = edit_dirty_flags(s_ed);
+    uint64_t dr = edit_dirty_rows(s_ed);
+#endif
+    render_dirty();
+    invalidate_pending();
+#if EDIT_TRACE_PAINT
+    uint16_t tp_crow = 0, tp_ccol = 0;
+    bool tp_crow_vis = edit_cursor_view(s_ed, &tp_crow, &tp_ccol);
+    (void)tp_ccol;
+    /* **時間で間引くと、肝心の 1 フレームを取り逃す。** 4/s のサンプリングは
+       タッチのドラッグが出す paint に埋もれて、改行した瞬間の paint を
+       1 度も捉えられなかった。だから壊れた形そのものを条件にする:
+       本文があるのに段が 1 つも描けなかった paint は**必ず**出す。
+       それ以外は 1/s の生存確認に落とす。 */
+    bool bad = edit_line_count(s_ed) > 1 && s_tp_rows > 1 && s_tp_nonempty <= 1;
+    int64_t now = esp_timer_get_time();
+    if (bad || now - s_tp_last > 1000000) {
+        s_tp_last = now;
+        ESP_LOGW(TAG, "paint fl=%u dr=%llx rt=%u ch=%d cv=%dx%d "
+                 "rows=%d/%d neg=%d rect=%d+%d x%d blit=%d/%d gone=%d direct=%u "
+                 "ln=%u cur=%u crow=%d top=%u scr=%dx%d gt=%dx%d%s",
+                 (unsigned)fl, (unsigned long long)dr, (unsigned)s_rows_text,
+                 s_cell_h, s_canvas_w, s_canvas_h,
+                 s_tp_nonempty, s_tp_rows, s_tp_neg,
+                 s_tp_rect_y, s_tp_rect_h, s_tp_rects,
+                 s_tp_drawn, s_tp_drawn + s_tp_failed, s_canvas_gone ? 1 : 0,
+                 (unsigned)(ui_tab5_direct_count() - d0),
+                 (unsigned)edit_line_count(s_ed),
+                 (unsigned)edit_cursor(s_ed).line1,
+                 tp_crow_vis ? (int)tp_crow : -1,
+                 (unsigned)edit_top_line(s_ed),
+                 s_tp_scr, s_tp_scr_lines, s_tp_gt, s_tp_gt_line,
+                 bad ? "  <<< BAD" : "");
+        s_tp_scr = s_tp_gt = 0;
+    }
+#endif
+    if (held)
+        ui_tab5_canvas_batch_end();
+}
+
 
 /* ---- 幾何 (§E-9: 両向き) --------------------------------------------
  *
@@ -777,9 +884,12 @@ static void on_key(const edit_cmd_t *c)
         ime_view_clear(&s_ime);
 
     const int64_t t2 = esp_timer_get_time();
+    bool held = ui_tab5_canvas_batch_begin();
     render_dirty();
     const int64_t t3 = esp_timer_get_time();
     invalidate_pending();
+    if (held)
+        ui_tab5_canvas_batch_end();
     const int64_t t4 = esp_timer_get_time();
 
     /* 時計読みはここまでで 4 回。t_isr / t_post は poster が刻んだもの
@@ -820,9 +930,11 @@ static void on_touch(const edit_cmd_t *c)
             s_touch_last_y += lines * s_cell_h;
             s_touch_moved = true;
             /* 指を下へ動かす = 本文を下へ引く = 上の行が出てくる。 */
+#if EDIT_TRACE_PAINT
+            s_tp_scr++; s_tp_scr_lines = -lines;
+#endif
             edit_scroll(s_ed, -lines);
-            render_dirty();
-            invalidate_pending();
+            paint_dirty();
         }
         return;
     }
@@ -841,9 +953,11 @@ static void on_touch(const edit_cmd_t *c)
     long line1 = (long)p.line1 - (long)crow + row;
     if (line1 < 1)
         line1 = 1;
+#if EDIT_TRACE_PAINT
+    s_tp_gt++; s_tp_gt_line = (int)line1;
+#endif
     edit_goto(s_ed, (uint32_t)line1, (uint32_t)col + 1);
-    render_dirty();
-    invalidate_pending();
+    paint_dirty();
 }
 
 /* ---- フォーカス ------------------------------------------------------ */
@@ -856,11 +970,14 @@ static void repaint_all(void)
     if (!s_fg || !s_ed || s_rows_text == 0)
         return;
     s_canvas_gone = false;
+    bool held = ui_tab5_canvas_batch_begin();
     clear_canvas();
     render_all();
     render_status();
     edit_dirty_clear(s_ed);      /* 描いたので次の打鍵に持ち越さない */
     invalidate_pending();        /* この中で HIDDEN が落ちる */
+    if (held)
+        ui_tab5_canvas_batch_end();
 
     if (s_canvas_gone) {
         /* キャンバスがまだ作られていない (CanvasApp::onCreate 前 / UI が落ちて
@@ -967,7 +1084,7 @@ static void edit_task_fn(void *arg)
         case EDIT_CMD_NEW:
             edit_set_text(s_ed, "", 0);
             s_vpath[0] = '\0';
-            if (s_fg) { render_dirty(); invalidate_pending(); }
+            if (s_fg) paint_dirty();
             break;
         case EDIT_CMD_OPEN:
             /* **読まない。** §A.2 が edit_task から fs_* を呼ぶことを禁じて
@@ -977,7 +1094,7 @@ static void edit_task_fn(void *arg)
             memcpy(s_vpath, c.u.open.vpath, sizeof(s_vpath));
             s_vpath[sizeof(s_vpath) - 1] = '\0';
             edit_set_text(s_ed, "", 0);
-            if (s_fg) { render_dirty(); invalidate_pending(); }
+            if (s_fg) paint_dirty();
             ESP_LOGW(TAG, "open(%s): Phase 1 では読み込まない (fs_io は M2)",
                      s_vpath);
             break;

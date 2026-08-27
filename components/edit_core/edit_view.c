@@ -137,6 +137,25 @@ void ev_follow_cursor(struct edit *e)
 
 /* ------------------------------------------------------------ public API */
 
+/* スクロールで送れる上限。**最後の 1 画面を下端に留める。**
+
+   以前は line_count-1 まで許していた ("最終行 1 本だけが見える" まで送れる)。
+   実機 (2026-08-27) で本文が丸ごと消えたのはこれで、13 行の文書を 22 段の
+   ビューで見ているときに指で送ると、見えるのは末尾の空行 1 本 —— 画面は
+   真っ白になる。そこで改行してもカーソルは top_line の範囲内にあるので
+   追従スクロールは何もせず、空のまま残った。
+
+   本文がビューに収まりきるとき (line_count <= view_rows) は 0、つまり
+   **スクロールできない**のが正しい。全部見えているのだから送る先が無い。
+
+   ev_follow_cursor がカーソルを最終行に置くときも top = line_count -
+   view_rows になるので、この上限と一致する。 */
+static int64_t ev_top_max(const struct edit *e)
+{
+    int64_t m = (int64_t)e->line_count - (int64_t)e->view_rows;
+    return m > 0 ? m : 0;
+}
+
 void edit_set_view(edit_t *e, uint16_t cols, uint16_t rows)
 {
     if (e == NULL)
@@ -151,6 +170,10 @@ void edit_set_view(edit_t *e, uint16_t cols, uint16_t rows)
         rows = e->cfg.max_rows;
     e->view_cols = cols;
     e->view_rows = rows;
+    /* 段数が増えると古い top_line は上限を超える (回転・キーボードの
+       出し入れ)。放っておくと下端に本文の無い帯が残る。 */
+    if ((int64_t)e->top_line > ev_top_max(e))
+        e->top_line = (uint32_t)ev_top_max(e);
     ev_follow_cursor(e);
     ev_mark_all(e);
 }
@@ -164,13 +187,18 @@ edit_err_t edit_scroll(edit_t *e, int32_t lines)
     t = (int64_t)e->top_line + (int64_t)lines;
     if (t < 0)
         t = 0;
-    if (t > (int64_t)e->line_count - 1)
-        t = (int64_t)e->line_count - 1;
+    if (t > ev_top_max(e))
+        t = ev_top_max(e);
     if ((uint32_t)t != e->top_line) {
         e->top_line = (uint32_t)t;
         ev_mark_all(e);
     }
     return EDIT_OK;
+}
+
+uint32_t edit_top_line(const edit_t *e)
+{
+    return (e == NULL) ? 0u : e->top_line;
 }
 
 uint32_t edit_dirty_flags(const edit_t *e)

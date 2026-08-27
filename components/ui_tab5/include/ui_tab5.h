@@ -263,6 +263,25 @@ void ui_tab5_canvas_size(int *w, int *h);
 bool ui_tab5_cells_draw(const ui_cells_draw_t *d); /* false = no canvas */
 void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb);
 void ui_tab5_canvas_invalidate(int x, int y, int w, int h);
+/* Hold the LVGL lock across a whole paint batch.
+ *
+ * **The canvas buffer has two readers and they are not otherwise
+ * ordered.** A caller renders cells/fills straight into it with no
+ * lock, then calls _canvas_invalidate. In between, the LVGL task can
+ * take the lock, refresh, and read the canvas **mid-render** — it then
+ * flushes a torn frame (half the row repainted, half still showing the
+ * old glyphs). Presenting correctly afterwards does not help: the torn
+ * flush can land last.
+ *
+ * Wrap render+invalidate in begin/end and that window closes. The lock
+ * is recursive, so _canvas_invalidate's own lock still nests fine.
+ * begin() never blocks forever; if it returns false, paint anyway —
+ * you get the old unordered behaviour, not a dropped frame. */
+/* 直接提示の通し回数。前後で差を取れば「その invalidate は LVGL を
+   通さず出たか」が分かる。計測専用。 */
+uint32_t ui_tab5_direct_count(void);
+bool ui_tab5_canvas_batch_begin(void);
+void ui_tab5_canvas_batch_end(void);
 /* Pixel size of a UTF-8 string in the canvas font (no wrapping; \n makes
  * it multi-line). 0x0 when the UI is off or init failed. Safe from any
  * task: only reads const font tables. */
@@ -486,6 +505,9 @@ static inline void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
     (void)w;
     (void)h;
 }
+static inline uint32_t ui_tab5_direct_count(void) { return 0; }
+static inline bool ui_tab5_canvas_batch_begin(void) { return true; }
+static inline void ui_tab5_canvas_batch_end(void) {}
 static inline void ui_tab5_text_size(const char *utf8, int *w, int *h)
 {
     (void)utf8;

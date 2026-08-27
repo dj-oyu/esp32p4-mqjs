@@ -123,6 +123,7 @@ typedef struct {
 } edit_run_t;
 int        edit_view_row(const edit_t *e, uint16_t row, edit_run_t *runs, int runs_cap,
                          char *utf8, size_t utf8_cap);
+uint32_t   edit_top_line(const edit_t *e);   /* 画面 0 段目の行 (0 始まり)。診断用 */
 bool       edit_cursor_view(const edit_t *e, uint16_t *row, uint16_t *col);  /* 画面外なら false */
 
 /* ---- 状態 ---- */
