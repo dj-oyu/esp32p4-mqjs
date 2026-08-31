@@ -5486,6 +5486,42 @@ static bool rects_overlap(const lv_area_t *a, const lv_area_t *b)
     return !(a->x2 < b->x1 || b->x2 < a->x1 || a->y2 < b->y1 || b->y2 < a->y1);
 }
 
+/* 何も描かない子か。**透明な板は遮蔽物ではない。**
+ *
+ * 当たり判定のためだけに lv_layer_top へ**常駐する**オブジェクトがある
+ * (fs_picker のスクリム: 外側タップで閉じるための透明な全画面の板。
+ * HIDDEN を触ると全画面ぶんの無効化が走るので、出し入れは CLICKABLE で
+ * やっている)。HIDDEN ではないので従来の判定はこれを遮蔽と見なし、しかも
+ * 全画面なので**すべての帯を常に塞いでいた** —— 直接経路が一度も通らない。
+ *
+ * 2026-09-01 の実機で発覚した。**ピッカーを軽くしたらエディタのスクロールが
+ * 遅くなる**という形で出たので、原因がピッカー側にあるとは見えにくい。
+ * 上の「存在ではなく交差を見る」と同じ罠の裏返しで、あちらは常駐する
+ * ステータスバー、こちらは常駐する透明板。
+ *
+ * **描くものが本当に無いときだけ飛ばす。** 子がいれば子が描くかもしれない
+ * ので数えない。判定を緩めるとエディタが直接経路で上書きして 1 フレーム
+ * 化ける (自己修復はするが) ので、迷ったら遮蔽側に倒すこと。 */
+static bool obj_draws_nothing(lv_obj_t *c)
+{
+    if (lv_obj_get_style_opa(c, LV_PART_MAIN) == LV_OPA_TRANSP)
+        return true;
+    if (lv_obj_get_child_count(c))
+        return false;
+    if (lv_obj_get_style_bg_opa(c, LV_PART_MAIN) != LV_OPA_TRANSP)
+        return false;
+    if (lv_obj_get_style_border_width(c, LV_PART_MAIN) &&
+        lv_obj_get_style_border_opa(c, LV_PART_MAIN) != LV_OPA_TRANSP)
+        return false;
+    if (lv_obj_get_style_outline_width(c, LV_PART_MAIN) &&
+        lv_obj_get_style_outline_opa(c, LV_PART_MAIN) != LV_OPA_TRANSP)
+        return false;
+    if (lv_obj_get_style_shadow_width(c, LV_PART_MAIN) &&
+        lv_obj_get_style_shadow_opa(c, LV_PART_MAIN) != LV_OPA_TRANSP)
+        return false;
+    return true;
+}
+
 /* この層の可視な子で、矩形と交差するものがあるか。 */
 static bool layer_blocks(lv_obj_t *parent, uint32_t from, const lv_area_t *a)
 {
@@ -5494,7 +5530,8 @@ static bool layer_blocks(lv_obj_t *parent, uint32_t from, const lv_area_t *a)
     uint32_t n = lv_obj_get_child_count(parent);
     for (uint32_t i = from; i < n; i++) {
         lv_obj_t *c = lv_obj_get_child(parent, i);
-        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) ||
+            obj_draws_nothing(c))
             continue;
         lv_area_t o;
         lv_obj_get_coords(c, &o);
@@ -5538,7 +5575,8 @@ static void layer_spans(lv_obj_t *parent, uint32_t from, const lv_area_t *a,
     uint32_t cnt = lv_obj_get_child_count(parent);
     for (uint32_t i = from; i < cnt; i++) {
         lv_obj_t *c = lv_obj_get_child(parent, i);
-        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) ||
+            obj_draws_nothing(c))
             continue;
         lv_area_t o;
         lv_obj_get_coords(c, &o);
