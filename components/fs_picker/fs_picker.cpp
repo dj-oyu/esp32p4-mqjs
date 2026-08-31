@@ -463,6 +463,38 @@ static void prof_detach(void)
     s_prof_on = false;
 }
 
+/* ---- 寸法と、その値段 -------------------------------------------- */
+
+/* ダイアログの寸法 (画面に対する %)。**面積がそのまま費用**なので、
+ * ここが性能の主要な旋回軸。
+ *
+ * 2026-09-01 に 2x2 の要因計画 (スクリム 有/無 x ダイアログ 大/小) を
+ * 実機で回して係数を出した。**往復 ~= 6.6 ms + 8.65 ms * chunks**、
+ * chunks = 面積 / 35,840 px (描画バッファ 1 枚ぶん)。3 点で検算済み:
+ *
+ *     50x30   3.9 ch   予測  41 ms   実測  41 ms   (1 行。UI として失格)
+ *     50x70   9.0 ch   予測  85 ms   実測  83 ms   <- いま。7 行見える
+ *     92x86  20.3 ch   予測 182 ms   実測 (元の全画面スクリム込み 240 ms)
+ *
+ * **高さは行数に、幅は文字数にしか効かない。** 一覧を広げたいときは
+ * 高さを買うこと。実測の内訳 (geom 行): 行 49 px、固定部分 158 px なので
+ *     必要な高さ px = 158 + 49 * 見せたい行数
+ * 1 行増やすと 49 px = 幅 640 なら 0.87 チャンク = 往復 +7.6 ms。 */
+#define FS_PICK_DLG_W 50
+#define FS_PICK_DLG_H 70
+
+/* 閉じる経路のメータ。**既定 0。恒久にはしない。**
+ * finish() の中で lv_refr_now を呼ぶので、本来は次の通常フレームで起きる
+ * 描き直しがここへ前倒しになり、LVGL ロックの保持時間がそのぶん伸びる
+ * —— 測る道具が測る対象を動かす。寸法を変えて効きを確かめるときだけ 1。
+ *
+ * (開く側の値段は present() が常に出しているので、こちらは閉じる側専用。
+ *  閉じる側が測られていなかったせいで、8/31 まで「開くのに 120 ms」しか
+ *  見えておらず、**往復の半分を見落としていた**。) */
+#ifndef FS_PICK_CLOSE_METER
+#define FS_PICK_CLOSE_METER 0
+#endif
+
 /* ---- 小道具 ------------------------------------------------------ */
 
 /* ここから下の塊は ESP-IDF にも LVGL にも触らない純粋な関数で、
@@ -812,20 +844,46 @@ static bool build_ui(void)
     lv_obj_set_style_radius(s_scrim, 0, 0);
     lv_obj_set_style_border_width(s_scrim, 0, 0);
     lv_obj_set_style_pad_all(s_scrim, 0, 0);
-    lv_obj_set_style_bg_color(s_scrim, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(s_scrim, LV_OPA_60, 0);
-    lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_CLICKABLE);
+    /* **これはもう「暗くする板」ではない。当たり判定だけの透明な板。**
+     *
+     * 全画面を黒 60% で覆っていた頃、実測でこうなっていた (9/1、各 5〜7 回):
+     *   - 開くのに draw_us 119.6 ms、**閉じるのに 120.4 ms** (26 チャンク)
+     *   - 費用は面積にほぼ完全に比例する (4.18 / 4.65 / 4.63 ms per chunk)
+     *   - 見えているのはダイアログ外の額縁だけなのに、**額縁を 21% から
+     *     85% にしても値段が変わらなかった** (比 0.85)。つまり LVGL は
+     *     隠れている 79% も毎回混ぜていた
+     *
+     * 透明なら 1 画素も描かない。そして **HIDDEN を触らない限り無効化も
+     * 起きない** —— lv_obj_add_flag が invalidate を呼ぶのは HIDDEN
+     * (と SCROLLABLE のスクロールバー) のときだけ (lv_obj.c)。
+     * なので出し入れは CLICKABLE の入り切りでやる。**HIDDEN は使わない。**
+     *
+     * 暗転を捨てたので「モーダルが出ている」の合図は
+     * ダイアログの枠と影に任せる。 */
+    lv_obj_set_style_bg_opa(s_scrim, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_scrim, scrim_event, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
 
     s_dlg = lv_obj_create(top);
-    /* 幅 92% は意図的に残す (2026-08-28)。LV_PCT(100) の A/B で停止は
-       出なくなったが、それは w%16 と h を同時に動かした交絡実験で、
-       しかも 1137 幅こそが実機で止まった経路そのもの。幾何は E2 の
-       プローブ (ui_tab5_geom_probe) が直接測るので、実経路は元のまま
-       置いておく —— 原因が割れた後に、根拠を書いて直すこと。 */
-    lv_obj_set_size(s_dlg, LV_PCT(92), LV_PCT(86));
+    /* **92x86 だった。原因が割れたので、根拠を書いて直す (2026-09-01)。**
+     *
+     * 前の版はこう書いてあった —— 「幅 92% は意図的に残す (2026-08-28)。
+     * 1137 幅こそが実機で止まった経路そのもの。**原因が割れた後に、根拠を
+     * 書いて直すこと**」。原因は 3491ae7 で割れた: 停止は幅ではなく、
+     * 回転後の 1 行が 14 バイト (出力幅 7) になる端数チャンクで DMA2D の
+     * RX が満杯のまま駐車していたもの。有界回転と dma2d_force_end の回収、
+     * および 1 文字行未満は PPA を使わない閾値で塞いである。**幅は無罪**。
+     *
+     * 縮める理由は性能。9/1 の実測で、費用は面積にほぼ完全に比例した:
+     *   92x86 (画面の 79%) -> 閉じるのに 97.7 ms / 21 チャンク
+     *   50x30 (画面の 15%) -> 閉じるのに **16.7 ms / 4 チャンク**
+     * チャンクは 35,840 px 固定バッファぶんで、end-to-end 約 7.8 Mpix/s。
+     *
+     * **代償: 一覧の見える行数が減る。** 一覧はスクロールするので機能は
+     * 落ちないが、一望性は落ちる。ここが操作感に合わなければ、まず
+     * FS_PICK_DLG_H を上げること —— 費用は高さにそのまま比例する。 */
+    lv_obj_set_size(s_dlg, LV_PCT(FS_PICK_DLG_W), LV_PCT(FS_PICK_DLG_H));
     lv_obj_center(s_dlg);
     lv_obj_set_style_radius(s_dlg, 12, 0);
     lv_obj_set_style_bg_color(s_dlg, lv_color_hex(PK_COL_BG), 0);
@@ -968,8 +1026,10 @@ static void kb_place(bool on)
         lv_keyboard_set_textarea(s_kb, s_name);
         lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_kb);
-        /* ダイアログを上へ寄せて鍵盤に隠れないようにする */
-        lv_obj_set_height(s_dlg, LV_PCT(50));
+        /* ダイアログを上へ寄せて鍵盤に隠れないようにする。
+           **高さは変えない** —— 既定が 30% になったので、鍵盤 (40%) と
+           足しても画面に収まる。ここで 50% に伸ばすと、かつて縮小のために
+           入れたコードが逆に面積を増やす側に回る。 */
         lv_obj_align(s_dlg, LV_ALIGN_TOP_MID, 0, 96);
     } else {
         if (s_kb) {
@@ -977,7 +1037,7 @@ static void kb_place(bool on)
             lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
         }
         if (s_dlg) {
-            lv_obj_set_height(s_dlg, LV_PCT(86));
+            lv_obj_set_height(s_dlg, LV_PCT(FS_PICK_DLG_H));
             lv_obj_center(s_dlg);
         }
     }
@@ -1293,6 +1353,30 @@ static void present(Pick *p, const char *what)
              (long long)(t1 - p->t_click), s_prof.flushes,
              (long long)(s_prof.render - s_prof.flush - s_prof.wait),
              (long long)s_prof.flush, (long long)s_prof.wait);
+
+    /* 実寸を 1 回だけ記録する。**行の高さは今まで推測でしか分かって
+       いなかった** ——「216px で 1 行」からの逆算で 1 行 ~50px / 固定部分
+       ~156px と見積もっていたが、測っていない。ここを出しておけば、次に
+       寸法を決めるときは値段表と突き合わせて算数で決められる。
+       レイアウトは lv_refr_now の後でないと確定しないので、ここで読む。 */
+    {
+        static bool geom_said;
+        lv_obj_t *r0 = (s_list && lv_obj_get_child_count(s_list))
+                           ? lv_obj_get_child(s_list, 0) : NULL;
+        if (!geom_said && r0) {
+            geom_said  = true;
+            int list_h = (int)lv_obj_get_height(s_list);
+            int row_h  = (int)lv_obj_get_height(r0);
+            ESP_LOGI(TAG,
+                     "geom dlg=%dx%d list_h=%d row_h=%d fit=%d "
+                     "chrome=%d (FS_PICK_DLG_W/H=%d/%d)",
+                     (int)lv_obj_get_width(s_dlg),
+                     (int)lv_obj_get_height(s_dlg), list_h, row_h,
+                     row_h > 0 ? list_h / row_h : -1,
+                     (int)lv_obj_get_height(s_dlg) - list_h,
+                     FS_PICK_DLG_W, FS_PICK_DLG_H);
+        }
+    }
 
 #if FS_PICK_STALL_PROBE
     if (p->stall_armed) {
@@ -1672,9 +1756,12 @@ static void do_open(Pick *p)
         kick_build(p);
     }
 
-    lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
+    /* **当たり判定を開けるだけ。HIDDEN は触らない** —— 触ると全画面ぶんの
+       無効化が走り、この作り替えで消したかった 26 チャンクが戻ってくる。
+       move_foreground も呼ばない: s_scrim は s_dlg より先に作ってあるので
+       既に下にいるし、z 順を動かせばそこも汚れる。 */
+    lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(s_dlg, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_scrim);
     lv_obj_move_foreground(s_dlg);
     p->shown  = true;
     p->open_us = esp_timer_get_time() - t0;
@@ -1715,8 +1802,37 @@ static void finish(Pick *p, bool ok, const char *vpath)
     kb_place(false);
     if (s_dlg)
         lv_obj_add_flag(s_dlg, LV_OBJ_FLAG_HIDDEN);
+    /* 当たり判定を閉じるだけ。**画素は動かない。**
+       非 CLICKABLE の板は当たり判定の走査から外れるので、裏のエディタへの
+       タップを遮らない (lv_indev は最も手前の CLICKABLE を探す)。 */
     if (s_scrim)
-        lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_scrim, LV_OBJ_FLAG_CLICKABLE);
+
+#if FS_PICK_CLOSE_METER
+    /* Q3: 閉じる経路の値段。**恒久にはしない。**
+       ここで lv_refr_now を呼ぶのは計測のためだけで、これ自体が挙動の
+       変更になる —— 本来この描き直しは次の通常フレームで起きるので、
+       LVGL ロックを握る時間がこのぶん伸びる。測る道具が測る対象を
+       動かす形なので、実験の旗の内側に閉じ込めておく。
+
+       見どころは chunks。**~26 が 2 回**出るなら、LVGL が空の画面を
+       塗り直した後にエディタが本文を描き直している = 全画面 2 パス。
+       その 2 回目はこちらの窓には入らず、直後の `edit_ui:` の行に出る。 */
+    {
+        int64_t t0c = esp_timer_get_time();
+        memset(&s_prof, 0, sizeof s_prof);
+        g_ui_refr_now = 1;
+        lv_refr_now(NULL);
+        g_ui_refr_now = 0;
+        ESP_LOGI(TAG,
+                 "close us=%lld chunks=%d draw_us=%lld flush_us=%lld "
+                 "wait_us=%lld",
+                 (long long)(esp_timer_get_time() - t0c), s_prof.flushes,
+                 (long long)(s_prof.render - s_prof.flush - s_prof.wait),
+                 (long long)s_prof.flush, (long long)s_prof.wait);
+    }
+#endif
+
     /* **行は消さない。** 隠して、押せない印を付けるだけ。
        消すと次の pick が 1 行 ~0.7 ms 払って作り直すことになる ——
        行を貯めておくのがこの作り替えの本体で、上限は
