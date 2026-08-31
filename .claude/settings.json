@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Select-String *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-CimInstance *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Start-Sleep -Seconds *)",
+      "PowerShell(Start-Sleep -Milliseconds *)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Test-NetConnection *)",
+      "PowerShell(Get-NetIPAddress *)",
+      "PowerShell(Get-Item *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-NetFirewallRule *)",
+      "PowerShell(Test-Connection *)",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}
