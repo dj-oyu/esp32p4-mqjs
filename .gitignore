@@ -55,3 +55,7 @@ docs/qr-test/provision.png
 # source dictionaries carry their own licence terms.
 components/skk_core/skk_dict.bin
 components/skk_core/skk_jisyo.bin
+
+# セッション間の引き継ぎメモ (git 管理外)。中身は「今わかっていること」で、
+# 履歴として残す価値は無い。
+handover.md
