@@ -1041,6 +1041,18 @@ static void on_key(const edit_cmd_t *c)
     if (!s_fg || !s_ed || s_rows_text == 0)
         return;
 
+    /* モーダル (fs_picker) が出ている間、キーはピッカーの持ち物。
+       **IME より前に**転送する —— ピッカーへ行くキーは IME を通さない
+       (意図的な選択): SKK の変換 UI はこの原稿のステータス行に出るが、
+       モーダル中それはスクリムの裏で見えないし、変換状態が原稿側に
+       育つのはモーダル境界の混線そのもの。ファイル名は ASCII 素通し
+       (M1 の lv_keyboard も日本語は打てなかった — kb_place の注記)。
+       ここで返ることで、打鍵が裏の原稿を書き換える穴も同時に塞がる
+       (描画は 4a640e0 でゲート済みだったが、edit_insert は素通りだった)。
+       false = ピッカーは出ていない、いつもの経路へ。 */
+    if (fs_pick_key(c->u.key.utf8, c->u.key.len))
+        return;
+
     const int64_t t1 = esp_timer_get_time();
 
     /* 順序規則: 何より先に IME へ。 */

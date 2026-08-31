@@ -92,6 +92,19 @@ bool fs_pick_begin(const fs_pick_req_t *req, fs_pick_cb_t cb, void *ctx);
    (2026-08-27)。スピンロックだけなので毎フレーム呼んでよい。 */
 bool fs_pick_active(void);
 
+/* キーをピッカーへ。**キーの現所有者のタスク (edit_task など) から呼ぶ。**
+ * 返り値 = モーダルが出ていて食べたか。false ならピッカーは出ていない ——
+ * 呼び出し側は自分の通常経路へ流すこと。true のときキーは UI タスクの
+ * 次の tick (≤ FS_PICK_IDLE_MS) で反映される: SAVE は印字文字が名前欄へ、
+ * BS が 1 字削除、Enter が「保存」、"\0left/right/del" が名前欄のカーソル。
+ * "\0esc" は全モードで取り消し。OPEN/DIR は BS =「上へ」、DIR は Enter =
+ * 「このフォルダ」。CONSENT の「許可」はキーでは押せない (明示タップのみ)。
+ * モーダル中の他のキー (Ctrl 和音を含む) は**食べて捨てる** —— 裏のアプリの
+ * Ctrl+S が走るのが最悪だから。LVGL には触らない (スピンロック + 小箱)。
+ * 例外: "\0rotate" は常に false —— 画面回転はモーダルの持ち物ではなく、
+ * 裏のビューも追従が要る (描画はモーダル中ゲートされていて安全)。 */
+bool fs_pick_key(const char *utf8, size_t len);
+
 /*
  * 出ているピッカーを畳む。いつ呼んでも安全 (出ていなければ何もしない)。
  * 畳むと cb が r->ok=false で**ちょうど 1 回**呼ばれる。

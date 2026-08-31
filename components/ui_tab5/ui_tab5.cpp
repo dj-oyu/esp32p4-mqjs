@@ -5909,6 +5909,14 @@ extern "C" void ui_tab5_set_hw_keyboard(bool present)
     lvgl_port_unlock();
 }
 
+/* Read side for components that raise their own software keyboard
+   (fs_picker). Plain flag read — no lock, any task; a race with a
+   (dis)dock costs at most one keyboard show/hide decision. */
+extern "C" bool ui_tab5_hw_keyboard(void)
+{
+    return s_hw_kb;
+}
+
 extern "C" void ui_tab5_set_landscape(bool on)
 {
     if (!s_disp || !s_canvas_w || s_landscape == on)

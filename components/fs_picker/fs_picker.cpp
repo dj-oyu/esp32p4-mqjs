@@ -891,6 +891,28 @@ static bool build_ui(void)
        なるため。「打っても出ないが保存すると変な名前で保存される」の
        正体はこれ。 */
     lv_obj_set_style_text_color(s_name, lv_color_hex(PK_COL_TEXT), 0);
+    /* カーソル。**テーマ任せでは出ない。**
+       draw_cursor は cursor.show と LV_PART_CURSOR の枠線幅しか見ない
+       (lv_textarea.c) —— フォーカスは見ていない。ところがテーマは
+       ta_cursor を **LV_PART_CURSOR | LV_STATE_FOCUSED** にしか張らない
+       (lv_theme_default.c:1018) ので、ドック運用でフォーカスが付かない
+       今は枠線幅 0 = 何も描かれない。さらにテーマの色は color_text
+       (=0x424242) で、本文と同じ理由で仮に出ても見えない。
+       **既定状態と FOCUSED の両方に当てる**: 状態付きスタイルは既定より
+       強いので、片方だけだとソフト鍵盤経路 (非ドック機) でテーマの
+       暗い色に戻される。 */
+    static const lv_style_selector_t k_cur_states[2] = { 0, LV_STATE_FOCUSED };
+    for (int i = 0; i < 2; i++) {
+        lv_style_selector_t st = k_cur_states[i];
+        lv_obj_set_style_border_color(s_name, lv_color_hex(PK_COL_ACCENT),
+                                      LV_PART_CURSOR | st);
+        lv_obj_set_style_border_opa(s_name, LV_OPA_COVER, LV_PART_CURSOR | st);
+        lv_obj_set_style_border_width(s_name, 2, LV_PART_CURSOR | st);
+        lv_obj_set_style_border_side(s_name, LV_BORDER_SIDE_LEFT,
+                                     LV_PART_CURSOR | st);
+        /* 点滅。0 にすると常時表示になる (start_cursor_blink)。 */
+        lv_obj_set_style_anim_duration(s_name, 400, LV_PART_CURSOR | st);
+    }
     lv_obj_set_style_border_color(s_name, lv_color_hex(PK_COL_ACCENT),
                                   LV_STATE_FOCUSED);
     lv_obj_add_event_cb(s_name, name_event, LV_EVENT_CLICKED, NULL);
@@ -924,6 +946,16 @@ static void kb_place(bool on)
 {
     Pick *p = s_p;
     if (!p || p->mode != FS_PICK_SAVE)
+        on = false;
+    /* ドック装着中は出さない (ユーザ要件): ドックが直接打つ
+       (fs_pick_key 経由)。ダイアログも縮めない・寄せない —— あの縮小の
+       再配置こそ、かつて 1137x38 の再描画で PPA を駐車させた形。
+       判定は**呼ばれるたび**にここで読む = 抜き差しは次の kb_place で
+       反映される (装着中に開いた鍵盤は、名前欄の次のタップ/確定/畳みの
+       kb_place(false) で消える。ピッカーはモーダルで寿命が短いので、
+       即時追従の配線は足さない)。向きではなくドックの事実を見る ——
+       s_hw_kb が入力方針の権威 (ui_tab5.cpp)。 */
+    if (on && ui_tab5_hw_keyboard())
         on = false;
     if (on) {
         if (!s_kb) {
@@ -1794,6 +1826,135 @@ bool fs_pick_active(void)
     return busy;
 }
 
+/* ---- ドックのキーをピッカーへ ------------------------------------
+ *
+ * 経路: kbd_task → mqjs_post_key → edit_task の on_key → fs_pick_key
+ * (edit_task 上) → この小箱 → tick_step (UI タスク、LVGL ロック下)。
+ *
+ * edit_task から LVGL に触らないための 1 段。**wake() も呼ばない** ——
+ * lv_timer_* は LVGL ロックの外から触れないし、ピッカーが出ている間
+ * tick は止まらない (S4、FS_PICK_IDLE_MS = 16 ms) ので、次の tick が
+ * 必ず拾う。打鍵の反映が最大 1 フレーム遅れるのは、画面キーボードの
+ * タップが indev のポーリングで拾われるのと同じ量。
+ *
+ * 箱は 8 段で足りる: 消費は 16 ms ごとに全件、人間の打鍵はロールオーバー
+ * 込みでもその窓に 8 は積まれない。溢れたら新しい方を黙って落とす ——
+ * モーダル中のキーを裏のアプリへ漏らすよりよい。 */
+#define FS_PICK_KEY_MAX 16   /* kbd_core の KBD_SEQ_MAX と同値 */
+#define FS_PICK_KEYQ    8
+struct PickKey {
+    uint8_t len;
+    char    b[FS_PICK_KEY_MAX];
+};
+static PickKey s_keyq[FS_PICK_KEYQ];
+static uint8_t s_key_r, s_key_w;   /* s_mux の下でだけ触る */
+
+bool fs_pick_key(const char *utf8, size_t len)
+{
+    if (!utf8 || len == 0)
+        return false;
+    /* 回転はモーダルの持ち物ではない。裏のエディタの resize_view が
+       これを見て段数を作り直す —— 食べると、ピッカーを閉じた後の画面が
+       古い段数のまま残る。裏の描画はモーダル中ゲートされているので、
+       通しても画素は動かない。 */
+    if (len >= 7 && utf8[0] == '\0' && memcmp(utf8 + 1, "rotate", 6) == 0)
+        return false;
+    taskENTER_CRITICAL(&s_mux);
+    bool active = s_busy && s_p;
+    if (active && len <= FS_PICK_KEY_MAX &&
+        (uint8_t)(s_key_w - s_key_r) < FS_PICK_KEYQ) {
+        PickKey *k = &s_keyq[s_key_w % FS_PICK_KEYQ];
+        k->len = (uint8_t)len;
+        memcpy(k->b, utf8, len);
+        s_key_w++;
+    }
+    taskEXIT_CRITICAL(&s_mux);
+    return active;
+}
+
+/* 1 キーぶん。UI タスク、LVGL ロック下 (tick_step から)。
+   仕事 (確定/取消/上へ) は p->work に書くだけ —— 実行は同じ tick の
+   switch がやる。名前欄 (s_name) はここで直接触ってよい: ここは
+   lv_timer_handler の中で、この textarea の持ち主は UI タスク。 */
+static void pick_key_one(Pick *p, const char *k, size_t len)
+{
+    if (len >= 2 && k[0] == '\0') {
+        const char *tok = k + 1;
+        size_t      tl  = len - 1;
+        if (tl == 3 && memcmp(tok, "esc", 3) == 0) {
+            p->work = W_ABORT;
+            return;
+        }
+        if (p->mode == FS_PICK_SAVE && s_name) {
+            if (tl == 4 && memcmp(tok, "left", 4) == 0) {
+                lv_textarea_cursor_left(s_name);
+                return;
+            }
+            if (tl == 5 && memcmp(tok, "right", 5) == 0) {
+                lv_textarea_cursor_right(s_name);
+                return;
+            }
+            if (tl == 3 && memcmp(tok, "del", 3) == 0) {
+                lv_textarea_delete_char_forward(s_name);
+                return;
+            }
+        }
+        return;   /* 他のトークン (矢印/F キー等) は食べるだけ */
+    }
+    if (len == 1) {
+        unsigned char c = (unsigned char)k[0];
+        if (c == '\r' || c == '\n') {
+            /* Enter = 確定。**CONSENT は含めない** —— 権限の「許可」は
+               明示のタップだけにする。OPEN の確定は行のタップ (一覧に
+               選択の概念が無いので、Enter に確定させると先頭を勝手に
+               開く形にしかならない)。 */
+            if (p->mode == FS_PICK_SAVE || p->mode == FS_PICK_DIR)
+                p->work = W_CONFIRM;
+            return;
+        }
+        if (c == '\b' || c == 0x7F) {
+            if (p->mode == FS_PICK_SAVE && s_name)
+                lv_textarea_delete_char(s_name);
+            else if (p->mode == FS_PICK_OPEN || p->mode == FS_PICK_DIR)
+                p->work = W_UP;   /* BS = 上のフォルダ (ファイラの作法) */
+            return;
+        }
+        if (c < 0x20)
+            return;   /* Ctrl 和音は裏へ流さない (裏の Ctrl+S が最悪) */
+    }
+    /* 印字文字 (UTF-8 可)。受け取るのは SAVE の名前欄だけ。長さ制限は
+       lv_textarea 側 (FS_PICK_NAME_MAX) が既に持っている。 */
+    if (p->mode == FS_PICK_SAVE && s_name) {
+        char buf[FS_PICK_KEY_MAX + 1];
+        memcpy(buf, k, len);
+        buf[len] = '\0';
+        lv_textarea_add_text(s_name, buf);
+    }
+}
+
+/* 箱を空にする。確定/取消/上へ が出たら残りは捨てる —— Enter の後に
+   並んでいた打鍵を、次のピッカーや畳んだ後の画面へ持ち越さない。 */
+static void pick_do_keys(Pick *p)
+{
+    for (;;) {
+        PickKey kk;
+        taskENTER_CRITICAL(&s_mux);
+        bool have = (uint8_t)(s_key_w - s_key_r) != 0;
+        if (have)
+            kk = s_keyq[s_key_r % FS_PICK_KEYQ];   /* 17 B の複製 */
+        s_key_r += have ? 1 : 0;
+        taskEXIT_CRITICAL(&s_mux);
+        if (!have)
+            return;
+        pick_key_one(p, kk.b, kk.len);
+        if (p->work != W_IDLE)
+            break;
+    }
+    taskENTER_CRITICAL(&s_mux);
+    s_key_r = s_key_w;
+    taskEXIT_CRITICAL(&s_mux);
+}
+
 static void do_confirm(Pick *p)
 {
     p->work = W_IDLE;
@@ -1868,6 +2029,12 @@ static void tick_step(lv_timer_t *t)
         finish(p, false, NULL);
         return;
     }
+    /* ドックのキー。出てから (shown)、かつ手が空いているとき (W_IDLE)
+       だけ読む —— W_BUILD の途中で work を上書きすると作り直しが
+       途中で放置され、nav が立ったまま一覧が死ぬ。積まれたキーは
+       消えない (次の tick で読む)。 */
+    if (p->shown && p->work == W_IDLE)
+        pick_do_keys(p);   /* work を書くことがある。下の switch が実行 */
     switch (p->work) {
     case W_OPEN:
         p->work = W_IDLE;
@@ -1957,8 +2124,11 @@ bool fs_pick_begin(const fs_pick_req_t *req, fs_pick_cb_t cb, void *ctx)
 
     taskENTER_CRITICAL(&s_mux);
     bool mine = !s_busy;
-    if (mine)
+    if (mine) {
         s_busy = true;
+        /* 前のモーダルの読み残しの打鍵を、この要求に食わせない。 */
+        s_key_r = s_key_w = 0;
+    }
     taskEXIT_CRITICAL(&s_mux);
     if (!mine)
         return false; /* モーダルは同時に 1 件 */
@@ -2126,5 +2296,12 @@ bool fs_pick_begin(const fs_pick_req_t *req, fs_pick_cb_t cb, void *ctx)
 }
 
 void fs_pick_cancel(void) {}
+
+bool fs_pick_key(const char *utf8, size_t len)
+{
+    (void)utf8;
+    (void)len;
+    return false;
+}
 
 #endif /* CONFIG_MQJS_TAB5_UI */

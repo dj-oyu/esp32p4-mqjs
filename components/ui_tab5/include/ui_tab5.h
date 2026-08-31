@@ -309,6 +309,13 @@ void ui_tab5_ime_face(int face);
  * unaware; their ui.keyboard() return value does the sizing. */
 void ui_tab5_set_hw_keyboard(bool present);
 
+/* Read side of the same flag: is the keyboard dock present right now?
+ * The authority for input policy — components that would raise their own
+ * software keyboard (fs_picker's SAVE name field) must check this, not
+ * the rotation: landscape and docked correlate on this device but are
+ * different facts. Plain flag read, callable from any task. */
+bool ui_tab5_hw_keyboard(void);
+
 /* Create a widget screen (flex column + title), retain the previously
  * active screen on the navigation stack and slide the new one in.
  * Returns the screen handle (0 if the display is down). When pushing
