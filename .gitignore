@@ -55,3 +55,25 @@ docs/qr-test/provision.png
 # source dictionaries carry their own licence terms.
 components/skk_core/skk_dict.bin
 components/skk_core/skk_jisyo.bin
+
+# セッション間の引き継ぎメモ (git 管理外)。中身は「今わかっていること」で、
+# 履歴として残す価値は無い。
+handover.md
+
+# Claude Code のローカル状態。**この repo 側に書くことに意味がある。**
+# これまで守っていたのは .git/info/exclude と個人の global gitignore だけで、
+# どちらもクローンに付いていかない —— 別マシンで作業すると無防備になり、
+# settings.local.json (ユーザ名入りの絶対パス) と worktrees/ (1.3GB の
+# ビルド成果物) が `git add .` 一発で public repo に向かって並ぶ。
+# settings.json だけは共有設定なので**意図的に除外しない**。
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+.claude/routines/.state/
+.claude/checkpoints/
+.claude/mailbox/
+.claude/agent-registry.json
+.claude/agent-memory-local
+.claude/first-run
+.claude/assistant-daemon-state.json

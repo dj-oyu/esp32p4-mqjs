@@ -17,6 +17,12 @@ CONFIG_MQJS_TAB5_POWER=y
 # Without this a Tab5 never charges (the charger is firmware-gated).
 CONFIG_MQJS_TAB5_BATTERY=y
 
+# microSD: Tab5 は SDMMC slot 0 (IOMUX 39-44) にカードスロットを持つ。
+# esp-hosted の C6 は slot 1 なので競合しない。IO 電源はオンチップ LDO ch4
+# (ch1=flash / ch2=PSRAM / ch3=MIPI DSI PHY は埋まっている)。
+# ピン既定値は Kconfig 側が Tab5 配線なので、ここでは有効化だけ。
+CONFIG_MQJS_SDCARD=y
+
 # Local network settings. Replace these values after copying the file.
 CONFIG_MQJS_WIFI_SSID="YOUR_WIFI_SSID"
 CONFIG_MQJS_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"
@@ -149,3 +155,14 @@ CONFIG_LV_DRAW_SW_SUPPORT_I1=n
 CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
 CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
 CONFIG_ESP_PERIPH_CTRL_FUNC_IN_IRAM=n
+
+# フラッシュの erase/program 中にキャッシュを止めない設定 (両コア停止が消える)。
+# Tab5 のチップは XMC-D (0x464018) で、IDF の汎用ドライバが名指しで suspend
+# 対応にしている。**有効にする前に MQJS_FLASH_SUSPEND_TEST を通すこと** ——
+# tSUS が足りないと「黙ってゴミを読む」という壊れ方をする。
+# CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+
+# 松 (SKK-JISYO.L, image 8.07MiB) を焼く場合。ソース辞書は gitignore なので
+# 各自 https://github.com/skk-dev/dict から取得し、その置き場を指す。
+# CONFIG_MQJS_SKK_DICT_L=y
+# CONFIG_MQJS_SKK_DICT_SOURCE_DIR="/path/to/dict"

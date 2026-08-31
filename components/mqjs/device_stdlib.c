@@ -468,6 +468,7 @@ static const JSClassDef js_ui_obj =
 static const JSPropDef js_term[] = {
     JS_CFUNC_DEF("create", 1, js_term_create),     /* (opts) -> id | -err */
     JS_CFUNC_DEF("show", 2, js_term_show),         /* (id, {x,y,w,h}) */
+    JS_CFUNC_DEF("scroll", 2, js_term_scroll),     /* (id, delta) -> 行 */
     JS_CFUNC_DEF("log", 2, js_term_log),           /* (id, str) line-atomic */
     JS_CFUNC_DEF("feed", 2, js_term_feed),         /* (id, bytes) VT input */
     JS_CFUNC_DEF("pipe", 2, js_term_pipe),         /* (id, sshHandle) */
@@ -598,6 +599,34 @@ static const JSPropDef js_http[] = {
 static const JSClassDef js_http_obj =
     JS_OBJECT_DEF("Http", js_http);
 
+/* ---- device API: fs object (内蔵ストレージ + microSD, filer-storage) ----
+   仮想パス "/internal/..." "/sd/..." だけを扱う。volumes() が返す本数が
+   ボードの差そのもので、アプリ側に #ifdef 相当の分岐は要らない。
+   読み取りは全アプリ、書き込み系は request() で得た grant が要る。 ---- */
+static const JSPropDef js_fs[] = {
+    JS_CFUNC_DEF("volumes", 0, js_fs_volumes),
+    JS_CFUNC_DEF("list", 2, js_fs_list),
+    JS_CFUNC_DEF("stat", 1, js_fs_stat),
+    JS_CFUNC_DEF("read", 2, js_fs_read),
+    /* 権限の主たる入口 (docs/native-editor-design.md §4.2)。ネイティブ
+       モーダルで 1 本選ばせ、その 1 本だけの grant を cb(grant, path) で
+       返す。mount / unmount / format は §5 で削除した。 */
+    JS_CFUNC_DEF("pick", 2, js_fs_pick),
+    /* 以下は grant が第 1 引数。0 を渡すと「トークン無し」で、
+       /internal/data/<app> だけが暗黙 grant で通る (§4.3)。 */
+    JS_CFUNC_DEF("request", 2, js_fs_request),
+    JS_CFUNC_DEF("release", 1, js_fs_release),
+    JS_CFUNC_DEF("write", 4, js_fs_write),
+    JS_CFUNC_DEF("mkdir", 2, js_fs_mkdir),
+    JS_CFUNC_DEF("remove", 3, js_fs_remove),
+    JS_CFUNC_DEF("rename", 3, js_fs_rename),
+    JS_CFUNC_DEF("copy", 3, js_fs_copy),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_fs_obj =
+    JS_OBJECT_DEF("Fs", js_fs);
+
 /* ---- device API: store object (NVS-backed key-value, W2) ---- */
 static const JSPropDef js_store[] = {
     JS_CFUNC_DEF("get", 1, js_store_get),
@@ -672,7 +701,7 @@ static const JSPropDef js_sys[] = {
     JS_CFUNC_DEF("notices", 0, js_sys_notices),
     /* §11 store catalog: browse the shelf, install on demand */
     JS_CFUNC_DEF("store", 0, js_sys_store),
-    JS_CFUNC_DEF("install", 1, js_sys_install),
+    JS_CFUNC_DEF("install", 2, js_sys_install),
     /* term phase 3 (docs/term-design.md §4.4): the LP SRAM black box.
        No argument = stats (any app). "live"/"lastboot" = the log tail, and
        that read is gated on the dev slot or an embedded system app (§7.2).
@@ -686,6 +715,9 @@ static const JSPropDef js_sys[] = {
        returns 0 at once, so the caller's "about to panic" MQTT publish can
        leave the device first. Off-device it is inert and returns -1. */
     JS_CFUNC_DEF("panic", 0, js_sys_panic),
+    /* sys.fsConsent は削除 (docs/native-editor-design.md §4.4/§5)。
+       同意画面はランチャー JS ではなくネイティブモーダルが描くので、
+       JS 側の返事の口は要らない。 */
     JS_PROP_END,
 };
 
@@ -751,6 +783,7 @@ static const JSPropDef js_global_object[] = {
        drives the engine directly (docs/keyboard-ime-unification.md §6.2). */
     JS_PROP_CLASS_DEF("sys", &js_sys_obj),
     JS_PROP_CLASS_DEF("store", &js_store_obj),
+    JS_PROP_CLASS_DEF("fs", &js_fs_obj),
     JS_PROP_CLASS_DEF("vault", &js_vault_obj),
     JS_PROP_CLASS_DEF("system", &js_system_obj),
     JS_PROP_CLASS_DEF("clipboard", &js_clipboard_obj),

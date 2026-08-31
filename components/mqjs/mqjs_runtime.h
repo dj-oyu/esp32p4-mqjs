@@ -185,6 +185,41 @@ typedef struct {
 void mqjs_set_store_provider(const mqjs_store_api_t *api);
 
 /*
+ * The same catalogue contract, second source: signed apps sitting on a
+ * removable card (docs/filer-storage-design.md section 13). count() IS the
+ * scan, so nothing reads the card until the store page asks. Rows from this
+ * provider are tagged src:"sd" by sys.store(), and sys.install(name, "sd")
+ * routes here -- a name present in both catalogues is shown twice rather
+ * than silently resolved, because there is no version field to compare.
+ *
+ * count()/get() must NOT verify signatures: they run on the cooperative JS
+ * task, and an Ed25519 check costs 226 ms per file on the device -- one
+ * store-page open over a card of twenty would freeze the whole UI for four
+ * and a half seconds. install() is where the signature is checked, and it
+ * must refuse on failure. Rows are therefore reported with verified:false.
+ */
+void mqjs_set_card_provider(const mqjs_store_api_t *api);
+
+/*
+ * The timestamp of the last real keystroke, and the clock it is on.
+ * These exist so the flash-stall meter can tell a stall that landed on
+ * top of typing from one that did not (docs/native-editor-spec.md C.2);
+ * that ratio is what decides whether the XIP work is worth its 12 MB.
+ * Callable with the flash cache disabled is NOT required -- the meter
+ * reads them after the cache is back.
+ */
+int64_t mqjs_last_key_us(void);
+int64_t mqjs_now_us(void);
+
+/*
+ * Dev only (CONFIG_MQJS_SKK_BENCH): time N dictionary lookups and log
+ * where the image lives, so "mmap'd flash vs a PSRAM copy" is a measured
+ * number rather than the estimate the design doc has been carrying.
+ * No-op when the Kconfig is off.
+ */
+void mqjs_skk_bench(void);
+
+/*
  * Called on the JS task right after sys.uninstall removes an app file:
  * the host drops the app's registry subscription so the retained body
  * does not reinstall it on the next broker sync (§11).
@@ -252,6 +287,25 @@ void mqjs_ime_field_focus(int mode, int x, int y, int h);
  */
 bool mqjs_post_ssh_data(int id, char *data, size_t len);
 void mqjs_post_ssh_closed(int id, const char *reason);
+
+/*
+ * Format a removable volume on a dedicated task (a big card writes tens
+ * of MB of FAT before it returns, so no caller's task may block on it).
+ * One at a time; false when one is already running, the id is unknown,
+ * or the volume is system storage (the internal one is never formatted).
+ *
+ * There is no JS binding any more (docs/native-editor-design.md §5:
+ * formatting is the filer's, and leaving it callable from JS gave every
+ * app a lever to stall the device). The native filer calls this; M2
+ * moves it behind fs_io (spec §A.7).
+ *
+ * `cb` runs ON THE FORMAT TASK when it finishes — post to your own queue
+ * from it and do nothing else. `err` is an esp_err_t widened to int so
+ * this header stays free of ESP-IDF includes. ESP build only.
+ */
+typedef void (*mqjs_fs_format_cb_t)(void *ctx, int err);
+bool mqjs_fs_format_begin(const char *volume_id, mqjs_fs_format_cb_t cb,
+                          void *ctx);
 
 #ifdef __cplusplus
 }

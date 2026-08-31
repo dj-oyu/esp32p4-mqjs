@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "fs_core.h"
 #include "mqjs_runtime.h"
 #include "storage.h"
 
@@ -20,6 +21,36 @@
 
 static const char *TAG = "storage";
 static bool s_mounted;
+
+/* ---- fs_core への登録 -------------------------------------------- */
+
+static esp_err_t lfs_usage(const fsvol_t *v, uint64_t *total, uint64_t *freeb)
+{
+    (void)v;
+    size_t t = 0, used = 0;
+    esp_err_t err = esp_littlefs_info("storage", &t, &used);
+    if (err != ESP_OK)
+        return err;
+    *total = t;
+    *freeb = (t > used) ? t - used : 0;
+    return ESP_OK;
+}
+
+/* mount/unmount/probe を持たない = 常時マウント済みの固定ボリューム。
+   littlefs は起動時に一度マウントされたら外れない (パーティションは
+   抜けない) ので、抜き挿しの機構は要らない。 */
+static const fsvol_ops_t s_internal_ops = {
+    .usage = lfs_usage,
+};
+
+static const fsvol_t s_internal_vol = {
+    .id     = "internal",
+    .label  = "内蔵",
+    .root   = MOUNT,
+    .fstype = "littlefs",
+    .flags  = FSVOL_SYSTEM,
+    .ops    = &s_internal_ops,
+};
 
 bool storage_init(void)
 {
@@ -36,6 +67,25 @@ bool storage_init(void)
     }
     s_mounted = true;
     ESP_LOGI(TAG, "littlefs mounted at %s", MOUNT);
+
+    /* 暗黙 grant とエディタの保存先の親を、**マウント直後に**作る。
+       `fs_write` / `fs_mkdir` は親を作らないので、これが無いと
+       `/internal/data/<app>` (native-editor-design.md §4.3 の「同意不要の
+       逃がし弁」) と `/internal/scripts` (native-editor-spec.md §A.7 の
+       固定保存先) はどちらも永久に ENOENT になる。
+
+       storage_save_app() の中ではなくここに置く理由: あちらはアプリを
+       インストールしたときにしか走らないので、1 本も入れない機体では
+       ディレクトリが 1 度も作られない。M1 の敵対的レビューが「暗黙 grant
+       はそもそも動かない」と指摘した穴で、最初の修正はまさに
+       storage_save_app() 側に入れて実機で外した。
+       下の `<app>` は runtime (vault_id ベース) の担当なので触らない。 */
+    mkdir(MOUNT "/data", 0777);    /* EEXIST is fine */
+    mkdir(MOUNT "/scripts", 0777); /* EEXIST is fine */
+    /* ファイラから見える "internal" ボリュームとして公開する。ここより
+       上の層 (fs.* バインディングも files.js も) は /littlefs という実パスを
+       一度も知らない — docs/filer-storage-design.md §4。 */
+    fsvol_register(&s_internal_vol);
     return true;
 }
 
@@ -126,6 +176,15 @@ bool storage_delete_app(const char *name)
     return true;
 }
 
+/* apps/ へ書ける唯一の経路。fopen/fwrite を直に使っているのは手抜きでは
+   なく、これが**特権書き込み**だからで、fs_core を通してはいけない
+   (通すと fs_path_reserved に弾かれる —— 弾くのが正しい)。
+ *
+ * 逆から言うと: このファイルの冒頭が主張する「apps/ に届く経路は署名
+ * 検証済みしか無い」は、fs_core 側が /internal/apps 以下の変更を全部
+ * 拒むことと、ここが唯一の抜け道であることの二枚で成り立っている。
+ * 「fs_core に揃えよう」と親切心で書き換えると、アプリが 1 本も
+ * インストールできなくなる。 */
 bool storage_save_app(const char *name, const char *src, size_t len)
 {
     if (!s_mounted)

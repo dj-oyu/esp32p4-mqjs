@@ -114,6 +114,38 @@ typedef struct {
                        ui_tab5_cmd() returns false. */
 } ui_cmd_t;
 
+/* One run of cells drawn straight into the canvas by a NATIVE presenter
+ * (the editor/filer, docs/native-editor-spec.md §A.3) — as opposed to
+ * UI_CMD_CELLS, which a JS app posts and the UI task executes.
+ *
+ * Same cell contract as ui.cells (see the top of ui_tab5.cpp): one
+ * codepoint per column, a width-2 codepoint followed by a filler
+ * codepoint. `ncells` is the columns this run OWNS: the background is
+ * filled across all of them, and columns past the end of `utf8` stay
+ * background — that is how a presenter clears the tail of a row in the
+ * same call. `utf8`/`len` need not be NUL-terminated.
+ *
+ * `a8`   caller-owned staging buffer, 64-BYTE ALIGNED, internal SRAM,
+ *        at least UI_CELL_H * ncells * UI_CELL_W bytes rounded up to 64
+ *        (the PPA's cache maintenance works in cache lines). Runs wider
+ *        than it fits are split; a NULL or unusable buffer is not an
+ *        error, it just puts the run on the CPU path.
+ * `ppa`  caller-owned ppa_client_handle_t for PPA_OPERATION_BLEND
+ *        (ppa_register_client). Each client has its own queue, the
+ *        engine serialises them; NULL = CPU path. Register it OFF the
+ *        presenter's task — registering allocates.
+ */
+typedef struct {
+    int col, row, ncells;
+    const char *utf8;
+    size_t len;
+    uint32_t fg, bg;   /* 0xRRGGBB */
+    unsigned attrs;    /* UI_CELL_ATTR_* */
+    uint8_t *a8;
+    size_t a8_len;
+    void *ppa;         /* ppa_client_handle_t */
+} ui_cells_draw_t;
+
 /* Overlay handles per app, and how many items one overlay shows. Both are
    small on purpose: overlays are transient decoration, and the labels are
    allocated up-front per handle on first use. */
@@ -207,6 +239,49 @@ void ui_tab5_set_fg_apps(const char *cur, const char *prev,
 bool ui_tab5_cmd(const ui_cmd_t *cmd);
 /* Logical canvas resolution; 0x0 when the UI is off or init failed. */
 void ui_tab5_canvas_size(int *w, int *h);
+
+/* ---- native presenter surface (docs/native-editor-spec.md §A.3) ----
+ *
+ * The native editor/filer draws into the same canvas as ui.*, but from
+ * its OWN task and without going through the command queue. Splitting
+ * the pixels from the presentation is the point: a 26-row scroll takes
+ * the LVGL lock ONCE, at the end, for microseconds.
+ *
+ * _cells_draw and _canvas_fill run on the CALLING task and take no
+ * LVGL lock at all — they touch a plain RGB565 buffer LVGL only reads.
+ * Two tasks drawing at once tear (a torn cell is one frame old); they
+ * never corrupt. Neither allocates, neither blocks except inside a
+ * blocking PPA operation.
+ *
+ * _canvas_invalidate takes the lock, marks the rectangle dirty and
+ * returns. Coordinates are canvas-relative pixels and are clamped.
+ * Pass the UNION of the rows that changed: LVGL renders in 720x50
+ * chunks, so two adjacent 24px rows often cost one chunk while two
+ * distant ones always cost two — merging them first is free.
+ * It also un-hides the canvas, because the caller has just drawn.
+ */
+bool ui_tab5_cells_draw(const ui_cells_draw_t *d); /* false = no canvas */
+void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb);
+void ui_tab5_canvas_invalidate(int x, int y, int w, int h);
+/* Hold the LVGL lock across a whole paint batch.
+ *
+ * **The canvas buffer has two readers and they are not otherwise
+ * ordered.** A caller renders cells/fills straight into it with no
+ * lock, then calls _canvas_invalidate. In between, the LVGL task can
+ * take the lock, refresh, and read the canvas **mid-render** — it then
+ * flushes a torn frame (half the row repainted, half still showing the
+ * old glyphs). Presenting correctly afterwards does not help: the torn
+ * flush can land last.
+ *
+ * Wrap render+invalidate in begin/end and that window closes. The lock
+ * is recursive, so _canvas_invalidate's own lock still nests fine.
+ * begin() never blocks forever; if it returns false, paint anyway —
+ * you get the old unordered behaviour, not a dropped frame. */
+/* 直接提示の通し回数。前後で差を取れば「その invalidate は LVGL を
+   通さず出たか」が分かる。計測専用。 */
+uint32_t ui_tab5_direct_count(void);
+bool ui_tab5_canvas_batch_begin(void);
+void ui_tab5_canvas_batch_end(void);
 /* Pixel size of a UTF-8 string in the canvas font (no wrapping; \n makes
  * it multi-line). 0x0 when the UI is off or init failed. Safe from any
  * task: only reads const font tables. */
@@ -233,6 +308,13 @@ void ui_tab5_ime_face(int face);
  * app's last requested mode is re-applied immediately. Apps stay
  * unaware; their ui.keyboard() return value does the sizing. */
 void ui_tab5_set_hw_keyboard(bool present);
+
+/* Read side of the same flag: is the keyboard dock present right now?
+ * The authority for input policy — components that would raise their own
+ * software keyboard (fs_picker's SAVE name field) must check this, not
+ * the rotation: landscape and docked correlate on this device but are
+ * different facts. Plain flag read, callable from any task. */
+bool ui_tab5_hw_keyboard(void);
 
 /* Create a widget screen (flex column + title), retain the previously
  * active screen on the navigation stack and slide the new one in.
@@ -284,6 +366,11 @@ bool ui_tab5_field_key(const char *utf8, size_t len);
  * by the JS runtime when a task ends (same role as the canvas clear on
  * task switch). Safe to call when nothing was ever created. */
 void ui_tab5_w_reset(void);
+
+/* フォアグラウンド切替の画面掃除を同期でやる (UI_CMD_RESET の同期版)。
+   完了して戻るので、呼んだ側は「以後この画面は自分のもの」と仮定してよい。
+   任意タスク。lvgl_port_lock を取り、全画面 fill 1 回ぶん待つ。 */
+void ui_tab5_canvas_reset_sync(void);
 
 /* Start the slide-in animation of the most recent ui_tab5_w_screen()
  * (P4a, design §3.4): screens are created WITHOUT loading so the page
@@ -404,6 +491,30 @@ static inline void ui_tab5_canvas_size(int *w, int *h)
     *w = 0;
     *h = 0;
 }
+static inline bool ui_tab5_cells_draw(const ui_cells_draw_t *d)
+{
+    (void)d;
+    return false;
+}
+static inline void ui_tab5_canvas_fill(int x, int y, int w, int h,
+                                       uint32_t rgb)
+{
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+    (void)rgb;
+}
+static inline void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
+{
+    (void)x;
+    (void)y;
+    (void)w;
+    (void)h;
+}
+static inline uint32_t ui_tab5_direct_count(void) { return 0; }
+static inline bool ui_tab5_canvas_batch_begin(void) { return true; }
+static inline void ui_tab5_canvas_batch_end(void) {}
 static inline void ui_tab5_text_size(const char *utf8, int *w, int *h)
 {
     (void)utf8;

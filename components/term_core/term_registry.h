@@ -608,6 +608,31 @@ term_err_t term_registry_resize(term_id_t id, const char *owner,
 term_err_t term_registry_show(term_id_t id, const char *owner,
                               const term_view_t *view);
 
+/*
+ * 履歴スクロール (§3.1 の再折り返しを使う)。
+ *
+ * `delta` は**表示行**の数で、正が過去へ。0 は「動かさずに現在値を読む」。
+ * 新しい位置が *now に入る (NULL 可)。生きている画面は 0。
+ *
+ * 上限はここでは決められない —— 1 本の論理行が現在の幅で何行になるかは
+ * term_core_line_seg_count に聞くまで分からず、それを全履歴ぶん足すのは
+ * ドラッグ 1 段ごとに払う値段ではない。だから要求はそのまま置き、
+ * **レンダラが届いた行数を term_registry_scroll_reached で書き戻す**。
+ * 履歴の先頭で指を動かし続けても要求が際限なく育たないのはそのため。
+ *
+ * 位置が変わると全面再描画が予約される: damage はセルの変化を語るもので、
+ * ここで変わったのは「どの画素が硝子の上に居るか」だから。
+ */
+term_err_t term_registry_scroll(term_id_t id, const char *owner, int delta,
+                                int *now);
+
+/* レンダラ用 (所有者を問わない)。**visit コールバックの中からだけ呼ぶ。**
+   term_registry_ui_visit は fn() をロックを持ったまま呼ぶので、この 2 本は
+   ロックを取らない —— 取り直すと非再帰ミューテックスに自分でぶつかり、
+   毎フレーム制御タイムアウトぶん待つことになる (実機で踏んだ)。 */
+int  term_registry_scroll_rows(term_id_t id);
+void term_registry_scroll_reached(term_id_t id, int achieved);
+
 /* ===================================================================== */
 /* Reads — owner-gated, and non-mutating (§7.2)                          */
 /* ===================================================================== */

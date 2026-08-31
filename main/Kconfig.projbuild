@@ -69,6 +69,72 @@ menu "mqjs platform"
             point). Falls back to PSRAM with a warning if the internal
             allocation fails at boot. Dev probe only — never ship.
 
+    config MQJS_FLASH_STALL_METER
+        bool "Count the cache stalls that flash writes cause"
+        default n
+        help
+            Wraps the IDF guard that disables the caches and parks the
+            other core during a flash erase or program, and counts how
+            often it happens, for how long, and how much of that landed
+            within 1.5 s of a keystroke.
+
+            That last ratio is the whole point. A stall costs core 1
+            about 40% of its throughput, but it only HURTS when it lands
+            on typing. Removing it costs roughly 12 MB of PSRAM and 1.3 s
+            of boot (XIP plus a PSRAM copy of the dictionary), so the
+            decision needs the number rather than an argument. See
+            docs/native-editor-design.md section 6.4.
+
+            Cheap: two counters and a CSR read per stall. Leave it on
+            while gathering data; it is not meant to ship.
+
+    config MQJS_PERF_METER
+        bool "Latency histograms and worst-case ring (arithmetic core of sys.perf())"
+        default y
+        help
+            Fixed 12-bucket log2 histograms (native-editor-spec.md section
+            C.0 rule 3), a worst-16 ring per measured pipeline, and a
+            same-core-in/same-core-out span guard for cache-stall-style
+            timers. The guard exists because M0a once subtracted two
+            different cores' cycle-count CSRs and reported a stall of
+            10,177,430 us (section C.0 rule 6) -- perf_span_exit_us()
+            checks the core before computing anything, so that mistake
+            cannot silently reproduce.
+
+            Pure arithmetic, no ESP-IDF calls beyond reading the core id
+            and cycle counter (main/perf_meter.c). Host-testable via
+            tools/tests/test_perf_hist.c.
+
+            Off collapses every perf_meter call to a no-op so call sites
+            never need their own #ifdef.
+
+    config MQJS_FLASH_SUSPEND_TEST
+        bool "Run the flash auto-suspend acceptance test at boot"
+        default n
+        help
+            Writes to littlefs on core 0 while CRC-ing an mmap'd flash
+            window on core 1, and reports whether the CRC ever differs.
+
+            This exists because CONFIG_SPI_FLASH_AUTO_SUSPEND fails
+            SILENTLY when the configured tSUS is shorter than the flash
+            chip needs: the cache reads a chip that is still busy and
+            gets garbage, which shows up as a wrong glyph or a wrong
+            dictionary line and only during a flash write. Normal
+            smoke-testing cannot find that. This turns it into a loud
+            mismatch count instead.
+
+            Dev only. It wears flash and steals both cores while it runs.
+
+    config MQJS_FLASH_SUSPEND_TEST_ITERS
+        int "Write iterations for the acceptance test"
+        default 150
+        range 10 5000
+        depends on MQJS_FLASH_SUSPEND_TEST
+        help
+            Each iteration rewrites a 16 KB file, so this many
+            iterations is roughly that many erase/program bursts. 150
+            takes a couple of minutes; raise it for a soak.
+
     config MQJS_OPUS_BENCHMARK
         bool "Run real-fixture Opus decoder benchmark at boot"
         default n

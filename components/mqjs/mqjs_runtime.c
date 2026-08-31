@@ -47,6 +47,7 @@
 #include "cutils.h"
 #include "mquickjs.h"
 #include "mqjs_runtime.h"
+#include "mqjs_native.h"
 #include "mqjs_classes.h"
 #include "mqjs_power.h"
 #include "system_vault.h"
@@ -97,6 +98,18 @@
 #include "cam_tab5.h"
 #include "audio_tab5.h"
 #include "term_ui_tab5.h"
+/* ボリューム登録簿。fs.* はこの層の仮想パスしか知らない
+   (docs/filer-storage-design.md §3)。 */
+#include "fs_core.h"
+/* grant の**判定**。範囲一致・操作ビット・暗黙 grant・予約サブツリーの
+   合成はすべてここ (純 C99、ホストで 94 チェック + fuzz 済み)。この
+   ファイルは表とトークンの寿命だけを持ち、判定は 1 行も持たない
+   (docs/native-editor-design.md §4.2)。fs_core.h の後に置くこと:
+   FS_PATH_MAX が見えていれば _Static_assert が食い違いを落とす。 */
+#include "fs_grant.h"
+/* ネイティブモーダル (ピッカー + 同意)。ランチャー JS の同意画面を
+   置き換える (design §4.4)。 */
+#include "fs_picker.h"
 static const char *TAG = "mqjs";
 #else
 #include <time.h>
@@ -180,7 +193,8 @@ typedef enum { EV_GPIO, EV_MQTT_CONNECTED, EV_MQTT_DATA, EV_TOUCH, EV_KEY,
                EV_SSH_DATA, EV_SSH_CLOSED, EV_WIDGET, EV_SIGNAL,
                EV_FOCUS, EV_CLIP, EV_CAM, EV_HTTP,
                EV_TERM_REPLY, /* term.onReply: a DSR/DA answer, inline */
-               EV_NET /* broadcast: release the net.onReady wait queue */
+               EV_NET, /* broadcast: release the net.onReady wait queue */
+               EV_FSGRANT /* fs.request: the consent answer came back */
              } MqjsEventType;
 
 typedef struct {
@@ -197,6 +211,7 @@ typedef struct {
         struct { char *data; uint32_t len; int16_t id; } ssh; /* heap rx */
         struct { char reason[84]; int16_t id; } ssh_closed;
         struct { uint32_t handle; int32_t value; } widget; /* tap/change */
+        struct { uint32_t id; uint8_t ok; } fsgrant; /* fs.request answer */
         struct { char *value; char from[32]; } signal; /* sys.signal;
                        from[] sized to MqjsWorker.name */
         struct { uint8_t target; } focus;
@@ -275,7 +290,9 @@ typedef struct {
     uint16_t gen;             /* bumped on every start: stale-event filter */
     char name[32];
     char vault_id[32];        /* immutable source identity; setAppName cannot
-                                 impersonate another app's vault */
+                                 impersonate another app's vault — nor, since
+                                 fs_cur_app_id(), another app's private
+                                 /internal/data/<app> directory */
     bool trusted_system;       /* immutable: only firmware registry can set */
     uint8_t *mem;             /* fixed arena (design §3.6) */
     size_t mem_size;
@@ -309,6 +326,8 @@ typedef struct {
     bool clip_used; JSGCRef clip_cb; /* clipboard.onChange (P4d) */
     bool cam_used; JSGCRef cam_cb;  /* camera.scan one-shot result */
     bool http_used; JSGCRef http_cb; /* http.get one-shot result */
+    bool fsreq_used; JSGCRef fsreq_cb; /* fs.request one-shot: fires with the
+                                          grant token, or 0 when refused */
     bool net_used;  JSGCRef net_cb;  /* net.onReady one-shot: the app's ticket
                                         in the network wait queue (fires once
                                         the link is up, then auto-releases) */
@@ -381,6 +400,85 @@ static void dev_rearm(void)
 /* the status-bar chip target: the previous foreground app, kept by NAME
    (a relaunch may land in a different slot) */
 static char s_prev_name[32];
+
+/* ---- native surface (mqjs_native.h / spec §A.6, 判断 §E #1) ----------
+ *
+ * エディタとファイラは JS ワーカーではないが fg にはなる。表はここに置き、
+ * 「fg = JS ワーカー 1 本」という前提を **1 変数だけ** 増やして解く:
+ *
+ *   s_fg_native >= 0  ==>  どの JS ワーカーも fg ではない。
+ *                          s_fg_worker は「戻り先」を憶えているだけ。
+ *   s_fg_native <  0  ==>  従来どおり s_workers[s_fg_worker] が fg。
+ *
+ * 表は起動時に埋めきる (mqjs_native_register の規約)。以後は読み取り専用
+ * なのでロックを持たない —— 打鍵の経路で mutex を取るのは、この campaign が
+ * いちばん避けたいこと。s_fg_native は JS タスクだけが書き、poster
+ * (kbd / LVGL / IME 所有) は読むだけ: int 1 個の読みで足りる。 */
+typedef struct {
+    bool used;
+    mqjs_native_surface_t s;   /* 記述子の複製。文字列は呼び出し側が永続で持つ */
+} NativeSurface;
+static NativeSurface s_native[MQJS_MAX_NATIVE];
+static int s_native_n;
+static volatile int s_fg_native = -1;
+
+/* 名前引き。表は起動後に変わらないので、打鍵経路の外から呼ぶぶんには
+   これで足りる (sys.open / チップのタップ / 通知のタップ)。 */
+int mqjs_native_find(const char *name)
+{
+    if (!name || !name[0])
+        return -1;
+    for (int i = 0; i < s_native_n; i++)
+        if (s_native[i].used && !strcmp(s_native[i].s.name, name))
+            return i;
+    return -1;
+}
+
+int mqjs_native_register(const mqjs_native_surface_t *s)
+{
+    if (!s || !s->name || !s->name[0])
+        return -1;
+    /* 31 バイト: ステータスバーの _chip_target が char[32] で、名前は
+       そこを通って mqjs_request_open へ戻ってくる (ui_tab5.cpp:1538)。 */
+    if (strlen(s->name) > 31)
+        return -1;
+    if (mqjs_native_find(s->name) >= 0)
+        return -1;                       /* 名前は住所: 重複は登録させない */
+    for (int i = 0; i < MQJS_MAX_WORKERS; i++)
+        if (s_workers[i].used && !strcmp(s_workers[i].name, s->name))
+            return -1;                   /* JS アプリと同名も同じ理由で不可 */
+    if (s_native_n >= MQJS_MAX_NATIVE)
+        return -1;
+    int id = s_native_n;
+    s_native[id].s = *s;
+    s_native[id].used = true;
+    s_native_n = id + 1;   /* 読み手は s_native_n までしか見ない。バリアは
+                              張らない —— 成立の条件は「入力が動き出す前に
+                              登録しきる」という規約の側 (mqjs_native.h) */
+    return id;
+}
+
+bool mqjs_native_is_fg(int id)
+{
+    return id >= 0 && id == s_fg_native;
+}
+
+bool mqjs_native_fg_active(void)
+{
+    return s_fg_native >= 0;
+}
+
+/* 打鍵/タッチを fg の native 面へ配る。呼び出しは poster のタスク上で、
+   面の実装は「自分のキューへ投げるだけ」という契約 (mqjs_native.h)。
+   fg かどうかを読むのは 1 回だけ: 2 回読むと、その隙に切り替わったとき
+   別の面へ配ることになる。 */
+static const mqjs_native_surface_t *native_fg(void)
+{
+    int id = s_fg_native;
+    return (id >= 0 && id < MQJS_MAX_NATIVE && s_native[id].used)
+               ? &s_native[id].s
+               : NULL;
+}
 
 /* Network readiness as a capability (event-driven Wi-Fi, see wifi.c). The
    token is the ONLY proof the link is up: net.onReady hands it to its callback
@@ -486,13 +584,23 @@ static void bar_update(void)
 {
 #ifdef ESP_PLATFORM
     MqjsWorker *fg = &s_workers[s_fg_worker];
+    /* native 面が fg のときは、どの JS ワーカーも fg ではない (§A.6)。
+       チップに出すのは **name** で title ではない: prev は
+       ui_tab5.cpp の _chip_target になり、タップで
+       mqjs_request_open(name) に戻ってくる (:1438/:1538)。表示用の
+       別名を入れると、そのタップが誰にも解決しなくなる。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    const char *cur = ns ? ns->name : (fg->used ? fg->name : "");
     bool prev_running = false;
     for (int i = 0; i < MQJS_MAX_WORKERS; i++)
         if (s_workers[i].used && !strcmp(s_workers[i].name, s_prev_name)) {
             prev_running = true;
             break;
         }
-    ui_tab5_set_fg_apps(fg->used ? fg->name : "", s_prev_name, prev_running);
+    /* native 面は止められない = 常に「走っている」(mqjs_native.h の 3) */
+    if (!prev_running && mqjs_native_find(s_prev_name) >= 0)
+        prev_running = true;
+    ui_tab5_set_fg_apps(cur, s_prev_name, prev_running);
 #endif
 }
 
@@ -564,7 +672,16 @@ void mqjs_set_print_sink(void (*fn)(const char *, size_t))
 /* §11 store catalog provider + uninstall unsubscribe hook (both
    host-registered; NULL on the PC build) */
 static const mqjs_store_api_t *s_store_api;
+/* 同じ契約の第 2 のカタログ: microSD 上の署名済みアプリ。棚 (MQTT) と
+   混ぜずに別ソースとして並べる —— 同名衝突は勝者を決めずに両方見せる
+   (docs/filer-storage-design.md §13)。 */
+static const mqjs_store_api_t *s_card_api;
 static void (*s_uninstall_hook)(const char *name);
+
+void mqjs_set_card_provider(const mqjs_store_api_t *api)
+{
+    s_card_api = api;
+}
 
 void mqjs_set_store_provider(const mqjs_store_api_t *api)
 {
@@ -1289,7 +1406,15 @@ typedef enum {
    stack = runtime-internal call: allowed.) */
 static bool ui_is_fg(void)
 {
-    return !s_cur_wk || s_cur_wk->idx == s_fg_worker;
+    if (!s_cur_wk)
+        return true;         /* runtime 内部の呼び出し */
+    /* native 面が fg の間、JS アプリは 1 本も fg ではない (§A.6)。ここを
+       素通しにすると、エディタが直接描いているキャンバスへ裏のアプリの
+       ui.* が混ざる —— 面は UI キューを通らないので、混ざった側は
+       自分が上書きされたことにも気づけない。 */
+    if (s_fg_native >= 0)
+        return false;
+    return s_cur_wk->idx == s_fg_worker;
 }
 
 /* Put one command on the UI queue, unconditionally. Takes ownership of
@@ -1567,6 +1692,14 @@ void mqjs_post_touch(int x, int y, int kind)
        tap wakes even when the foreground app has no touch handler). */
     if (mqjs_power_note_input(kind))
         return;
+    /* fg が native 面なら、そこで終わり (§A.6)。電源ゲートの後ろに置くのは
+       JS と同じ理由: 画面を起こしただけのタップは誰にも配らない。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    if (ns) {
+        if (ns->touch)
+            ns->touch(ns->ctx, x, y, kind);
+        return;
+    }
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* touch always goes to the fg app */
     if (!s_event_queue || !fg->used || !fg->touch_used)
         return;
@@ -1903,14 +2036,25 @@ static bool ime_route_key(const char *utf8, size_t len);
 /* 打鍵を fg アプリの ui.onKey へ流す、唯一の出口。IME を通した後の配達も
    ここなので IME 所有タスクからも呼ばれる — どのタスクから来ても触るのは
    s_event_queue だけなので、それで足りる。 */
-static void key_to_app(const char *utf8, size_t len)
+static void key_to_app(const char *utf8, size_t len,
+                       uint32_t t_post, uint32_t t_isr)
 {
-    /* シンクの振り分け (§7): widget の field にフォーカスがあれば行き先は
-       その textarea、無ければ従来どおり JS アプリ。ここに置くのは、素通しの
-       打鍵も IME の確定文字列も必ずこの 1 か所を通るから — 分配の手前に
-       置くと「英字は field に入るが日本語は入らない」になる。 */
+    /* シンクの振り分け (§7 + spec §A.6): field → **native fg** → JS fg の
+       3 段。ここに置くのは、素通しの打鍵も IME の確定文字列も必ずこの
+       1 か所を通るから — 分配の手前に置くと「英字は field に入るが
+       日本語は入らない」になる。 */
     if (ui_tab5_field_key(utf8, len))
         return;
+    /* 2 段目: native 面 (エディタ / ファイラ)。JS のイベントキューは
+       通らない —— 面は自分のタスクに自分のキューを持っており、そこへ
+       投げるのが面の側の契約。t_post/t_isr をそのまま渡すので、面は
+       「入力面 → 画面」の端対端を自分で刻める (§C)。 */
+    const mqjs_native_surface_t *ns = native_fg();
+    if (ns) {
+        if (ns->key)
+            ns->key(ns->ctx, utf8, len, t_post, t_isr);
+        return;
+    }
     MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
     if (!s_event_queue || !fg->used || !fg->key_used)
         return;
@@ -1937,7 +2081,23 @@ static void key_to_app(const char *utf8, size_t len)
 }
 #endif
 
+/* 最終打鍵の時刻。フラッシュ停止が打鍵と重なったかを数えるためだけに在る
+   (docs/native-editor-spec.md §C.2)。停止中の wrapper から読まれるので
+   int64 1 個で済ませ、ロックは持たない —— 1 打鍵ぶんずれても、
+   1.5 秒の窓の判定は変わらない。 */
+static volatile int64_t s_last_key_us;
+
+int64_t mqjs_last_key_us(void) { return s_last_key_us; }
+int64_t mqjs_now_us(void)      { return time_us(); }
+
 void mqjs_post_key(const char *utf8, size_t len)
+{
+    mqjs_post_key_ts(utf8, len, 0);
+}
+
+/* ISR 時刻つきの入口 (mqjs_native.h)。入力面がまだ ISR 時刻を刻んで
+   いないので、今はどの呼び出しも t_isr = 0 で入ってくる。 */
+void mqjs_post_key_ts(const char *utf8, size_t len, uint32_t t_isr)
 {
 #ifdef ESP_PLATFORM
     /* keys feed the device idle clock like touch does (matters for the
@@ -1946,9 +2106,17 @@ void mqjs_post_key(const char *utf8, size_t len)
        blanked screen is swallowed here, exactly like the wake tap. */
     if (mqjs_power_note_input(2))
         return;
-    MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys always go to the fg app */
-    if (!s_event_queue || !fg->used || !utf8 || len == 0)
+    if (!utf8 || len == 0)
         return;
+    /* native 面が fg なら、JS ワーカーの生死は行き先に関係しない。
+       この判定を 1 回だけ読んで下まで使う (2 回読むと、その隙に
+       切り替わったとき IME の判定と配達先が食い違う)。 */
+    bool native = s_fg_native >= 0;
+    if (!native) {
+        MqjsWorker *fg = &s_workers[s_fg_worker]; /* keys go to the fg app */
+        if (!s_event_queue || !fg->used)
+            return;
+    }
 
     /* IME はここ (docs/keyboard-ime-unification.md §7)。両側とも理由がある。
        復帰キーの握り潰しの「後」: 画面を起こしただけのキーで変換を始めない。
@@ -1956,13 +2124,28 @@ void mqjs_post_key(const char *utf8, size_t len)
        アプリの打鍵をここで殺しており (launcher や reading のような widget
        専用アプリがそれ)、後ろに置くと「ドックの物理キーが field に入らない」
        という §2 の根っこをそのまま踏む。 */
-    if (ime_route_key(utf8, len))
+    /* 「打鍵中」の判定に使う (main/flash_stall_meter.c)。電源ゲートより後、
+       IME より前に置く: 画面を起こしただけのキーは打鍵として数えないが、
+       IME に吸われた打鍵は打鍵として数えたい。 */
+    s_last_key_us = time_us();
+
+    /* native fg のとき IME の判定は want=false (spec §E-2)。エディタは
+       自前の ime_t を持っており、ここを通すと打鍵が IME 所有タスクへ
+       吸われて面には 1 バイトも届かない。**これを外すと「打てない
+       エディタ」になる。**
+
+       残る競合は 1 つだけ: 切替の直前に IME キューへ入っていた打鍵は、
+       所有タスクが後から key_to_app へ配るので native 面に着く。落とすと
+       入力が黙って消えるので、着かせる方を採った (前のアプリ宛ての確定
+       文字列が 1 つエディタに入りうる、という値段)。 */
+    if (!native && ime_route_key(utf8, len))
         return;   /* この打鍵の行き先は所有タスクが決める */
 
-    key_to_app(utf8, len);
+    key_to_app(utf8, len, (uint32_t)s_last_key_us, t_isr);
 #else
     (void)utf8;
     (void)len;
+    (void)t_isr;
 #endif
 }
 
@@ -2944,6 +3127,1034 @@ JSValue js_store_del(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* fs.*  — 内蔵ストレージと microSD (docs/filer-storage-design.md)      */
+/*                                                                     */
+/* このブロックは fs_core の仮想パス ("/internal/...", "/sd/...") しか  */
+/* 知らない。"/littlefs" も SDMMC も LittleFS も一度も出てこないので、  */
+/* Tab5 と Stamp-P4 で同じコードが動く —— 差は fs.volumes() が何本      */
+/* 返すかだけになる (§2: Stamp は「カードが永久に入っていない Tab5」)。 */
+/*                                                                     */
+/* 読み取りは全アプリに開放 (この 2 ボリュームに秘密は無い。vault と    */
+/* Wi-Fi 資格情報は NVS 側)。書き込み・削除・マウント操作は grant を    */
+/* 要求する。grant は net.onReady のトークンと同じ不透明な整数で、      */
+/* ユーザの同意を経ないと手に入らない = トップレベルで書けない (§7)。  */
+/* 同意画面はランチャーが描く: 要求元のアプリに描かせると偽装できる。   */
+/*                                                                     */
+/* grant の**下**にもう 1 層ある。fs_core の予約サブツリー              */
+/* (fs_path_reserved) は "/internal/apps" 以下の変更をどんな grant でも */
+/* 通さない。同意画面は「内蔵への書き込み」としか言えないので、         */
+/* "/internal" を丸ごと許した人が署名済みアプリの中身を差し替えられて   */
+/* しまう —— そこだけは権限ではなく不変条件として fs_core が握る。      */
+/* ここ (バインディング側) には対応するコードが 1 行も無いのが正しい。  */
+/* ------------------------------------------------------------------ */
+
+#define MQJS_FS_GRANTS    4
+#define MQJS_FS_SCOPE_MAX 128
+#define MQJS_FS_READ_MAX  65536
+#define MQJS_FS_READ_DEF  8192
+#define MQJS_FS_LIST_MAX  512
+#define MQJS_FS_REASON_MAX 96
+
+#ifdef ESP_PLATFORM
+
+/* 器の大きさは fs_grant.h と共有する。ずれると fs_grant_in_scope が
+   「root が器の中で終端していない」を見て拒否側へ倒れる (黙って通る道は
+   無い) が、それは事故の受け皿であって設計ではないので、ここで落とす。 */
+_Static_assert(MQJS_FS_SCOPE_MAX == FS_GRANT_ROOT_MAX,
+               "MQJS_FS_SCOPE_MAX != FS_GRANT_ROOT_MAX");
+
+/* 判定に要る 3 つ (kind/ops/root) は fs_grant_scope_t を**埋め込む**。
+   平らに持って呼ぶたびに詰め替えると、詰め替えを 1 箇所忘れたときに
+   古い ops で通ってしまう。fs_grant.h も埋め込みを前提に書いてある。 */
+typedef struct {
+    uint32_t         token;    /* 0 = 空き */
+    uint8_t          worker;
+    uint16_t         gen;
+    uint32_t         epoch;    /* 発行時のボリュームのマウント世代 */
+    const fsvol_t   *vol;
+    fs_grant_scope_t sc;       /* kind / ops / root */
+} FsGrant;
+
+static FsGrant  s_fs_grants[MQJS_FS_GRANTS];
+static uint32_t s_fs_token_seq;
+
+/* 返事待ちの要求。ネイティブモーダル (fs_pick_begin) が返事を返すまで
+   ここに置く。要求 1 件がアプリ 1 つに対応する (fsreq_cb が一発限りの
+   ハンドラなので、同じアプリからの二重要求は後勝ちで潰す)。
+   **JS タスクだけが触る。** ピッカーの cb は UI タスクの上なので、
+   そこからここへは書かない (下の landing を経由する)。 */
+typedef struct {
+    uint32_t id;             /* 0 = 空き */
+    uint8_t  worker;
+    uint16_t gen;
+    uint8_t  kind;           /* mint する grant の FS_SCOPE_* */
+    uint8_t  ops;            /* mint する grant の FS_OP_* */
+    bool     from_pick;      /* true = root は landing から来る (fs.pick) */
+    bool     modal;          /* true = ネイティブモーダルが開いている */
+    char     root[MQJS_FS_SCOPE_MAX];
+} FsPending;
+
+static FsPending s_fs_pending[MQJS_FS_GRANTS];
+static uint32_t  s_fs_req_seq;
+
+/* ピッカーの答えの受け皿。モーダルは同時に 1 件なので 1 枠でよい。
+ *
+ * **欄ごとに書き手は 1 つだけ。** ロックが無いので、これが崩れると
+ * 「誰が何を守っているか」を言えなくなる:
+ *
+ *   worker / gen  … JS タスクだけが書く (fs_pick_open、モーダルを開く前)。
+ *                   UI タスクは読むだけ。答えの宛先を作るのに使う。
+ *   ok / vpath / id … UI タスク (fs_pick_cb) だけが書く。JS タスクは
+ *                   読むだけ —— 「使い終わった印」に id を 0 で潰しに
+ *                   行かない。一度きりは FsPending 表が保証している
+ *                   (答えを配ると要求の席が空き、同じ id は二度と現れない)。
+ *
+ * 順序はキューが保証する: cb は「landing を埋める → ev_post」の順、JS 側は
+ * 「イベントを受け取る → landing を読む」の順で、xQueueSend / xQueueReceive
+ * の間にメモリバリアが入る。id が一致しない landing は使わない (要求 id は
+ * 使い回さないので、古い答えが今の要求の id と一致することはない)。
+ *
+ * 守れていないもの: worker / gen は JS タスクが**次の**要求のために書き
+ * 換えうるので、UI タスクが古い答えを新しい宛先へ投げることがある。その
+ * 配送違いは dispatch_fsgrant の id+worker+gen 照合が落とす (S3)。 */
+typedef struct {
+    /* JS タスクが fs_pick_begin を呼ぶ前に埋める (UI タスクは読むだけ) */
+    uint8_t  worker;
+    uint16_t gen;
+    /* UI タスクが埋める (JS タスクは読むだけ)。id は最後に立てる */
+    bool     ok;
+    char     vpath[MQJS_FS_SCOPE_MAX];
+    uint32_t id;                 /* 答えの届いた要求の id。0 = まだ */
+} FsPickLanding;
+
+static FsPickLanding s_fs_pick_land;
+
+/* パス引数をスタックへ写す。JS の文字列は以降の割り当てで動きうるので、
+   触る前に必ずコピーを取る (store_key と同じ理由)。 */
+static int fs_path_arg(JSContext *ctx, JSValue v, char *dst, size_t cap)
+{
+    JSCStringBuf buf;
+    size_t len;
+    const char *s = JS_ToCStringLen(ctx, &len, v, &buf);
+    if (!s)
+        return -1;
+    if (len == 0 || len >= cap) {
+        JS_ThrowRangeError(ctx, "fs: path length must be 1..%d", (int)cap - 1);
+        return -1;
+    }
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+    return 0;
+}
+
+static JSValue fs_throw(JSContext *ctx, const char *what, esp_err_t err)
+{
+    JS_ThrowTypeError(ctx, "fs.%s: %s", what, fs_err_str(err));
+    return JS_EXCEPTION;
+}
+
+/* grant を引き当てる。持ち主・世代・マウント世代がすべて一致したものだけ
+   が生きている: アプリが止まればその grant は使えなくなり、カードを
+   抜き差しすれば epoch がずれて死ぬ。掃除の常駐処理は要らない (§7)。
+ *
+ * 第 1 引数が 0 / undefined / null なら「トークンを持っていない」。それは
+ * 誤りではない —— 暗黙 grant (/internal/data/<app>) はトークンを配らない
+ * (design §4.3)。呼び出し元が区別できるよう *no_token に書き分ける。
+ *
+ *   戻り値 != NULL         生きている grant
+ *   NULL かつ *no_token    トークン無し。判定は暗黙 grant に委ねる
+ *   NULL かつ !*no_token   例外を投げ済み */
+static FsGrant *fs_grant_lookup(JSContext *ctx, JSValue v, bool *no_token)
+{
+    *no_token = false;
+    if (JS_IsUndefined(v) || JS_IsNull(v)) {
+        *no_token = true;
+        return NULL;
+    }
+    int token = 0;   /* JS_ToInt32 は int* を取る (riscv32) */
+    if (JS_ToInt32(ctx, &token, v)) {
+        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request/fs.pick");
+        return NULL;
+    }
+    if (token == 0) {
+        *no_token = true;
+        return NULL;
+    }
+    if (token < 0) {
+        JS_ThrowTypeError(ctx, "fs: expected a grant from fs.request/fs.pick");
+        return NULL;
+    }
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        FsGrant *g = &s_fs_grants[i];
+        if (!g->token || g->token != (uint32_t)token)
+            continue;
+        if (!s_cur_wk || g->worker != s_cur_wk->idx || g->gen != s_cur_wk->gen)
+            break;
+        if (fsvol_epoch(g->vol) != g->epoch) {
+            g->token = 0;              /* 抜かれたカードの権限 */
+            break;
+        }
+        return g;
+    }
+    JS_ThrowTypeError(ctx, "fs: grant expired or not yours");
+    return NULL;
+}
+
+/* 暗黙 grant の主体 (/internal/data/<app> の <app>)。
+ *
+ * **名前ではなく vault_id を返す。** name は sys.setAppName で後から
+ * 名乗り変えられる ── 止まっているアプリの名前は空いているので、押し込んだ
+ * 未署名アプリが sys.setAppName("reading") と名乗るだけで、同意画面を一度も
+ * 出さずに他アプリの記録を書き換え・削除できた (トークン 0 = 暗黙 grant)。
+ * vault_id は起動時に一度だけ決まって以後不変で、vault.* が既にこれを
+ * 隔離の鍵に使っている。fs の私有ディレクトリだけが可変な名前を主体に
+ * していたので、鍵を 1 本に揃える (design §4.1 の 2 点目)。
+ *
+ * 空なら NULL —— 主体の無いアプリに私有ディレクトリは無い (vault_key が
+ * app[0] == '\0' を拒むのと同じ規則)。'/' や制御文字が混じっていても
+ * fs_grant_name_ok が拒否側へ倒すので、ここでは形を見ない (判定を 2 箇所に
+ * 持たせない。長さも FS_GRANT_NAME_MAX=256 > sizeof vault_id=32 なので、
+ * 器で落ちることはない)。 */
+static const char *fs_cur_app_id(void)
+{
+    return (s_cur_wk && s_cur_wk->vault_id[0]) ? s_cur_wk->vault_id : NULL;
+}
+
+/* 「この操作を、このパスに対して、この grant で行ってよいか」。
+   判定そのものは fs_grant_check() —— ここは表から scope を取り出して
+   渡し、拒否の理由を例外の文言にするだけ。判定を 2 箇所に持たせない。 */
+static bool fs_grant_allow(JSContext *ctx, JSValue gv, const char *path,
+                           uint8_t need_ops, const char *what)
+{
+    bool no_token = false;
+    FsGrant *g = fs_grant_lookup(ctx, gv, &no_token);
+    if (!g && !no_token)
+        return false;                  /* 例外は投げ済み */
+
+    fs_grant_verdict_t v = fs_grant_check(g ? &g->sc : NULL,
+                                          fs_cur_app_id(), path, need_ops);
+    if (v != FS_GRANT_OK) {
+        JS_ThrowTypeError(ctx, "fs.%s: '%s': %s", what, path,
+                          fs_grant_verdict_str(v));
+        return false;
+    }
+    return true;
+}
+
+/* 一番古い grant を潰して席を空ける (4 席、LRU ですらない単純な使い回し:
+   アプリが同時に 4 つの範囲へ書くことは想定していない)。 */
+static FsGrant *fs_grant_slot(void)
+{
+    for (int i = 0; i < MQJS_FS_GRANTS; i++)
+        if (!s_fs_grants[i].token)
+            return &s_fs_grants[i];
+    FsGrant *oldest = &s_fs_grants[0];
+    for (int i = 1; i < MQJS_FS_GRANTS; i++)
+        if (s_fs_grants[i].token < oldest->token)
+            oldest = &s_fs_grants[i];
+    return oldest;
+}
+
+/* ---- ネイティブモーダル (fs_picker) との継ぎ手 -------------------- *
+ *
+ * ピッカーは grant を知らない。「ユーザがこの道をこの意図で選んだ」しか
+ * 返さず、mint は今までどおり JS タスク (dispatch_fsgrant) がやる
+ * (spec §A.4)。モーダルは同時に 1 件なので、開いている要求も 1 件。
+ *
+ * cb は **UI タスクの上**で呼ばれる。そこから権限表にも FsPending にも
+ * 触らない —— 単一所有者を崩すと、この 2 つの表からロックが消えている
+ * 理由がなくなる (spec §B.2)。答えは landing に置いてイベントを 1 本
+ * 投げるだけ。
+ *
+ * 文字列は要求が閉じるまで生きていなければならない (fs_pick_req_t は
+ * const char * を持つだけで、写しを取るとは言っていない)。モーダルが
+ * 1 件なので静的な器 1 組で足りる。 */
+static char        s_fs_pick_title[64];
+static char        s_fs_pick_start[MQJS_FS_SCOPE_MAX];
+static char        s_fs_pick_name[64];
+static char        s_fs_pick_scope[MQJS_FS_SCOPE_MAX];
+#define MQJS_FS_PICK_EXTS 4
+static char        s_fs_pick_ext[MQJS_FS_PICK_EXTS][16];
+static const char *s_fs_pick_extp[MQJS_FS_PICK_EXTS];
+
+static void fs_pick_cb(void *cbctx, const fs_pick_result_t *r)
+{
+    uint32_t id = (uint32_t)(uintptr_t)cbctx;
+    bool ok = (r != NULL) && r->ok;
+
+    s_fs_pick_land.id = 0;      /* 埋め終わるまで「答え未着」のまま */
+    s_fs_pick_land.vpath[0] = '\0';
+    if (ok) {
+        /* grant の root は MQJS_FS_SCOPE_MAX で終端しなければならない。
+           入らない道は「拒否」に倒す: 切り詰めて別の道の権限を出すより
+           良い (切り詰めた先が実在してしまう可能性がある)。 */
+        int n = snprintf(s_fs_pick_land.vpath, sizeof s_fs_pick_land.vpath,
+                         "%s", r->vpath);
+        if (n < 0 || (size_t)n >= sizeof s_fs_pick_land.vpath) {
+            s_fs_pick_land.vpath[0] = '\0';
+            ok = false;
+        }
+    }
+    s_fs_pick_land.ok = ok;
+    /* id は最後。この後の ev_post は外部呼び出しなので、上の書き込みが
+       キューへの送信を越えて後ろへ動くことはない。読み手 (JS タスク) は
+       xQueueReceive の後で読む。 */
+    s_fs_pick_land.id = id;
+
+    MqjsEvent ev = { .type = EV_FSGRANT,
+                     .worker = s_fs_pick_land.worker,
+                     .gen = s_fs_pick_land.gen };
+    ev.u.fsgrant.id = id;
+    ev.u.fsgrant.ok = ok ? 1 : 0;
+    ev_post(&ev, 0);
+}
+
+/* 開いているモーダルがこの要求のものなら閉じる。JS タスクから呼ぶ。 */
+static void fs_pick_drop(FsPending *p)
+{
+    if (p->modal) {
+        p->modal = false;
+        fs_pick_cancel();
+    }
+}
+
+/* fs.request / fs.pick の共通後半: 空き枠を取り、モーダルを開く。
+   開けなければ枠を返して false (cb の登録解除は呼び出し元)。 */
+static FsPending *fs_pending_take(void)
+{
+    FsPending *p = NULL;
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        /* 同じアプリの前の要求は捨てる (ハンドラは一発限りなので、返事が
+           二度来ると片方が宙に浮く)。開きっぱなしのモーダルも畳む。 */
+        if (s_fs_pending[i].id && s_fs_pending[i].worker == s_cur_wk->idx) {
+            fs_pick_drop(&s_fs_pending[i]);
+            s_fs_pending[i].id = 0;
+        }
+        if (!s_fs_pending[i].id && !p)
+            p = &s_fs_pending[i];
+    }
+    if (!p)
+        p = &s_fs_pending[0];
+    memset(p, 0, sizeof *p);
+    if (++s_fs_req_seq == 0)
+        s_fs_req_seq = 1;
+    p->id     = s_fs_req_seq;
+    p->worker = s_cur_wk->idx;
+    p->gen    = s_cur_wk->gen;
+    return p;
+}
+
+static bool fs_pick_open(FsPending *p, const fs_pick_req_t *req)
+{
+    /* UI タスクが読む欄 (worker/gen) は、モーダルを開く前に揃えておく。
+       答えの欄 (ok/vpath/id) には**触らない** —— あれは UI タスクの持ち物で、
+       ここから消しに行くと 1 つの欄を 2 つのタスクが書くことになる (前の
+       要求の cb がまだ走っている隙がある)。古い答えが残っていても害は無い:
+       要求 id は使い回さないので、この要求の id とは一致しない。 */
+    s_fs_pick_land.worker = p->worker;
+    s_fs_pick_land.gen    = p->gen;
+    if (!fs_pick_begin(req, fs_pick_cb, (void *)(uintptr_t)p->id))
+        return false;
+    p->modal = true;
+    return true;
+}
+
+#endif /* ESP_PLATFORM */
+
+/* fs.volumes() -> [{id,label,path,fstype,mounted,removable,system,total,free}]
+   ボードにボリュームが 1 本しか無ければ 1 本返る。アプリはこの配列を
+   回すだけで、どのボードで動いているかを知る必要がない。 */
+JSValue js_fs_volumes(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr))
+        return arr;
+#ifdef ESP_PLATFORM
+    JS_PUSH_VALUE(ctx, arr);
+    int n = 0;
+    int count = fsvol_count();
+    for (int i = 0; i < count; i++) {
+        const fsvol_t *v = fsvol_at(i);
+        if (!v)
+            continue;
+        bool mounted = fsvol_mounted(v);
+        uint64_t total = 0, freeb = 0;
+        if (mounted)
+            fs_usage(v->id, &total, &freeb);
+
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        /* 文字列は必ず自分の文だけで作る: 生成中の GC が obj を動かしても
+           obj_ref.val は追随するが、入れ子にすると評価順で古い値を読む。 */
+        JSValue s_id = JS_NewString(ctx, v->id);
+        JS_SetPropertyStr(ctx, obj_ref.val, "id", s_id);
+        JSValue s_label = JS_NewString(ctx, v->label ? v->label : v->id);
+        JS_SetPropertyStr(ctx, obj_ref.val, "label", s_label);
+        JSValue s_type = JS_NewString(ctx, v->fstype ? v->fstype : "");
+        JS_SetPropertyStr(ctx, obj_ref.val, "fstype", s_type);
+        char vroot[40];
+        snprintf(vroot, sizeof vroot, "/%s", v->id);
+        JSValue s_path = JS_NewString(ctx, vroot);
+        JS_SetPropertyStr(ctx, obj_ref.val, "path", s_path);
+        JS_SetPropertyStr(ctx, obj_ref.val, "mounted", JS_NewBool(mounted));
+        /* 「入っていない」と「入っているが読めない」を混ぜない。混ぜると
+           未フォーマットのカードが「入っていません」と出て、直す導線が
+           画面から消える (docs/filer-storage-design.md §12)。 */
+        const char *st = "absent";
+        switch (fsvol_state(v)) {
+        case FSVOL_ST_MOUNTED:    st = "mounted";    break;
+        case FSVOL_ST_UNKNOWN:    st = "unknown";    break;
+        case FSVOL_ST_UNREADABLE: st = "unreadable"; break;
+        default:                                     break;
+        }
+        JSValue s_state = JS_NewString(ctx, st);
+        JS_SetPropertyStr(ctx, obj_ref.val, "state", s_state);
+        JS_SetPropertyStr(ctx, obj_ref.val, "removable",
+                          JS_NewBool((v->flags & FSVOL_REMOVABLE) ? 1 : 0));
+        JS_SetPropertyStr(ctx, obj_ref.val, "system",
+                          JS_NewBool((v->flags & FSVOL_SYSTEM) ? 1 : 0));
+        /* バイト数は 32bit int に収まらない (32GB カード)。倍精度なら
+           2^53 まで正確なので、そのまま数として渡してよい。 */
+        JS_SetPropertyStr(ctx, obj_ref.val, "total",
+                          JS_NewFloat64(ctx, (double)total));
+        JS_SetPropertyStr(ctx, obj_ref.val, "free",
+                          JS_NewFloat64(ctx, (double)freeb));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    JS_POP_VALUE(ctx, arr);
+#else
+    (void)this_val; (void)argc; (void)argv;
+#endif
+    return arr;
+}
+
+/* fs.list(path[, {offset, limit, stat}]) -> [{name,dir,size,mtime}]
+   size/mtime は既定で埋めるが、limit を大きく取ると FAT の線形検索で
+   高くつくので {stat:false} で外せる。truncated は配列の .more に立つ。 */
+JSValue js_fs_list(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+
+    int offset = 0, limit = MQJS_FS_LIST_MAX;
+    bool want_stat = true;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int tmp = 0;
+        JSValue v = JS_GetPropertyStr(ctx, argv[1], "offset");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            offset = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "limit");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            limit = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "stat");
+        if (!JS_IsUndefined(v))
+            want_stat = uiw_truthy(ctx, v);
+    }
+    if (offset < 0)
+        offset = 0;
+    if (limit < 0 || limit > MQJS_FS_LIST_MAX)
+        limit = MQJS_FS_LIST_MAX;
+
+    fs_dir_t *dir = NULL;
+    esp_err_t err = fs_dir_open(path, &dir);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "list", err);
+
+    JSGCRef arr_ref, obj_ref;
+    JSValue arr = JS_NewArray(ctx, 0);
+    if (JS_IsException(arr)) {
+        fs_dir_close(dir);
+        return arr;
+    }
+    JS_PUSH_VALUE(ctx, arr);
+    int total = fs_dir_count(dir);
+    int n = 0;
+    for (int i = offset; i < total && n < limit; i++) {
+        fs_entry_t e;
+        if (!fs_dir_get(dir, i, &e))
+            break;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            break;
+        JS_PUSH_VALUE(ctx, obj);
+        /* 名前は dir のプールを指している。JS_NewString は JS ヒープしか
+           動かさないので、プールが消えるのは fs_dir_close のときだけ。 */
+        JSValue s_name = JS_NewString(ctx, e.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", s_name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "dir", JS_NewBool(e.is_dir));
+        if (want_stat) {
+            fs_stat_t st;
+            if (fs_dir_stat(dir, i, &st) == ESP_OK) {
+                JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                                  JS_NewFloat64(ctx, (double)st.size));
+                JS_SetPropertyStr(ctx, obj_ref.val, "mtime",
+                                  JS_NewFloat64(ctx, (double)st.mtime));
+            }
+        }
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    /* 一覧そのものが長すぎて切られたか (FS_DIR_MAX)、あるいは窓の先に
+       まだ続きがあるか。黙って切ると「全部見た」と誤読される。 */
+    JS_SetPropertyStr(ctx, arr_ref.val, "more",
+                      JS_NewBool(fs_dir_truncated(dir) ||
+                                 offset + n < total));
+    JS_SetPropertyStr(ctx, arr_ref.val, "total", JS_NewInt32(ctx, total));
+    JS_POP_VALUE(ctx, arr);
+    fs_dir_close(dir);
+    return arr;
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewArray(ctx, 0);
+#endif
+}
+
+/* fs.stat(path) -> {name,dir,size,mtime} | undefined (存在しないとき) */
+JSValue js_fs_stat(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+    fs_stat_t st;
+    esp_err_t err = fs_stat(path, &st);
+    if (err == ESP_ERR_NOT_FOUND)
+        return JS_UNDEFINED;         /* 「無い」は例外ではない */
+    if (err != ESP_OK)
+        return fs_throw(ctx, "stat", err);
+
+    JSGCRef obj_ref;
+    JSValue obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return obj;
+    JS_PUSH_VALUE(ctx, obj);
+    JS_SetPropertyStr(ctx, obj_ref.val, "dir", JS_NewBool(st.is_dir));
+    JS_SetPropertyStr(ctx, obj_ref.val, "size",
+                      JS_NewFloat64(ctx, (double)st.size));
+    JS_SetPropertyStr(ctx, obj_ref.val, "mtime",
+                      JS_NewFloat64(ctx, (double)st.mtime));
+    JS_POP_VALUE(ctx, obj);
+    return obj;
+#else
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return JS_UNDEFINED;
+#endif
+}
+
+/* fs.read(path[, {offset, length, hex}]) -> string
+   既定は先頭 8KB のテキスト。hex:true なら 16 進 2 桁/バイトで返す
+   (バイナリを JS 文字列に押し込むと UTF-8 の検査で壊れるため)。 */
+JSValue js_fs_read(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[0], path, sizeof path))
+        return JS_EXCEPTION;
+
+    int offset = 0, length = MQJS_FS_READ_DEF;
+    bool hex = false;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        int tmp = 0;
+        JSValue v = JS_GetPropertyStr(ctx, argv[1], "offset");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            offset = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "length");
+        if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v))
+            length = tmp;
+        v = JS_GetPropertyStr(ctx, argv[1], "hex");
+        hex = uiw_truthy(ctx, v);
+    }
+    if (offset < 0)
+        offset = 0;
+    if (length <= 0)
+        return JS_NewStringLen(ctx, "", 0);
+    if (length > MQJS_FS_READ_MAX)
+        length = MQJS_FS_READ_MAX;
+    if (hex && length > MQJS_FS_READ_MAX / 2)
+        length = MQJS_FS_READ_MAX / 2;   /* 出力が倍になる */
+
+    /* JS ヒープの外で読む: 数十 KB をアリーナに置くと GC が動く。 */
+    char *buf = heap_caps_malloc((size_t)length, MALLOC_CAP_SPIRAM);
+    if (!buf)
+        buf = malloc((size_t)length);
+    if (!buf)
+        return JS_ThrowOutOfMemory(ctx);
+    size_t got = 0;
+    esp_err_t err = fs_read(path, (uint64_t)offset, buf, (size_t)length, &got);
+    if (err != ESP_OK) {
+        free(buf);
+        return fs_throw(ctx, "read", err);
+    }
+    JSValue out;
+    if (hex) {
+        static const char HEX[] = "0123456789abcdef";
+        char *h = malloc(got * 2 + 1);
+        if (!h) {
+            free(buf);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        for (size_t i = 0; i < got; i++) {
+            h[i * 2]     = HEX[(unsigned char)buf[i] >> 4];
+            h[i * 2 + 1] = HEX[(unsigned char)buf[i] & 15];
+        }
+        out = JS_NewStringLen(ctx, h, got * 2);
+        free(h);
+    } else {
+        out = JS_NewStringLen(ctx, buf, got);
+    }
+    free(buf);
+    return out;
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewStringLen(ctx, "", 0);
+#endif
+}
+
+/* fs.request({path, write, reason}, cb) -> bool
+   同意を求め、返事が出たら cb(grant, path) を呼ぶ (拒否なら cb(0, ""))。
+   grant はここと fs.pick でしか手に入らないので、トップレベルでの
+   書き込みは書けない。
+
+   同意画面は**ネイティブモーダル** (fs_picker) が描く。ランチャー JS に
+   描かせるのをやめた理由は design §4.4: ランチャーは JS 協調タスクの上の
+   アプリなので、他アプリが長い C 呼び出しをしている間は画面を描けない
+   (カタログ検証で 1.8 秒フリーズを実測した)。 */
+JSValue js_fs_request(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char root[MQJS_FS_SCOPE_MAX];
+    char reason[MQJS_FS_REASON_MAX];
+    bool write = true;
+
+    if (argc < 2 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+        return JS_ThrowTypeError(ctx,
+            "fs.request({path, write, reason}, cb)");
+    if (fs_path_arg(ctx, JS_GetPropertyStr(ctx, argv[0], "path"),
+                    root, sizeof root))
+        return JS_EXCEPTION;
+    JSValue wv = JS_GetPropertyStr(ctx, argv[0], "write");
+    if (!JS_IsUndefined(wv))
+        write = uiw_truthy(ctx, wv);
+    reason[0] = '\0';
+    JSValue rv = JS_GetPropertyStr(ctx, argv[0], "reason");
+    if (!JS_IsUndefined(rv) && uiw_copy_str(ctx, rv, reason, sizeof reason))
+        return JS_EXCEPTION;
+
+    /* 範囲が実在するボリュームを指しているか、ここで確かめる。カードが
+       入っていないのに同意画面を出しても意味がない。 */
+    const fsvol_t *vol = NULL;
+    esp_err_t err = fsvol_resolve(root, &vol, NULL, 0);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "request", err);
+
+    /* 求める操作。write:false は読みだけの範囲 grant (バルク走査アプリ)。
+       write:true はサブツリー全部 —— 旧 bool write と同じ意味を、
+       op ビットで書き直しただけ。 */
+    uint8_t ops = write ? (uint8_t)FS_OP_ALL : (uint8_t)FS_OP_READ;
+
+    JSValue r = register_cb(ctx, argv[1], &s_cur_wk->fsreq_used,
+                            &s_cur_wk->fsreq_cb);
+    if (JS_IsException(r))
+        return r;
+
+    FsPending *p = fs_pending_take();
+    p->kind      = FS_SCOPE_SUBTREE;
+    p->ops       = ops;
+    p->from_pick = false;
+    snprintf(p->root, sizeof p->root, "%s", root);
+
+    /* dev スロットは同意を経ずに通す。camera.scanQr / sys.blackbox /
+       system.* と同じ最高権限を既に持っており、ここだけ締めても新しい
+       安全性は生まれない一方、MQTT で押し込む probe が画面を触れずに
+       止まってしまう。 */
+    if (s_cur_wk->idx == MQJS_WORKER_DEV) {
+        MqjsEvent ev = { .type = EV_FSGRANT, .worker = s_cur_wk->idx,
+                         .gen = s_cur_wk->gen };
+        ev.u.fsgrant.id = p->id;
+        ev.u.fsgrant.ok = 1;
+        if (!ev_post(&ev, 0)) {
+            p->id = 0;
+            return JS_NewBool(0);
+        }
+        return JS_NewBool(1);
+    }
+
+    /* reason はまだ画面に出ない: fs_pick_req_t (spec §A.4) に理由を運ぶ
+       欄が無い。引数としては受け取り続ける (アプリ側の JS を今ここで
+       壊さないため) が、モーダルには渡らない。 */
+    snprintf(s_fs_pick_title, sizeof s_fs_pick_title, "%s", s_cur_wk->name);
+    snprintf(s_fs_pick_scope, sizeof s_fs_pick_scope, "%s", root);
+    fs_pick_req_t req = {
+        .mode         = FS_PICK_CONSENT,
+        .title        = s_fs_pick_title,
+        .start_vpath  = NULL,
+        .exts         = NULL,
+        .n_exts       = 0,
+        .suggest_name = NULL,
+        .scope_vpath  = s_fs_pick_scope,
+        .ops          = ops,
+    };
+
+    if (!fs_pick_open(p, &req)) {
+        /* 先客のモーダルが出ている。要求は成立しなかったので、一発限りの
+           ハンドラも返しておく (握ったままだと次の fs.request が
+           「前の要求」として自分を潰す)。 */
+        p->id = 0;
+        s_cur_wk->fsreq_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->fsreq_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.request: no filesystem on this build");
+#endif
+}
+
+/* fs.pick({mode, title, start, exts, name}, cb) -> bool
+   権限の主たる入口 (design §4.2)。ユーザが 1 本のファイルを選び、その
+   1 本だけの grant (kind = FILE、完全一致) が出る。
+
+     mode "open" -> READ           mode "save" -> CREATE|WRITE
+
+   返るのは cb(grant, path): 道は表示と fs.write の第 2 引数のためで、
+   権威は grant の方にある —— 道を権威にすると、モーダルを閉じた後も
+   「名前を知っている道」に書ける ambient authority になる。 */
+JSValue js_fs_pick(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char mode[8];
+
+    if (argc < 2 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]))
+        return JS_ThrowTypeError(ctx, "fs.pick({mode, ...}, cb)");
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "mode"),
+                     mode, sizeof mode))
+        return JS_EXCEPTION;
+
+    fs_pick_mode_t pmode;
+    uint8_t ops;
+    if (!strcmp(mode, "save")) {
+        pmode = FS_PICK_SAVE;
+        ops   = (uint8_t)(FS_OP_CREATE | FS_OP_WRITE);
+    } else if (!mode[0] || !strcmp(mode, "open")) {
+        pmode = FS_PICK_OPEN;
+        ops   = (uint8_t)FS_OP_READ;
+    } else {
+        /* "dir" は出さない: ディレクトリを 1 つ選ばせたときにどの op を
+           付けるかが決まっていない (spec §A.5 は open/save しか書いて
+           いない)。決まるまで、範囲 grant の入口は fs.request のまま。 */
+        return JS_ThrowTypeError(ctx, "fs.pick: mode must be 'open' or 'save'");
+    }
+
+    s_fs_pick_title[0] = '\0';
+    s_fs_pick_start[0] = '\0';
+    s_fs_pick_name[0]  = '\0';
+    if (uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "title"),
+                     s_fs_pick_title, sizeof s_fs_pick_title) ||
+        uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "start"),
+                     s_fs_pick_start, sizeof s_fs_pick_start) ||
+        uiw_copy_str(ctx, JS_GetPropertyStr(ctx, argv[0], "name"),
+                     s_fs_pick_name, sizeof s_fs_pick_name))
+        return JS_EXCEPTION;
+
+    /* 拡張子フィルタ。表示の都合であって権限ではないので、読めない形は
+       黙って「フィルタ無し」に落とす。 */
+    int n_exts = 0;
+    JSValue exts_v = JS_GetPropertyStr(ctx, argv[0], "exts");
+    if (!JS_IsUndefined(exts_v) && !JS_IsNull(exts_v)) {
+        int len = 0;
+        JSValue lv = JS_GetPropertyStr(ctx, exts_v, "length");
+        if (JS_IsNumber(ctx, lv) && !JS_ToInt32(ctx, &len, lv)) {
+            if (len > MQJS_FS_PICK_EXTS)
+                len = MQJS_FS_PICK_EXTS;
+            for (int i = 0; i < len; i++) {
+                JSValue it = JS_GetPropertyUint32(ctx, exts_v, (uint32_t)i);
+                if (uiw_copy_str(ctx, it, s_fs_pick_ext[n_exts],
+                                 sizeof s_fs_pick_ext[0]))
+                    return JS_EXCEPTION;
+                if (s_fs_pick_ext[n_exts][0]) {
+                    s_fs_pick_extp[n_exts] = s_fs_pick_ext[n_exts];
+                    n_exts++;
+                }
+            }
+        }
+    }
+
+    JSValue r = register_cb(ctx, argv[1], &s_cur_wk->fsreq_used,
+                            &s_cur_wk->fsreq_cb);
+    if (JS_IsException(r))
+        return r;
+
+    FsPending *p = fs_pending_take();
+    p->kind      = FS_SCOPE_FILE;   /* 1 本だけ。完全一致 */
+    p->ops       = ops;
+    p->from_pick = true;            /* 道は landing から来る */
+    p->root[0]   = '\0';
+
+    fs_pick_req_t req = {
+        .mode         = pmode,
+        .title        = s_fs_pick_title[0] ? s_fs_pick_title : s_cur_wk->name,
+        .start_vpath  = s_fs_pick_start[0] ? s_fs_pick_start : NULL,
+        .exts         = n_exts ? s_fs_pick_extp : NULL,
+        .n_exts       = n_exts,
+        .suggest_name = s_fs_pick_name[0] ? s_fs_pick_name : NULL,
+        .scope_vpath  = NULL,
+        .ops          = ops,
+    };
+    if (!fs_pick_open(p, &req)) {
+        p->id = 0;
+        s_cur_wk->fsreq_used = false;
+        JS_DeleteGCRef(ctx, &s_cur_wk->fsreq_cb);
+        return JS_NewBool(0);
+    }
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.pick: no filesystem on this build");
+#endif
+}
+
+/* fs.release(grant) -> bool: 使い終わった権限を自分から返す。 */
+JSValue js_fs_release(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    bool no_token = false;
+    FsGrant *g = fs_grant_lookup(ctx, argv[0], &no_token);
+    if (!g) {
+        /* トークンを渡していないなら返すものも無い。暗黙 grant は表に
+           入っていないので、release できない (design §4.3)。 */
+        if (no_token)
+            return JS_NewBool(0);
+        return JS_EXCEPTION;
+    }
+    g->token = 0;
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return JS_NewBool(0);
+#endif
+}
+
+/* sys.fsConsent は削除した (design §5)。同意はネイティブモーダルが
+   受け持ち、返事は fs_pick_cb → EV_FSGRANT で JS タスクへ戻る。
+   ランチャー JS が同意画面を描く経路が無くなったので、返事の口も要らない
+   —— 残しておくと「ランチャーだけが呼べる、任意の要求を承認する関数」が
+   宙に浮いたまま残る。 */
+
+/* ---- grant を要る操作 --------------------------------------------
+ *
+ * どの op を要求するかは 1 行ずつ明示する。ここを 1 つでも書き漏らすと
+ * 権限の穴になるので、grant を要る関数はすべて fs_grant_allow() を
+ * 通ること (判定そのものは fs_grant_check、spec §A.5)。
+ *
+ *   write        -> CREATE|WRITE    mkdir      -> CREATE
+ *   remove       -> DELETE          copy       -> CREATE|WRITE 先だけ
+ *   rename/move  -> RENAME 両端
+ *
+ * copy の元を見ないのは、読み取りが全開放だから (js_fs_copy のコメント)。
+ * rename/move は別 —— あれは両端とも**書き換える**ので両端を見る。
+ * 両端を取る操作は fs_grant_check を 2 回呼ぶ (この関数は vpath を 1 本
+ * しか取らない)。片方でも通らなければ操作は起きない。 */
+
+JSValue js_fs_write(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+
+    /* 常に CREATE|WRITE。「既存なら WRITE だけでよい」と出し分けていた
+       時期があるが、撤去した: WRITE を持つが CREATE を持たない grant を
+       作る経路が存在しない (ピッカーの SAVE も fs.request も CREATE|WRITE
+       を出す) ので、出し分けは**決して結果を変えず**、そのくせ書き込み
+       1 回ごとに fs_stat = flash 読みを 1 回足していた (キャッシュ停止の芽)。
+       WRITE だけの grant を出す経路を作るなら、ここも一緒に戻すこと。 */
+    if (!fs_grant_allow(ctx, argv[0], path,
+                        (uint8_t)(FS_OP_CREATE | FS_OP_WRITE), "write"))
+        return JS_EXCEPTION;
+
+    bool append = false;
+    if (argc >= 4 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3]))
+        append = uiw_truthy(ctx, JS_GetPropertyStr(ctx, argv[3], "append"));
+
+    JSCStringBuf dbuf;
+    size_t dlen;
+    const char *data = JS_ToCStringLen(ctx, &dlen, argv[2], &dbuf);
+    if (!data)
+        return JS_EXCEPTION;
+    /* data は JS ヒープを指す。fs_write は JS の割り当てを一切しない。 */
+    esp_err_t err = fs_write(path, data, dlen, append);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "write", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.write: no filesystem on this build");
+#endif
+}
+
+JSValue js_fs_mkdir(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    (void)argc;
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+    if (!fs_grant_allow(ctx, argv[0], path, (uint8_t)FS_OP_CREATE, "mkdir"))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_mkdir(path);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "mkdir", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.mkdir: no filesystem on this build");
+#endif
+}
+
+JSValue js_fs_remove(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    char path[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], path, sizeof path))
+        return JS_EXCEPTION;
+    if (!fs_grant_allow(ctx, argv[0], path, (uint8_t)FS_OP_DELETE, "remove"))
+        return JS_EXCEPTION;
+    bool recursive = argc >= 3 && uiw_truthy(ctx, argv[2]);
+    esp_err_t err = fs_remove(path, recursive);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "remove", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.remove: no filesystem on this build");
+#endif
+}
+
+/* fs.rename(grant, from, to) — 両端に RENAME が要る。「読める範囲から
+   書ける範囲へ動かす」ことはできない: 移動は元も消す。 */
+JSValue js_fs_rename(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    (void)argc;
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
+        fs_path_arg(ctx, argv[2], to, sizeof to))
+        return JS_EXCEPTION;
+    if (!fs_grant_allow(ctx, argv[0], from, (uint8_t)FS_OP_RENAME, "rename") ||
+        !fs_grant_allow(ctx, argv[0], to, (uint8_t)FS_OP_RENAME, "rename"))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_move(from, to);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "rename", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.rename: no filesystem on this build");
+#endif
+}
+
+/* fs.copy(grant, from, to) — **書き込み先の CREATE|WRITE だけ**を要る。
+ *
+ * 読み出し元に READ を課していた時期があるが、撤去した。安全性が 1 ミリも
+ * 増えないのに、正当な用途だけが死ぬからである:
+ *
+ *   - fs.read / fs.list / fs.stat は grant を要らない (design §5 の決定で
+ *     全開放)。したがって元に READ を課しても、アプリは fs.read + fs.write
+ *     で同じ結果に迂回できる。止まるのは「迂回しない書き方」だけ。
+ *   - 一方 examples/files.js のボリュームまたぎコピー/移動は、片方の
+ *     ボリュームの grant しか持たないので必ず落ちる —— design §5 が移行
+ *     ゲートとして残すと決めた当の機能。
+ *
+ * 次に「元にも READ が要るのでは」と思ったら、まず fs.read が grant 無しで
+ * 通ることを確かめること。そこが閉じたなら、この判断も変わる。 */
+JSValue js_fs_copy(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+#ifdef ESP_PLATFORM
+    (void)argc;
+    char from[FS_PATH_MAX], to[FS_PATH_MAX];
+    if (fs_path_arg(ctx, argv[1], from, sizeof from) ||
+        fs_path_arg(ctx, argv[2], to, sizeof to))
+        return JS_EXCEPTION;
+    if (!fs_grant_allow(ctx, argv[0], to,
+                        (uint8_t)(FS_OP_CREATE | FS_OP_WRITE), "copy"))
+        return JS_EXCEPTION;
+    esp_err_t err = fs_copy(from, to, NULL, NULL);
+    if (err != ESP_OK)
+        return fs_throw(ctx, "copy", err);
+    return JS_NewBool(1);
+#else
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx, "fs.copy: no filesystem on this build");
+#endif
+}
+
+#ifdef ESP_PLATFORM
+/* フォーマットは専用タスクで走らせる。大容量カードでは FAT テーブル
+   だけで数十 MB 書くので、呼び出し元のタスクで回すと (JS タスクなら
+   MQJS_MAX_RUN_MS の 5 秒コールバック watchdog に) 轢かれる。同時に 1 本。
+ *
+ * JS からは呼べなくなった (design §5: ファイラ専用で、JS に残す用途が
+ * 無い)。タスクは残す —— M2 で fs_io がこれを引き取る (spec §A.7)。
+ * 今の入口は C だけ: mqjs_fs_format_begin()。 */
+static const fsvol_t      *s_fmt_vol;
+static mqjs_fs_format_cb_t s_fmt_cb;
+static void               *s_fmt_ctx;
+
+static void fs_format_task(void *arg)
+{
+    (void)arg;
+    esp_err_t err = fsvol_format(s_fmt_vol);
+    mqjs_fs_format_cb_t cb = s_fmt_cb;
+    void *cbctx = s_fmt_ctx;
+    s_fmt_vol = NULL;
+    s_fmt_cb  = NULL;
+    s_fmt_ctx = NULL;
+    if (cb)
+        cb(cbctx, (int)err);   /* このタスクの上。呼ばれた側は投げ直すだけ */
+    vTaskDelete(NULL);
+}
+
+bool mqjs_fs_format_begin(const char *volume_id, mqjs_fs_format_cb_t cb,
+                          void *cbctx)
+{
+    if (!volume_id || s_fmt_vol)
+        return false;
+    const fsvol_t *v = fsvol_find(volume_id);
+    if (!v)
+        return false;
+    /* 内蔵は消させない。アプリも設定も辞書もそこに在る。 */
+    if (v->flags & FSVOL_SYSTEM)
+        return false;
+    s_fmt_vol = v;
+    s_fmt_cb  = cb;
+    s_fmt_ctx = cbctx;
+    /* 6KB: f_mkfs は作業バッファを自分で確保するが、VFS/FATFS の呼び出しが
+       深いので既定の 4KB では心もとない。 */
+    if (xTaskCreate(fs_format_task, "fs_format", 6144, NULL, 4, NULL) != pdPASS) {
+        s_fmt_vol = NULL;
+        s_fmt_cb  = NULL;
+        s_fmt_ctx = NULL;
+        return false;
+    }
+    return true;
+}
+#endif
+
+/* fs.mount / fs.unmount / fs.format は JS から消した (design §5)。
+   mount は 150ms 級のブロッキング呼び出しで、誰でも呼べると全アプリを
+   止められる。unmount は他アプリの grant を epoch 失効させられる
+   = ワーカー間 DoS のレバー。format はファイラ専用。 */
+
+/* ------------------------------------------------------------------ */
 /* clipboard: typed, system-shared buffer (P4d, ssh-terminal §7).      */
 /* One C-owned value outside every JS context: survives app stops and  */
 /* foreground switches, and is the first app-to-app data hand-off      */
@@ -3344,6 +4555,116 @@ static void dispatch_cam(MqjsWorker *app, const MqjsEvent *ev)
     if (JS_IsException(ret))
         dump_error(ctx);
 }
+
+/* fs.request の返事。grant はここ (JS タスクの上) で発行する: 権限表を
+   触るのがこのタスクだけになり、ロックが要らなくなる。 */
+static void dispatch_fsgrant(MqjsWorker *app, const MqjsEvent *ev)
+{
+#ifdef ESP_PLATFORM
+    JSContext *ctx = app->ctx;
+    uint32_t token = 0;
+    char granted[MQJS_FS_SCOPE_MAX];
+    granted[0] = '\0';
+
+    /* id **だけでなく持ち主も**照合する。答えの宛先 (ev->worker) は UI
+       タスクが landing から読んだ値で、その隙に別のアプリの fs.pick が
+       landing を上書きしていれば、B のアプリが A の要求を引き当てる。
+       トークンは worker/gen 照合で B には使えないが、**A のユーザが選んだ
+       パス文字列が B へ渡ってしまう**。合わなければ何もしない
+       (ピッカー側の順序も直すが、runtime だけでも配送違いを起こさない)。 */
+    FsPending *p = NULL;
+    for (int i = 0; i < MQJS_FS_GRANTS; i++)
+        if (s_fs_pending[i].id && s_fs_pending[i].id == ev->u.fsgrant.id &&
+            s_fs_pending[i].worker == app->idx &&
+            s_fs_pending[i].gen == app->gen) {
+            p = &s_fs_pending[i];
+            break;
+        }
+    if (!p) {
+        /* 生きている要求のどれでもない = 取り消された要求の答えか、二重の
+           答えか、配送違い。ここで cb を呼んではいけない: 同じアプリが
+           既に**次の**要求を出していれば、その cb を「拒否」で潰してしまう
+           (fs.pick を 2 回続けて呼ぶと必ず起きる)。landing にも触らない
+           —— あれは UI タスクの持ち物 (FsPickLanding のコメント)。 */
+        return;
+    }
+    {
+        /* 返事が届いた = モーダルはもう閉じている。取り消しはしない。
+           要求の席はここで空ける: 以降どの道を通っても席が残らないし、
+           同じ id の二度目の答えは上の照合で落ちる (答えは一度きり)。 */
+        p->modal = false;
+        uint32_t req_id = p->id;
+        p->id = 0;
+
+        /* 受け手が居なければ mint しない。4 席しかない権限表を、誰にも
+           渡らないトークンで 1 席埋めてしまう —— 受け手が消えるのは
+           fs.request の one-shot が既に差し替えられた/解放されたとき。 */
+        if (!app->fsreq_used)
+            return;
+
+        bool ok = ev->u.fsgrant.ok != 0;
+        const char *root = p->root;
+        if (ok && p->from_pick) {
+            /* 道はピッカーから来る。landing は UI タスクが埋め、id を
+               最後に立てる約束 (fs_pick_cb)。id が合わない landing は
+               この要求の答えではないので使わない (id は要求ごとに新しく、
+               使い回さないので、id の一致だけでこの要求の答えと言える)。 */
+            if (s_fs_pick_land.id != req_id || !s_fs_pick_land.ok ||
+                !s_fs_pick_land.vpath[0])
+                ok = false;
+            else
+                root = s_fs_pick_land.vpath;
+        }
+
+        /* 同意が出るまでの間にカードが抜かれていることがある。ここで
+           解決し直し、通らなければ黙って「拒否」と同じ結果にする。 */
+        const fsvol_t *vol = NULL;
+        if (ok && root[0] && fsvol_resolve(root, &vol, NULL, 0) == ESP_OK) {
+            FsGrant *g = fs_grant_slot();
+            s_fs_token_seq = (s_fs_token_seq + 1) & 0x7fffffff;
+            if (!s_fs_token_seq)
+                s_fs_token_seq = 1;
+            g->token   = s_fs_token_seq;
+            g->worker  = p->worker;
+            g->gen     = p->gen;
+            g->vol     = vol;
+            g->epoch   = fsvol_epoch(vol);
+            g->sc.kind = p->kind;
+            g->sc.ops  = p->ops;
+            snprintf(g->sc.root, sizeof g->sc.root, "%s", root);
+            token = g->token;
+            snprintf(granted, sizeof granted, "%s", root);
+        }
+    }
+
+    if (JS_StackCheck(ctx, 4)) {
+        dump_error(ctx);
+        return;
+    }
+    /* args are pushed in reverse: last-pushed becomes arg0.
+       arg1 は許された道 —— 表示と、fs.write の第 2 引数のため。権威は
+       arg0 の grant の方にある (design §4.2)。拒否なら "" が入る。 */
+    JS_PushArg(ctx, JS_NewString(ctx, granted));         /* arg1 */
+    JS_PushArg(ctx, JS_NewInt32(ctx, (int32_t)token));   /* arg0 */
+    JS_PushArg(ctx, app->fsreq_cb.val);                  /* func */
+    JS_PushArg(ctx, JS_NULL);                            /* this */
+    /* 一発限り: 呼ぶ前に解放しておけば、ハンドラの中から次の
+       fs.request / fs.pick を出せる (cam/http と同じ約束)。 */
+    app->fsreq_used = false;
+    JS_DeleteGCRef(ctx, &app->fsreq_cb);
+    arm_watchdog();
+    JSValue ret = JS_Call(ctx, 2);
+    if (JS_IsException(ret))
+        dump_error(ctx);
+#else
+    (void)app;
+    (void)ev;
+#endif
+}
+
+/* fs.format の結果を JS へ返す経路 (EV_FSOP / dispatch_fsop) は消した:
+   fs.format は JS から呼べなくなり (design §5)、fs_format_task は C の cb を
+   直に呼ぶので、この道に post する者が居なくなっていた。 */
 
 /* ------------------------------------------------------------------ */
 /* audio: Tab5 speaker (audio.start/stop/tone/volume/stats, audio_tab5) */
@@ -3933,6 +5254,13 @@ JSValue js_sys_focus(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         char name[32];
         if (uiw_copy_str(ctx, argv[0], name, sizeof name))
             return JS_EXCEPTION;
+        /* native 面を先に引く (§A.6): エディタもファイラも sys.focus で
+           前へ出せる。ランチャーの一覧の行タップがこの道を通る。 */
+        int nid = mqjs_native_find(name);
+        if (nid >= 0) {
+            mqjs_native_focus(nid);
+            return JS_NewBool(1);
+        }
         slot = app_slot_by_name(name);
         if (slot < 0)
             return JS_NewBool(0);
@@ -3967,6 +5295,17 @@ JSValue js_sys_setAppName(JSContext *ctx, JSValue *this_val, int argc, JSValue *
     if (uiw_copy_str(ctx, argv[0], name, sizeof name))
         return JS_EXCEPTION;
     if (!name[0])
+        return JS_NewBool(0);
+    /* "system" is the sender the runtime itself signs its signals with
+       (the fs.request consent ask, filer-storage-design §7). An app that
+       could take that name could put a forged permission prompt in front
+       of the launcher, so the name is reserved. */
+    if (!strcmp(name, "system"))
+        return JS_NewBool(0);
+    /* native 面の名前も同じ理由で予約 (§A.6): sys.open / sys.focus /
+       チップのタップは native を先に引くので、同名の JS アプリは名乗った
+       瞬間にどの経路からも開けなくなる。 */
+    if (mqjs_native_find(name) >= 0)
         return JS_NewBool(0);
     for (const char *p = name; *p; p++) {
         /* names travel inside JSON open requests: keep them quote-free */
@@ -4027,6 +5366,37 @@ JSValue js_sys_apps(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
            evictable). JS_NewBool is an immediate — no GC hazard. */
         JS_SetPropertyStr(ctx, obj_ref.val, "evictable",
             JS_NewBool(rec && (rec->policy.flags & MQJS_APP_EVICTABLE) ? 1 : 0));
+        JS_POP_VALUE(ctx, obj);
+        JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
+    }
+    /* native 面 (spec §A.6)。ランチャーの一覧はこの配列だけを見るので、
+       ここに出さない限りエディタもファイラも画面に現れない。
+       kind = "native" で、slot は -1: ワーカー番号を持たないものに
+       それらしい番号を与えると、slot で引く古い経路が誤爆する。
+       running は常に true、evictable は false —— 面は止められない
+       (sys.stop は名前を解決できず false を返す)。
+       JS_NewString はいったんローカルへ: 圧縮 GC が obj を動かすので、
+       JS_SetPropertyStr の引数の中に入れ子にしてはいけない (既知の罠)。 */
+    for (int i = 0; i < s_native_n; i++) {
+        if (!s_native[i].used)
+            continue;
+        JSValue obj = JS_NewObject(ctx);
+        if (JS_IsException(obj)) {
+            JS_POP_VALUE(ctx, arr);
+            return obj;
+        }
+        JS_PUSH_VALUE(ctx, obj);
+        JSValue nm = JS_NewString(ctx, s_native[i].s.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "name", nm);
+        JSValue ti = JS_NewString(ctx, s_native[i].s.title
+                                           ? s_native[i].s.title
+                                           : s_native[i].s.name);
+        JS_SetPropertyStr(ctx, obj_ref.val, "title", ti);
+        JS_SetPropertyStr(ctx, obj_ref.val, "slot", JS_NewInt32(ctx, -1));
+        JS_SetPropertyStr(ctx, obj_ref.val, "running", JS_NewBool(1));
+        JSValue kind = JS_NewString(ctx, "native");
+        JS_SetPropertyStr(ctx, obj_ref.val, "kind", kind);
+        JS_SetPropertyStr(ctx, obj_ref.val, "evictable", JS_NewBool(0));
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, n++, obj);
     }
@@ -4303,10 +5673,12 @@ JSValue js_sys_installed(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
     return arr;
 }
 
-/* sys.store() -> [{name, title, icon, desc, size, installed}] straight
-   from the broker catalog (§11). Catalog-only on purpose: the launcher
-   merges it with sys.installed() itself, and a device-side install
-   shows up here as installed=true on the next call. */
+/* sys.store() -> [{name, title, icon, desc, size, installed, src,
+   verified}] straight from the broker catalog (§11). Catalog-only on
+   purpose: the launcher merges it with sys.installed() itself, and a
+   device-side install shows up here as installed=true on the next call.
+   `verified` is always false: a catalogue row's signature is not checked
+   until the body is actually installed. */
 JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
 {
     JSGCRef arr_ref;
@@ -4315,10 +5687,19 @@ JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         return arr;
     JS_PUSH_VALUE(ctx, arr);
     int n = 0;
-    int cnt = s_store_api ? s_store_api->count() : 0;
+    /* 棚 (MQTT) とカード (microSD) を続けて並べる。同名が両方に在っても
+       勝者を決めない: 出所を row に付けて両方見せ、どちらを入れるかは
+       人が選ぶ (docs/filer-storage-design.md §13)。カード側は count() が
+       走査そのものなので、ストア画面を開いたときだけ読みに行くことに
+       なる —— 常駐の監視は置かない。 */
+    const mqjs_store_api_t *const cats[2] = { s_store_api, s_card_api };
+    static const char *const cat_src[2]   = { "mqtt", "sd" };
+    for (int c = 0; c < 2; c++) {
+    const mqjs_store_api_t *api = cats[c];
+    int cnt = api ? api->count() : 0;
     for (int i = 0; i < cnt; i++) {
         char name[25], head[224];
-        if (!s_store_api->get(i, name, sizeof name, head, sizeof head))
+        if (!api->get(i, name, sizeof name, head, sizeof head))
             continue;
         size_t hlen = strlen(head);
         char title[48], icon[8], desc[120], perm[48], sizes[16];
@@ -4360,8 +5741,18 @@ JSValue js_sys_store(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         JS_SetPropertyStr(ctx, obj_ref.val, "size",
                           JS_NewInt32(ctx, (int32_t)size));
         JS_SetPropertyStr(ctx, obj_ref.val, "installed", JS_NewBool(inst));
+        JSValue v_src = JS_NewString(ctx, cat_src[c]);
+        JS_SetPropertyStr(ctx, obj_ref.val, "src", v_src);
+        /* カタログ行は署名を**見ていない**。棚は retained メッセージを
+           読んだだけ、カードはファイルの先頭 224 バイトを読んだだけで、
+           どちらも本体の検証はインストールの瞬間まで走らない (カードで
+           実機 226ms/本、一覧で回すと画面を開くたびに秒単位で固まる)。
+           行に書いてある @title も @desc も自称にすぎないので、UI が
+           「署名済み」と言い切ってよい根拠はここには無い。 */
+        JS_SetPropertyStr(ctx, obj_ref.val, "verified", JS_NewBool(0));
         JS_POP_VALUE(ctx, obj);
         JS_SetPropertyUint32(ctx, arr_ref.val, (uint32_t)n++, obj);
+    }
     }
     JS_POP_VALUE(ctx, arr);
     return arr;
@@ -4375,8 +5766,14 @@ JSValue js_sys_install(JSContext *ctx, JSValue *this_val, int argc, JSValue *arg
     char name[64];
     if (uiw_copy_str(ctx, argv[0], name, sizeof name))
         return JS_EXCEPTION;
-    bool ok = s_store_api && name[0] && !strchr(name, '/') &&
-              s_store_api->install(name);
+    /* 同じ名前が棚とカードの両方に在りうるので、どちらから入れるかは
+       呼び出し側が名指しする (§13)。省略時は従来どおり棚。 */
+    char src[8] = "";
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]) &&
+        uiw_copy_str(ctx, argv[1], src, sizeof src))
+        return JS_EXCEPTION;
+    const mqjs_store_api_t *api = !strcmp(src, "sd") ? s_card_api : s_store_api;
+    bool ok = api && name[0] && !strchr(name, '/') && api->install(name);
     return JS_NewBool(ok);
 }
 
@@ -4581,6 +5978,14 @@ JSValue js_sys_open(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     char arg[96];
     if (uiw_copy_str(ctx, argv[0], arg, sizeof arg))
         return JS_EXCEPTION;
+    /* native 面は「起動」の段が無い (常駐で、登録した時点から在る) ので、
+       名前が一致したら focus だけして返す (§A.6)。sys.launch へ回すと
+       ソースを探しに行って落ちる。 */
+    int nid = mqjs_native_find(arg);
+    if (nid >= 0) {
+        mqjs_native_focus(nid);
+        return JS_NewBool(1);
+    }
     int slot = sys_launch_core(arg);
     if (slot < 0)
         return JS_NewBool(0);
@@ -4636,7 +6041,9 @@ JSValue js_sys_stop(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
         app->kill_req = true; /* reaper finishes after this dispatch */
         return JS_NewBool(1);
     }
-    bool was_fg = (slot == s_fg_worker);
+    /* native 面が fg なら、この JS アプリは fg ではない (§A.6): 止めても
+       前面はエディタのままで、ランチャーへ落としてはいけない。 */
+    bool was_fg = (slot == s_fg_worker && s_fg_native < 0);
     app_stop_internal(app);
     if (was_fg && s_workers[MQJS_WORKER_LAUNCHER].used)
         switch_foreground(MQJS_WORKER_LAUNCHER);
@@ -4749,6 +6156,14 @@ JSValue js_sys_uninstall(JSContext *ctx, JSValue *this_val, int argc, JSValue *a
    request. */
 void mqjs_request_open(const char *name)
 {
+    /* native の名前を **先に** 引く (spec §A.6)。ランチャーへ回すと
+       sys.launch がソースを探しに行き、見つからず落ちる —— 面には
+       走らせるソースが無い。 */
+    int nid = mqjs_native_find(name);
+    if (nid >= 0) {
+        mqjs_native_focus(nid);
+        return;
+    }
     MqjsWorker *l = &s_workers[MQJS_WORKER_LAUNCHER];
     if (!name || !name[0] || !l->used)
         return;
@@ -5640,6 +7055,40 @@ static int skkpart_open(const char *name, SkkImage *im)
     if (image_len < sizeof(skk_image_hdr_t) || image_len > p->size)
         return SKK_ERR_TRUNCATED;
 
+#if CONFIG_MQJS_SKK_DICT_IN_PSRAM
+    /* 辞書を PSRAM へ写して、そこから読む。
+     *
+     * これ単独では速度のためではない (探索はサンプリング木で 6 ライン、
+     * 実測 77µs/変換なので、PSRAM 化で買えるのは数十 µs)。目的は
+     * **フラッシュのキャッシュ読みを打鍵経路から消すこと**で、
+     * SPIRAM_XIP_FROM_PSRAM を安全に有効化するための前提条件になる ——
+     * XIP は「コードと rodata が PSRAM にあるなら flash のキャッシュ流量は
+     * ゼロ」という IDF の仮定の上で cache_disable を省くが、mmap した辞書は
+     * その仮定を破る唯一の存在だから (spi_flash_os_func_app.c:32)。
+     *
+     * 代償は PSRAM を image 分そのまま食うこと。松なら 8.46MB。 */
+    {
+        uint8_t *ram = skk_image_alloc(image_len);
+        if (!ram)
+            return -105;                  /* PSRAM が足りない */
+        if (esp_partition_read(p, 0, ram, image_len) != ESP_OK) {
+            skk_image_free(ram);
+            return -100;
+        }
+        skk_blob_t rblob = { ram, image_len };
+        rc = skk_dict_open(&im->dict, rblob, SKK_OPEN_VERIFY);
+        if (rc != SKK_OK) {
+            skk_image_free(ram);
+            return rc;
+        }
+        im->base   = ram;
+        im->len    = image_len;
+        im->mapped = false;
+        im->owned  = true;   /* 参照ゼロで skk_image_free される */
+        return SKK_OK;
+    }
+#endif
+
     if (esp_partition_mmap(p, 0, image_len, ESP_PARTITION_MMAP_DATA, &win, &h) != ESP_OK)
         return -100;
 
@@ -5660,6 +7109,108 @@ static int skkpart_open(const char *name, SkkImage *im)
     im->owned  = false;
     return SKK_OK;
 }
+
+#if CONFIG_MQJS_SKK_BENCH
+/* 辞書の引きにかかる時間を実測する (mmap したフラッシュ vs PSRAM コピー)。
+ *
+ * 設計文書は「コールドで概算 25µs、PSRAM なら約 2.5µs」と見積もっているが、
+ * 見積もりのまま置かれている。置き場を変えるかどうかは PSRAM を 8.46MB
+ * 払う話なので、推測ではなく測ってから決める。
+ *
+ * 見出しは辞書自身から取る: skk_complete に 1 バイトの接頭辞 "\xe3"
+ * (かなの UTF-8 先頭バイト) を渡すと、実在する読みを nth で拾えるので、
+ * ソースに日本語リテラルを埋め込まずに済む。 */
+#define BENCH_N     64
+#define BENCH_STRIDE 37           /* 素数。1 つの接頭辞の中で散らす */
+#define BENCH_RDMAX 48
+
+void mqjs_skk_bench(void)
+{
+    static SkkImage im;
+    int rc = skkpart_open(MQJS_SKK_PARTITION, &im);
+    if (rc != SKK_OK) {
+        ESP_LOGE(TAG, "skk bench: open failed (%d)", rc);
+        return;
+    }
+
+    /* 1 周目: 実在する読みを集める。ここは計らない (探索そのものなので、
+       計ると 2 回引いたことになる)。
+     *
+     * 接頭辞は「有効な UTF-8 文字」でなければならない: packed key は
+     * 文字単位のランクで組まれるので、バイト 1 個では引けない (最初そう
+     * 書いて 1 件も取れなかった)。行頭のかなを 8 つ並べて、それぞれから
+     * 飛び飛びに拾う。ソースに日本語リテラルを置かずに済むよう、
+     * UTF-8 のバイト列で書く。 */
+    static const char *const pfx[] = {
+        "\xe3\x81\x82",  /* あ */ "\xe3\x81\x8b",  /* か */
+        "\xe3\x81\x95",  /* さ */ "\xe3\x81\x9f",  /* た */
+        "\xe3\x81\xaa",  /* な */ "\xe3\x81\xaf",  /* は */
+        "\xe3\x81\xbe",  /* ま */ "\xe3\x82\x89",  /* ら */
+    };
+    static char  rd[BENCH_N][BENCH_RDMAX];
+    static size_t rdlen[BENCH_N];
+    int have = 0;
+    for (size_t k = 0; k < sizeof pfx / sizeof pfx[0] && have < BENCH_N; k++) {
+        for (int j = 0; j < BENCH_N / 8 && have < BENCH_N; j++) {
+            const char *out = NULL;
+            size_t olen = 0;
+            if (skk_complete(&im.dict, SKK_BLK_NASI, pfx[k], 3,
+                             (size_t)j * BENCH_STRIDE, &out, &olen, NULL) != 1)
+                break;                 /* この接頭辞はもう尽きた */
+            if (olen == 0 || olen > BENCH_RDMAX)
+                continue;
+            memcpy(rd[have], out, olen);
+            rdlen[have] = olen;
+            have++;
+        }
+    }
+    if (!have) {
+        ESP_LOGE(TAG, "skk bench: no readings sampled");
+        return;
+    }
+
+    /* キャッシュを流す。1 周目で温まった行を追い出しておかないと、
+       「コールドで何 µs か」が測れない。 */
+    volatile uint32_t sink = 0;
+    const uint8_t *img = im.base;
+    size_t evict = im.len < (1u << 20) ? im.len : (1u << 20);
+    for (size_t i = 0; i < evict; i += 64)
+        sink += img[i];
+    (void)sink;
+
+    /* 2 周目: 引きだけを計る。 */
+    skk_cand_t cand[16];
+    skk_stats_t st;
+    uint32_t total = 0, worst = 0, hits = 0;
+    for (int i = 0; i < have; i++) {
+        size_t n = 0;
+        memset(&st, 0, sizeof st);
+        int64_t t0 = esp_timer_get_time();
+        int r = skk_lookup_stats(&im.dict, SKK_BLK_NASI, rd[i], rdlen[i],
+                                 cand, 16, &n, &st);
+        uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        if (r < 0)
+            continue;
+        hits++;
+        total += us;
+        if (us > worst)
+            worst = us;
+    }
+
+    ESP_LOGW(TAG, "==== SKK BENCH place=%s len=%u load_us=%lu",
+#if CONFIG_MQJS_SKK_DICT_IN_PSRAM
+             "psram",
+#else
+             "mmap-flash",
+#endif
+             (unsigned)im.len, (unsigned long)im.load_us);
+    ESP_LOGW(TAG, "==== lookups=%lu avg_us=%lu max_us=%lu",
+             (unsigned long)hits,
+             (unsigned long)(hits ? total / hits : 0),
+             (unsigned long)worst);
+}
+#endif /* CONFIG_MQJS_SKK_BENCH */
+
 #endif /* ESP_PLATFORM */
 
 /* Load `path` (or take another reference to it) and return its index in
@@ -5917,6 +7468,26 @@ static bool ime_arm_now(void)
         ime_attach(&s_ime, &s_skk_img[img].dict);
     }
     return true;
+}
+
+/* 辞書を 1 本確保して返す (ネイティブ・エディタ用)。
+ *
+ * skk_dict_t は **読み取り専用で共有可能** —— 個人辞書は 2026-07-30 に
+ * 削除済みで (skk_core.h:16 が明言)、書き換わる共有状態が無い。だから
+ * IME 所有タスクと edit_task が同じ辞書を指してよい (spec §A.2 の
+ * 「自前 ime_t が安全である 3 条件」の (1)(3))。
+ *
+ * s_ime_img には触らない —— あれは IME 所有タスクの状態で、別タスクから
+ * 書くと単一所有者が崩れる。こちらは独立に acquire する。
+ * 個人辞書が復活したらこの関数ごと見直すこと (§A.2 の警告)。 */
+const skk_dict_t *mqjs_skk_dict_acquire(void)
+{
+    int err = 0;
+    const char *first = "";
+    int img = skkimg_acquire_best("", &err, &first);
+    if (img < 0)
+        return NULL;
+    return &s_skk_img[img].dict;
 }
 
 /* IME を降りるときの後始末。読みかけは捨てる (確定させない — 誤操作で
@@ -6205,7 +7776,11 @@ static void ime_owner_key(const char *key, size_t len, uint32_t t_post)
     }
     if (d == IME_TAKEN)
         return;                     /* 変換中: preedit は外へ 1 バイトも出さない */
-    key_to_app(key, len);
+    /* t_isr は 0: IME 経路の打鍵は native 面へは行かない (native fg の間は
+       ime_route_key を迂回する) ので、この 0 を読む相手は居ない。切替の
+       競合で 1 つだけ着きうるが、そのとき t_isr=0 は「刻まれていない」の
+       正しい値でもある。ImeCmd を 4 バイト太らせない方を採った。 */
+    key_to_app(key, len, t_post, 0);
 }
 
 /* コマンドキュー。打鍵は投げっぱなし、ARM/FOLD/STATS だけ ack を待つ。
@@ -6793,6 +8368,30 @@ JSValue js_term_show(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
     v = JS_GetPropertyStr(ctx, argv[1], "h");
     if (JS_IsNumber(ctx, v) && !JS_ToInt32(ctx, &tmp, v)) view.h = (int16_t)tmp;
     return term_err_value(ctx, term_registry_show((term_id_t)id, owner, &view));
+}
+
+/* term.scroll(id, delta) -> 現在の位置 (表示行) か負の term_err_t。
+   正の delta で過去へ。0 は読むだけ。生きている画面に戻すには
+   現在値ぶん引く: `term.scroll(id, -term.scroll(id, 0))`。
+   上限はレンダラが実際にさかのぼれた行数を書き戻すので、履歴の先頭で
+   指を動かし続けても値は育たない (term_registry.h に理由)。 */
+JSValue js_term_scroll(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
+{
+    (void)this_val;
+    const char *owner = term_owner();
+    int id = 0, delta = 0, now = 0;
+    term_err_t e;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt32(ctx, &delta, argv[1]))
+        return JS_EXCEPTION;
+    if (!owner || !term_registry_ready())
+        return term_err_value(ctx, TERM_ERR_NOT_READY);
+    e = term_registry_scroll((term_id_t)id, owner, delta, &now);
+    if (e != TERM_OK)
+        return term_err_value(ctx, e);
+    return JS_NewInt32(ctx, now);
 }
 
 /* term.log(id, str) -> 0 or a negative term_err_t. Line-atomic and
@@ -7481,6 +9080,25 @@ static void app_reset_bindings(MqjsWorker *app)
         JS_DeleteGCRef(ctx, &app->net_cb);
         app->net_used = false;
     }
+    if (app->fsreq_used) {
+        JS_DeleteGCRef(ctx, &app->fsreq_cb);
+        app->fsreq_used = false;
+    }
+#ifdef ESP_PLATFORM
+    /* 権限は世代で自然に失効するが (fs_grant_lookup)、席を空けておく方が
+       素直。返事待ちの要求も、返事が来ても行き先が無いので捨てる。
+       出しっぱなしのモーダルはここで畳む —— 畳まないと、死んだアプリの
+       ために開いたピッカーが画面に残って誰も閉じられなくなる。 */
+    for (int i = 0; i < MQJS_FS_GRANTS; i++) {
+        if (s_fs_grants[i].worker == app->idx)
+            s_fs_grants[i].token = 0;
+        if (s_fs_pending[i].worker == app->idx) {
+            if (s_fs_pending[i].id)
+                fs_pick_drop(&s_fs_pending[i]);
+            s_fs_pending[i].id = 0;
+        }
+    }
+#endif
 #if defined(ESP_PLATFORM) && CONFIG_MQJS_CAMERA
     if (s_cam_active && s_cam_worker == app->idx)
         cam_tab5_cancel(); /* its result event dies on the gen check */
@@ -7507,8 +9125,11 @@ static void app_reset_bindings(MqjsWorker *app)
     s_cur_wk = prev;
 
     /* the foreground app owned the screen: tear it down. The next
-       foreground app rebuilds in its sys.onForeground. */
-    if (app->idx == s_fg_worker) {
+       foreground app rebuilds in its sys.onForeground.
+       native 面が fg のときは、s_fg_worker が指すのは「戻り先」であって
+       画面の持ち主ではない (§A.6)。ここで RESET を投げると、裏で死んだ
+       アプリの後始末がエディタのキャンバスを消す。 */
+    if (app->idx == s_fg_worker && s_fg_native < 0) {
 #ifdef ESP_PLATFORM
         ui_tab5_w_reset();
         ui_cmd_t c = { .op = UI_CMD_RESET };
@@ -7558,8 +9179,9 @@ static void app_stop_internal_r(MqjsWorker *app, mqjs_app_stop_reason_t reason)
         s_cur_wk = prev;
     }
     /* a dying foreground app becomes the chip target: "tap to bring it
-       back" survives the stop (design §4: open = focus-or-relaunch) */
-    if (app->idx == s_fg_worker)
+       back" survives the stop (design §4: open = focus-or-relaunch).
+       native 面が fg の間はチップの行き先が別に居るので触らない。 */
+    if (app->idx == s_fg_worker && s_fg_native < 0)
         snprintf(s_prev_name, sizeof s_prev_name, "%s", app->name);
     app_reset_bindings(app);
     JS_FreeContext(app->ctx);  /* runs user-object finalizers */
@@ -7679,31 +9301,82 @@ static int app_start_internal(MqjsWorker *app, const char *src, size_t src_len,
     return 0;
 }
 
+/* 画面の後始末 (§3.3 の hygiene)。JS ワーカー同士の切替でも native 面への
+   切替でも、これが focus/onForeground の **手前** に 1 回だけ通る。
+   判断 §E #1 が native surface を runtime 側に置いた理由がこれ:
+   UI_CMD_RESET が 1 か所に残る。
+
+   ⚠ UI_CMD_RESET は **非同期**。ui_tab5_cmd は投げっぱなしで、掃くのは
+   UI タスク。ここが返った瞬間にキャンバスが空になっている保証は無く、
+   さらに RESET はキャンバスを HIDDEN にもする。UI キューを通さずに
+   自分のタスクから直接描く native 面 (spec §A.3) は、最初の 1 枚が
+   これに消されうる前提で組むこと (mqjs_native.h の落とし穴 1)。 */
+static void fg_screen_reset(void)
+{
+#ifdef ESP_PLATFORM
+    ui_tab5_w_reset();
+    /* **同期**でやる。以前はここで UI_CMD_RESET をキューへ投げるだけで、
+       掃くのは UI タスク、完了を知る口が無かった。だから新しい面は
+       「自分の最初の 1 枚が消されるかもしれない」前提で全画面を 4 回
+       描き直す保険を持っていた (全画面 1 枚 = 実測 74.6 ms なので、
+       切替のたびに core 1 が 370 ms)。同期にすればその保険が消える。 */
+    ui_tab5_canvas_reset_sync();
+#else
+    pcw_reset();
+#endif
+}
+
+/* いま fg の JS ワーカーを背面へ送る。JS タスク上。 */
+static void fg_worker_to_background(void)
+{
+    MqjsWorker *old = &s_workers[s_fg_worker];
+    if (!old->used)
+        return;
+    if (old->bg_used)
+        app_call0(old, &old->bg_cb); /* may snapshot UI state */
+    /* destroy the outgoing app's screen state (§3.3 / decision 3) */
+    wcb_release_all(old);
+    fg_screen_reset();
+    /* the outgoing app becomes the status-bar chip target */
+    snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
+    mqjs_app_record_set_view(old->name, MQJS_APP_VIEW_BACKGROUND);
+}
+
+/* fg の native 面から降りる。JS タスク上。降りたら true。
+   **fg フラグを先に落としてから blur を呼ぶ** —— 逆にすると、blur の
+   最中に届いた打鍵が「もう畳んだ面」へ流れる (mqjs_ime_field_focus が
+   FOLD の前に s_ime_field を落とすのと同じ順序)。 */
+static bool native_leave(void)
+{
+    const mqjs_native_surface_t *ns = native_fg();
+    if (!ns)
+        return false;
+    s_fg_native = -1;
+    if (ns->blur)
+        ns->blur(ns->ctx);
+    fg_screen_reset();
+    snprintf(s_prev_name, sizeof s_prev_name, "%s", ns->name);
+    return true;
+}
+
 /* Foreground switch protocol (§3.3), synchronous on the JS task so the
    order background-cb -> teardown -> foreground-cb cannot interleave
    with other dispatches. */
 static void switch_foreground(int new_slot)
 {
-    if (new_slot < 0 || new_slot >= MQJS_MAX_WORKERS || new_slot == s_fg_worker ||
+    if (new_slot < 0 || new_slot >= MQJS_MAX_WORKERS ||
         !s_workers[new_slot].used)
         return;
 
-    MqjsWorker *old = &s_workers[s_fg_worker];
-    if (old->used) {
-        if (old->bg_used)
-            app_call0(old, &old->bg_cb); /* may snapshot UI state */
-        /* destroy the outgoing app's screen state (§3.3 / decision 3) */
-        wcb_release_all(old);
-#ifdef ESP_PLATFORM
-        ui_tab5_w_reset();
-        ui_cmd_t c = { .op = UI_CMD_RESET };
-        ui_tab5_cmd(&c);
-#else
-        pcw_reset();
-#endif
-        /* the outgoing app becomes the status-bar chip target */
-        snprintf(s_prev_name, sizeof s_prev_name, "%s", old->name);
-        mqjs_app_record_set_view(old->name, MQJS_APP_VIEW_BACKGROUND);
+    /* native 面から戻るときは「もう居る」で打ち切ってはいけない: その面が
+       fg だった間、s_fg_worker は行き先を憶えていただけで、そのアプリは
+       fg ではなかった (§A.6 の不変条件)。面は blur が要るし、アプリは
+       消えた画面を onForeground で作り直す必要がある。 */
+    bool from_native = native_leave();
+    if (!from_native) {
+        if (new_slot == s_fg_worker)
+            return;
+        fg_worker_to_background();
     }
 
     s_fg_worker = new_slot;
@@ -7721,10 +9394,50 @@ static void switch_foreground(int new_slot)
     ui_tab5_w_commit();              /* §3.4: anim only after the rebuild */
 }
 
+/* native 面を fg にする。JS タスク上、switch_foreground と同じ順序規約
+   (背面へ送る -> UI_CMD_RESET -> focus)。 */
+static void switch_to_native(int id)
+{
+    if (id < 0 || id >= MQJS_MAX_NATIVE || !s_native[id].used ||
+        id == s_fg_native)
+        return;
+    if (!native_leave())            /* native -> native もここで畳まれる */
+        fg_worker_to_background();  /* JS -> native */
+
+    s_fg_native = id;               /* ここから打鍵とタッチは面へ行く */
+    const mqjs_native_surface_t *ns = &s_native[id].s;
+#ifdef ESP_PLATFORM
+    ESP_LOGI(TAG, "foreground -> '%s' (native %d)", ns->name, id);
+#else
+    printf("[sys] foreground -> '%s' (native %d)\n", ns->name, id);
+#endif
+    bar_update();
+    if (ns->focus)
+        ns->focus(ns->ctx);
+    ui_tab5_w_commit();             /* §3.4: 作り直しの後でだけアニメする */
+}
+
+/* EV_FOCUS の target は uint8_t 1 本で JS ワーカーと native 面の両方を
+   運ぶ: [0, MQJS_MAX_WORKERS) がワーカー、それ以上が native の id。
+   もともと focus_apply が `target < MQJS_MAX_WORKERS` で弾いていた
+   範囲をそのまま意味に使うので、イベントは 1 バイトも太らない。 */
 static void focus_apply(int target)
 {
     if (target < MQJS_MAX_WORKERS)
         switch_foreground(target);
+    else
+        switch_to_native(target - MQJS_MAX_WORKERS);
+}
+
+void mqjs_native_focus(int id)
+{
+    if (id < 0 || id >= MQJS_MAX_NATIVE || !s_native[id].used)
+        return;
+    if (id + MQJS_MAX_WORKERS > 255)
+        return;                      /* focus.target は uint8_t */
+    MqjsEvent ev = { .type = EV_FOCUS };
+    ev.u.focus.target = (uint8_t)(MQJS_MAX_WORKERS + id);
+    ev_post(&ev, 0);
 }
 
 /* EV_NET broadcast: release every app parked in the net.onReady wait queue.
@@ -7805,6 +9518,7 @@ static MqjsWorker *event_owner(const MqjsEvent *ev)
     case EV_CLIP:
     case EV_CAM:
     case EV_HTTP:
+    case EV_FSGRANT:
     case EV_TERM_REPLY: {
         MqjsWorker *app = &s_workers[ev->worker];
         return (app->used && app->gen == ev->gen) ? app : NULL;
@@ -7844,6 +9558,7 @@ static void dispatch_event(MqjsWorker *app, MqjsEvent *ev)
     case EV_SIGNAL:         dispatch_signal(app, ev);        break;
     case EV_CLIP:           dispatch_clip(app, ev);          break;
     case EV_CAM:            dispatch_cam(app, ev);           break;
+    case EV_FSGRANT:        dispatch_fsgrant(app, ev);       break;
     case EV_HTTP:           dispatch_http(app, ev);          break;
     case EV_TERM_REPLY:     dispatch_term_reply(app, ev);    break;
     }
@@ -7902,7 +9617,7 @@ static void reap_idle_apps(void)
             app->kill_req ? MQJS_APP_STOP_USER
             : (i == MQJS_WORKER_DEV && s_stop_req) ? MQJS_APP_STOP_UPDATED
             : MQJS_APP_STOP_IDLE;
-        bool was_fg = (i == s_fg_worker);
+        bool was_fg = (i == s_fg_worker && s_fg_native < 0); /* §A.6 */
         app_stop_internal_r(app, reason);
         if (i == MQJS_WORKER_DEV) {
             /* push-replace = ask the provider right away; natural end =

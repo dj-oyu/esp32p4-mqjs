@@ -31,6 +31,7 @@
  * the acks are still what lets stage 2 free a block.
  */
 #include "term_registry.h"
+#include "term_hist.h"
 
 #include <string.h>
 
@@ -107,6 +108,11 @@ typedef struct {
 
     term_view_t view;
     int         cols, rows;   /* geometry the UI task has actually applied */
+    /* 履歴を何**表示行**さかのぼって見ているか。0 = 生きている画面。
+       上限はレンダラだけが知っている (折り返しは現在の幅で決まり、
+       走ってみるまで何行になるか分からない) ので、要求はここに置いて
+       **届いた値をレンダラが書き戻す**。 */
+    int         scroll;
 
     int64_t detached_since_ms; /* LRU key while DETACHED, else 0 */
     int64_t dying_since_ms;    /* stage-2 deadline base */
@@ -1525,6 +1531,71 @@ term_err_t term_registry_show(term_id_t id, const char *owner,
     return TERM_OK;
 }
 
+/* ---- 履歴スクロール ------------------------------------------------- */
+
+/* delta 表示行ぶんさかのぼる (負で戻る)。新しい位置を *now に返す。
+   0 は「動かさずに現在値を読む」。位置が変わったら全面再描画を予約する
+   —— damage はセルの変化を語るもので、**変わったのはどの画素が硝子の
+   上に居るか**だから (term_registry_show の可視化遷移と同じ理由)。 */
+term_err_t term_registry_scroll(term_id_t id, const char *owner, int delta,
+                                int *now)
+{
+    term_slot_t *sl;
+    term_err_t e;
+    int before;
+
+    if (!s_ready)
+        return TERM_ERR_NOT_READY;
+    if (!owner)
+        return TERM_ERR_INVAL;
+    if (!lock_for(TERM_CONTROL_TIMEOUT_MS))
+        return TERM_ERR_TIMEOUT;
+    e = slot_lookup(id, owner, false, &sl);
+    if (e != TERM_OK) {
+        unlock();
+        return e;
+    }
+    before = sl->scroll;
+    sl->scroll += delta;
+    if (sl->scroll < 0)
+        sl->scroll = 0;
+    if (sl->scroll != before)
+        term_core_repaint_all(sl->core);
+    if (now)
+        *now = sl->scroll;
+    unlock();
+    return TERM_OK;
+}
+
+/* ---- 以下 2 本は visit コールバックの中からだけ呼ぶ ------------------
+ *
+ * **ロックを取らない。** term_registry_ui_visit は fn() を**ロックを
+ * 持ったまま**呼ぶので、ここで取り直すと非再帰ミューテックスに自分で
+ * ぶつかる —— 実機では毎フレーム制御タイムアウトぶん待って 0 が返り、
+ * 「表示が遅い・入力が遅い・スクロールしない」が同時に出た。
+ * スロットが生きていることも view が可視であることも visit が保証済み。 */
+
+int term_registry_scroll_rows(term_id_t id)
+{
+    term_slot_t *sl;
+
+    if (!s_ready || slot_lookup(id, NULL, true, &sl) != TERM_OK)
+        return 0;
+    return sl->scroll;
+}
+
+/* レンダラが「実際にさかのぼれた行数」を書き戻す。履歴の先頭で指を
+   動かし続けても、要求だけが際限なく増えていくのを防ぐ。 */
+void term_registry_scroll_reached(term_id_t id, int achieved)
+{
+    term_slot_t *sl;
+
+    if (!s_ready || achieved < 0)
+        return;
+    if (slot_lookup(id, NULL, true, &sl) == TERM_OK && sl->scroll > achieved)
+        sl->scroll = achieved;
+}
+
 /* ===================================================================== */
 /* Reads (§7.2) — serialised on the UI task, non-mutating                */
 /* ===================================================================== */
@@ -1536,13 +1607,49 @@ static term_err_t snapshot_locked(term_slot_t *sl, char *out, size_t out_size,
     int r;
     size_t off = 0, total = 0;
     bool trunc = false;
+    /* **画面に出ているものを返す。** さかのぼって見ている間、grid の
+       行 r と画面の行 r は対応しない —— 生きた grid を返すと、選択した
+       範囲とコピーされる文字列が食い違う (実機 2026-08-27: 反転は触った
+       場所に出るのに、貼ると全然違う行が出た)。
+       plan は 1 回の走査。cells の一時置き場はロックの内側でしか触らない
+       ので static でよい (1.7KB をスタックに積まない)。 */
+    hist_ref_t plan[TERM_MAX_ROWS_DEFAULT];
+    static term_cell_t seg_cells[TERM_MAX_COLS_DEFAULT];
+    int scroll = sl->scroll;
+    bool hist = scroll > 0;
+
+    if (hist) {
+        if (rows > (int)(sizeof plan / sizeof plan[0]))
+            rows = (int)(sizeof plan / sizeof plan[0]);
+        hist_plan(sl->core, scroll, rows, term_core_rows(sl->core), plan);
+    }
 
     if (out && out_size)
         out[0] = '\0';
     for (r = 0; r < rows; r++) {
         size_t avail = (!trunc && out && out_size > off) ? out_size - off : 0;
-        int need = term_core_row_utf8(sl->core, r, avail ? out + off : NULL,
-                                      avail);
+        int need;
+        if (hist) {
+            /* plan は下から数えた並び。画面の上から r 段目は
+               下から rows-1-r 番目。 */
+            int k = rows - 1 - r;
+            if (plan[k].seg < 0) {
+                need = 0;                    /* 履歴の外 = 空行 */
+            } else if (plan[k].id == 0) {
+                need = term_core_row_utf8(sl->core, plan[k].seg,
+                                          avail ? out + off : NULL, avail);
+            } else {
+                int nc = term_core_line_segment(
+                    sl->core, plan[k].id, plan[k].seg, seg_cells,
+                    (int)(sizeof seg_cells / sizeof seg_cells[0]));
+                need = (nc < 0) ? 0
+                    : term_core_cells_utf8(seg_cells, nc,
+                                           avail ? out + off : NULL, avail);
+            }
+        } else {
+            need = term_core_row_utf8(sl->core, r,
+                                      avail ? out + off : NULL, avail);
+        }
         if (need < 0)
             need = 0;
         if (avail && (size_t)need + 1 <= avail)

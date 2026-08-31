@@ -2288,6 +2288,31 @@ static size_t emit_cp(char *out, size_t out_size, size_t pos, uint32_t cp)
     return pos + n;
 }
 
+/* cells 配列を row_utf8 と**同じ規則**で UTF-8 にする (末尾の空白を落とし、
+ * CONT セルは飛ばす)。履歴のセグメントを画面と同じ形で読むために要る ——
+ * 規則が分かれると、選択した範囲とコピーされた文字列がずれる。 */
+int term_core_cells_utf8(const term_cell_t *cells, int n, char *out,
+                         size_t out_size)
+{
+    size_t pos = 0;
+    int col;
+
+    if (out && out_size > 0)
+        out[0] = '\0';
+    if (!cells || n < 0)
+        return -1;
+    while (n > 0 && cells[n - 1].cp == 0x20u)
+        n--;
+    for (col = 0; col < n; col++) {
+        if (cells[col].flags & TERM_CELL_CONT)
+            continue;
+        pos = emit_cp(out, out_size, pos, cells[col].cp);
+    }
+    if (out && out_size > 0)
+        out[pos < out_size ? pos : out_size - 1] = '\0';
+    return (int)pos;
+}
+
 int term_core_row_utf8(const term_core_t *c, int row, char *out, size_t out_size)
 {
     const term_cell_t *cells;

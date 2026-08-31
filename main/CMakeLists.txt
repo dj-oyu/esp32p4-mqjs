@@ -22,8 +22,10 @@ configure_file(${MQJS_SCRIPT_PATH} ${CMAKE_CURRENT_BINARY_DIR}/task.js COPYONLY)
 
 idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
                             "board_tab5.c" "ui_status.c" "ppa_bench.c"
-                            "jsmem_bench.c" "panic_note.c"
-                       PRIV_REQUIRES mqjs term_core nvs_flash esp_wifi esp_netif esp_event
+                            "jsmem_bench.c" "panic_note.c" "card_apps.c"
+                            "flash_suspend_test.c" "flash_stall_meter.c" "perf_meter.c"
+                       PRIV_REQUIRES mqjs term_core fs_io nvs_flash esp_wifi esp_netif esp_event
+                                     fs_core sdcard edit_ui
                                      tweetnacl esp_driver_i2c ui_tab5 cam_tab5
                                      audio_tab5 audio_device kbd_tab5 pwr_tab5
                                      esp_driver_ppa
@@ -38,3 +40,12 @@ idf_component_register(SRCS "app_main.c" "wifi.c" "task_source.c" "storage.c"
 # mechanism components/ui_tab5 uses for esp_hosted_init / lvgl_port_ppa_create.
 target_link_options(${COMPONENT_LIB} INTERFACE
                     "-Wl,--wrap=esp_panic_handler")
+
+# flash_stall_meter.c: 停止の入口と出口を挟んで数える。ui_tab5 が
+# esp_hosted_init に、上の行が esp_panic_handler にやっているのと同じ手で、
+# 別 TU からの呼び出しにだけ効く (spi_flash の内部呼び出しは素通り)。
+if(CONFIG_MQJS_FLASH_STALL_METER)
+    target_link_options(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=spi_flash_disable_interrupts_caches_and_other_cpu"
+        "-Wl,--wrap=spi_flash_enable_interrupts_caches_and_other_cpu")
+endif()

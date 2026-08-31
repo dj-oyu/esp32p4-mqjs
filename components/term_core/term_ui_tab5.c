@@ -28,6 +28,7 @@ typedef int term_ui_tab5_tu_t;
 #include <string.h>
 
 #include "term_ui_tab5.h"
+#include "term_hist.h"
 #include "ui_tab5.h"
 
 /* ------------------------------------------------------------------ */
@@ -205,6 +206,49 @@ static void repaint_cell(term_core_t *core, int col, int row,
 }
 
 /* ------------------------------------------------------------------ */
+/* history view (§3.1)                                                 */
+/* ------------------------------------------------------------------ */
+
+/* 履歴の外に出た段。地の色で 1 段ぶん塗り直す。 */
+static bool hist_blank(int ncols, int cell_col, int cell_row)
+{
+    static term_cell_t row[TERM_MAX_COLS_DEFAULT + 2];
+    int i;
+
+    if (ncols <= 0)
+        return true;
+    if (ncols > (int)(sizeof row / sizeof row[0]))
+        ncols = (int)(sizeof row / sizeof row[0]);
+    for (i = 0; i < ncols; i++) {
+        memset(&row[i], 0, sizeof row[i]);
+        row[i].cp = 0x20;
+    }
+    return blit_row(row, ncols, cell_col, cell_row);
+}
+
+/* 履歴の段を 1 本描く。生きている行と同じ blit_row に落とす。 */
+static bool hist_blit(term_core_t *core, uint32_t id, int seg, int ncols,
+                      int cell_col, int cell_row)
+{
+    /* UI フレームタスクしか触らないので static でよい。段の幅は
+       max_cols (142) が上限。スタックに置くと 1.7KB を毎段積むことになる。 */
+    static term_cell_t row[TERM_MAX_COLS_DEFAULT + 2];
+    int n;
+
+    if (ncols > (int)(sizeof row / sizeof row[0]))
+        ncols = (int)(sizeof row / sizeof row[0]);
+    n = term_core_line_segment(core, id, seg, row, ncols);
+    if (n < 0)
+        return true;              /* 消えた id: 空段のまま置く */
+    /* seg が短くても段の残りは埋めておく —— 前の内容が残る。 */
+    for (; n < ncols; n++) {
+        memset(&row[n], 0, sizeof row[n]);
+        row[n].cp = 0x20;
+    }
+    return blit_row(row, ncols, cell_col, cell_row);
+}
+
+/* ------------------------------------------------------------------ */
 /* the visit callback                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -235,6 +279,57 @@ static void visit(term_id_t id, term_core_t *core, const term_view_t *view,
         return;
 
     full = term_core_full_repaint(core);
+
+    /* さかのぼって見ている間は damage が意味を持たない —— 変わったのは
+       セルではなく「どの段が硝子の上に居るか」なので、毎回全部描く。
+       位置が動いた瞬間は term_registry_scroll が repaint_all を予約済み。 */
+    int scroll = term_registry_scroll_rows(id);
+    if (scroll > 0) {
+        int grid_rows = term_core_rows(core);
+        /* **描く前に切り詰める。** 無効な位置で 1 フレーム描いてから直すと、
+           その「上端が空いたフレーム」が残る —— 端末は入力が無い間フレームを
+           回さないので、誰も描き直さない。上限を先に 1 回求めれば、その状態が
+           そもそも存在しない (走査も段ごとから 1 回に減る)。 */
+        int avail = hist_rows_avail(core, scroll);
+        if (scroll > avail) {
+            scroll = avail;
+            term_registry_scroll_reached(id, avail);
+        }
+        if (scroll <= 0)
+            goto live;               /* 履歴が無い: 生きた画面のまま */
+        cp->on = false;              /* 履歴にカーソルは無い */
+        /* **走査は 1 回。** 段ごとに hist_row_at を呼ぶと O(段数 × 履歴) に
+           なり、ドラッグ中は毎フレーム全段を描き直すのでそのまま体感に
+           出る (実機で「スワイプへの反応が遅い」)。 */
+        {
+            static hist_ref_t plan[TERM_MAX_ROWS_DEFAULT];
+            int nplan = vis_rows;
+            if (nplan > (int)(sizeof plan / sizeof plan[0]))
+                nplan = (int)(sizeof plan / sizeof plan[0]);
+            hist_plan(core, scroll, nplan, grid_rows, plan);
+            for (r = 0; r < nplan; r++) {
+                /* plan[k] は下から k 番目 = 画面では下から k 段目。 */
+                int k = vis_rows - 1 - r;
+                if (k < 0 || k >= nplan)
+                    continue;
+                if (plan[k].seg < 0) {
+                    if (!hist_blank(vis_cols, col0, row0 + r))
+                        ok = false;
+                } else if (plan[k].id == 0) {
+                    const term_cell_t *cells = term_core_row(core, plan[k].seg);
+                    if (cells && !blit_row(cells, vis_cols, col0, row0 + r))
+                        ok = false;
+                } else if (!hist_blit(core, plan[k].id, plan[k].seg, vis_cols,
+                                      col0, row0 + r)) {
+                    ok = false;
+                }
+            }
+        }
+        if (ok)
+            term_core_dirty_clear(core);
+        return;
+    }
+live:
 
     /* Lift the caret before repainting, so a row that carries it is
        drawn from the grid and not from the inverted copy. */

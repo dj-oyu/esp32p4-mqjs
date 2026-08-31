@@ -30,8 +30,18 @@ sys.onSignal(function (v, from) {
     } catch (e) {
         return; // open 規約以外のシグナルは無視
     }
-    if (req && req.op === "open" && req.app)
+    if (!req)
+        return;
+    if (req.op === "open" && req.app) {
         openApp(req.app);
+        return;
+    }
+    /* ストレージの同意画面はネイティブモーダルへ移した
+       (docs/native-editor-design.md §4.4, §5)。ランチャーは JS 協調
+       タスク上のアプリなので、他アプリが長い C 呼び出しをしている間は
+       同意画面を描けない (カタログ検証で 1.8 秒フリーズを実測)。
+       "fs-consent" シグナルと sys.fsConsent はもう来ない —
+       fs_picker (native, UI タスク上) が同じ役目を独立に持つ。 */
 });
 
 /* ---- §9 ストア: インストール済み (= 棚と同期した littlefs) の閲覧。
@@ -54,26 +64,40 @@ function storePage() {
             list.add(label, function () { detailPage(it, !!running[it.name]); });
         })(inst[j]);
     }
-    /* §11: 棚にあってこの端末に入っていないアプリ (カタログ由来)。
-       インストールは要求のみ非同期 — 完了は "installed:" 通知で届き、
-       次にこのページを開いたとき済み側に並ぶ。 */
+    /* §11/§13: この端末に入っていないアプリ。出所は 2 つある —— 棚
+       (MQTT のブローカー) と microSD 上の署名済みファイル。**同名が
+       両方に在っても勝者を決めず、出所ごとに分けて両方見せる**: 比べる
+       版番号が無いので、機械が選ぶと黙って古い方を掴みうる。
+       カード側は sys.store() を呼んだ瞬間にだけ走査される (常駐なし)。 */
     var store = sys.store();
     var have = {};
     for (var k = 0; k < inst.length; k++)
         have[inst[k].name] = true;
-    var avail = [];
-    for (var m = 0; m < store.length; m++)
-        if (!store[m].installed && !have[store[m].name])
-            avail.push(store[m]);
-    if (avail.length) {
-        s.label("入手可能 (" + avail.length + ")");
-        var al = s.list();
-        for (var a = 0; a < avail.length; a++) {
-            (function (it) {
-                al.add((it.icon ? it.icon + " " : "") + it.title,
-                       function () { availPage(it); });
-            })(avail[a]);
-        }
+    var sources = [
+        { id: "mqtt", title: "棚 (ブローカー)" },
+        { id: "sd",   title: "microSD" }
+    ];
+    for (var si = 0; si < sources.length; si++) {
+        (function (src) {
+            var avail = [];
+            for (var m = 0; m < store.length; m++) {
+                var it = store[m];
+                if ((it.src || "mqtt") !== src.id)
+                    continue;
+                if (!it.installed && !have[it.name])
+                    avail.push(it);
+            }
+            if (!avail.length)
+                return;
+            s.label(src.title + " から入手可能 (" + avail.length + ")");
+            var al = s.list();
+            for (var a = 0; a < avail.length; a++) {
+                (function (it) {
+                    al.add((it.icon ? it.icon + " " : "") + it.title,
+                           function () { availPage(it); });
+                })(avail[a]);
+            }
+        })(sources[si]);
     }
     s.label("行タップで詳細 (説明 / 権限 / 起動)");
     s.button("戻る", function () { ui.back(); });
@@ -83,7 +107,15 @@ function storePage() {
    署名検証済みの本体が registry 経路で入る (自動実行はしない §6)。 */
 function availPage(it) {
     var s = ui.screen((it.icon ? it.icon + " " : "") + it.title);
+    var src = it.src || "mqtt";
     s.label("name: " + it.name);
+    /* カタログ行の署名はまだ確かめていない。一覧で 1 本ずつ検証すると
+       実機 226ms × 本数ぶん UI が止まるので、確認はインストールの瞬間に
+       1 回だけ走る (§13.3)。ここで「署名済み」と書くと嘘になる。 */
+    if (src === "sd")
+        s.label("出所: microSD — 署名は入れるときに確認します");
+    else
+        s.label("出所: 棚 (ブローカー)");
     if (it.desc)
         s.label(it.desc);
     if (it.perm)
@@ -91,10 +123,17 @@ function availPage(it) {
     if (it.size)
         s.label("サイズ: " + it.size + " B");
     s.button("インストール", function () {
-        if (sys.install(it.name))
-            sys.notify("インストール要求: " + it.name);
+        /* 同名が両方に在りうるので、どちらから入れるかを名指しする。
+           カード側はその場で入り、棚側は要求だけ出して非同期に届く。 */
+        if (sys.install(it.name, src))
+            sys.notify(src === "sd" ? "インストール: " + it.name
+                                    : "インストール要求: " + it.name);
         else
-            sys.notify("要求できません (ブローカー未接続?)");
+            /* カード側の失敗はほぼ「署名が合わない」。理由の全文は C 側の
+               ログにしか出せない (sys.install は bool しか返せない)。 */
+            sys.notify(src === "sd"
+                       ? "入れられません: 署名が合わないか読めません — " + it.name
+                       : "要求できません (ブローカー未接続?)");
         ui.back(); /* 完了は installed: 通知 → ストアを開き直すと済み側 */
     });
     s.button("戻る", function () { ui.back(); });

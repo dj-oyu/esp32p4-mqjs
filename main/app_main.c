@@ -37,6 +37,13 @@
 #include "esp_log.h"
 #include "board_tab5.h"
 #include "mqjs_runtime.h"
+#include "card_apps.h"
+#include "flash_stall_meter.h"
+#include "flash_suspend_test.h"
+#include "sdcard.h"
+#include "edit_ui.h"
+#include "fs_io.h"
+#include "mqjs_native.h"
 #include "storage.h"
 #include "task_source.h"
 #include "ui_status.h"
@@ -237,7 +244,30 @@ void app_main(void)
     mqjs_set_notify_sink(ui_status_set_event); /* sys.notify -> status bar */
     mqjs_set_store_provider(&s_store_api);     /* §11 catalog browse */
     mqjs_set_uninstall_hook(task_source_app_unsub); /* §11 no-resurrect */
+    /* ネイティブ・エディタ (M4 Phase 1)。ui_tab5_start の後・js_task を
+       起こす前に置く: mqjs_native.h が「native 面の登録は入力が動き出す
+       前に済ませる」ことを規約にしている (表にロックを置かない代わり)。
+       Phase 1 はファイル入出力を持たない —— fs_io が M2 で入るまで、
+       開けるのは空バッファだけ。 */
+    /* ファイル入出力の逃がし先を先に起こす (§A.7)。edit_task が
+       fsio_submit を呼ぶ時点で受け手が居ないと、開くも保存もできない。 */
+    fsio_start();
+    edit_ui_start(NULL);
+    /* SKK の辞書を繋ぐ。これが無いと「あ」で面だけ かな に変わって
+       入力は ASCII のまま、という嘘の状態になる (実機報告 2026-08-26)。
+       辞書は読み取り専用で共有可能 —— 個人辞書は 2026-07-30 に削除済み
+       (skk_core.h:16)。NULL = jisyo が焼かれていないだけで、その場合は
+       edit_ui 側が日本語入力を出さない。 */
+    edit_ui_attach_dict(mqjs_skk_dict_acquire());
+
     storage_init();            /* mount LittleFS for persisted tasks */
+    sdcard_init();             /* "sd" volume, if this board has a slot */
+    card_apps_init();          /* signed apps on the card = a 2nd catalogue */
+    flash_suspend_test_start(); /* dev only: no-op unless the Kconfig is on */
+    flash_stall_meter_start();  /* dev only: no-op unless the Kconfig is on */
+#if CONFIG_MQJS_SKK_BENCH
+    mqjs_skk_bench();          /* dev only: mmap-flash vs PSRAM lookup cost */
+#endif
 
     /* Platform-owned network defaults: apps never hardcode the broker or the
        topic namespace. The namespace is the first segment of the task topic

@@ -499,6 +499,12 @@ if (SELFTEST) {
         if (actIdx < 0)
             return;
         var s = sessions[actIdx];
+        /* 打鍵したら生きている画面へ戻す。履歴を見ている最中に入力だけ
+           通ると、自分の打った文字がどこにも出ない。
+           term.scroll(id, 0) は「動かさずに読む」。 */
+        var back = term.scroll(s.tid, 0);
+        if (back > 0)
+            term.scroll(s.tid, -back);
         if (k.charCodeAt(0) === 0) {
             var name = k.slice(1);
             if (name === "ctrl") { pendCtrl = !pendCtrl; drawTabs(); return; }
@@ -680,13 +686,26 @@ if (SELFTEST) {
                        ティック (repaint は次フレームなので順序が要る)。 */
                     repaintActive();
                 }
-            } else if (press && !press.moved) {
+            } else if (press) {
                 var dx = x - press.x, dy = y - press.y;
-                if (dx * dx + dy * dy > 144) { /* 12px: 長押しキャンセル */
+                if (!press.moved && dx * dx + dy * dy > 144) {
+                    /* 12px 動いた = 長押しではない。ここから先はスクロール。
+                       選択は長押し、スクロールはドラッグ、と役割を分ける。 */
                     press.moved = true;
+                    press.sy = y;
                     if (press.timer !== null) {
                         clearTimeout(press.timer);
                         press.timer = null;
+                    }
+                }
+                if (press.moved && actIdx >= 0) {
+                    /* 指を下へ = 紙を下へ引く = 古い行が出てくる。
+                       段の高さで量子化し、残りは press.sy に持ち越す
+                       (毎フレーム端数を捨てると指の速度で挙動が変わる)。 */
+                    var lines = Math.floor((y - press.sy) / LH);
+                    if (lines !== 0) {
+                        press.sy += lines * LH;
+                        term.scroll(sessions[actIdx].tid, lines);
                     }
                 }
             }

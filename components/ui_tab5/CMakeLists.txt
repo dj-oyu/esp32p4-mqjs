@@ -26,7 +26,11 @@ idf_component_register(SRCS ${UI_SRCS}
                        PRIV_INCLUDE_DIRS "vendor"
                        PRIV_REQUIRES esp_lcd esp_driver_i2c esp_driver_gpio
                                      esp_driver_ledc esp_driver_ppa esp_timer
-                                     kbd_core mooncake smooth_ui_toolkit)
+                                     kbd_core mooncake smooth_ui_toolkit
+                                     # 検死役 (E1) が ppa_priv.h / dma2d_priv.h
+                                     # を読むため。esp_pm は ppa_priv.h が
+                                     # esp_pm.h を引く、esp_mm は esp_cache.h
+                                     esp_driver_dma esp_mm esp_pm)
 
 if(CONFIG_MQJS_TAB5_UI)
     # the lv_font_conv-generated font selects #include "lvgl.h" via this guard
@@ -44,6 +48,49 @@ if(CONFIG_MQJS_TAB5_UI)
                                "${lvgl_port_dir}/src/common/ppa")
     target_link_options(${COMPONENT_LIB} INTERFACE
                         "-Wl,--wrap=lvgl_port_ppa_create")
+    # ... and time the rotation itself. esp_lvgl_port's flush_cb is
+    # [PPA rotate] + esp_lcd_panel_draw_bitmap, and LVGL's FLUSH_START/
+    # FINISH events bracket the whole of it, so the two cannot be told
+    # apart from events alone. lvgl_port_ppa_rotate lives in the same
+    # (separate) TU as lvgl_port_ppa_create, so the same seam works:
+    # __wrap_lvgl_port_ppa_rotate reports "rot" in the ui_prof line,
+    # which is what decides whether rotation or the DSI transfer is
+    # what a full-screen scroll actually pays for (spec §F #13).
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=lvgl_port_ppa_rotate")
+
+    # esp_lvgl_port は esp_lcd_panel_draw_bitmap の戻り値を捨てる
+    # (esp_lvgl_port_disp.c:754)。DSI の非 direct モードでは flush_ready が
+    # fbcpy の完了 ISR からしか来ないので、**draw_bitmap がエラーを返した
+    # 瞬間に flushing が永久に 1** —— LVGL は while(disp->flushing); を
+    # 回り続け core 1 が死ぬ。実機で再現し、バックトレースで確定した。
+    # エラーになる経路は esp_lcd_panel_dpi.c:472 の
+    # xSemaphoreTake(draw_sem, 0) 失敗 (前の転送が飛行中)。
+    # __wrap_esp_lcd_panel_draw_bitmap がそれを数えて flush_ready を呼ぶ:
+    # 永久ハングを「数えられる 1 チャンクの欠落」に変える。
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=esp_lcd_panel_draw_bitmap"
+                        "-Wl,--wrap=lvgl_port_lock"
+                        "-Wl,--wrap=lvgl_port_unlock")
+
+    # DMA2D の ISR は自分が読んだ直後に in_int_st を全消しする
+    # (dma2d.c:283-284)。落ちた通知の理由 (DESC_ERROR) はそこにしか
+    # 出ないので、検死役が 3 秒後に読んでも手遅れ。dma2d.c は 5 本の
+    # ISR を esp_intr_alloc_intrstatus で取る (:442-447 / :457-462) ——
+    # 別 TU なので --wrap が効く。__wrap_ は本物の前に 1 枚写すだけで、
+    # DMA2D 以外の source は素通しする。
+    target_link_options(${COMPONENT_LIB} INTERFACE
+                        "-Wl,--wrap=esp_intr_alloc_intrstatus")
+
+    # E1 (2026-08-28): 検死役が「駐車している descriptor は誰のものか」を
+    # 答えるには、PPA の各エンジンが持つ固定の RX descriptor のアドレスと、
+    # dma2d のソフト側 (free mask / pending / on_recv_eof) が要る。どちらも
+    # ドライバの private ヘッダにしか無い (esp_driver_ppa/src/ppa_priv.h、
+    # esp_driver_dma/src/dma2d_priv.h)。読むだけで、書かない。
+    idf_component_get_property(ppa_dir esp_driver_ppa COMPONENT_DIR)
+    idf_component_get_property(dma_dir esp_driver_dma COMPONENT_DIR)
+    target_include_directories(${COMPONENT_LIB} PRIVATE
+                               "${ppa_dir}/src" "${dma_dir}/src")
 endif()
 
 # W1-1: back the LVGL builtin tlsf pool with PSRAM. lv_mem_init() (called

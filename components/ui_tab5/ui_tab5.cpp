@@ -34,6 +34,9 @@
 #include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+/* disp->flushing を見るため。LVGL の既定の待ちは while(disp->flushing);
+   で抜け道が無く、実機で永久に回った (下の ui_flush_wait)。 */
+#include "display/lv_display_private.h"
 /* private to esp_lvgl_port; on the include path via its COMPONENT_DIR
    (see CMakeLists) so __wrap_lvgl_port_ppa_create gets the real cfg
    type instead of a hand-copied one that could drift */
@@ -57,9 +60,15 @@
 /* mqjs public API (extern decl instead of REQUIRES: mqjs already
    depends on this component for ui_tab5.h, same trick as wifi.c) */
 extern "C" void mqjs_post_touch(int x, int y, int kind);
+/* モーダル (fs_picker) が出ているか。**依存は張れない** —— fs_picker が
+   こちらを REQUIRES しているので逆向きは循環する。mqjs_post_touch と同じ
+   extern の手で、リンクされていない構成のために weak の既定を置く。 */
+extern "C" bool fs_pick_active(void);
+extern "C" __attribute__((weak)) bool fs_pick_active(void) { return false; }
 extern "C" void mqjs_post_key(const char *utf8, size_t len);
 extern "C" void mqjs_focus(int slot);
 extern "C" void mqjs_request_open(const char *name);
+extern "C" bool mqjs_native_fg_active(void);
 
 #include "ili9881_init_data.inc"
 #include "st7123_init_data.inc"
@@ -131,7 +140,23 @@ const lv_font_t *ui_tab5_jp_font(void)
  * The C side therefore measures width to size the CLIP, never to
  * advance the column: doing both would double-count and shear every
  * line of CJK to the right. */
+#include "freertos/idf_additions.h"
 #include "driver/ppa.h"
+/* 検死役がハードウェアの生の状態を読むため。
+   PPA も DMA2D も止まった瞬間に「誰が何を待っているか」を
+   ドライバの内部構造を覗かずに答えられるのはレジスタだけ。 */
+#include "soc/dma2d_struct.h"
+#include "soc/ppa_struct.h"
+#include "soc/interrupts.h"   /* ETS_DMA2D_*_INTR_SOURCE */
+#include "esp_intr_alloc.h"
+/* E1 (2026-08-28): 検死役が「駐車している descriptor は誰のものか」と
+   「dma2d のソフト側は何を待っているか」を答えるため。どちらもドライバの
+   private ヘッダにしか無い (CMakeLists が src/ を include に足している)。
+   読むだけで書かない。esp_cache.h は descriptor / 番兵を CPU で読む前の
+   M2C のため。 */
+#include "esp_cache.h"
+#include "ppa_priv.h"
+#include "dma2d_priv.h"
 #include "ui_cell_width.h"
 
 #define UI_CELL_W 9
@@ -154,11 +179,28 @@ static ppa_client_handle_t s_ppa_fill;
    ui_blend565's a/15 math exactly. One full text row max. */
 #define UI_PPA_CELLS_MIN_CELLS 6
 static ppa_client_handle_t s_ppa_blend;
+
+/* A SECOND fill client, used only by the native-surface entry points
+   (ui_tab5_cells_draw / ui_tab5_canvas_fill, spec §A.3) — they run on
+   the caller's task, concurrently with the UI task's own drawing.
+   Sharing one client would not corrupt anything: ppa_register_client
+   gives a client max(1, max_pending_trans_num) transaction elements
+   (ppa_core.c:271) and ppa_do_fill takes one with xQueueReceive(...,0)
+   (ppa_fill.c:124), so the loser of a race just gets ESP_FAIL and falls
+   back to the CPU loop. A client of its own costs one queue plus one
+   descriptor and removes that coin flip. The blending ENGINE still
+   serialises the two clients (per-engine semaphore + spinlock,
+   ppa_core.c:120-132) — that is the driver's job, not ours. */
+static ppa_client_handle_t s_ppa_fill_nat;
 /* 720px = 80 cells: the max PPA segment (cells_run splits longer runs,
    e.g. 142-cell landscape rows); 64B-aligned (and 64B-multiple) for PPA
    cache ops. Deliberately NOT grown for landscape: internal SRAM. */
 static uint8_t s_cells_a8[720 * UI_CELL_H] __attribute__((aligned(64)));
 
+/* pc_test/run_tests.sh cuts between the two markers below and compiles
+   the result, so the host test exercises THIS text and not a copy of
+   it. Move the markers with the functions if they ever move. */
+/* >>> host-testable cell helpers begin <<< */
 /* Columns one glyph is allowed to paint, per the shared ui_cell_width()
    table. Width 0 (combining marks) is clamped UP to 1 rather than
    skipped: ui.cells is a column-indexed API, so whatever the caller put
@@ -169,18 +211,26 @@ static inline int cells_glyph_cols(uint32_t cp)
     return ui_cell_width(cp) == 2 ? 2 : 1;
 }
 
-/* minimal UTF-8 decode, shared by both cells paths */
-static inline uint32_t cells_utf8_next(const uint8_t *&s)
+/* minimal UTF-8 decode, shared by both cells paths.
+   `e` is the end of the buffer, or nullptr when the text is known to be
+   NUL-terminated (the ui.cells command path, where a truncated sequence
+   stops at the NUL because a NUL is not a continuation byte). The
+   native surface passes a POINTER+LENGTH that need not be terminated
+   (ui_cells_draw_t), so a sequence cut off at the very end must not
+   read the two bytes after it — hence the explicit bound. With
+   e == nullptr every branch is byte-for-byte the old one. */
+static inline uint32_t cells_utf8_next(const uint8_t *&s,
+                                       const uint8_t *e = nullptr)
 {
     uint32_t cp = *s++;
-    if (cp >= 0xF0 && (s[0] & 0xC0) == 0x80) {
+    if (cp >= 0xF0 && (!e || s + 3 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x07) << 18) | ((s[0] & 0x3F) << 12) |
              ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
         s += 3;
-    } else if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80) {
+    } else if (cp >= 0xE0 && (!e || s + 2 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F);
         s += 2;
-    } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
+    } else if (cp >= 0xC0 && (!e || s + 1 <= e) && (s[0] & 0xC0) == 0x80) {
         cp = ((cp & 0x1F) << 6) | (s[0] & 0x3F);
         s += 1;
     }
@@ -197,6 +247,7 @@ static inline uint16_t ui_blend565(uint16_t bg, uint16_t fg, int a)
     int b = bb + ((fb - bb) * a) / 15;
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
+/* >>> host-testable cell helpers end <<< */
 
 static const char *TAG = "ui_tab5";
 
@@ -425,11 +476,104 @@ extern "C" void ui_tab5_set_fg_apps(const char *cur, const char *prev,
    Non-blocking by design — a full queue drops the command and bumps a
    counter that the status bar displays (visible backpressure, JS is
    never stalled). */
-#define UI_CMD_QUEUE_DEPTH 128 /* 16B each; static scenes burst >64 */
+/* 1 コマンド 24B。**htop のような画面は 1 フレームで数百 run になる。**
+   128 段では溢れ、溢れた run は ok=false になる —— 内容は失われない
+   (dirty を消さないので次フレームで再送される) が、**取りこぼしが 1 つでも
+   あると term_core_dirty_clear が丸ごとスキップされる**ので、成功した行も
+   含めて毎フレーム全部描き直しになり空回りする。実機で drop カウンタが
+   htop の描画中だけ急増したのはこれ。
+
+   段数を増やす代わりに実体を PSRAM へ置く。ここは ISR から触らない
+   (js_task と UI フレームタスクだけ) ので内部 SRAM である必要が無く、
+   内部は 67KB しか空いていない。 */
+#define UI_CMD_QUEUE_DEPTH 512
 
 static QueueHandle_t s_cmd_queue;
 static volatile uint32_t s_cmd_drops;
 static int s_canvas_w, s_canvas_h; /* set once the display is up */
+/* DSI パネル。srm_bench (キャンバス→FB を PPA SRM 1 op で出せるか) が
+   esp_lcd_dpi_panel_get_frame_buffer に渡すためだけに持つ。 */
+static esp_lcd_panel_handle_t s_dpi_panel;
+/* Pixels the canvas allocation actually holds. The buffer is allocated
+   ONCE at the portrait size (720*1192 = 858,240 px) and re-bound with
+   swapped dimensions on rotation (1280*632 = 808,960), so it fits both
+   — but only for a MATCHED pair.
+   This matters because the native surface draws off the LVGL lock
+   (spec §A.3) while ui_tab5_set_landscape changes w and h under it: a
+   draw that reads the old height and the new width would address
+   1191*1280+1279 = 1,525,759 and walk 667,519 pixels past the end of
+   the allocation. The surf_* primitives therefore snapshot both
+   dimensions once and refuse a pair that does not fit here — a dropped
+   frame instead of a corrupted heap. (What the presenter should DO
+   across a rotation is a policy question, not this guard's job.) */
+static size_t s_canvas_px;
+
+/* ---- 差分 invalidate の値打ちを、やる前に測る (docs/native-editor-spec.md §A.3)
+ *
+ * 今の ui.cells は描画バッチの末尾で lv_obj_invalidate(_canvas) を呼ぶ ——
+ * キャンバス全体。term_ui_tab5.c は既に dirty 行だけ blit しているのに、
+ * その情報がここで捨てられている。ピッカーの実測 (2026-08-26) が示したのは
+ * 「描画のコストは面積で決まり、描画バッファの 720×50 段に量子化される」で、
+ * ならばこの 1 行が ssh_vt の毎フレームを丸ごと払わせている可能性がある。
+ *
+ * ここで数えるのは 2 つだけ:
+ *   act  実際に無効化した面積 (= キャンバス全体 × バッチ数)
+ *   want dirty な部分だけなら要った面積 (バッチ内の CELLS の外接矩形)
+ * **比が小さければこの工事はやる価値が無い。** 挙動を変えずにそれが分かる。
+ *
+ * 5 秒ごと、動いたときだけ 1 行出す。計測器自身が停止や描画を増やさない
+ * よう、時計は 1 バッチ 1 回、書式化は 5 秒に 1 回。 */
+struct AreaMeter {
+    uint32_t batches;      /* 描画のあったバッチ数 */
+    uint32_t full;         /* 矩形を出せない op が混ざったバッチ数 */
+    uint64_t act_px;       /* Σ キャンバス全体 */
+    uint64_t want_px;      /* Σ 外接矩形 (full のバッチは全体で数える) */
+    uint32_t rows_min, rows_max; /* 外接矩形の高さ [段] の範囲 */
+    int64_t  t_report;
+};
+static AreaMeter s_am;
+
+static void area_meter_batch(bool bbox_ok, int x0, int y0, int x1, int y1)
+{
+    if (!s_canvas_w || !s_canvas_h)
+        return;
+    uint64_t whole = (uint64_t)s_canvas_w * (uint64_t)s_canvas_h;
+    s_am.batches++;
+    s_am.act_px += whole;
+    if (!bbox_ok || x1 <= x0 || y1 <= y0) {
+        s_am.full++;
+        s_am.want_px += whole;
+    } else {
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > s_canvas_w) x1 = s_canvas_w;
+        if (y1 > s_canvas_h) y1 = s_canvas_h;
+        /* 幅は使わない: LVGL が無効領域を段で切るので、値打ちを決めるのは
+           高さ。ただし want_px は面積で持っておく (将来 x 方向も切るなら要る)。 */
+        s_am.want_px += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+        uint32_t rows = (uint32_t)((y1 - y0 + UI_CELL_H - 1) / UI_CELL_H);
+        if (!s_am.rows_min || rows < s_am.rows_min) s_am.rows_min = rows;
+        if (rows > s_am.rows_max) s_am.rows_max = rows;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (!s_am.t_report) {
+        s_am.t_report = now;
+        return;
+    }
+    if (now - s_am.t_report < 5000000)
+        return;
+    ESP_LOGW("ui_area",
+             "5s: batches=%lu full=%lu act=%llu want=%llu px  want/act=%lu%%  "
+             "rows=%lu..%lu of %d",
+             (unsigned long)s_am.batches, (unsigned long)s_am.full,
+             (unsigned long long)s_am.act_px, (unsigned long long)s_am.want_px,
+             (unsigned long)(s_am.act_px ? s_am.want_px * 100 / s_am.act_px : 0),
+             (unsigned long)s_am.rows_min, (unsigned long)s_am.rows_max,
+             s_canvas_h / UI_CELL_H);
+    s_am = AreaMeter{};
+    s_am.t_report = now;
+}
 
 /* Landscape rotation (keyboard dock). The handles below are the few
    fixed-size widgets that ui_tab5_set_landscape must re-size by hand —
@@ -623,6 +767,299 @@ static inline int ui_cur_hres(void)
    asking for DMA|SPIRAM together is legal here. */
 extern "C" lvgl_port_ppa_handle_t
 __real_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg);
+/* 回転の handle。検死役 (E1) が SRM エンジンの descriptor アドレスと
+   スクラッチの場所をここから引く。書き手は起動時の 1 回だけ。 */
+static lvgl_port_ppa_handle_t s_rot_handle;
+static uint32_t               s_rot_buf_size;
+
+/* ------------------------------------------------------------------ */
+/* 回転の有界化 (E3): 待つのは UI_ROT_TIMEOUT_MS まで、死ぬのは禁止    */
+/* ------------------------------------------------------------------ */
+/* DMA2D RX が絵の途中で駐車する (descriptor owner=DMA のまま・RX L2
+ * FIFO full (cnt=12)・FSM idle・エラービット無し・PPA sr_eof=1・割り込み
+ * 永久沈黙 — 検死役の実測、24 分後も同じ) と、BLOCKING の回転は
+ * ppa_core.c:470 の xSemaphoreTake(trans_elm->sem, portMAX_DELAY) から
+ * 二度と戻らず UI タスク (core 1) が永久に固まる。watchdog はどれも
+ * 鳴らない: 「正当にブロックしたタスク」を見張る仕組みは無い。
+ *
+ * 単純なタイムアウト付き待ちでは足りない: エンジンのセマフォは ISR の
+ * 完了経路 (ppa_core.c:511) でしか返らないので、諦めて帰るだけでは次の
+ * 回転が :431 で永久に待つ —— 凍結が 1 回転ぶん後ろへずれるだけ。
+ * 対策は 3 段:
+ *   1. 回転を NON_BLOCKING で撃つ (rotate_cfg->ppa_mode は lcd_ppa.c が
+ *      そのまま SRM config へ写す) と、エンジンのセマフォ取得も 0 tick に
+ *      なり (ppa_core.c:430-431)、:431/:470 のどちらの永久待ちも消える。
+ *      完了は自前の on_trans_done (下の ui_rot_done_cb) + セマフォで
+ *      有界に待つ。PPA_LCD_ENABLE_CB=0 なので port 側の callback とは
+ *      衝突しない。
+ *   2. タイムアウトしたら dma2d_force_end() (ドライバ公式の強制終了 API、
+ *      JPEG エラー回復用に存在する) で駐車した RX チャネルを止めて解放し、
+ *      続けてドライバ自身の完了ルーチン ppa_transaction_done_cb() を呼ぶ。
+ *      これは来なかった ISR がやるはずだった仕事そのもの (エンジンの
+ *      キューから外す・エンジンのセマフォを返す・trans をリサイクル・
+ *      trans_cnt を戻す) で、偽の semaphore give ではない。チャネルの
+ *      ハードは次に選ばれたとき dma2d_connect() がリセットする
+ *      (dma2d.c:212) ので、満杯のまま残った FIFO もそこで消える。
+ *   3. 回復に失敗したら s_rot_dead を立て、以後 PPA には二度と触らず
+ *      CPU で回す。遅いが確実に生きる。
+ * どの経路でも、駐車したチャンクは CPU で回し直してから返すので、
+ * 呼び出し元 (flush) は常に完全な絵を受け取る。 */
+
+/* 健康な回転は 1〜3 ms。全画面 (720x1280) でも flush 全体で 67 ms
+ * (実測、rot 含む)。NON_BLOCKING では回転がカメラの SRM 処理の後ろに
+ * 並ぶことがあり、それでも数十 ms。1000 ms はその 10 倍超で正当な経路
+ * では切れず、検死役の 3 秒よりは十分手前 —— 「UI stalled 3s」の行は
+ * 回転以外の停止のために残る。 */
+#define UI_ROT_TIMEOUT_MS 1000
+
+/* 回転後の出力幅 (90/270 では = 入力チャンクの高さ h) がこれ未満なら
+ * PPA を使わず最初から CPU で回す。実機で駐車した 14/14 は全て出力幅 7
+ * (1 行 14 B、1280x7 含む —— w 系の仮説は全滅) で、幅 8 以上の駐車は
+ * 0 件。だが引き金の下限は不明なので、UI_CELL_H (24) =「文字 1 行の
+ * 断片は全部 CPU」に丸めた (ユーザ決定、16 のマクロブロック境界より
+ * こちら)。性能でも損はしない見込み: PPA 回転は固定費 ~790 us +
+ * ~0.0115 us/px (実測フィット) で、1137x7 は 890 us 中 92 us しか実仕事が
+ * 無い。実測は下の s_cpu_rot が集める —— 閾値の再調整はこの 1 行。
+ *
+ * **24 -> 16 (2026-08-31、実機実測で確定)**。CPU 回転の実測は
+ * **18〜21 Mpix/s** で、見積り 43 の 2.3 分の 1 だった。交差点を引き直すと
+ *   PPA 790 + 0.0115*N  ==  N/18.5   ->  N ~ 18,600 px
+ * = w1137 なら h~16、w1280 なら h~14。閾値 24 の最悪チャンク 1137x23
+ * (26,151 px) は CPU 1414 us / PPA 1091 us で **CPU が 320 us 遅い**。
+ * h=17〜23 の帯は損をしていた。
+ *
+ * 16 で足りる根拠: 観測された駐車 14 件は**全部 h=7** (1137x7 x11,
+ * 1138x7 x2, 1280x7 x1) なので 2 倍以上の余裕がある。しかも SRM の
+ * マクロブロックは 16x16 で、境界としても筋が通る。
+ *
+ * 下げるもう一つの理由: **CPU 回転はフラッシュのキャッシュ停止に弱い**。
+ * program/erase 中は命令フェッチが止まるので CPU ループは死ぬが、PPA の
+ * DMA は走り続ける。実測で fstall max=18ms のとき 1 回転が 31ms/58ms まで
+ * 伸びた (18.5 Mpix/s なら 29k px は 1.6ms のはず)。CPU に回す量は
+ * 必要最小限にする。 */
+#define UI_ROT_CPU_BYPASS_H 16
+
+/* CPU 回転の集計 (ui_prof の窓ごとに 1 行)。書き手は LVGL タスクだけ、
+ * 読み/リセットも prof_report (同じタスク) なのでロック不要。
+ * bypass = 閾値未満 (と s_rot_dead) で PPA を素通りした回転、
+ * redo   = タイムアウト回収/enqueue 失敗の後の回し直し、
+ * ppa    = PPA へ撃った回転。px/us は CPU で回した分だけ (msync 込み)。 */
+static struct {
+    uint32_t bypass_n, redo_n, ppa_n;
+    uint64_t px, us;
+    uint32_t max_us;
+} s_cpu_rot;
+
+#ifndef UI_CORONER
+#define UI_CORONER 1
+#endif
+#if UI_CORONER
+static void coroner_dump_dma(void);   /* 定義は検死役の節 (下) */
+#endif
+
+/* lcd_ppa.c:20-25 の private struct の写し。first field の buffer を公開
+   API (lvgl_port_ppa_get_output_buffer) と突き合わせて一致したときだけ
+   srm_handle を信じる。 */
+struct ui_lcd_ppa_mirror_t {
+    uint8_t             *buffer;
+    uint32_t             buffer_size;
+    ppa_client_handle_t  srm_handle;
+    ppa_srm_color_mode_t color_mode;
+};
+
+static ppa_srm_engine_t *coroner_srm_engine(void)
+{
+    if (!s_rot_handle)
+        return nullptr;
+    ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)s_rot_handle;
+    if (m->buffer != lvgl_port_ppa_get_output_buffer(s_rot_handle) ||
+        !m->srm_handle)
+        return nullptr;   /* 写しが実物と食い違う: 触らない */
+    ppa_engine_t *e = m->srm_handle->engine;
+    if (!e || e->type != PPA_ENGINE_TYPE_SRM)
+        return nullptr;
+    return (ppa_srm_engine_t *)e;   /* base は先頭メンバ */
+}
+
+/* NULL = 未武装 (写し不一致など)。そのときは従来どおり BLOCKING。 */
+static SemaphoreHandle_t s_rot_done_sem;
+/* 回復失敗で立つ。以後 PPA 回転は封印、CPU のみ。戻さない。 */
+static volatile bool     s_rot_dead;
+static uint32_t          s_rot_timeouts, s_rot_recovered;
+
+static bool ui_rot_done_cb(ppa_client_handle_t c, ppa_event_data_t *e,
+                           void *user)
+{
+    (void)c; (void)e; (void)user;
+    BaseType_t hp = pdFALSE;
+    if (s_rot_done_sem)
+        xSemaphoreGiveFromISR(s_rot_done_sem, &hp);
+    return hp == pdTRUE;
+}
+
+/* CPU の 90 度回転 (RGB565)。dst = PSRAM のスクラッチ、src = 内部 SRAM の
+   draw buffer。dst の行を順に書く (PSRAM へは線形バースト)、src は
+   ストライド読み。32x32 タイルで src のキャッシュ足跡を抑える。 */
+static void ui_cpu_rotate_rgb565(uint16_t *dst, const uint16_t *src,
+                                 int w, int h, ppa_srm_rotation_angle_t rot,
+                                 bool swap)
+{
+    const int T = 32;
+    switch (rot) {
+    case PPA_SRM_ROTATION_ANGLE_90:
+        /* CCW: dst[(w-1-x)*h + y] = src[y*w + x]、dst の行幅 = h */
+        for (int ty = 0; ty < h; ty += T) {
+            int ye = ty + T < h ? ty + T : h;
+            for (int tx = 0; tx < w; tx += T) {
+                int xe = tx + T < w ? tx + T : w;
+                for (int x = tx; x < xe; x++) {
+                    uint16_t *d = dst + (uint32_t)(w - 1 - x) * h + ty;
+                    const uint16_t *s = src + (uint32_t)ty * w + x;
+                    for (int y = ty; y < ye; y++) {
+                        uint16_t px = *s;
+                        *d++ = swap ? __builtin_bswap16(px) : px;
+                        s += w;
+                    }
+                }
+            }
+        }
+        break;
+    case PPA_SRM_ROTATION_ANGLE_270:
+        /* CW: dst[x*h + (h-1-y)] = src[y*w + x] */
+        for (int ty = 0; ty < h; ty += T) {
+            int ye = ty + T < h ? ty + T : h;
+            for (int tx = 0; tx < w; tx += T) {
+                int xe = tx + T < w ? tx + T : w;
+                for (int x = tx; x < xe; x++) {
+                    uint16_t *d = dst + (uint32_t)x * h + (h - 1 - ty);
+                    const uint16_t *s = src + (uint32_t)ty * w + x;
+                    for (int y = ty; y < ye; y++) {
+                        uint16_t px = *s;
+                        *d-- = swap ? __builtin_bswap16(px) : px;
+                        s += w;
+                    }
+                }
+            }
+        }
+        break;
+    case PPA_SRM_ROTATION_ANGLE_180:
+        for (int y = 0; y < h; y++) {
+            uint16_t *d = dst + (uint32_t)(h - 1 - y) * w + (w - 1);
+            const uint16_t *s = src + (uint32_t)y * w;
+            for (int x = 0; x < w; x++) {
+                uint16_t px = *s++;
+                *d-- = swap ? __builtin_bswap16(px) : px;
+            }
+        }
+        break;
+    default:   /* ANGLE_0: 来ないはずだが、来ても絵は正しく */
+        for (uint32_t i = 0; i < (uint32_t)w * h; i++)
+            dst[i] = swap ? __builtin_bswap16(src[i]) : src[i];
+        break;
+    }
+}
+
+/* 1 チャンクを CPU で回してスクラッチへ。スクラッチは CPU ではなく
+   fbcpy の DMA が読むので、書いた分を C2M で押し出す。 */
+static bool ui_cpu_rotate_chunk(const uint8_t *in_buff, int w, int h,
+                                ppa_srm_rotation_angle_t rot, bool swap)
+{
+    if (!s_rot_handle || !in_buff || w <= 0 || h <= 0)
+        return false;
+    uint8_t *dst = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+    uint32_t bytes = (uint32_t)w * (uint32_t)h * 2u;   /* RGB565 */
+    uint32_t len = (bytes + 63u) & ~63u;
+    if (!dst || len > s_rot_buf_size)
+        return false;
+    /* msync も CPU 経路の実費なので測る範囲に入れる */
+    int64_t rt0 = esp_timer_get_time();
+    ui_cpu_rotate_rgb565((uint16_t *)dst, (const uint16_t *)in_buff,
+                         w, h, rot, swap);
+    esp_cache_msync(dst, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    uint32_t dus = (uint32_t)(esp_timer_get_time() - rt0);
+    s_cpu_rot.px += (uint64_t)w * (uint64_t)h;
+    s_cpu_rot.us += dus;
+    if (dus > s_cpu_rot.max_us)
+        s_cpu_rot.max_us = dus;
+    return true;
+}
+
+/* lcd_ppa.c:131-161 が PPA を撃つ前にやる座標変換の複製。s_rot_dead で
+   __real を呼ばない経路でも、flush は rotate_cfg->area を読む。 */
+static void ui_rotate_area_like_ppa(lvgl_port_ppa_disp_rotate_t *rc)
+{
+    uint16_t x1 = rc->area.x1, x2 = rc->area.x2;
+    uint16_t y1 = rc->area.y1, y2 = rc->area.y2;
+    switch (rc->rotation) {
+    case PPA_SRM_ROTATION_ANGLE_90:
+        rc->area.x1 = y1;
+        rc->area.x2 = y2;
+        rc->area.y1 = (uint16_t)(rc->disp_size.hres - x2 - 1);
+        rc->area.y2 = (uint16_t)(rc->disp_size.hres - x1 - 1);
+        break;
+    case PPA_SRM_ROTATION_ANGLE_180:
+        rc->area.x1 = (uint16_t)(rc->disp_size.hres - x2 - 1);
+        rc->area.x2 = (uint16_t)(rc->disp_size.hres - x1 - 1);
+        rc->area.y1 = (uint16_t)(rc->disp_size.vres - y2 - 1);
+        rc->area.y2 = (uint16_t)(rc->disp_size.vres - y1 - 1);
+        break;
+    case PPA_SRM_ROTATION_ANGLE_270:
+        rc->area.x1 = (uint16_t)(rc->disp_size.vres - y2 - 1);
+        rc->area.x2 = (uint16_t)(rc->disp_size.vres - y1 - 1);
+        rc->area.y1 = x1;
+        rc->area.y2 = x2;
+        break;
+    default:
+        break;
+    }
+}
+
+/* タイムアウト後の回収。返り値:
+ *   0 = 実は完了していた (遅かっただけ)。出力は完全、CPU 回し直し不要。
+ *   1 = force_end + 手動完了で回収成功。出力は不完全 → CPU で回し直す。
+ *   2 = 回収失敗。s_rot_dead を立てる側で。出力不完全 → CPU。
+ * 前提: この client (rotate) の trans は常に 1 個までしか飛ばない
+ * (LVGL flush は直列で、毎回ここで完了を待つ) ので、エンジンのキューの
+ * 先頭がこの client のものなら、それが駐車した回転そのもの。 */
+static int ui_rot_recover(void)
+{
+    /* ログを書いている間に完了していた、を最初に拾う */
+    if (xSemaphoreTake(s_rot_done_sem, 0) == pdTRUE)
+        return 0;
+    ppa_srm_engine_t *eng = coroner_srm_engine();
+    ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)s_rot_handle;
+    ppa_trans_t *trans = nullptr;
+    if (eng && m) {
+        portENTER_CRITICAL(&eng->base.spinlock);
+        trans = STAILQ_FIRST(&eng->base.trans_stailq);
+        portEXIT_CRITICAL(&eng->base.spinlock);
+    }
+    if (trans && trans->client == m->srm_handle) {
+        dma2d_trans_t *dt = trans->dma_trans_placeholder;
+        /* rx_chan はリサイクルでクリアされないので、それだけでは飛行中の
+           証拠にならない。チャネルが「今この trans を運んでいる」ことまで
+           確かめてから撃つ —— でないと他人の転送を殺しうる。 */
+        if (dt && dt->rx_chan && dt->rx_chan->status.transaction == dt) {
+            bool need_yield = false;
+            if (dma2d_force_end(dt, &need_yield) == ESP_OK) {
+                /* 来なかった ISR の仕事を代行する (ppa_core.c:477-526 と
+                   同じ経路)。この中で ui_rot_done_cb も呼ばれセマフォが
+                   立つので、次の回転が誤読しないよう飲み干す。 */
+                ppa_transaction_done_cb(NULL, NULL, trans);
+                xSemaphoreTake(s_rot_done_sem, 0);
+                if (need_yield)
+                    portYIELD();
+                return 1;
+            }
+        }
+    }
+    /* 飛行中でない/force_end 拒否: タイムアウトと完了が競った可能性に
+       少しだけ猶予を与える */
+    if (xSemaphoreTake(s_rot_done_sem, pdMS_TO_TICKS(50)) == pdTRUE)
+        return 0;
+    return 2;
+}
+
 extern "C" lvgl_port_ppa_handle_t
 __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
 {
@@ -630,7 +1067,259 @@ __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
     in_psram.flags.buff_spiram = 1;
     ESP_LOGI(TAG, "PPA rotation scratch -> PSRAM (%u bytes)",
              (unsigned)in_psram.buffer_size);
-    return __real_lvgl_port_ppa_create(&in_psram);
+    lvgl_port_ppa_handle_t h = __real_lvgl_port_ppa_create(&in_psram);
+    if (h) {
+        s_rot_handle = h;
+        /* lcd_ppa.c は ALIGN_UP(size, cache line) している。写し (上の
+           ui_lcd_ppa_mirror_t) を信じる前に、ここで公開 API と同じ値を
+           持っておく。 */
+        s_rot_buf_size = (in_psram.buffer_size + 63u) & ~63u;
+        /* E3: 有界待ちの道具立て。写しが実物と一致するときだけ武装する。
+           一致しなければ従来どおり BLOCKING (freeze の危険は残るが、
+           検証できない構造体を信じるよりよい)。 */
+        ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)h;
+        if (m->buffer == lvgl_port_ppa_get_output_buffer(h) &&
+            m->srm_handle) {
+            s_rot_done_sem = xSemaphoreCreateBinary();
+            ppa_event_callbacks_t cbs = {};
+            cbs.on_trans_done = ui_rot_done_cb;
+            if (!s_rot_done_sem ||
+                ppa_client_register_event_callbacks(m->srm_handle, &cbs)
+                    != ESP_OK) {
+                if (s_rot_done_sem) {
+                    vSemaphoreDelete(s_rot_done_sem);
+                    s_rot_done_sem = NULL;
+                }
+                ESP_LOGW(TAG, "bounded rotate UNARMED (cb registration)");
+            } else {
+                ESP_LOGI(TAG, "bounded rotate armed (timeout %d ms)",
+                         UI_ROT_TIMEOUT_MS);
+            }
+        } else {
+            ESP_LOGW(TAG, "bounded rotate UNARMED (lcd_ppa mirror mismatch)");
+        }
+    }
+    return h;
+}
+
+/* How much of a presentation is the ROTATION? (spec §F #13)
+ *
+ * esp_lvgl_port's flush_cb is [PPA rotate] + esp_lcd_panel_draw_bitmap
+ * (esp_lvgl_port_disp.c:663-745) and the LVGL FLUSH_START/FINISH pair
+ * brackets the whole of it, so the profiler below cannot tell the two
+ * apart from events alone. lvgl_port_ppa_rotate lives in lcd_ppa.c —
+ * a different TU from its caller — so --wrap splits it out for the
+ * price of two clock reads per chunk, and only in landscape (portrait
+ * never enters this branch).
+ *
+ * Single writer: flush_cb runs on the LVGL task and nowhere else. The
+ * accumulator is reset at RENDER_START and read at RENDER_READY, both
+ * on that same task. */
+static int64_t s_ppa_rot_us;
+
+/* ------------------------------------------------------------------ */
+/* 回転の幾何のリング。検死役が最後の 8 枚を出す。                     */
+/* ------------------------------------------------------------------ */
+/* 単一書き手 (LVGL タスクの flush_cb だけ)。読むのは core 0 の検死役で、
+   欠けても壊れない値なのでロックは要らない。 */
+/* t_ms は回転を撃つ直前の時刻。irq ring の EOF 時刻と対にして
+   「どの回転がいつ始まり、いつ (fbcpy まで) 終わったか」を読めるように
+   (E1、2026-08-28)。 */
+struct ui_geom_t { uint16_t w, h; uint32_t t_ms; };
+static volatile ui_geom_t s_geom[8];
+/* 直近の回転が返ってきた時刻 (0 = まだ返っていない)。 */
+static volatile uint32_t  s_rot_end_ms;
+/* **32 ビット。** 8 ビットにしていたら 256 回転 (= 全面 10 枚) で
+   一周し、検死役の "k <= head" が 8 件未満しか出さない —— head が
+   たまたま 0 なら "(none)" になり、**「割り込みが来ていない」という
+   一番効く結論と見分けが付かなくなる**。計器が嘘をつく側に倒れる。 */
+static volatile uint32_t  s_geom_i;
+
+static inline void ui_geom_note(int w, int h)
+{
+    uint32_t i = s_geom_i;
+    s_geom[i & 7].w = (uint16_t)w;
+    s_geom[i & 7].h = (uint16_t)h;
+    s_geom[i & 7].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_geom_i = i + 1;
+}
+
+/* ---- 番兵 (E1) ------------------------------------------------------
+ * 駐車した RX descriptor は完了時にしか書き戻されないので、「何バイト
+ * 足りなかったか」は descriptor からは取れない。代わりに、h が小さい
+ * チャンクだけ、回転の出力領域 (out_w = h, out_h = w → w*h*2 バイト) を
+ * 撃つ前に 0xA5 で埋めて C2M しておく。ドライバは自分で M2C するので
+ * 順序は壊れない。止まったら検死役が同じ領域を M2C して数える。
+ *
+ * **これは h <= UI_SENTINEL_MAX_H の回転を ~30 us 遅らせる** (16 KB の
+ * memset + writeback)。fbcpy 完了から次の回転までの間隔がタイミング候補
+ * (C2) の変数そのものなので、E2 で 1137x7 が止まらなくなったら
+ * -DUI_CORONER_SENTINEL=0 で焼き直すこと。 */
+#ifndef UI_CORONER_SENTINEL
+#define UI_CORONER_SENTINEL 1
+#endif
+#define UI_SENTINEL_MAX_H 8
+#define UI_SENTINEL_WORD  0xA5A5u
+static volatile uint32_t s_sent_bytes;   /* 0 = 直近の回転に番兵は無い */
+static volatile uint16_t s_sent_w, s_sent_h;
+static volatile uint32_t s_sent_t_ms;
+
+extern "C" esp_err_t
+__real_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
+                            lvgl_port_ppa_disp_rotate_t *rotate_cfg);
+/* UI タスクが flush のどこに居るか。検死役が読む。
+   0 なし / 1 PPA 回転中 / 2 回転終わり / 3 draw_bitmap 中 / 4 その後 */
+volatile uint8_t g_ui_phase;
+/* fs_picker の present() が lv_refr_now に入っている間だけ非 0。
+   「タイマ内リフレッシュの再入」仮説を実機で殺すための旗。 */
+extern "C" volatile uint8_t g_ui_refr_now;
+volatile uint8_t g_ui_refr_now;
+
+extern "C" esp_err_t
+__wrap_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
+                            lvgl_port_ppa_disp_rotate_t *rotate_cfg)
+{
+    int64_t t0 = esp_timer_get_time();
+    const int gw = rotate_cfg->area.x2 - rotate_cfg->area.x1 + 1;
+    const int gh = rotate_cfg->area.y2 - rotate_cfg->area.y1 + 1;
+
+    /* 文字 1 行に満たない断片 (実機で駐車した 14/14 は全て出力幅 7) と、
+       回復失敗後 (s_rot_dead: エンジンのセマフォが人質のままかもしれない)
+       は PPA に触らない。座標変換も自前でやって CPU で回す。enqueue も
+       待ちも回収も検死も無し —— Ctrl+G プローブの h=7/8 段が駐車しなく
+       なるのは、これの合格信号であって退行ではない。 */
+    if (s_rot_dead || gh < UI_ROT_CPU_BYPASS_H) {
+        ui_geom_note(gw, gh);
+        s_rot_end_ms = 0;
+        g_ui_phase = 1;
+        ui_rotate_area_like_ppa(rotate_cfg);
+        bool ok = ui_cpu_rotate_chunk(rotate_cfg->in_buff, gw, gh,
+                                      rotate_cfg->rotation,
+                                      rotate_cfg->swap_bytes);
+        s_cpu_rot.bypass_n++;
+        g_ui_phase = 2;
+        s_rot_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_ppa_rot_us += esp_timer_get_time() - t0;
+        return ok ? ESP_OK : ESP_FAIL;
+    }
+
+    /* PPA の EOF は誰も拾っていない (ppa_core.c は esp_intr_alloc を
+       呼ばない) ので、この生ビットは「SRM エンジンが自分の仕事を
+       終えたか」だけを表す自由な旗になる。撃つ前に落としておく。
+       止まった瞬間に立っていれば、止まっているのは SRM ではなく
+       その先 —— DMA2D の通知側。 */
+    /* bit1 = blend_eof も一緒に落とす (E1)。誰も PPA の割り込みを使って
+       いないので影響は無く、止まった瞬間に立っていれば「この回転が
+       始まってから BLEND エンジンが仕事を終えた」= 別タスクの fill/blend
+       が割り込んだ、と言える。 */
+    PPA.int_clr.val = (1u << 0) | (1u << 1);   /* sr_eof | blend_eof */
+    /* **ena に入っていないビットを落としておく。**
+       ドライバが有効にするのは SUC_EOF|ERR_EOF|DESC_ERROR だけ
+       (dma2d_priv.h:36) で、int_st はそれで刈られる。だから
+       DESC_EMPTY / FIFO ovf・udf / reorder / dscr_task_ovf は
+       **割り込みを上げないまま in_int_raw に立ちっぱなしになる**
+       (R/WTC/SS: 書いてしか消えない)。ドライバは int_st に出たビットしか
+       クリアしないので、ここで撃つ前に落としておけば、止まった瞬間に
+       立っている = この回転で起きた、と言い切れる。
+       bit 1-3 は触らない (ドライバの通知経路そのもの)。
+       他方のチャネルが飛行中でも安全: このビット群は誰も読まず、
+       誰にも割り込まない。 */
+    DMA2D.in_channel[0].in_int_clr.val = 0x3FF0;
+    DMA2D.in_channel[1].in_int_clr.val = 0x3FF0;
+    /* この回転の幾何を残す。回転先の 1 行は 2*h バイト (lcd_ppa.c:135
+       out_w = h、ppa_srm.c が out.pic_w を ha_length に写す)。幾何の
+       仮説はどれも実機ダンプで死んだ: 奇数 h / 4 バイト非整列は 1137x31
+       が完走して否定、「最終出力ブロック 16 B 未満」も w%16 も停止例と
+       完走例を分けない (2026-08-31 幾何プローブ)。生き残った軸は
+       **出力幅 7 (1 行 14 B) だけ**で、しかも同じ幾何が 2 回完走して
+       3 回目に止まる —— 間欠。受け手 (DMA2D RX) 側のハード停止で、
+       DIG-734 の 12x128bit FIFO が満杯のまま FSM が idle で駐車する。 */
+    ui_geom_note(gw, gh);
+#if UI_CORONER_SENTINEL
+    s_sent_bytes = 0;
+    if (s_rot_handle && gh > 0 && gh <= UI_SENTINEL_MAX_H && gw > 0) {
+        uint8_t *sb = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+        uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 2u;   /* RGB565 */
+        uint32_t len = (bytes + 63u) & ~63u;
+        if (sb && len <= s_rot_buf_size) {
+            memset(sb, 0xA5, len);
+            esp_cache_msync(sb, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            s_sent_w = (uint16_t)gw;
+            s_sent_h = (uint16_t)gh;
+            s_sent_t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            s_sent_bytes = bytes;
+        }
+    }
+#endif
+    /* __real は撃つ前に rotate_cfg->area を回転後の座標へ書き換える。
+       CPU で回し直すときに要る入力側の情報をここで確保しておく。 */
+    uint8_t *in_buff = rotate_cfg->in_buff;
+    ppa_srm_rotation_angle_t rot = rotate_cfg->rotation;
+    bool swap = rotate_cfg->swap_bytes;
+
+    s_rot_end_ms = 0;
+    g_ui_phase = 1;
+    esp_err_t err;
+    if (s_rot_done_sem && handle == s_rot_handle) {
+        xSemaphoreTake(s_rot_done_sem, 0);   /* 前回の残り火を消す */
+        rotate_cfg->ppa_mode = PPA_TRANS_MODE_NON_BLOCKING;
+        s_cpu_rot.ppa_n++;
+        err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+        if (err != ESP_OK) {
+            /* 撃てすらしなかった (例: 過去の回収失敗で trans elm が漏れて
+               いる)。area は既に書き換わっているので、足りないのは絵だけ。 */
+            ESP_LOGE(TAG, "ROT: enqueue failed (%s), CPU fallback %dx%d",
+                     esp_err_to_name(err), gw, gh);
+            if (ui_cpu_rotate_chunk(in_buff, gw, gh, rot, swap)) {
+                s_cpu_rot.redo_n++;
+                err = ESP_OK;
+            }
+        } else if (xSemaphoreTake(s_rot_done_sem,
+                                  pdMS_TO_TICKS(UI_ROT_TIMEOUT_MS))
+                       != pdTRUE) {
+            s_rot_timeouts++;
+            ESP_LOGE(TAG,
+                     "ROT-TIMEOUT #%lu: %dx%d no completion in %d ms "
+                     "(healthy is 1-3 ms) - DMA2D RX parked?",
+                     (unsigned long)s_rot_timeouts, gw, gh,
+                     UI_ROT_TIMEOUT_MS);
+#if UI_CORONER
+            /* 駐車したままの姿を先に検死する。回収すると消える。 */
+            coroner_dump_dma();
+#endif
+            int r = ui_rot_recover();
+            if (r == 0) {
+                ESP_LOGE(TAG, "ROT-LATE: completed during recovery, "
+                              "output kept");
+            } else {
+                if (r == 1) {
+                    s_rot_recovered++;
+                    ESP_LOGE(TAG,
+                             "ROT-RECOVERED (%lu/%lu): DMA2D force-ended, "
+                             "PPA engine released; redoing chunk on CPU",
+                             (unsigned long)s_rot_recovered,
+                             (unsigned long)s_rot_timeouts);
+                } else {
+                    s_rot_dead = true;
+                    ESP_LOGE(TAG,
+                             "ROT-DEAD: recovery failed, PPA rotate is "
+                             "OFF for good - CPU rotation from now on");
+                }
+                if (ui_cpu_rotate_chunk(in_buff, gw, gh, rot, swap))
+                    s_cpu_rot.redo_n++;
+                else
+                    err = ESP_FAIL;
+            }
+        }
+    } else {
+        /* 未武装 (写し不一致): 従来どおり BLOCKING。 */
+        s_cpu_rot.ppa_n++;
+        err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+    }
+    g_ui_phase = 2;
+    s_rot_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_ppa_rot_us += esp_timer_get_time() - t0;
+    return err;
 }
 /* Touch sampling period. LVGL's default is LV_DEF_REFR_PERIOD (33 ms),
    which is too coarse to catch a quick tap — see lvgl_port_add_touch. */
@@ -879,6 +1568,580 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
    events: the scrim owns the screen like a web modal backdrop */
 static volatile bool s_cam_modal;
 
+/* ------------------------------------------------------------------ */
+/* 検死役 (UI_CORONER)                                                 */
+/* ------------------------------------------------------------------ */
+/*
+ * **「両方 Blocked で watchdog が鳴らない」形は、プラットフォームが何も
+ * 教えてくれない。** 今日はその一つを 6 回の当て推量で外した (タッチの
+ * 二重配達・wake のロック無し呼び出し・SAVE モード特有・鍵盤・列挙・
+ * 閾値)。推測を足す代わりに、止まった瞬間の事実を 1 行で出す。
+ *
+ * core 0 に置く。core 1 が止まっても動き続けるのが要件。
+ * 出すのは「誰が LVGL ロックを持っていて、どこで取ったか」。
+ * PC は addr2line で解決できる —— **解決してから語ること**
+ * (今日、生の PC を思い込みで読んで誤った原因をメモにまで書いた)。
+ */
+#ifndef UI_CORONER
+#define UI_CORONER 1
+#endif
+
+#if UI_CORONER
+static volatile uint32_t s_ui_beat;      /* UI フレームが立てる脈 */
+static volatile uint32_t s_ui_beat_ms;   /* その最後の時刻 (E1) */
+extern volatile uint8_t  g_ui_phase;     /* flush のどこに居るか (上で定義) */
+extern "C" uint32_t      s_draw_errs_ref(void);
+extern "C" uint32_t      s_flush_tmo_ref(void);
+static TaskHandle_t      s_lock_owner;   /* LVGL ロックの持ち主 */
+static void             *s_lock_pc;      /* それを取った場所 */
+static volatile uint8_t  s_lock_depth;   /* 再帰の深さ */
+
+extern "C" bool __real_lvgl_port_lock(uint32_t timeout_ms);
+extern "C" void __real_lvgl_port_unlock(void);
+
+extern "C" bool __wrap_lvgl_port_lock(uint32_t timeout_ms)
+{
+    bool ok = __real_lvgl_port_lock(timeout_ms);
+    if (!ok)
+        return false;   /* 取れなかったものを数えると持ち主が狂う */
+    uint8_t d = s_lock_depth;
+    s_lock_depth = (uint8_t)(d + 1);
+    if (d == 0) {
+        s_lock_owner = xTaskGetCurrentTaskHandle();
+        s_lock_pc = __builtin_return_address(0);
+    }
+    return true;
+}
+
+extern "C" void __wrap_lvgl_port_unlock(void)
+{
+    uint8_t d = s_lock_depth;
+    if (d) {
+        d = (uint8_t)(d - 1);
+        s_lock_depth = d;
+    }
+    if (d == 0) {
+        s_lock_owner = nullptr;
+        s_lock_pc = nullptr;
+    }
+    __real_lvgl_port_unlock();
+}
+
+/* ------------------------------------------------------------------ */
+/* DMA2D の割り込みステータスを保存するシム                            */
+/* ------------------------------------------------------------------ */
+/*
+ * **なぜ要るか。** ドライバの ISR は自分が読んだ直後に
+ * `in_int_st` を全部クリアする (dma2d.c:283-284)。だから検死役が
+ * 3 秒後に読んでも、落ちた理由のビットはもう残っていない。
+ * 残っている sticky なレジスタは `in_suc_eof_des_addr` と
+ * `in_err_eof_des_addr` の 2 本だけで、**後者は JPEG 専用**
+ * (dma2d_ll.h:57 "Only JPEG") なので回転では永久に 0。
+ *
+ * dma2d.c は 5 本の ISR を `esp_intr_alloc_intrstatus` 経由で取る
+ * (:442-447 rx / :457-462 tx)。別の翻訳単位からの呼び出しなので
+ * --wrap が効く。ここで本物のハンドラの前に 1 枚だけ写しを取る。
+ *
+ * **絞り込み。** ドライバが有効にする RX の割り込みは
+ * `SUC_EOF | ERR_EOF | DESC_ERROR` だけ (dma2d_priv.h:36)。
+ * `in_int_st` は ena で刈られるので、`DESC_EMPTY` は最初から上がらない。
+ * ERR_EOF は JPEG 専用。**つまり「通知が落ちる」経路は実質
+ * DESC_ERROR 一本**で、それが立っていればここに残る。
+ * 何も残っていなければ、そもそも割り込みが来ていない = ハードが
+ * 走り続けているか、起動されていないか (検死役の FSM が分ける)。
+ *
+ * IRAM 安全ではない。ドライバの ISR 自身がそうでない
+ * (CONFIG_DMA2D_ISR_IRAM_SAFE=n) ので条件は同じ。
+ * 万一 IRAM フラグ付きで来たら素通しする。
+ */
+struct ui_d2d_shim_t {
+    intr_handler_t     real;
+    void              *arg;
+    volatile uint32_t *st;
+    uint8_t            src;   /* ETS_DMA2D_IN_CH0 からの相対番号 */
+};
+static ui_d2d_shim_t s_d2d_shim[5];
+static uint8_t       s_d2d_shim_n;
+
+struct ui_d2d_ev_t { uint32_t t_ms; uint16_t st; uint8_t src; };
+static volatile ui_d2d_ev_t s_d2d_ev[16];
+static volatile uint32_t    s_d2d_ev_i;   /* 8 ビットだと全面 1 枚で一周する */
+
+static void ui_d2d_shim_isr(void *arg)
+{
+    ui_d2d_shim_t *sh = (ui_d2d_shim_t *)arg;
+    uint32_t st = *sh->st;
+    uint32_t i = s_d2d_ev_i;
+    s_d2d_ev[i & 15].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_d2d_ev[i & 15].st = (uint16_t)st;
+    s_d2d_ev[i & 15].src = sh->src;
+    s_d2d_ev_i = i + 1;
+    sh->real(sh->arg);
+}
+
+extern "C" esp_err_t
+__real_esp_intr_alloc_intrstatus(int source, int flags, uint32_t reg,
+                                 uint32_t mask, intr_handler_t handler,
+                                 void *arg, intr_handle_t *ret_handle);
+
+extern "C" esp_err_t
+__wrap_esp_intr_alloc_intrstatus(int source, int flags, uint32_t reg,
+                                 uint32_t mask, intr_handler_t handler,
+                                 void *arg, intr_handle_t *ret_handle)
+{
+    /* DMA2D の 5 本だけ。ほかのドライバも同じ口を使うので素通しが既定。 */
+    if (source < ETS_DMA2D_IN_CH0_INTR_SOURCE ||
+        source > ETS_DMA2D_OUT_CH2_INTR_SOURCE ||
+        (flags & ESP_INTR_FLAG_IRAM) ||
+        s_d2d_shim_n >= (uint8_t)(sizeof s_d2d_shim / sizeof s_d2d_shim[0]))
+        return __real_esp_intr_alloc_intrstatus(source, flags, reg, mask,
+                                                handler, arg, ret_handle);
+
+    ui_d2d_shim_t *sh = &s_d2d_shim[s_d2d_shim_n++];
+    sh->real = handler;
+    sh->arg = arg;
+    sh->st = (volatile uint32_t *)reg;
+    sh->src = (uint8_t)(source - ETS_DMA2D_IN_CH0_INTR_SOURCE);
+    return __real_esp_intr_alloc_intrstatus(source, flags, reg, mask,
+                                            ui_d2d_shim_isr, sh, ret_handle);
+}
+
+/* 止まった瞬間のハードウェアを 1 行で出す。
+ *
+ * 読み方 (dma2d.c:283-326 / dma2d_priv.h:36 / ppa_core.c:412-462 が根拠):
+ *
+ *   シムの環に **DESC_ERROR (b3)** が最後に居る
+ *       → 通知は上がったが**捨てられた**。RX ISR は
+ *         ERR_EOF/DESC_ERROR/DESC_EMPTY でもチャネルを解放するのに、
+ *         on_recv_eof を呼ぶのは SUC_EOF のときだけ。PPA の完了
+ *         コールバックは on_recv_eof にしか登録できない
+ *         (dma2d_rx_event_callbacks_t にエラーの口が無い) ので
+ *         trans_elm->sem は永久に与えられない。
+ *   raw に **DESC_EMPTY / FIFO ovf・udf / reorder / dscr_task_ovf**
+ *   が立っていて FSM idle・最後の SUC_EOF 以降にシムの環が空
+ *       → **そもそも通知が上がっていない**。これらは ena に無いので
+ *         割り込みにならず、raw にだけ残る (だから撃つ前に落としてある)。
+ *   FSM が busy
+ *       → ハードウェアが本当に走り続けている。ソフトの問題ではない。
+ *   raw 何も無し・FSM idle・PPA sr_eof も立たず
+ *       → そもそも起動されていない (チャネル待ちで積まれたまま)。
+ *
+ * **err_eof_des_addr は読まない。** ERR_EOF は JPEG 専用
+ * (dma2d_ll.h:57 "Only JPEG") なので回転では永久に 0 で、
+ * 追いかけると時間を捨てる。
+ *
+ * ppa_eof は __wrap_lvgl_port_ppa_rotate が撃つ前に落としている。
+ * 立っていれば SRM エンジンは仕事を終えている。
+ *
+ * 読むだけ (int_st は RO、int_raw は R/WTC で書いてしか消えない)。
+ * DMA2D のクロックはプール取得から解放まで入りっぱなしで、ここでは
+ * 解放されないので、**どの phase で呼んでも安全**。
+ */
+/* ------------------------------------------------------------------ */
+/* E1: 駐車 descriptor の持ち主・dma2d のソフト側・番兵                */
+/* ------------------------------------------------------------------ */
+/* dma2d pool 0。検死役が起動後に 1 度だけ dma2d_acquire_pool で握る
+   (参照カウントが 1 増えるだけ。ISR は既に確保済みなので、ここで
+   確保が走って ISR の core が変わることは無い —— シムが armed になって
+   from 呼ぶのはそのため)。 */
+static dma2d_group_t *s_d2d_group;
+
+/* ui_lcd_ppa_mirror_t と coroner_srm_engine() は回転の有界化 (E3) も
+   使うので、__wrap_lvgl_port_ppa_create の手前 (上) へ移した。 */
+
+static ppa_blend_engine_t *coroner_blend_engine(void)
+{
+    ppa_client_handle_t c = s_ppa_blend ? s_ppa_blend : s_ppa_fill;
+    if (!c || !c->engine || c->engine->type != PPA_ENGINE_TYPE_BLEND)
+        return nullptr;
+    return (ppa_blend_engine_t *)c->engine;
+}
+
+static const char *coroner_buf_name(const void *p)
+{
+    if (!p)
+        return "null";
+    if (s_rot_handle && p == lvgl_port_ppa_get_output_buffer(s_rot_handle))
+        return "scratch";
+    void *fb0 = nullptr;
+    if (s_dpi_panel &&
+        esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0) == ESP_OK &&
+        p == fb0)
+        return "fb0";
+    if (p == (const void *)s_js_canvas_buf)
+        return "canvas";
+    return "?";
+}
+
+/* descriptor を 1 行で。内部 SRAM・64 B 整列・64 B 確保 (ppa_core.c:67-71)
+   なので 1 行ぶん M2C してから読む。駐車中なら DMA は何も書き戻して
+   いないので cache と memory は元々一致しているはずだが、念のため。 */
+static void coroner_dump_desc(const char *who, const dma2d_descriptor_t *d)
+{
+    uintptr_t base = (uintptr_t)d & ~(uintptr_t)63;
+    size_t len = (((uintptr_t)d - base) + sizeof *d + 63) & ~(size_t)63;
+    esp_cache_msync((void *)base, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    const uint32_t *w = (const uint32_t *)d;
+    ESP_LOGE(TAG,
+             "CORONER: desc %s @%p w0=%08lx w1=%08lx w2=%08lx buf=%p(%s) "
+             "next=%p | vb=%u hb=%u eof=%u en=%u owner=%s va=%u ha=%u "
+             "pbyte=%u x=%u y=%u mode=%u",
+             who, (const void *)d, (unsigned long)w[0], (unsigned long)w[1],
+             (unsigned long)w[2], d->buffer, coroner_buf_name(d->buffer),
+             (const void *)d->next, (unsigned)d->vb_size,
+             (unsigned)d->hb_length, (unsigned)d->suc_eof,
+             (unsigned)d->dma2d_en, d->owner ? "DMA" : "CPU",
+             (unsigned)d->va_size, (unsigned)d->ha_length,
+             (unsigned)d->pbyte, (unsigned)d->x, (unsigned)d->y,
+             (unsigned)d->mode);
+}
+
+struct ui_desc_known_t { const char *name; const dma2d_descriptor_t *p; };
+
+static int coroner_known_descs(ui_desc_known_t *out, int cap)
+{
+    int n = 0;
+    ppa_srm_engine_t *s = coroner_srm_engine();
+    ppa_blend_engine_t *b = coroner_blend_engine();
+    if (s && n + 2 <= cap) {
+        out[n++] = { "SRM.rx", s->dma_rx_desc };
+        out[n++] = { "SRM.tx", s->dma_tx_desc };
+    }
+    if (b && n + 3 <= cap) {
+        out[n++] = { "BLEND.rx", b->dma_rx_desc };
+        out[n++] = { "BLEND.tx_bg", b->dma_tx_bg_desc };
+        out[n++] = { "BLEND.tx_fg", b->dma_tx_fg_desc };
+    }
+    return n;
+}
+
+static const char *coroner_desc_name(const ui_desc_known_t *k, int n,
+                                     uint32_t low18)
+{
+    for (int i = 0; i < n; i++)
+        if (((uintptr_t)k[i].p & 0x3FFFFu) == low18)
+            return k[i].name;
+    return "?";
+}
+
+static const dma2d_descriptor_t *coroner_desc_ptr(const ui_desc_known_t *k,
+                                                  int n, uint32_t low18)
+{
+    for (int i = 0; i < n; i++)
+        if (((uintptr_t)k[i].p & 0x3FFFFu) == low18)
+            return k[i].p;
+    return nullptr;
+}
+
+static const char *coroner_picked_name(dma2d_trans_on_picked_callback_t f)
+{
+    if (f == ppa_srm_transaction_on_picked)   return "srm";
+    if (f == ppa_blend_transaction_on_picked) return "blend";
+    if (f == ppa_fill_transaction_on_picked)  return "fill";
+    return f ? "other(fbcpy?)" : "NULL";
+}
+
+/* dma2d のソフト側。止まった後にしか呼ばないので spinlock は取らない
+   (何も動いていない)。 */
+static void coroner_dump_d2d_sw(void)
+{
+    dma2d_group_t *g = s_d2d_group;
+    if (!g) {
+        ESP_LOGE(TAG, "CORONER: dma2d sw: pool not held (armed before?)");
+        return;
+    }
+    char line[160];
+    int n = 0, npend = 0;
+    dma2d_trans_t *t;
+    TAILQ_FOREACH(t, &g->pending_trans_tailq, entry) {
+        if (npend < 6 && n < (int)sizeof line - 24)
+            n += snprintf(line + n, sizeof line - n, " %s",
+                          t->desc ? coroner_picked_name(t->desc->on_job_picked)
+                                  : "?");
+        if (++npend > 64)
+            break;   /* 壊れたリストで永久に回らない */
+    }
+    ESP_LOGE(TAG, "CORONER: dma2d sw tx_free=0x%x rx_free=0x%x pending=%d%s",
+             (unsigned)g->tx_channel_free_mask,
+             (unsigned)g->rx_channel_free_mask, npend, n ? line : "");
+    for (int i = 0; i < 2; i++) {
+        dma2d_rx_channel_t *rc = g->rx_chans[i];
+        if (!rc)
+            continue;
+        const char *cb = rc->on_recv_eof == ppa_transaction_done_cb ? "ppa_done"
+                       : rc->on_recv_eof ? "other(fbcpy?)" : "NULL";
+        dma2d_trans_t *tr = rc->base.status.transaction;
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d sw rx%d on_recv_eof=%s user=%p trans=%p(%s) "
+                 "bundled_tx=0x%x periph_sel=%d",
+                 i, cb, rc->user_data, (void *)tr,
+                 tr && tr->desc ? coroner_picked_name(tr->desc->on_job_picked)
+                                : "-",
+                 (unsigned)rc->bundled_tx_channel_mask,
+                 (int)rc->base.status.periph_sel_id);
+    }
+}
+
+/* 番兵の残り = SRM が書けなかったバイト数。 */
+static void coroner_dump_sentinel(void)
+{
+#if UI_CORONER_SENTINEL
+    uint32_t bytes = s_sent_bytes;
+    if (!bytes || !s_rot_handle) {
+        ESP_LOGE(TAG, "CORONER: sentinel none (last rotate h > %d)",
+                 UI_SENTINEL_MAX_H);
+        return;
+    }
+    uint8_t *buf = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+    uint32_t len = (bytes + 63u) & ~63u;
+    if (!buf || len > s_rot_buf_size)
+        return;
+    esp_cache_msync(buf, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    const uint16_t *px = (const uint16_t *)buf;
+    uint32_t nw = bytes / 2, first = nw, last_written = 0, cnt = 0;
+    for (uint32_t i = 0; i < nw; i++) {
+        if (px[i] == UI_SENTINEL_WORD) {
+            cnt++;
+            if (first == nw)
+                first = i;
+        } else {
+            last_written = i;
+        }
+    }
+    unsigned ow = s_sent_h;   /* 回転後の 1 行 = h 画素 */
+    ESP_LOGE(TAG,
+             "CORONER: sentinel in %ux%u -> out %ux%u (%lu B, laid @%lu ms): "
+             "unwritten=%lu B (%lu/%lu words) first_unwritten=%lu B "
+             "(out row %lu of %u) last_written=%lu B (out row %lu)",
+             (unsigned)s_sent_w, (unsigned)s_sent_h, ow, (unsigned)s_sent_w,
+             (unsigned long)bytes, (unsigned long)s_sent_t_ms,
+             (unsigned long)(cnt * 2), (unsigned long)cnt, (unsigned long)nw,
+             (unsigned long)(first * 2),
+             (unsigned long)(ow ? (first * 2) / (ow * 2) : 0),
+             (unsigned)s_sent_w, (unsigned long)(last_written * 2),
+             (unsigned long)(ow ? (last_written * 2) / (ow * 2) : 0));
+#else
+    ESP_LOGE(TAG, "CORONER: sentinel off (UI_CORONER_SENTINEL=0)");
+#endif
+}
+
+static void coroner_dump_dma(void)
+{
+    uint32_t ppa_raw = PPA.int_raw.val;
+    ui_desc_known_t known[5];
+    int nknown = coroner_known_descs(known, 5);
+    {
+        char line[160];
+        int n = 0;
+        for (int i = 0; i < nknown; i++)
+            n += snprintf(line + n, sizeof line - n, " %s=%p", known[i].name,
+                          (const void *)known[i].p);
+        void *fb0 = nullptr;
+        if (s_dpi_panel)
+            esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0);
+        ESP_LOGE(TAG, "CORONER: desc table%s | scratch=%p(%lu) fb0=%p canvas=%p",
+                 nknown ? line : " (none: mirror mismatch?)",
+                 s_rot_handle ? (void *)lvgl_port_ppa_get_output_buffer(s_rot_handle)
+                              : nullptr,
+                 (unsigned long)s_rot_buf_size, fb0, (void *)s_js_canvas_buf);
+    }
+    for (int i = 0; i < 2; i++) {   /* RX チャネルは 2 本 */
+        uint32_t st = DMA2D.in_channel[i].in_state.val;
+        /* state は生も出す: 下位 18 ビットが**今どの descriptor に
+           居るか**で、suc_eof_des_addr と突き合わせると
+           「この回転の descriptor に張り付いたまま」かどうかが分かる。 */
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d rx%d state=0x%08lx fsm=%u dscr=%u "
+                 "suc_eof=0x%08lx",
+                 i, (unsigned long)st,
+                 (unsigned)((st >> 20) & 0x7), (unsigned)((st >> 18) & 0x3),
+                 (unsigned long)DMA2D.in_channel[i].in_suc_eof_des_addr.val);
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d rx%d raw=0x%04lx ena=0x%04lx st=0x%04lx",
+                 i, (unsigned long)DMA2D.in_channel[i].in_int_raw.val,
+                 (unsigned long)DMA2D.in_channel[i].in_int_ena.val,
+                 (unsigned long)DMA2D.in_channel[i].in_int_st.val);
+        /* E1: 今の descriptor と最後に EOF した descriptor の持ち主、
+           FIFO の残り、start 時に書かれた link_addr。 */
+        {
+            uint32_t cur18 = st & 0x3FFFFu;
+            uint32_t eof = DMA2D.in_channel[i].in_suc_eof_des_addr.val;
+            uint32_t f = DMA2D.in_channel[i].infifo_status.val;
+            ESP_LOGE(TAG,
+                     "CORONER: dma2d rx%d cur=%s eof=%s | link_addr=0x%08lx "
+                     "dscr_bf0=0x%08lx | fifo raw=0x%08lx l2:empty=%u cnt=%u "
+                     "remain_under=0x%02x l1:cnt=%u l3:cnt=%u",
+                     i, coroner_desc_name(known, nknown, cur18),
+                     coroner_desc_name(known, nknown, eof & 0x3FFFFu),
+                     (unsigned long)DMA2D.in_channel[i].in_link_addr.val,
+                     (unsigned long)DMA2D.in_channel[i].in_dscr_bf0.val,
+                     (unsigned long)f, (unsigned)((f >> 1) & 1),
+                     (unsigned)((f >> 2) & 0xF), (unsigned)((f >> 7) & 0xFF),
+                     (unsigned)((f >> 17) & 0x1F), (unsigned)((f >> 24) & 0x1F));
+            const dma2d_descriptor_t *d = coroner_desc_ptr(known, nknown, cur18);
+            char who[16];
+            snprintf(who, sizeof who, "rx%d.cur", i);
+            if (d) {
+                coroner_dump_desc(who, d);
+            } else if (cur18) {
+                /* 持ち主不明 (fbcpy の descriptor など)。上位 14 bit は
+                   suc_eof のものを借りる —— L2MEM 768 KB の 1/3 なので
+                   外れうる。**推測** と明記して出す。 */
+                const dma2d_descriptor_t *g =
+                    (const dma2d_descriptor_t *)((eof & ~0x3FFFFu) | cur18);
+                snprintf(who, sizeof who, "rx%d.cur?", i);
+                coroner_dump_desc(who, g);
+            }
+        }
+    }
+    ESP_LOGE(TAG, "CORONER: dma2d tx fsm=%u/%u/%u raw=%04lx/%04lx/%04lx",
+             (unsigned)((DMA2D.out_channel[0].out_state.val >> 20) & 0xF),
+             (unsigned)((DMA2D.out_channel[1].out_state.val >> 20) & 0xF),
+             (unsigned)((DMA2D.out_channel[2].out_state.val >> 20) & 0xF),
+             (unsigned long)DMA2D.out_channel[0].out_int_raw.val,
+             (unsigned long)DMA2D.out_channel[1].out_int_raw.val,
+             (unsigned long)DMA2D.out_channel[2].out_int_raw.val);
+    /* blend_eof も回転の直前に落としている (wrap)。立っていれば、この
+       回転が始まってから BLEND エンジンが 1 枚仕上げた = 別タスクの
+       fill/blend が同時に居た。 */
+    ESP_LOGE(TAG,
+             "CORONER: ppa int_raw=0x%08lx (sr_eof=%u blend_eof=%u sr_cfg_err=%u)",
+             (unsigned long)ppa_raw, (unsigned)(ppa_raw & 1),
+             (unsigned)((ppa_raw >> 1) & 1), (unsigned)((ppa_raw >> 2) & 1));
+    /* cfg_err が立っていたら理由はこのレジスタに全部書いてある
+       (TRM: PPA_SR_PARAM_ERR_ST_REG)。立っていなければ 0。 */
+    if (ppa_raw & (1u << 2))
+        ESP_LOGE(TAG, "CORONER: ppa sr_param_err_st=0x%08lx",
+                 (unsigned long)PPA.sr_param_err_st.val);
+
+    /* ドライバがクリアする前に写した割り込み。新しい順に 8 件。
+       src 0,1 = RX ch0,ch1 / 2,3,4 = TX ch0..2。
+       st のビット (dma2d_ll.h:46-59):
+         b1 SUC_EOF  b2 ERR_EOF(JPEG 専用)  b3 DESC_ERROR
+       **b3 が最後に立っていたら、それが落ちた通知そのもの。**
+       最後の SUC_EOF より後に何も無ければ、割り込み自体が来ていない。 */
+    {
+        char line[192];
+        int n = 0;
+        uint32_t head = s_d2d_ev_i;
+        uint32_t have = head < 8 ? head : 8;
+        for (uint32_t k = 1; k <= have; k++) {
+            uint32_t i = (head - k) & 15;
+            n += snprintf(line + n, sizeof line - n, " %lu:s%u=%04x",
+                          (unsigned long)s_d2d_ev[i].t_ms,
+                          (unsigned)s_d2d_ev[i].src,
+                          (unsigned)s_d2d_ev[i].st);
+            if (n >= (int)sizeof line - 24)
+                break;
+        }
+        /* armed= はシムが実際に噛んでいる ISR の本数 (RX 2 + TX 3 = 5)。
+           DMA2D の ISR はプール取得時に確保されるので**起動直後は 0**
+           でありうる。ここで出しておけば "(none)" が
+           「割り込みが来ていない」なのか「計器が入っていない」なのかを
+           取り違えずに済む。 */
+        ESP_LOGE(TAG, "CORONER: d2d irq armed=%u total=%lu (newest first)%s",
+                 (unsigned)s_d2d_shim_n, (unsigned long)head,
+                 n ? line : " (none)");
+    }
+
+    /* 止まった回転の幾何。! = 奇数 h。bNN = 回転後の**最小出力ブロック**の
+       バイト数: SRM は 16x16 のマクロブロック (P4 rev1.x, ppa_ll.h:505) で
+       入力を刻むので、最後の列 (w%16) × 最後の行 (h%16) が最小 (1137x7 →
+       1x7 → 転置して 7x1 = 14 B)。@ は撃った時刻 ms。 */
+    {
+        char line[192];
+        int n = 0;
+        uint32_t head = s_geom_i;
+        uint32_t have = head < 8 ? head : 8;
+        for (uint32_t k = 1; k <= have; k++) {
+            uint32_t i = (head - k) & 7;
+            unsigned w = s_geom[i].w, h = s_geom[i].h;
+            unsigned wr = w % 16 ? w % 16 : 16, hr = h % 16 ? h % 16 : 16;
+            n += snprintf(line + n, sizeof line - n, " %ux%u%sb%u@%lu", w, h,
+                          (h & 1) ? "!" : "", wr * hr * 2,
+                          (unsigned long)s_geom[i].t_ms);
+            if (n >= (int)sizeof line - 24)
+                break;
+        }
+        ESP_LOGE(TAG, "CORONER: rot wxh (newest first, ! odd h, bN min out "
+                      "block B, @ms) last_end=%lu%s",
+                 (unsigned long)s_rot_end_ms, n ? line : " (none)");
+    }
+    coroner_dump_d2d_sw();
+    coroner_dump_sentinel();
+}
+
+static void coroner_task(void *arg)
+{
+    uint32_t last = 0;
+    int stale = 0;
+    bool armed_said = false;
+
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        /* **計器が生きていることを、停止を待たずに 1 度だけ言う。**
+           DMA2D の ISR はプール取得時に確保されるので起動直後は 0 本。
+           ここで n と件数が出れば、あとで環が空でも
+           「割り込みが来ていない」と読んでよい。 */
+        if (!armed_said && s_d2d_shim_n) {
+            armed_said = true;
+            ESP_LOGI(TAG, "CORONER: dma2d irq shim armed n=%u ev=%lu",
+                     (unsigned)s_d2d_shim_n, (unsigned long)s_d2d_ev_i);
+            /* E1: プールは既に在る (ISR が確保済み = シムが噛んでいる)
+               ので、ここで握っても新しい確保は走らない。参照が 1 増える
+               だけで、解放はしない (検死役は死なない)。 */
+            if (!s_d2d_group) {
+                dma2d_pool_config_t pc = {};
+                pc.pool_id = 0;
+                dma2d_pool_handle_t h = nullptr;
+                if (dma2d_acquire_pool(&pc, &h) == ESP_OK && h) {
+                    s_d2d_group = h;
+                    ESP_LOGI(TAG, "CORONER: dma2d pool held %p tx_free=0x%x "
+                                  "rx_free=0x%x",
+                             (void *)h, (unsigned)h->tx_channel_free_mask,
+                             (unsigned)h->rx_channel_free_mask);
+                } else {
+                    ESP_LOGW(TAG, "CORONER: dma2d_acquire_pool failed");
+                }
+            }
+        }
+        uint32_t b = s_ui_beat;
+        if (b != last) {
+            last = b;
+            stale = 0;
+            continue;
+        }
+        if (++stale != 3)      /* 3 秒動かなかったら 1 回だけ吐く */
+            continue;
+        TaskHandle_t o = s_lock_owner;
+        /* owner= は **UI タスク自身を見られない**。--wrap は同じ
+           翻訳単位の中の呼び出しを書き換えないので (ld manual:
+           "translation unit internal references ... are not resolved
+           to __wrap_symbol")、esp_lvgl_port.c の中でタスクループが
+           自分で呼ぶ lvgl_port_lock はここを通らない。
+           **"(none)" は「UI タスク以外の誰も持っていない」の意味**で、
+           「誰も持っていない」ではない。一日これを読み違えた。 */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        ESP_LOGE(TAG,
+                 "CORONER: UI stalled 3s | lock owner(non-UI)=%s depth=%u "
+                 "pc=%p | flushing=%d phase=%u refr_now=%u draw_err=%lu "
+                 "flush_tmo=%lu | last_beat=%lu ms (%lu ago)",
+                 o ? pcTaskGetName(o) : "(none)", (unsigned)s_lock_depth,
+                 s_lock_pc, s_disp ? (int)s_disp->flushing : -1,
+                 (unsigned)g_ui_phase, (unsigned)g_ui_refr_now,
+                 (unsigned long)s_draw_errs_ref(),
+                 (unsigned long)s_flush_tmo_ref(),
+                 (unsigned long)s_ui_beat_ms,
+                 (unsigned long)(now_ms - s_ui_beat_ms));
+        /* phase で絞らない。draw_bitmap 側で止まっていても
+           同じレジスタが同じだけ物を言う。1 回の停止につき数行、
+           それだけの価値がある。 */
+        coroner_dump_dma();
+    }
+}
+#endif /* UI_CORONER */
+
 static void touch_observe(void)
 {
     static bool was_pressed;
@@ -886,7 +2149,16 @@ static void touch_observe(void)
 
     if (!s_touch_indev)
         return;
-    if (s_cam_modal) {
+    /* **モーダルが出ている間はアプリへ配らない。**
+       ここは以前カメラのスクリムしか見ておらず、fs_picker のスクリムは
+       素通りしていた —— キーは fs_pick が横取りするのにタッチはしない、
+       という非対称。結果、ピッカーの上のタップが裏のエディタにも届き、
+       ファイルを選ぶと裏の原稿のカーソルが動き、一覧をドラッグすると
+       裏の原稿がスクロールしていた (それ自体がバグ)。
+       さらに悪いのは負荷で、ドラッグ 1 サンプル (10 ms) ごとに裏で
+       全画面再描画が走り、UI タスクの lv_refr_now と同じ PPA を
+       ロックの内側で奪い合う —— 実機の core 1 フリーズはこの形。 */
+    if (s_cam_modal || fs_pick_active()) {
         /* close any in-flight gesture so ui.onTouch apps don't hang in
            "pressed" state, then go silent for the modal's lifetime */
         if (was_pressed)
@@ -1662,6 +2934,7 @@ static lv_obj_t *s_kb_clip_lbl;
 static lv_obj_t *s_kb_lock_lbl; /* which modifiers are latched, in words */
 static lv_timer_t *s_kb_clip_tmr; /* another app may replace the value */
 static bool s_kb_sym;        /* symbol layer showing */
+static bool s_kb_sym2;       /* ... and which of its two pages */
 static int s_kb_map_shown = -1; /* layer the matrix currently draws;
                                    -1 = none yet (also after a rebuild) */
 /* Where the Shift key currently is. Row as well as id now: the layers
@@ -2441,6 +3714,7 @@ static void kb_collapse(void)
 #define KB_LBL_SHIFT "Aa"
 #define KB_LBL_SYM   "sym"
 #define KB_LBL_ABC   "abc"
+#define KB_LBL_MORE  "#+"  /* 記号の 2 ページ目へ */
 #define KB_SPACE     " " /* the widest key; an empty face is the hint */
 
 /* One map per ROW per layer (see s_kb_row): a row matrix takes a map of
@@ -2468,21 +3742,40 @@ static const char *KB_R2_UPPER[] = { KB_LBL_SHIFT, "Z", "X", "C", "V",
 static const char *KB_R3_ALPHA[] = { KB_LBL_SYM, ",", KB_SPACE,
                                      LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
                                      LV_SYMBOL_COPY, "" };
+/* 記号は 2 ページ。実機報告 2026-08-26:「記号キーボードにボタンが多すぎて
+   押しづらい」—— 直前の版は 1 行に 10〜11 個詰めていた。1 行 8〜9 個に減らし、
+   あふれた分を 2 ページ目へ送る。`#+` で 2 ページ目、`sym` で 1 ページ目、
+   `abc` で英字へ戻る。
+
+   1 ページ目は **JS を書くときに手が伸びるもの**を集めてある: 数字、括弧 6 種、
+   引用符 3 種 (バックティックはテンプレートリテラルに要る)、四則と `=`。
+   Enter は残した —— ユーザの案は「Enter を消してシフトにする」だったが、
+   コードを書いていると `{` の直後に改行したくなるので、Enter を消すより
+   行あたりの個数を減らすほうが効くと判断した。合わなければ動かす。 */
 static const char *KB_R0_SYM[] = { "1", "2", "3", "4", "5",
                                    "6", "7", "8", "9", "0", "" };
-static const char *KB_R1_SYM[] = { "-", "_", "=", "+", "/", "\\",
-                                   "|", ":", ";", LV_SYMBOL_NEW_LINE,
-                                   "" };
-static const char *KB_R2_SYM[] = { "!", "?", "@", "#", "$", "%",
-                                   "&", "*", "~", LV_SYMBOL_BACKSPACE,
-                                   "" };
-static const char *KB_R3_SYM[] = { KB_LBL_ABC, "\"", "'", KB_SPACE,
-                                   ">", "[", "]", "" };
+static const char *KB_R1_SYM[] = { "(", ")", "[", "]", "{", "}",
+                                   "<", ">", LV_SYMBOL_BACKSPACE, "" };
+static const char *KB_R2_SYM[] = { "\"", "'", "`", "=", "+", "-",
+                                   "*", "/", LV_SYMBOL_NEW_LINE, "" };
+static const char *KB_R3_SYM[] = { KB_LBL_ABC, KB_LBL_MORE, KB_SPACE,
+                                   ",", ".", "" };
 
-static const char *const *KB_LAYER[3][KB_ROWS] = {
-    { KB_R0_LOWER, KB_R1_LOWER, KB_R2_LOWER, KB_R3_ALPHA }, /* 0 lower */
-    { KB_R0_UPPER, KB_R1_UPPER, KB_R2_UPPER, KB_R3_ALPHA }, /* 1 upper */
-    { KB_R0_SYM,   KB_R1_SYM,   KB_R2_SYM,   KB_R3_SYM   }, /* 2 sym   */
+/* 2 ページ目: 1 ページ目に載らなかったもの + カーソル移動。 */
+static const char *KB_R0_SYM2[] = { "!", "?", "@", "#", "$", "%",
+                                    "^", "&", "" };
+static const char *KB_R1_SYM2[] = { "_", "|", "\\", ":", ";", "~",
+                                    LV_SYMBOL_NEW_LINE, "" };
+static const char *KB_R2_SYM2[] = { LV_SYMBOL_LEFT, LV_SYMBOL_RIGHT,
+                                    LV_SYMBOL_COPY, LV_SYMBOL_BACKSPACE, "" };
+static const char *KB_R3_SYM2[] = { KB_LBL_ABC, KB_LBL_SYM, KB_SPACE,
+                                    ",", ".", "" };
+
+static const char *const *KB_LAYER[4][KB_ROWS] = {
+    { KB_R0_LOWER, KB_R1_LOWER, KB_R2_LOWER, KB_R3_ALPHA }, /* 0 lower  */
+    { KB_R0_UPPER, KB_R1_UPPER, KB_R2_UPPER, KB_R3_ALPHA }, /* 1 upper  */
+    { KB_R0_SYM,   KB_R1_SYM,   KB_R2_SYM,   KB_R3_SYM   }, /* 2 sym 1  */
+    { KB_R0_SYM2,  KB_R1_SYM2,  KB_R2_SYM2,  KB_R3_SYM2  }, /* 3 sym 2  */
 };
 /* what each row is actually pointed at, so a layer change only touches
    the rows that differ (lower<->upper leaves row 3 alone), and where
@@ -2548,6 +3841,7 @@ static void kb_row_apply_flags(int r)
            modifier or a layer key it would machine-gun taps and flip
            the lock on and off. */
         if (shift || !strcmp(t, KB_LBL_SYM) || !strcmp(t, KB_LBL_ABC) ||
+            !strcmp(t, KB_LBL_MORE) ||
             !strcmp(t, LV_SYMBOL_NEW_LINE) || !strcmp(t, LV_SYMBOL_COPY))
             lv_buttonmatrix_set_button_ctrl(m, id,
                                             LV_BUTTONMATRIX_CTRL_NO_REPEAT);
@@ -2561,7 +3855,7 @@ static void kb_apply_map(void)
     if (!s_kb_row[0])
         return;
     bool upper = s_ui_mods.shift.lock;
-    int want = s_kb_sym ? 2 : upper ? 1 : 0;
+    int want = s_kb_sym ? (s_kb_sym2 ? 3 : 2) : upper ? 1 : 0;
     if (want == s_kb_map_shown)
         return;
     s_kb_map_shown = want;
@@ -2841,8 +4135,10 @@ static void kb_show(int mode)
                 return;
 
             /* keys that only change the keyboard: nothing is posted */
-            if (!strcmp(txt, KB_LBL_SYM) || !strcmp(txt, KB_LBL_ABC)) {
-                s_kb_sym = !strcmp(txt, KB_LBL_SYM);
+            if (!strcmp(txt, KB_LBL_SYM) || !strcmp(txt, KB_LBL_ABC) ||
+                !strcmp(txt, KB_LBL_MORE)) {
+                s_kb_sym = strcmp(txt, KB_LBL_ABC) != 0;
+                s_kb_sym2 = !strcmp(txt, KB_LBL_MORE);
                 ui_kb_refresh();
                 return;
             }
@@ -2918,6 +4214,464 @@ void ui_tab5_kb_field(int mode)
     cbar_apply_mods(); /* paints 「あ」's DISABLED flag */
 }
 
+/* ------------------------------------------------------------------ */
+/* 提示 (presentation) の内訳 — 常時計測 (spec §F #13)                 */
+/*                                                                     */
+/* 決めたいのは 1 つ: **1 回の提示の時間はどこへ行くのか**。           */
+/*   draw   LVGL がチャンクを CPU でラスタライズした時間               */
+/*   rot    PPA 回転 (landscape のみ。--wrap=lvgl_port_ppa_rotate)     */
+/*   flush  flush_cb 全体 = rot + esp_lcd_panel_draw_bitmap の投入     */
+/*   wait   前のチャンクの DSI DMA が終わるのを待った時間              */
+/* これが要るのは、スクロールが全段 dirty になって面積 invalidate で   */
+/* は救えないから (ssh_vt で 26 段中 22 段が dirty)。救う道は「PPA/    */
+/* DMA2D でキャンバスをブリットする」か「DSI のフレームバッファを直接  */
+/* 動かす」かだが、**内訳が分からないとどちらが効くか決められない**。  */
+/*   rot が支配的  -> sw_rotate とスクラッチと 50 段バッファが本題     */
+/*   wait が支配的 -> フレームバッファ直接操作が効く                   */
+/*   draw が支配的 -> 生成側 (LVGL に渡す前) の話                      */
+/*                                                                     */
+/* 計測器が計測対象を太らせないための約束 (と、その代金):              */
+/*  - 時計読みは 1 提示あたり **2 + 4×チャンク** 回 (landscape では     */
+/*    回転の 2×チャンクが増える)。26 チャンクなら 106 / 158 回。       */
+/*    「6 回」ではない —— flush と flush-wait が 1 チャンクにつき       */
+/*    2 対のイベントを出すため。1 回の値段は spec §F #0 が「測る」と    */
+/*    している未測の数字なので、**ここに見積もりは書かない**。         */
+/*    どれも LVGL タスクの上でしか走らない = 単一書き手、ロック 0。    */
+/* **この定義は前方宣言より前に置くこと。**
+   以前はずっと下 (canvas_present_direct の定義の隣) にあった。すると
+   CanvasApp のバッチ末尾にある `#if UI_DIRECT_PRESENT` は**未定義 = 0**
+   として評価され、端末の呼び出しだけがプリプロセッサで消えていた ——
+   警告は出ない。エディタ (ui_tab5_canvas_invalidate) は定義より後ろに
+   あるので動き、端末だけが直接経路に入れず、拒否理由の内訳まで全部 0
+   だった (= 入口にすら来ていなかった)。 */
+/* **切り分け済み (2026-08-27 に 0、2026-08-31 に 1 へ復帰)**:
+   検死役が phase=1 を出した —— UI タスクが LVGL の flush が撃った PPA
+   回転から戻ってこない。PPA SRM を flush 以外から使う唯一のコードが
+   この経路で、DMA2D のチャネルは esp_async_fbcpy と共有。これを 0 に
+   して固まらなければ犯人が確定する、として落としていた。
+
+   **結果: この経路は犯人ではなかった。** 駐車は flush 側の回転そのもの
+   で起き (DMA2D の RX が FIFO 満杯のまま idle で停まる)、引き金は
+   出力幅 7 = 1 行 14 バイト。安全網 (有界回転 + dma2d_force_end 回収) と
+   バイパス (UI_ROT_CPU_BYPASS_H) で塞いだので、借りていた速度を返す。
+   横 90.4 -> 32.5 ms。 */
+#ifndef UI_DIRECT_PRESENT
+#define UI_DIRECT_PRESENT 1
+#endif
+/* 回転の向き。**実測で決着 (2026-08-27)**: PPA の ANGLE_90 はソース段の
+   先頭行を出力の**低い側の列**に置く。CW を仮定した式 (ox = 720-ly-h) は
+   先頭行が高い側に来る前提なので、丸ごと逆だった。
+
+   全面のときだけ差が小さく (ox が 0 対 88)、絵は 88px ずれるだけなので
+   「少し上にずれている」で済んでいた。部分矩形ではずれ幅が矩形ごとに
+   変わるため画面が崩れる —— 閾値を 3 チャンクに下げて部分矩形が初めて
+   この経路に入った回から症状が出た。
+
+   **全面のケースでは ox=oy=0 に潰れるので、式を検算できない。**
+   「全面は正しく見える」を根拠に 3 回この式を正しいと判断したが、
+   あれは何の証拠にもなっていなかった。決着は FB を読み戻して付けた
+   (FB を読み戻して行と列のチェックサムを突き合わせた)。 */
+#ifndef UI_DIRECT_ROT_CW
+#define UI_DIRECT_ROT_CW 0
+#endif
+/* この高さ以上の damage でだけ直接経路を使う。
+
+   **px ではなくチャンク単位で考える。** LVGL の 1 リフレッシュの値段は
+   px ではなく「描画バッファ何杯ぶんか」で決まり、その 1 杯の高さは
+   バッファ画素数 ÷ 領域の幅 —— 横 (幅 1280) なら 28 px、縦 (幅 720) なら
+   50 px。同じ 144 px の damage が横では 6 杯、縦では 3 杯になる。
+   「キャンバスの半分」という px 固定は、この差を無視していた上に
+   安全側へ寄せすぎていた: 横で 316 px = 13 杯である。
+
+   実測 (2026-08-26 の ui_prof / ui_area):
+     LVGL   26 杯 = 74.6 ms  →  約 2.9 ms/杯
+     直接   キャンバス全体 (632px = 23 杯) = 33.3 ms  →  約 1.5 ms/杯
+   **どちらも面積に比例し、直接のほうが 1 杯あたり倍近く安い。** つまり
+   閾値の役目は「傾きの交差点」ではなく、直接経路の**固定費**
+   (ロック + 飛行中 flush の drain) を回収できない極小 damage を弾くこと
+   だけ。3 杯に置く。
+
+   これで端末が拾えるようになる: ssh_vt の 1 バッチは平均 184,032 px
+   = 横 6 杯で、13 杯の壁に全部弾かれていた (実測 direct 0 x 0 us)。 */
+#define UI_DIRECT_MIN_CHUNKS 3
+/* 宛先の向きは FB を読み戻して決着済み (UI_DIRECT_ROT_CW のコメント)。
+   probe は消した —— 毎秒 1.8MB のキャッシュ無効化を描画経路に残すと、
+   次に速度を測る人が計測器ごと測ってしまう。 */
+/* LVGL のチャンク高 = バッファ画素数 ÷ 領域の幅 (lv_refr.c の get_max_row)。
+   キャンバスは画面幅いっぱいなので s_canvas_w がそのまま領域の幅。 */
+#define UI_LVGL_CHUNK_H \
+    ((UI_LCD_H_RES * UI_LVGL_BUF_LINES) / (s_canvas_w ? s_canvas_w : 1))
+#define UI_DIRECT_MIN_H (UI_DIRECT_MIN_CHUNKS * UI_LVGL_CHUNK_H)
+
+static bool canvas_present_direct(int x, int y, int w, int h,
+                                  int *done_y, int *done_h);
+/* 直接経路 (LVGL を通さず PPA SRM で FB へ) の集計。ui_prof に出す ——
+   出さないと「効いているのか、閾値に届かず毎回 LVGL へ落ちているのか」が
+   区別できない。定義は canvas_present_direct の隣。 */
+static int64_t  s_direct_us;
+/* 窓でリセットしない通し番号。プレゼンタが「この invalidate は直接経路に
+   行ったか」を差分で読む (ui_tab5_direct_count)。 */
+static uint32_t s_direct_total;
+/* 直接経路を断った理由の内訳。**「0 回だった」だけでは何も分からない** ——
+   端末が入れない理由を、閾値・重なり・幾何と 3 度当て推量で外した。
+   0 向き/キャンバス無し 1 閾値 2 ロック 3 帯が無い 4 flush 待ち 5 幾何 6 PPA */
+static uint32_t s_direct_rej[7];
+static uint32_t s_direct_n;
+/* flush の完了待ちが上限に達した回数 (ui_flush_wait)。0 でないなら
+   「固まりかけたが先へ進んだ」が起きている。 */
+static uint32_t s_flush_timeouts;
+/* esp_lcd_panel_draw_bitmap が返したエラーの数 (__wrap_...)。0 でないなら
+   「flush が永久に来なくなる」経路が生きている。 */
+static uint32_t s_draw_errs;
+
+/*  - 書式化は窓に 1 回。しかも **RENDER_READY** で出す —— その提示の  */
+/*    画素はもう出ている (fs_picker が今日置いた作法と同じ)。          */
+/*    1 行はログの前置きを入れて ~150 B、115200 baud なら ~13 ms を    */
+/*    その場のタスク (= LVGL タスク) が払う。無料ではないので窓は      */
+/*    5 秒、動きが無ければ 1 行も出ない。                              */
+/*  - 妥当性の上限を持つ (C.0 規則 7): 1 提示 > 1 秒は外れ値として     */
+/*    捨て、捨てた数を drop= で報告する。黙って捨てない。              */
+/* ------------------------------------------------------------------ */
+/* >>> host-testable presentation meter begin <<< */
+#define UI_PROF_WINDOW_US   5000000  /* 報告の窓 */
+#define UI_PROF_SANE_US     1000000  /* 1 提示の上限。超えたら外れ値 */
+
+/* 「この提示はキャンバスのものか」。ui.cells のバッチ末尾と
+   ui_tab5_canvas_invalidate が、どちらも LVGL ロックの内側で立てる。
+   読むのは RENDER_START (LVGL タスク、同じロックの内側) なので、
+   排他は既にある。取りこぼす形は 1 つだけ: 描画中に着いた invalidate
+   が今の提示に数えられる —— 数の分類が 1 件ずれるだけで、時間には
+   影響しない。 */
+static bool s_prof_canvas_mark;
+
+/* 窓の集計。書き手は LVGL タスクだけ。 */
+static struct {
+    uint32_t refr, refr_cv;      /* 提示の数 / うちキャンバス由来 */
+    uint32_t chunks;
+    int64_t  draw, rot, flush, wait;
+    int      w_chunks;           /* この窓で最もチャンクの多かった提示 */
+    int64_t  w_draw, w_rot, w_flush, w_wait;
+    uint32_t dropped;
+    int64_t  t_report;
+} s_pm;
+
+/* Where a repaint actually goes. LVGL brackets a refresh with
+   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
+   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
+   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
+   PPA rotation in landscape (which --wrap now splits out separately);
+   wait is time blocked on the previous chunk's DMA, which is exactly
+   what a second draw buffer would hide.
+   These four are ONE presentation: RENDER_START zeroes them, so
+   kb_bench (which memsets and then forces a single lv_refr_now) reads
+   exactly what it always read. */
+static struct {
+    int64_t t_render, t_flush, t_wait;
+    int64_t render, flush, wait;
+    int flushes;
+    bool canvas;
+} s_prof;
+
+static bool s_prof_emit_pending = false;
+
+static void prof_report(int64_t now)
+{
+    /* 呼ばれるのは RENDER_READY —— この提示の画素はもう出ている。 */
+    ESP_LOGW("ui_prof",
+             "%s %lu refr(cv %lu) %lu ch | draw=%lld rot=%lld flush=%lld "
+             "wait=%lld us | max %d ch: %lld/%lld/%lld/%lld | drop=%lu"
+             " | direct %lu x %lld us | rej %lu/%lu/%lu/%lu/%lu/%lu/%lu"
+             " | flush_tmo=%lu draw_err=%lu",
+             s_landscape ? "L" : "P", (unsigned long)s_pm.refr,
+             (unsigned long)s_pm.refr_cv, (unsigned long)s_pm.chunks,
+             (long long)s_pm.draw, (long long)s_pm.rot,
+             (long long)s_pm.flush, (long long)s_pm.wait, s_pm.w_chunks,
+             (long long)s_pm.w_draw, (long long)s_pm.w_rot,
+             (long long)s_pm.w_flush, (long long)s_pm.w_wait,
+             (unsigned long)s_pm.dropped,
+             (unsigned long)s_direct_n, (long long)s_direct_us,
+             (unsigned long)s_direct_rej[0], (unsigned long)s_direct_rej[1],
+             (unsigned long)s_direct_rej[2], (unsigned long)s_direct_rej[3],
+             (unsigned long)s_direct_rej[4], (unsigned long)s_direct_rej[5],
+             (unsigned long)s_direct_rej[6],
+             (unsigned long)s_flush_timeouts,
+             (unsigned long)s_draw_errs);
+    /* CPU 回転の窓集計 (E3 Task 2)。回した実績がある窓だけ 1 行 ——
+       縦画面では黙る。px/us == Mpix/s なので割るだけでよい。 */
+    if (s_cpu_rot.bypass_n || s_cpu_rot.redo_n) {
+        uint32_t r100 = s_cpu_rot.us
+            ? (uint32_t)(s_cpu_rot.px * 100 / s_cpu_rot.us) : 0;
+        ESP_LOGW("ui_prof",
+                 "cpu_rot: bypass=%lu redo=%lu ppa=%lu | %llu px / %llu us "
+                 "= %lu.%02lu Mpix/s | max %lu us",
+                 (unsigned long)s_cpu_rot.bypass_n,
+                 (unsigned long)s_cpu_rot.redo_n,
+                 (unsigned long)s_cpu_rot.ppa_n,
+                 (unsigned long long)s_cpu_rot.px,
+                 (unsigned long long)s_cpu_rot.us,
+                 (unsigned long)(r100 / 100), (unsigned long)(r100 % 100),
+                 (unsigned long)s_cpu_rot.max_us);
+    }
+    memset(&s_cpu_rot, 0, sizeof s_cpu_rot);
+    s_direct_n = 0;
+    s_direct_us = 0;
+    memset(s_direct_rej, 0, sizeof s_direct_rej);
+    memset(&s_pm, 0, sizeof s_pm);
+    /* 出力そのものに ~10 ms かかるので、窓の起点は書いた後で読む。 */
+    s_pm.t_report = esp_timer_get_time();
+    (void)now;
+}
+
+/* 1 提示ぶんを窓へ畳む。時計読み 0 回 (now は呼び出し側が持っている)。 */
+static void prof_fold(int64_t now)
+{
+    int64_t total = s_prof.render;
+    int64_t draw = total - s_prof.flush - s_prof.wait;
+    if (total > UI_PROF_SANE_US || draw < 0) {
+        /* C.0 規則 7: 黙って捨てない。draw < 0 は「イベントの対が
+           揃わなかった」で、時間ではなく計測器の話。 */
+        s_pm.dropped++;
+        return;
+    }
+    s_pm.refr++;
+    if (s_prof.canvas)
+        s_pm.refr_cv++;
+    s_pm.chunks += (uint32_t)s_prof.flushes;
+    s_pm.draw += draw;
+    s_pm.rot += s_ppa_rot_us;
+    s_pm.flush += s_prof.flush;
+    s_pm.wait += s_prof.wait;
+    if (s_prof.flushes > s_pm.w_chunks) {
+        s_pm.w_chunks = s_prof.flushes;
+        s_pm.w_draw = draw;
+        s_pm.w_rot = s_ppa_rot_us;
+        s_pm.w_flush = s_prof.flush;
+        s_pm.w_wait = s_prof.wait;
+    }
+    if (!s_pm.t_report) {
+        s_pm.t_report = now;
+        return;
+    }
+    /* **書式化はここでやらない。** 呼ばれているのは RENDER_READY で、
+       ~150B を 115200 baud へ同期に吐くと ~13 ms を LVGL タスクが払う。
+       その 13 ms は次のフレームを押し出し、まさに測ろうとしている
+       flush/wait を揺らす —— 計測器が計測対象を太らせる形になる。
+       印だけ立てて、コマンド掃きの先頭 (描画の外) で吐く。 */
+    if (now - s_pm.t_report >= UI_PROF_WINDOW_US)
+        s_prof_emit_pending = true;
+}
+
+/* ------------------------------------------------------------------ *
+ * srm_bench —— 「キャンバスを LVGL を通さず PPA SRM 1 op で DSI の
+ * フレームバッファへ直接出す」が成立するかを、作る前に測る。
+ *
+ * 今の 1 画素の道はコピー 5 回で、うち 3 回が計測済みの重量物:
+ *   3. キャンバス(PSRAM) →[CPU lv_memcpy]→ 描画バッファ(内部)   draw 27.9ms
+ *   4. 描画バッファ →[PPA SRM]→ 回転スクラッチ(PSRAM)           rot  18.5ms
+ *   5. スクラッチ →[DMA2D]→ DSI FB(PSRAM)                       wait 26.5ms
+ * SRM は回転を畳めるので、3+4+5 を「キャンバス→FB の 1 op」に潰せる**かも**
+ * しれない。**その 1 op が何 ms かは誰も知らない。** それを測る。
+ *
+ * 画面は一瞬乱れる (FB を直接書く)。**それ自体が情報**で、絵が正しい向き
+ * で出れば幾何も合っていることになる。次の提示で LVGL が塗り直す。 */
+/* **既定オフ。役目は終わった** —— 測りたかった 4 数字は取れている
+   (横 全画面 37.2ms / 帯 2.05ms、縦 39.6ms / 1.19ms、どちらも 46 ns/px)。
+   これは DSI のフレームバッファを直接書く唯一の残りで、回転のたびに走る。
+   実機が LVGL の描画中に固まる件を切り分けるため、まず外す。 */
+#ifndef UI_SRM_BENCH
+#define UI_SRM_BENCH 0
+#endif
+#if UI_SRM_BENCH
+static void srm_bench(void)
+{
+    if (!s_dpi_panel || !s_js_canvas_buf || !s_canvas_w || !s_canvas_h) {
+        ESP_LOGW("srm_bench", "skip: panel=%p canvas=%p %dx%d",
+                 (void *)s_dpi_panel, (void *)s_js_canvas_buf,
+                 s_canvas_w, s_canvas_h);
+        return;
+    }
+    void *fb0 = NULL;
+    esp_err_t e = esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0);
+    if (e != ESP_OK || !fb0) {
+        ESP_LOGE("srm_bench", "get_frame_buffer: %s", esp_err_to_name(e));
+        return;
+    }
+    ppa_client_handle_t cli = NULL;
+    ppa_client_config_t cfg = {};
+    cfg.oper_type = PPA_OPERATION_SRM;
+    cfg.max_pending_trans_num = 1;
+    if (ppa_register_client(&cfg, &cli) != ESP_OK) {
+        ESP_LOGE("srm_bench", "register_client failed");
+        return;
+    }
+
+    /* 回転は「キャンバスの向き」ではなくパネルとの関係で決まる。横のとき
+       だけ 90 度。RGB565 の SRM は幅とオフセットが偶数であることを要求する
+       (ppa_srm.c) —— 1280/720/24 はどれも偶数。 */
+    bool land = s_landscape;
+    struct { const char *tag; int h; } cases[] = {
+        { "full", s_canvas_h },
+        { "band", UI_CELL_H },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ppa_srm_oper_config_t srm = {};
+        srm.in.buffer         = s_js_canvas_buf;
+        srm.in.pic_w          = (uint32_t)s_canvas_w;
+        srm.in.pic_h          = (uint32_t)s_canvas_h;
+        srm.in.block_w        = (uint32_t)s_canvas_w;
+        srm.in.block_h        = (uint32_t)cases[i].h;
+        srm.in.block_offset_x = 0;
+        srm.in.block_offset_y = 0;
+        srm.in.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+        srm.out.buffer        = fb0;
+        srm.out.buffer_size   = (uint32_t)UI_LCD_H_RES * UI_LCD_V_RES * 2;
+        srm.out.pic_w         = UI_LCD_H_RES;
+        srm.out.pic_h         = UI_LCD_V_RES;
+        srm.out.block_offset_x = 0;
+        srm.out.block_offset_y = 0;
+        srm.out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565;
+        srm.rotation_angle    = land ? PPA_SRM_ROTATION_ANGLE_90
+                                     : PPA_SRM_ROTATION_ANGLE_0;
+        srm.scale_x = 1.0f;
+        srm.scale_y = 1.0f;
+        srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t r = ppa_do_scale_rotate_mirror(cli, &srm);
+        int64_t dt = esp_timer_get_time() - t0;
+        uint32_t px = (uint32_t)s_canvas_w * (uint32_t)cases[i].h;
+        ESP_LOGW("srm_bench", "%s %s %dx%d rot=%d -> %lld us (%lu px, %s)",
+                 land ? "L" : "P", cases[i].tag, s_canvas_w, cases[i].h,
+                 land ? 90 : 0, (long long)dt, (unsigned long)px,
+                 r == ESP_OK ? "ok" : esp_err_to_name(r));
+    }
+    ppa_unregister_client(cli);
+    /* 乱した画面を戻す。 */
+    lv_obj_invalidate(lv_screen_active());
+}
+
+static void srm_bench_timer(lv_timer_t *t)
+{
+    lv_timer_delete(t);
+    srm_bench();
+}
+#endif /* UI_SRM_BENCH */
+
+/* flush の完了を **上限つきで** 待つ。
+ *
+ * LVGL の既定は `while(disp->flushing);` (lv_refr.c:1442) —— 完了が来なければ
+ * 永久に回り、core 1 が丸ごと死ぬ。実機で再現した (2026-08-26、横画面で
+ * エディタをスクロール中)。バックトレースで確定:
+ *   wait_for_flushing <- refr_configured_layer <- refr_area
+ *                     <- lv_display_refr_timer <- lvgl_port_task
+ *
+ * 完了は esp_async_fbcpy -> DMA2D の ISR -> lv_display_flush_ready で来る。
+ * 来ない条件は未特定だが、**DMA2D のチャネルは PPA と共有**されており
+ * (fill=tx0/rx1, blend=tx2/rx1, srm=tx1/rx1)、edit_task が LVGL の flush と
+ * 別タスクから PPA を叩く最初の利用者になった時期と一致している。
+ *
+ * ここで諦めて返れば、LVGL 自身が `disp->flushing = 0` にして次へ進む
+ * (lv_refr.c:1437)。**1 フレーム崩れるが固まらない。** 原因が分かるまでの
+ * 保険ではなく、恒久的に持っていてよい類の防御 —— 表示の完了待ちに上限が
+ * 無いのは、それ自体が設計の穴。
+ *
+ * 速度は落とさない: 通常の flush は 1〜2 ms なので、最初はこれまでどおり
+ * 回して待ち、2 ms を超えてから初めて CPU を返す (vTaskDelay(1) = 10 ms 刻み
+ * なので、常に譲ると 26 チャンク x 10 ms で桁が変わってしまう)。 */
+/* バッチ用のロック待ち上限。LVGL の 1 リフレッシュ (最悪 ~90ms) を
+   またげる程度に取る。超えたら順序無しで描くだけで、フレームは落とさない。 */
+#define UI_BATCH_LOCK_MS 200
+#define UI_FLUSH_SPIN_US 2000     /* これを超えたら CPU を返す */
+#define UI_FLUSH_MAX_US  200000   /* これを超えたら諦める (通常の 100 倍) */
+/* esp_lvgl_port が捨てているエラーを拾う。
+ *
+ * esp_lvgl_port_disp.c:754 は esp_lcd_panel_draw_bitmap() の戻り値を見ない。
+ * DSI の非 direct モードでは lv_display_flush_ready が fbcpy の完了 ISR から
+ * しか来ないので、**この呼び出しが失敗した瞬間に disp->flushing は永久に 1**
+ * になる。エラーの出所は esp_lcd_panel_dpi.c:472 —— 前の転送がまだ飛行中だと
+ * xSemaphoreTake(draw_sem, 0) が落ちて ESP_ERR_INVALID_STATE を返す。
+ *
+ * 実機で観測したハングはこの形だった (2026-08-26、横画面でスクロール中):
+ *   wait_for_flushing <- refr_configured_layer <- refr_area
+ *                     <- lv_display_refr_timer <- lvgl_port_task
+ * 原因を 3 回推測して 3 回外し、最後にこの 1 行が見つかった。
+ *
+ * ここで flush_ready を代わりに呼べば、**永久ハングが「1 チャンクの欠落」に
+ * 変わる**。欠けた領域は次の invalidate で埋まる。数えて ui_prof に出す —— 
+ * 0 でないなら、この経路が生きている証拠になる。 */
+extern "C" esp_err_t __real_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
+                                                      int x1, int y1, int x2,
+                                                      int y2, const void *data);
+extern "C" esp_err_t __wrap_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
+                                                      int x1, int y1, int x2,
+                                                      int y2, const void *data)
+{
+    g_ui_phase = 3;
+    esp_err_t r = __real_esp_lcd_panel_draw_bitmap(p, x1, y1, x2, y2, data);
+    g_ui_phase = 4;
+    if (r != ESP_OK && s_disp) {
+        s_draw_errs++;
+        /* 転送は始まっていない。LVGL に「終わった」と伝えないと永久に待つ。 */
+        lv_display_flush_ready(s_disp);
+    }
+    return r;
+}
+
+extern "C" uint32_t s_draw_errs_ref(void) { return s_draw_errs; }
+extern "C" uint32_t s_flush_tmo_ref(void) { return s_flush_timeouts; }
+
+static void ui_flush_wait(lv_display_t *d)
+{
+    int64_t t0 = esp_timer_get_time();
+    while (d->flushing) {
+        int64_t dt = esp_timer_get_time() - t0;
+        if (dt > UI_FLUSH_MAX_US) {
+            s_flush_timeouts++;
+            return; /* LVGL が flushing を落として先へ進む */
+        }
+        if (dt > UI_FLUSH_SPIN_US)
+            vTaskDelay(1);
+    }
+}
+
+static void prof_event(lv_event_t *e)
+{
+    int64_t now = esp_timer_get_time();
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_RENDER_START:
+        s_prof.t_render = now;
+        s_prof.render = s_prof.flush = s_prof.wait = 0;
+        s_prof.flushes = 0;
+        s_prof.canvas = s_prof_canvas_mark;
+        s_prof_canvas_mark = false;
+        s_ppa_rot_us = 0;
+        break;
+    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render;
+                                     prof_fold(now); break;
+    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
+    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
+                                     s_prof.flushes++; break;
+    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
+    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
+    default: break;
+    }
+}
+
+/* Register the six events on the display. Called once, from
+   ui_tab5_start, right after the display exists — so kb_bench must NOT
+   register them again (double registration would double every time). */
+static void prof_attach(lv_display_t *disp)
+{
+    static const lv_event_code_t prof_codes[] = {
+        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
+        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
+        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
+    };
+    for (auto code : prof_codes)
+        lv_display_add_event_cb(disp, prof_event, code, nullptr);
+}
+/* >>> host-testable presentation meter end <<< */
+
 /* Temporary instrumentation: what does each kind of keyboard repaint
    actually cost on this panel? (single draw buffer, 25-line chunks,
    PPA rotate per flush). Times the render+flush by forcing it. */
@@ -2969,43 +4723,11 @@ void ui_tab5_kb_field(int mode)
 #define UI_KB_BENCH 0
 #endif
 #if UI_KB_BENCH
-/* Where a repaint actually goes. LVGL brackets a refresh with
-   RENDER_START/READY and each flush with FLUSH_START/FINISH plus
-   FLUSH_WAIT_START/FINISH (lv_refr.c:755,823,1415,1423,1433,1446), so
-   total - flush_cb - wait = the CPU pixel work. flush_cb includes the
-   PPA rotation in landscape; wait is time blocked on the previous
-   chunk's DMA, which is exactly what a second draw buffer would hide. */
-static struct {
-    int64_t t_render, t_flush, t_wait;
-    int64_t render, flush, wait;
-    int flushes;
-} s_prof;
-
-static void prof_event(lv_event_t *e)
-{
-    int64_t now = esp_timer_get_time();
-    switch (lv_event_get_code(e)) {
-    case LV_EVENT_RENDER_START:      s_prof.t_render = now; break;
-    case LV_EVENT_RENDER_READY:      s_prof.render += now - s_prof.t_render; break;
-    case LV_EVENT_FLUSH_START:       s_prof.t_flush = now; break;
-    case LV_EVENT_FLUSH_FINISH:      s_prof.flush += now - s_prof.t_flush;
-                                     s_prof.flushes++; break;
-    case LV_EVENT_FLUSH_WAIT_START:  s_prof.t_wait = now; break;
-    case LV_EVENT_FLUSH_WAIT_FINISH: s_prof.wait += now - s_prof.t_wait; break;
-    default: break;
-    }
-}
-
 static void kb_bench(void)
 {
     int64_t t0;
-    static const lv_event_code_t prof_codes[] = {
-        LV_EVENT_RENDER_START,     LV_EVENT_RENDER_READY,
-        LV_EVENT_FLUSH_START,      LV_EVENT_FLUSH_FINISH,
-        LV_EVENT_FLUSH_WAIT_START, LV_EVENT_FLUSH_WAIT_FINISH,
-    };
-    for (auto code : prof_codes)
-        lv_display_add_event_cb(s_disp, prof_event, code, nullptr);
+    /* prof_event is already attached (prof_attach, from ui_tab5_start):
+       registering it a second time would count every event twice. */
 
 #define KB_BENCH_STEP(label, body)                                        \
     do {                                                                  \
@@ -3096,6 +4818,129 @@ static void kb_bench(void)
 }
 #endif
 
+/* ------------------------------------------------------------------ */
+/* E2: 幾何プローブ (CONFIG_MQJS_UI_GEOM_PROBE)                          */
+/* ------------------------------------------------------------------ */
+/*
+ * landscape の回転が「どの幾何で」止まるかを、人の操作から切り離して
+ * 決定論的に踏む。lv_layer_top に透明なオブジェクトを 1 個置き、寸法を
+ * W×H にして lv_refr_now する —— 描画バッファ 36000 px は H ≤ 31 の
+ * どの段も 1 チャンクに収まるので、1 ステップ = ちょうど W×H の回転 1 回。
+ *
+ * 順番は「生きるはず」から「死ぬはず」へ。止まった所が答え:
+ *   1280x28  sanity。普段のチャンクそのもの
+ *   1280x7   奇数・小 h だが w%16=0 → 最小ブロック 7x16 = 224 B。
+ *            ここで止まれば「奇数 h / 行整列」(D7 原型) が復活
+ *   1137x8   w%16=1 だが 1x8 → 16 B (境界)
+ *   1138x7   w%16=2 → 2x7 = 28 B
+ *   1137x7   1x7 = 14 B。実機で止まったのと同じ幾何
+ *   1137x31  同じ幅の完走例 (ring で完了が見えていたもの)
+ *
+ * 各ステップは 2 段: settle (前のオブジェクトを消して 1 回 refresh =
+ * 前の幾何の回転がもう 1 回走る) と probe (新しい寸法で refresh)。
+ * 消して作り直すのは、寸法変更だと旧領域と新領域の 2 つが 1 回の
+ * refresh に乗って幾何が濁るから。
+ *
+ * ログ: "GEOM_PROBE probe WxH begin" の後に "done" が出ない段が犯人。
+ * 検死役は 3 秒後に通常の CORONER 行を出す (rot ring の先頭が同じ WxH)。
+ * rotates= が 1 でなければ、その refresh に別の無効化 (時計など) が
+ * 相乗りしている —— rot ring で確かめること。
+ */
+#if CONFIG_MQJS_UI_GEOM_PROBE
+struct ui_geom_step_t { uint16_t w, h; };
+static const ui_geom_step_t s_gp_steps[] = {
+    { 1280, 28 }, { 1280, 7 }, { 1137, 8 }, { 1138, 7 }, { 1137, 7 },
+    { 1137, 31 },
+};
+#define UI_GP_N ((int)(sizeof s_gp_steps / sizeof s_gp_steps[0]))
+static lv_obj_t *s_gp_obj;
+static int       s_gp_i;
+static bool      s_gp_probe_phase;   /* false: settle / true: probe */
+static bool      s_gp_running;
+
+static void gp_refresh(const char *what, int w, int h)
+{
+    const int max_row = 36000 / (w > 0 ? w : 1);   /* 描画バッファ 72000 B */
+    uint32_t g0 = s_geom_i;
+    int64_t t0 = esp_timer_get_time();
+    ESP_LOGW(TAG, "GEOM_PROBE %s %dx%d begin (w%%16=%d h%%16=%d min_blk=%d B, "
+                  "chunk h=%d)",
+             what, w, h, w % 16, h % 16,
+             (w % 16 ? w % 16 : 16) * (h % 16 ? h % 16 : 16) * 2,
+             h <= max_row ? h : max_row);
+    memset(&s_prof, 0, sizeof s_prof);
+    lv_refr_now(s_disp);
+    ESP_LOGW(TAG, "GEOM_PROBE %s %dx%d done %lld us | chunks=%d rot=%lld us "
+                  "rotates=%lu",
+             what, w, h, (long long)(esp_timer_get_time() - t0),
+             s_prof.flushes, (long long)s_ppa_rot_us,
+             (unsigned long)(s_geom_i - g0));
+}
+
+static void gp_timer(lv_timer_t *t)
+{
+    if (!s_gp_probe_phase) {
+        if (s_gp_obj) {
+            int pw = (int)lv_obj_get_width(s_gp_obj);
+            int ph = (int)lv_obj_get_height(s_gp_obj);
+            lv_obj_delete(s_gp_obj);
+            s_gp_obj = nullptr;
+            gp_refresh("settle", pw, ph);
+        }
+        if (s_gp_i >= UI_GP_N) {
+            ESP_LOGW(TAG, "GEOM_PROBE end: all %d steps completed", UI_GP_N);
+            s_gp_running = false;
+            lv_timer_delete(t);
+            return;
+        }
+        s_gp_probe_phase = true;
+        return;
+    }
+    const ui_geom_step_t &st = s_gp_steps[s_gp_i];
+    s_gp_obj = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_gp_obj);
+    lv_obj_remove_flag(s_gp_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_gp_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_gp_obj, 0, UI_STATUSBAR_H + 40);
+    lv_obj_set_size(s_gp_obj, st.w, st.h);
+    lv_obj_set_style_bg_color(s_gp_obj, lv_color_hex(0xFF00FF), 0);
+    lv_obj_set_style_bg_opa(s_gp_obj, LV_OPA_50, 0);
+    ESP_LOGW(TAG, "GEOM_PROBE step %d/%d", s_gp_i + 1, UI_GP_N);
+    gp_refresh("probe", st.w, st.h);
+    s_gp_i++;
+    s_gp_probe_phase = false;
+}
+
+/* UI タスクの上 (ui_run_frame_work、ロックの内側) で呼ばれる。 */
+static void gp_job(void *)
+{
+    if (s_gp_running) {
+        ESP_LOGW(TAG, "GEOM_PROBE already running");
+        return;
+    }
+    if (!s_disp) {
+        ESP_LOGW(TAG, "GEOM_PROBE no display");
+        return;
+    }
+    s_gp_running = true;
+    s_gp_i = 0;
+    s_gp_probe_phase = true;
+    ESP_LOGW(TAG, "GEOM_PROBE start: %s hres=%d sentinel=%d (portrait = no "
+                  "rotate, the probe then measures nothing)",
+             s_landscape ? "landscape" : "portrait", ui_cur_hres(),
+             (int)UI_CORONER_SENTINEL);
+    lv_timer_create(gp_timer, 400, nullptr);
+}
+
+extern "C" void ui_tab5_geom_probe(void)
+{
+    if (!ui_tab5_post_job(gp_job, nullptr, 0))
+        ESP_LOGW(TAG, "GEOM_PROBE: job queue full / UI not up");
+}
+#endif /* CONFIG_MQJS_UI_GEOM_PROBE */
+
+#include "ui_tab5_surf.inc"
+
 /* Phase 2: JS-drawable canvas over the console area. Hidden until the
    running script issues its first ui.* command; hides again (and
    clears) when a different task takes over, so console-only tasks get
@@ -3118,6 +4963,9 @@ public:
                      (unsigned)bytes);
             return;
         }
+        /* what the allocation really holds, for surf_geom's guard —
+           published before anything can draw */
+        s_canvas_px = bytes / 2;
         if (!s_ppa_fill) {
             ppa_client_config_t cfg = {};
             cfg.oper_type = PPA_OPERATION_FILL;
@@ -3132,6 +4980,18 @@ public:
             if (ppa_register_client(&cfg, &s_ppa_blend) != ESP_OK) {
                 s_ppa_blend = nullptr; /* cells runs stay on the CPU */
                 ESP_LOGW(TAG, "PPA blend unavailable, cells stay on CPU");
+            }
+        }
+        /* the native surface's own fill client (see s_ppa_fill_nat).
+           Registered HERE, on the UI task at startup, because
+           ppa_register_client allocates and the native presenter's task
+           is not allowed to (spec §A.2, "edit_task の禁止事項"). */
+        if (!s_ppa_fill_nat) {
+            ppa_client_config_t cfg = {};
+            cfg.oper_type = PPA_OPERATION_FILL;
+            if (ppa_register_client(&cfg, &s_ppa_fill_nat) != ESP_OK) {
+                s_ppa_fill_nat = nullptr; /* native fills stay on the CPU */
+                ESP_LOGW(TAG, "PPA fill (native) unavailable, CPU fallback");
             }
         }
         fill_all(lv_color_to_u16(lv_color_hex(UI_COL_BG)));
@@ -3154,7 +5014,14 @@ public:
         track_task_switch();
 
         ui_cmd_t cmd;
+        if (s_prof_emit_pending) {
+            s_prof_emit_pending = false;
+            prof_report(esp_timer_get_time());
+        }
         bool drew = false;
+        /* このバッチが実際に触った矩形 (面積の計測用。§A.3)。 */
+        int  bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
+        bool bbox_ok = true;
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             if (cmd.op == UI_CMD_KEYBOARD) {
                 /* not a drawing op: must not unhide the canvas */
@@ -3187,14 +5054,138 @@ public:
                 ovl_hide_all();    /* a dead app's float must not survive */
                 continue;
             }
+            /* 面積の計測。**挙動は 1 ビットも変えない** —— 下の
+               lv_obj_invalidate(_canvas) はキャンバス全体のままで、ここでは
+               「dirty な部分だけなら何 px で済んだか」を数えるだけ。
+
+               なぜ要るか (2026-08-26、ピッカーの実測から): 描画のコストは
+               面積で決まり、描画バッファの 720×50 段に量子化される。
+               term_ui_tab5.c は **既に dirty 行だけ blit している**のに、
+               その情報はこの 1 行で捨てられ、1 文字来るたびに 1280×632 が
+               再描画される。差分 invalidate (spec §A.3 の
+               ui_tab5_canvas_invalidate) に置き換える価値があるかを、
+               置き換える前に測る。
+
+               CELLS 以外の描画 op は矩形を出さず「全体」に倒す。端末は
+               全部 CELLS なので測りたいものは測れるし、出せない op を
+               勝手に見積もって過大な期待値を出すより正直。 */
+            /* **op ごとに矩形を出す。CELLS だけではない。**
+
+               ここは元々「CELLS 以外は矩形を出さず全体に倒す。端末は全部
+               CELLS なので測りたいものは測れる」と書いていた。**その前提が
+               誤り**だった —— 端末のセルはネイティブが出すが、アプリ側
+               (ssh_vt2.js) がタブバーを RECT/TEXT で描くので、CELLS 以外が
+               毎フレーム混ざる。1 つ混ざるだけでバッチ全体が全面 invalidate
+               へ倒れ、差分にも直接経路にも入れなかった (実測 direct 0、
+               拒否理由の内訳も全部 0 = 入口にすら来ていなかった)。
+
+               矩形を持っている op には矩形を出させる。持っていないもの
+               (CLEAR/FILL = 全面) だけが全体に倒れる。 */
+            int x0 = 0, y0 = 0, x1 = -1, y1 = -1;
+            switch (cmd.op) {
+            case UI_CMD_CELLS:
+                if (!cmd.text) { bbox_ok = false; break; }
+                {
+                    int n = 0;
+                    for (const uint8_t *q = (const uint8_t *)cmd.text; *q; q++)
+                        if ((*q & 0xC0) != 0x80)
+                            n++;
+                    x0 = cmd.x * UI_CELL_W; y0 = cmd.y * UI_CELL_H;
+                    x1 = x0 + n * UI_CELL_W; y1 = y0 + UI_CELL_H;
+                }
+                break;
+            case UI_CMD_RECT:
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + cmd.w; y1 = cmd.y + cmd.h;
+                break;
+            case UI_CMD_LINE:   /* w,h は終点 (大きさではない) */
+                x0 = cmd.x < cmd.w ? cmd.x : cmd.w;
+                y0 = cmd.y < cmd.h ? cmd.y : cmd.h;
+                x1 = (cmd.x > cmd.w ? cmd.x : cmd.w) + 1;
+                y1 = (cmd.y > cmd.h ? cmd.y : cmd.h) + 1;
+                break;
+            case UI_CMD_PIXEL:
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + 1; y1 = cmd.y + 1;
+                break;
+            case UI_CMD_TEXT: {
+                /* text() と同じフォントで測る。取れなければ全体へ。 */
+                int tw = 0, th = 0;
+                if (cmd.text)
+                    ui_tab5_text_size(cmd.text, &tw, &th);
+                if (tw <= 0 || th <= 0) { bbox_ok = false; break; }
+                x0 = cmd.x; y0 = cmd.y; x1 = cmd.x + tw; y1 = cmd.y + th;
+                break;
+            }
+            case UI_CMD_SCROLL:  /* 段 [x,y] を w 行ずらす = その帯全部 */
+                x0 = 0; y0 = cmd.x * UI_CELL_H;
+                x1 = s_canvas_w; y1 = (cmd.y + 1) * UI_CELL_H;
+                break;
+            default:             /* CLEAR / FILL は全面 */
+                bbox_ok = false;
+                break;
+            }
+            if (bbox_ok && x1 > x0 && y1 > y0) {
+                if (x0 < 0) x0 = 0;
+                if (y0 < 0) y0 = 0;
+                if (x1 > s_canvas_w) x1 = s_canvas_w;
+                if (y1 > s_canvas_h) y1 = s_canvas_h;
+                if (bx0 > x0) bx0 = x0;
+                if (by0 > y0) by0 = y0;
+                if (bx1 < x1) bx1 = x1;
+                if (by1 < y1) by1 = y1;
+            }
+
             apply(cmd);
             free(cmd.text);
             drew = true;
         }
         if (drew) {
-            if (lv_obj_has_flag(_canvas, LV_OBJ_FLAG_HIDDEN))
+            bool unhid = lv_obj_has_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
+            if (unhid)
                 lv_obj_remove_flag(_canvas, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_invalidate(_canvas);
+            /* 触った矩形だけを無効にする (spec §A.3)。
+               描画のコストは面積で決まり、描画バッファの 720×50 段に
+               量子化される —— 1 行だけ変わった打鍵で 1280×632 を全部
+               描き直していた。実測 (2026-08-26) の want/act は 1 行だけ
+               dirty のとき 3%。
+
+               座標は絶対系。lv_obj_get_content_coords を使うのは、
+               キャンバスに padding/border が付いた日に (0,0) がずれて
+               **残像が出る**形で壊れるのを避けるため。
+               隠れていたキャンバスを今出したときは、まだ一度も描かれて
+               いない領域があるので全体を無効にする。 */
+            s_prof_canvas_mark = true; /* attribute the next refresh */
+            bool presented = false;
+            int dy = 0, dh = 0;
+            if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
+#if UI_DIRECT_PRESENT
+                /* 隠れていない帯だけ直接 FB へ。端末はここを一度も通れて
+                   いなかった —— ui.keyboard(2) の制御バーが載っているだけで
+                   全部あきらめていた。残りは下の LVGL 経路が受ける。 */
+                presented =
+                    canvas_present_direct(bx0, by0, bx1 - bx0, by1 - by0,
+                                          &dy, &dh);
+#endif
+            }
+            if (presented) {
+                /* 出せなかった帯だけを LVGL へ回す。 */
+                if (dy > by0)
+                    ui_tab5_canvas_invalidate(bx0, by0, bx1 - bx0, dy - by0);
+                int tail = by1 - (dy + dh);
+                if (tail > 0)
+                    ui_tab5_canvas_invalidate(bx0, dy + dh, bx1 - bx0, tail);
+            } else if (bbox_ok && !unhid && bx1 > bx0 && by1 > by0) {
+                lv_area_t cv;
+                lv_obj_get_content_coords(_canvas, &cv);
+                lv_area_t a;
+                a.x1 = (int32_t)(cv.x1 + bx0);
+                a.y1 = (int32_t)(cv.y1 + by0);
+                a.x2 = (int32_t)(cv.x1 + bx1 - 1);
+                a.y2 = (int32_t)(cv.y1 + by1 - 1);
+                lv_obj_invalidate_area(_canvas, &a);
+            } else {
+                lv_obj_invalidate(_canvas);
+            }
+            area_meter_batch(bbox_ok, bx0, by0, bx1, by1);
         }
     }
 
@@ -3213,6 +5204,15 @@ private:
         if (gen == _seen_gen)
             return;
         _seen_gen = gen;
+        /* native 面 (エディタ・ファイラ) が前面のときは消さない。
+           ここは「タスクが替わったら古い画素を残さない」ための掃除だが、
+           native 面は JS ワーカーではないので、その面が描いた画素まで
+           消してしまう —— しかも面は気づけない (cells_draw は true を
+           返し続ける) ので、次の打鍵で背景が空のまま 1 行だけ文字が出る
+           絵になる。UI_CMD_RESET 側の 3 経路には同じガードが入っている
+           のに、ここだけ抜けていた (M4 Phase 1 の敵対的レビューが発見)。 */
+        if (mqjs_native_fg_active())
+            return;
         if (strcmp(tn, _task) != 0 || strcmp(to, _origin) != 0) {
             memcpy(_task, tn, sizeof _task);
             memcpy(_origin, to, sizeof _origin);
@@ -3230,38 +5230,7 @@ private:
 
     void fill_rect(int x, int y, int w, int h, uint16_t px)
     {
-        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
-        int x1 = x + w, y1 = y + h;
-        if (x1 > s_canvas_w)
-            x1 = s_canvas_w;
-        if (y1 > s_canvas_h)
-            y1 = s_canvas_h;
-        if (s_ppa_fill && x1 - x0 > 0 && y1 - y0 > 0 &&
-            (x1 - x0) * (y1 - y0) >= UI_PPA_FILL_MIN_PX) {
-            ppa_fill_oper_config_t op = {};
-            op.out.buffer = _buf;
-            op.out.buffer_size =
-                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
-            op.out.pic_w = (uint32_t)s_canvas_w;
-            op.out.pic_h = (uint32_t)s_canvas_h;
-            op.out.block_offset_x = (uint32_t)x0;
-            op.out.block_offset_y = (uint32_t)y0;
-            op.out.fill_cm = PPA_FILL_COLOR_MODE_RGB565;
-            op.fill_block_w = (uint32_t)(x1 - x0);
-            op.fill_block_h = (uint32_t)(y1 - y0);
-            /* 565 -> 888 by zero-extend; PPA truncates back, lossless */
-            op.fill_argb_color.a = 0xFF;
-            op.fill_argb_color.r = (uint32_t)(((px >> 11) & 0x1F) << 3);
-            op.fill_argb_color.g = (uint32_t)(((px >> 5) & 0x3F) << 2);
-            op.fill_argb_color.b = (uint32_t)((px & 0x1F) << 3);
-            op.mode = PPA_TRANS_MODE_BLOCKING;
-            if (ppa_do_fill(s_ppa_fill, &op) == ESP_OK)
-                return;
-            /* any PPA error: fall through to the CPU loop */
-        }
-        for (int yy = y0; yy < y1; yy++)
-            for (int xx = x0; xx < x1; xx++)
-                _buf[(size_t)yy * s_canvas_w + xx] = px;
+        surf_fill_rect(_buf, x, y, w, h, px, s_ppa_fill);
     }
 
     void put_pixel(int x, int y, uint16_t px)
@@ -3309,274 +5278,20 @@ private:
         lv_canvas_finish_layer(_canvas, &layer);
     }
 
-    /* Blit one monospace glyph, fg blended over whatever bg is already in
-       the cell, clipped to its cell box — one cell wide, two for a
-       width-2 codepoint (no lv_draw_label, no layer).
-       `run_right` is the run's right edge in pixels: the CPU path has to
-       honour it for the same reason the PPA path clamps to the A8 buffer
-       (see compose_glyph_a8). Without it the two paths disagree for a
-       width-2 codepoint that ends a run — PPA shears the glyph, the CPU
-       paints its right half into the next column, which fill_rect never
-       cleared, so half a kanji survives until that row is redrawn. Same
-       ui.cells call, two different pictures depending only on the run's
-       length (UI_PPA_CELLS_MIN_CELLS). */
-    void blit_glyph(int cx0, int cy0, uint32_t cp, uint16_t fg, int run_right)
-    {
-        const lv_font_t *font = &font_term_mono;
-        lv_font_glyph_dsc_t g;
-        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
-            return;
-        if (g.box_w == 0 || g.box_h == 0) /* space etc. */
-            return;
-        /* Get the raw A4 bitmap and decode it ourselves. NOTE: the public
-           lv_font_get_glyph_bitmap() force-resets req_raw_bitmap to 0
-           (decoding to A8 into a draw_buf we don't pass -> NULL deref
-           crash). Call the font's method directly so req_raw_bitmap=1
-           sticks and we get the raw glyph_bitmap pointer. Packing is a
-           continuous 4bpp bitstream, MSB nibble first (host-verified in
-           fonts/decode_test.py). */
-        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
-        if (!rf->get_glyph_bitmap)
-            return;
-        g.req_raw_bitmap = 1;
-        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
-        if (!bmp)
-            return;
-        /* fmt_txt 4bpp: rows are padded to `stride` bytes if stride>0, else
-           the glyph is a continuous bitstream (no per-row padding). */
-        const int bpp = 4;
-        int baseline = cy0 + (UI_CELL_H - font->base_line);
-        int gx0 = cx0 + g.ofs_x;
-        int gy0 = baseline - g.ofs_y - g.box_h;
-        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
-        if (clipR > run_right) {
-            clipR = run_right;
-            cells_note_clip();
-        }
-        int clipB = cy0 + UI_CELL_H;
-        for (int py = 0; py < g.box_h; py++) {
-            int y = gy0 + py;
-            if (y < cy0 || y >= clipB || y < 0 || y >= s_canvas_h)
-                continue;
-            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
-            for (int px = 0; px < g.box_w; px++) {
-                int x = gx0 + px;
-                if (x < cx0 || x >= clipR || x < 0 || x >= s_canvas_w)
-                    continue;
-                int bitpos = rowbit + px * bpp;
-                uint8_t byte = bmp[bitpos >> 3];
-                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
-                if (!a)
-                    continue;
-                size_t idx = (size_t)y * s_canvas_w + x;
-                _buf[idx] = a == 15 ? fg : ui_blend565(_buf[idx], fg, a);
-            }
-        }
-    }
-
-    /* Compose one glyph's coverage into the run's A8 buffer (no canvas
-       access, no blending — just alpha bytes). Mirrors blit_glyph's
-       positioning/clipping; a4*17 so 15 -> 255 = fully opaque. */
-    void compose_glyph_a8(uint8_t *dst, int dst_w, int cx0, uint32_t cp)
-    {
-        const lv_font_t *font = &font_term_mono;
-        lv_font_glyph_dsc_t g;
-        if (!lv_font_get_glyph_dsc(font, &g, cp, 0))
-            return;
-        if (g.box_w == 0 || g.box_h == 0)
-            return;
-        const lv_font_t *rf = g.resolved_font ? g.resolved_font : font;
-        if (!rf->get_glyph_bitmap)
-            return;
-        g.req_raw_bitmap = 1;
-        const uint8_t *bmp = (const uint8_t *)rf->get_glyph_bitmap(&g, NULL);
-        if (!bmp)
-            return;
-        const int bpp = 4;
-        int baseline = UI_CELL_H - font->base_line;
-        int gx0 = cx0 + g.ofs_x;
-        int gy0 = baseline - g.ofs_y - g.box_h;
-        int clipL = cx0 < 0 ? 0 : cx0;
-        int clipR = cx0 + cells_glyph_cols(cp) * UI_CELL_W;
-        /* Clamp to the A8 buffer, i.e. to the run's right edge. This is
-           NOT just a last line of defence: cells()'s straddle guard only
-           runs inside the `while (n > seg_max)` splitting loop, so every
-           run of <= seg_max cells (which is nearly every run ssh_vt's
-           drawRow emits) and the final segment of a long one can still
-           END on a width-2 codepoint — a selection dragged to the left
-           half of a full-width character does exactly that. The CPU path
-           clamps to the same edge (blit_glyph's run_right) so the two
-           paths agree; without that they diverge on run length alone. */
-        if (clipR > dst_w) {
-            clipR = dst_w;
-            cells_note_clip();
-        }
-        for (int py = 0; py < g.box_h; py++) {
-            int y = gy0 + py;
-            if (y < 0 || y >= UI_CELL_H)
-                continue;
-            int rowbit = g.stride ? py * g.stride * 8 : py * g.box_w * bpp;
-            uint8_t *drow = dst + (size_t)y * dst_w;
-            for (int px = 0; px < g.box_w; px++) {
-                int x = gx0 + px;
-                if (x < clipL || x >= clipR)
-                    continue;
-                int bitpos = rowbit + px * bpp;
-                uint8_t byte = bmp[bitpos >> 3];
-                int a = (bitpos & 4) ? (byte & 0x0F) : (byte >> 4);
-                if (a)
-                    drow[x] = (uint8_t)(a * 17);
-            }
-        }
-    }
-
-    /* Draw a run of cells (one fg/bg) starting at (col,row) using the
-       monospace grid font. UTF-8 decoded to codepoints. Long runs that
-       sit fully on the grid go compose-then-one-PPA-blend; short runs
-       and any PPA failure use the per-glyph CPU blit. Runs wider than
-       the A8 compose buffer (80 cells = the portrait width; landscape
-       rows are 142) are split into segments so the PPA path keeps
-       winning instead of falling back to the CPU wholesale. */
+    /* Draw a run of cells (one fg/bg) starting at (col,row). The work
+       lives in surf_cells (spec §A.3); this is the ui.cells command's
+       binding to it: the JS canvas's own buffer, the shared A8 staging
+       buffer in internal SRAM, and the UI task's PPA clients. The
+       column count comes from the text (ncells = 0) because that is
+       what the ui_cmd_t carries. */
     void cells(const ui_cmd_t &cmd)
     {
         if (!cmd.text)
             return;
-        int col = cmd.x, row = cmd.y;
-        uint16_t fg = lv_color_to_u16(lv_color_hex(cmd.color));
-        uint16_t bg = lv_color_to_u16(lv_color_hex(cmd.bg));
-        const uint8_t *s = (const uint8_t *)cmd.text;
-        /* the run has a single bg: clear it in one rect (instead of one
-           9x24 fill per cell) — row-contiguous, and long runs clear the
-           PPA threshold. Columns == codepoints (the CONT contract at the
-           top of this file), so counting UTF-8 lead bytes gives the run's
-           width. Deliberately NOT sum(ui_cell_width): the caller already
-           spent a column on the filler cell, and counting the wide
-           glyph's second column here as well would overshoot the fill by
-           one cell per CJK character and eat the head of the next run. */
-        int n = 0;
-        for (const uint8_t *p = s; *p; p++)
-            if ((*p & 0xC0) != 0x80)
-                n++;
-        fill_rect(col * UI_CELL_W, row * UI_CELL_H, n * UI_CELL_W,
-                  UI_CELL_H, bg);
-        const int run_col = col, run_cells = n;
-
-        const int seg_max = (int)(sizeof(s_cells_a8) /
-                                  ((size_t)UI_CELL_W * UI_CELL_H));
-        while (n > seg_max) {
-            /* Fill a segment, but never let one END on a width-2 glyph:
-               its right half belongs to the next segment's first cell,
-               which is outside the A8 buffer, so compose_glyph_a8 would
-               shear it — and only on the PPA path, since the CPU blit
-               writes straight to the canvas and would not. Hand the
-               straddling glyph to the next segment instead. */
-            const uint8_t *p = s;
-            int take = 0;
-            while (take < seg_max) {
-                const uint8_t *q = p;
-                if (take + cells_glyph_cols(cells_utf8_next(p)) > seg_max) {
-                    p = q; /* rewind over the straddling glyph */
-                    break;
-                }
-                take++; /* one column per codepoint, wide or not */
-            }
-            if (take == 0) { /* unreachable at seg_max=80; no stuck loop */
-                cells_utf8_next(p);
-                take = 1;
-            }
-            cells_run(col, row, s, p, take, fg);
-            s = p;
-            col += take;
-            n -= take;
-        }
-        cells_run(col, row, s, nullptr, n, fg);
-        cells_rules(run_col, row, run_cells, fg, (unsigned)cmd.w);
-    }
-
-    /* §6's "1 本線描画": underline and strike-through, the only two SGR
-       attributes the cell contract does not fold into fg/bg. One
-       fill_rect per rule for the WHOLE run — not per cell — so a fully
-       underlined 142-column row costs two rect writes, and a run with no
-       attributes costs one compare. Drawn after the glyphs so the rule
-       sits on top of a descender rather than under it, which is what a
-       terminal looks like. */
-    void cells_rules(int col, int row, int n, uint16_t fg, unsigned attrs)
-    {
-        if (!(attrs & (UI_CELL_ATTR_UNDERLINE | UI_CELL_ATTR_STRIKE)) || n <= 0)
-            return;
-        int y0 = row * UI_CELL_H;
-        int x0 = col * UI_CELL_W, w = n * UI_CELL_W;
-        if (attrs & UI_CELL_ATTR_UNDERLINE) {
-            /* One pixel below the baseline (blit_glyph's own baseline
-               arithmetic), kept inside the cell so consecutive underlined
-               rows never touch. */
-            int y = y0 + (UI_CELL_H - (int)font_term_mono.base_line) + 1;
-            if (y > y0 + UI_CELL_H - 1)
-                y = y0 + UI_CELL_H - 1;
-            fill_rect(x0, y, w, 1, fg);
-        }
-        if (attrs & UI_CELL_ATTR_STRIKE)
-            fill_rect(x0, y0 + UI_CELL_H / 2, w, 1, fg);
-    }
-
-    /* One ≤80-cell segment: PPA compose+blend when it qualifies, else
-       per-glyph CPU blit. `e` bounds the UTF-8 walk (nullptr = NUL). */
-    void cells_run(int col, int row, const uint8_t *s, const uint8_t *e,
-                   int n, uint16_t fg)
-    {
-        int x0 = col * UI_CELL_W, y0 = row * UI_CELL_H, bw = n * UI_CELL_W;
-
-        if (s_ppa_blend && n >= UI_PPA_CELLS_MIN_CELLS && x0 >= 0 &&
-            y0 >= 0 && x0 + bw <= s_canvas_w &&
-            y0 + UI_CELL_H <= s_canvas_h &&
-            (size_t)bw * UI_CELL_H <= sizeof(s_cells_a8)) {
-            memset(s_cells_a8, 0, (size_t)bw * UI_CELL_H);
-            const uint8_t *p = s;
-            for (int c = 0; *p && (!e || p < e); c++)
-                compose_glyph_a8(s_cells_a8, bw, c * UI_CELL_W,
-                                 cells_utf8_next(p));
-            ppa_blend_oper_config_t op = {};
-            op.in_bg.buffer = _buf;
-            op.in_bg.pic_w = (uint32_t)s_canvas_w;
-            op.in_bg.pic_h = (uint32_t)s_canvas_h;
-            op.in_bg.block_w = (uint32_t)bw;
-            op.in_bg.block_h = UI_CELL_H;
-            op.in_bg.block_offset_x = (uint32_t)x0;
-            op.in_bg.block_offset_y = (uint32_t)y0;
-            op.in_bg.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
-            op.in_fg.buffer = s_cells_a8;
-            op.in_fg.pic_w = (uint32_t)bw;
-            op.in_fg.pic_h = UI_CELL_H;
-            op.in_fg.block_w = (uint32_t)bw;
-            op.in_fg.block_h = UI_CELL_H;
-            op.in_fg.blend_cm = PPA_BLEND_COLOR_MODE_A8;
-            op.out.buffer = _buf;
-            op.out.buffer_size =
-                ((size_t)s_canvas_w * s_canvas_h * 2 + 63) & ~(size_t)63;
-            op.out.pic_w = (uint32_t)s_canvas_w;
-            op.out.pic_h = (uint32_t)s_canvas_h;
-            op.out.block_offset_x = (uint32_t)x0;
-            op.out.block_offset_y = (uint32_t)y0;
-            op.out.blend_cm = PPA_BLEND_COLOR_MODE_RGB565;
-            op.bg_alpha_update_mode = PPA_ALPHA_FIX_VALUE;
-            op.bg_alpha_fix_val = 255;
-            op.fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
-            op.fg_fix_rgb_val.r = (uint32_t)(((fg >> 11) & 0x1F) << 3);
-            op.fg_fix_rgb_val.g = (uint32_t)(((fg >> 5) & 0x3F) << 2);
-            op.fg_fix_rgb_val.b = (uint32_t)((fg & 0x1F) << 3);
-            op.mode = PPA_TRANS_MODE_BLOCKING;
-            if (ppa_do_blend(s_ppa_blend, &op) == ESP_OK)
-                return;
-            /* any PPA error: fall through to the per-glyph CPU path */
-        }
-
-        int c = col;
-        int run_right = (col + n) * UI_CELL_W;
-        while (*s && (!e || s < e)) {
-            uint32_t cp = cells_utf8_next(s);
-            blit_glyph(c * UI_CELL_W, row * UI_CELL_H, cp, fg, run_right);
-            c++;
-        }
+        surf_cells(_buf, cmd.x, cmd.y, (const uint8_t *)cmd.text, nullptr, 0,
+                   lv_color_to_u16(lv_color_hex(cmd.color)),
+                   lv_color_to_u16(lv_color_hex(cmd.bg)), (unsigned)cmd.w,
+                   s_cells_a8, sizeof s_cells_a8, s_ppa_blend, s_ppa_fill);
     }
 
     /* Scroll cell-rows [top,bot] by n (n>0 up, n<0 down) in the buffer
@@ -3651,6 +5366,501 @@ private:
 };
 
 /* ------------------------------------------------------------------ */
+/* Native surface entry points (spec §A.3)                             */
+/*                                                                     */
+/* The native editor/filer presenter runs on ITS OWN task (edit_task,   */
+/* core 1, prio 5) and draws straight into the same canvas the JS       */
+/* ui.* commands use. Three calls, and the split between them is the    */
+/* whole point:                                                        */
+/*                                                                     */
+/*   ui_tab5_cells_draw / ui_tab5_canvas_fill   pixels, NO LVGL lock   */
+/*   ui_tab5_canvas_invalidate                  lock, held for µs      */
+/*                                                                     */
+/* so a 26-row repaint pays the lock once instead of 26 times, and the  */
+/* presenter's own budget (spec §C.4: edit_task's max hold > 100 µs is  */
+/* a design violation) stays inside one short critical section.        */
+/*                                                                     */
+/* The canvas belongs to CanvasApp; these functions reach it through    */
+/* s_js_canvas / s_js_canvas_buf, which CanvasApp::onCreate publishes   */
+/* and ui_tab5_set_landscape re-binds with swapped dimensions. Before   */
+/* the UI is up (or on a build without it) they are no-ops / false.     */
+/* ------------------------------------------------------------------ */
+
+/* >>> host-testable native surface begin <<< */
+extern "C" bool ui_tab5_cells_draw(const ui_cells_draw_t *d)
+{
+    if (!d || !d->utf8 || d->ncells <= 0)
+        return false;
+    if (!s_js_canvas_buf || !s_canvas_w || !s_canvas_h)
+        return false; /* no canvas: caller keeps its model, draws later */
+    surf_cells(s_js_canvas_buf, d->col, d->row, (const uint8_t *)d->utf8,
+               (const uint8_t *)d->utf8 + d->len, d->ncells,
+               lv_color_to_u16(lv_color_hex(d->fg)),
+               lv_color_to_u16(lv_color_hex(d->bg)), d->attrs, d->a8,
+               d->a8_len, (ppa_client_handle_t)d->ppa, s_ppa_fill_nat);
+    return true;
+}
+
+extern "C" void ui_tab5_canvas_fill(int x, int y, int w, int h, uint32_t rgb)
+{
+    if (!s_js_canvas_buf || !s_canvas_w || !s_canvas_h)
+        return;
+    surf_fill_rect(s_js_canvas_buf, x, y, w, h,
+                   lv_color_to_u16(lv_color_hex(rgb)), s_ppa_fill_nat);
+}
+
+/* フォアグラウンド切替の掃除を、**同期で**やる。
+ *
+ * これまでは UI_CMD_RESET をキューへ投げるだけだった。掃くのは UI タスク
+ * で、完了を知る口が無い。だから新しい面 (エディタ) は「自分の最初の 1 枚が
+ * RESET に消されるかもしれない」前提で、80ms 間隔で全画面を 4 回描き直す
+ * 保険を持っていた —— 全画面 1 枚が実測 74.6 ms なので、**アプリを切り替える
+ * たびに core 1 が 370 ms 持っていかれていた**。
+ *
+ * ここを同期にすると保険が要らなくなる。ui_tab5_w_reset() が既に
+ * lvgl_port_lock を同期で取っているので、その隣に並べるだけ。
+ * 呼ぶのは JS タスク (fg_screen_reset)。全画面 fill 1 回ぶん待つ。 */
+/* ===================================================================== *
+ * キャンバスを LVGL を通さず DSI のフレームバッファへ直接出す
+ *
+ * 実測 (2026-08-26、横 1280x632):
+ *   LVGL 経路 = draw 27.9 + flush 20.2 + wait 26.5 = **74.6 ms**
+ *   PPA SRM で回転を畳んだ 1 op          = **37.2 ms**
+ * 1 画素あたりでは SRM のほうが遅い (46 vs 34 ns/px) —— 転置しながら書く
+ * ので書き側が strided になる。それでも勝つのは、LVGL 経路が
+ * 「PSRAM→内部→(回転)→PSRAM→PSRAM」と **3 回コピーする**から。
+ * SRM は 1 回で済む。コピー 5 回のうち 3 本が 1 本になる。
+ *
+ * **小さな damage では負ける**: 1 段 (24px) は SRM 2.05 ms、LVGL は 1 チャンク
+ * ~1.5 ms。固定費と strided が効く。だから閾値で切り替える —— 打鍵は
+ * 今までどおり LVGL、スクロールや全面はこちら。
+ *
+ * **キャンバスが真実であり続ける**ので LVGL と矛盾しない: PARTIAL モードの
+ * LVGL は画面のコピーを持たず「無効化された矩形を描き直す」だけなので、
+ * あとで同じ領域を描いても同じ画素になる。破れるのは「キャンバスに無い
+ * ものが画面にある」= 何かが上に載っているときだけ。そのときは従来経路へ。
+ * ===================================================================== */
+/* **既定オフ。実機で LVGL の flush をデッドロックさせた (2026-08-26)。**
+ *
+ *   task_wdt: IDLE1 (CPU 1) / CPU 1: taskLVGL
+ *   MEPC 0x400fccca  RA 0x400fcca4   <- ほぼ同じ番地 = 密なループ
+ *
+ * taskLVGL が `while(disp->flushing);` (lv_refr.c:1442、esp_lvgl_port は
+ * flush_wait_cb を設定しないので busy-spin) を回り続け、flush が永久に
+ * 完了しなかった。横画面でスクロールした瞬間に再現。
+ *
+ * 原因の見立て (**未確定**): PPA SRM と esp_async_fbcpy は **同じ DMA2D の
+ * チャネルを奪い合う** (ppa_srm.c は tx1/rx1、fbcpy も DMA2D)。こちらは
+ * edit_task から PPA_TRANS_MODE_BLOCKING で投げており、LVGL が待っている
+ * fbcpy と噛み合った。エンジン (SRM/BLEND) が別でもチャネルは別ではない。
+ *
+ * 測定は生きている: キャンバス→FB は 46 ns/px、横の全画面 37.2 ms 対
+ * LVGL 経路 74.6 ms。**取り分は本物だが、この統合の仕方が間違っている。**
+ * 再挑戦するなら先に決めること —— 非ブロッキング + 完了待ちにするのか、
+ * LVGL の flush と同じ経路 (fbcpy) に相乗りするのか、そもそも LVGL の
+ * flush が走っていない瞬間にだけ撃つのか。DMA2D の共有を理解する前に
+ * 1 に戻してはいけない。 */
+/* **1 に戻した (2026-08-26)。** 一度 0 にしたのは「これがハングの原因」と
+   判断したためだが、**無効化しても同じ場所で固まった**ので犯人ではない。
+   加えて ui_flush_wait が入り、flush の完了待ちに 200ms の上限がついた ——
+   完了が来なくても LVGL は先へ進む (固まる代わりに 1 フレーム崩れる)。
+   横の全画面 74.6ms が 37.2ms になるかを実測する。 */
+
+#if UI_DIRECT_PRESENT
+static ppa_client_handle_t s_ppa_srm_direct;
+
+/* この矩形の上に何か載っていないか。
+ *
+ * **存在ではなく交差を見る。** 最初の版は「lv_layer_top() に見えている子が
+ * 1 つでもあれば従来経路へ」にしていたが、**ステータスバーが常にそこに居る**
+ * (ui_tab5.cpp:1274 が lv_layer_top() に作る) ので、直接経路は一度も通れて
+ * いなかった —— 実機で `direct 0 x 0 us` が全窓に出て発覚した。しかも
+ * ステータスバーはキャンバス (y = UI_STATUSBAR_H の下) と重ならない。
+ *
+ * LVGL のツリーを edit_task から読むので、幾何を取る間だけロックを持つ。
+ * ロックを離してから PPA を撃つ (37 ms を握ったままにしない)。その隙に
+ * 何かが現れたら、その 1 フレームだけ上書きされて次の再描画で戻る —— 
+ * 自己修復するので、ロックを長く持つより安い。 */
+static bool rects_overlap(const lv_area_t *a, const lv_area_t *b)
+{
+    return !(a->x2 < b->x1 || b->x2 < a->x1 || a->y2 < b->y1 || b->y2 < a->y1);
+}
+
+/* この層の可視な子で、矩形と交差するものがあるか。 */
+static bool layer_blocks(lv_obj_t *parent, uint32_t from, const lv_area_t *a)
+{
+    if (!parent)
+        return false;
+    uint32_t n = lv_obj_get_child_count(parent);
+    for (uint32_t i = from; i < n; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, i);
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t o;
+        lv_obj_get_coords(c, &o);
+        if (rects_overlap(&o, a))
+            return true;
+    }
+    return false;
+}
+
+/* この矩形のうち、**上に何も載っていない一番大きい横帯**を返す。
+ *
+ * 以前は「1 つでも重なっていたら false」だった。守りとしては正しいが、
+ * 端末はそれで一度も直接経路に入れなかった —— ui.keyboard(2) が制御バーと
+ * その上の帯を layer_top に出すので、毎フレーム全部あきらめて LVGL に
+ * 落ちていた (実測 direct 0 x 0、1 リフレッシュ 14ms・チャンク 428 本)。
+ *
+ * クロームは画面の上下に張り付くので、遮蔽は縦の帯になる。**隠れている
+ * 帯を避けて残りを直接出し、残余だけ LVGL に渡す**ほうが、全部あきらめる
+ * より常に良い。何も載っていなければ帯 = 矩形そのもので、以前と同じ道。
+ *
+ * 判定は z-order (キャンバスより後ろの兄弟 + layer_top/layer_sys)。列挙は
+ * 足し忘れれば静かに壊れる —— 最初の版はステータスバーが常駐しているせいで
+ * 一度も直接経路を通らなかった。 */
+#define UI_BLOCK_MAX 24
+
+static void band_note(int *n, int (*sp)[2], int a, int b, int y, int y2)
+{
+    if (a < y)  a = y;
+    if (b > y2) b = y2;
+    if (a >= b || *n >= UI_BLOCK_MAX)
+        return;
+    sp[*n][0] = a; sp[*n][1] = b; (*n)++;
+}
+
+/* この層の可視な子のうち、矩形と交差するものの縦の範囲を集める。 */
+static void layer_spans(lv_obj_t *parent, uint32_t from, const lv_area_t *a,
+                        int *n, int (*sp)[2], int cvy, int y, int y2)
+{
+    if (!parent)
+        return;
+    uint32_t cnt = lv_obj_get_child_count(parent);
+    for (uint32_t i = from; i < cnt; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, i);
+        if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+            continue;
+        lv_area_t o;
+        lv_obj_get_coords(c, &o);
+        if (!rects_overlap(&o, a))
+            continue;
+        band_note(n, sp, (int)o.y1 - cvy, (int)o.y2 + 1 - cvy, y, y2);
+    }
+}
+
+static bool canvas_free_band(int x, int y, int w, int h, int *fy, int *fh)
+{
+    lv_area_t cv;
+    lv_obj_get_content_coords(s_js_canvas, &cv);
+    lv_area_t a = { (int32_t)(cv.x1 + x), (int32_t)(cv.y1 + y),
+                    (int32_t)(cv.x1 + x + w - 1), (int32_t)(cv.y1 + y + h - 1) };
+    int y2 = y + h;
+    int n = 0, sp[UI_BLOCK_MAX][2];
+
+    lv_obj_t *parent = lv_obj_get_parent(s_js_canvas);
+    layer_spans(parent, lv_obj_get_index(s_js_canvas) + 1, &a, &n, sp,
+                (int)cv.y1, y, y2);
+    layer_spans(lv_layer_top(), 0, &a, &n, sp, (int)cv.y1, y, y2);
+    layer_spans(lv_layer_sys(), 0, &a, &n, sp, (int)cv.y1, y, y2);
+
+    if (n == 0) {
+        *fy = y; *fh = h;
+        return h > 0;
+    }
+    /* 帯を昇順に並べて、いちばん広い隙間を取る。n は 24 が上限なので
+       挿入ソートで十分 (毎フレーム走るが、実際は 0〜3 本)。 */
+    for (int i = 1; i < n; i++) {
+        int a0 = sp[i][0], b0 = sp[i][1], k = i - 1;
+        while (k >= 0 && sp[k][0] > a0) { sp[k+1][0] = sp[k][0];
+                                          sp[k+1][1] = sp[k][1]; k--; }
+        sp[k+1][0] = a0; sp[k+1][1] = b0;
+    }
+    int best_y = y, best_h = 0, cur = y;
+    for (int i = 0; i <= n; i++) {
+        int a0 = (i < n) ? sp[i][0] : y2;
+        if (a0 - cur > best_h) { best_h = a0 - cur; best_y = cur; }
+        if (i < n && sp[i][1] > cur)
+            cur = sp[i][1];
+    }
+    *fy = best_y; *fh = best_h;
+    return best_h > 0;
+}
+
+/* true を返したら「もう画面に出した」。false なら呼び出し側が
+   従来の lv_obj_invalidate_area へ落とす。 */
+static bool canvas_present_direct(int x, int y, int w, int h,
+                                  int *done_y, int *done_h)
+{
+    if (!s_dpi_panel || !s_js_canvas_buf || !s_js_canvas || !s_canvas_w ||
+        !s_canvas_h)
+        return false;
+    if (lv_obj_has_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN))
+        return false;
+    /* **横のときだけ。** 実測 (2026-08-26、全画面):
+         横  LVGL 74.6 ms  /  直接 37.2 ms   -> 直接が 2 倍速い
+         縦  LVGL 36.1 ms  /  直接 39.6 ms   -> **LVGL のほうが速い**
+       直接経路は 46 ns/px で、これは向きに依存しない PPA SRM の素の速度
+       (PSRAM->PSRAM 約 87 MB/s)。**回転はこの経路のコストではなかった** ——
+       当初「転置で strided になるから遅い」と読んだのは誤りで、縦を測って
+       初めて分かった。差がつくのは LVGL 側で、縦は回転もキャッシュ跨ぎの
+       転送も無いので 36.1 ms で済む。横だけが 74.6 ms を払っている。 */
+    if (!s_landscape) {
+        s_direct_rej[0]++;
+        return false;
+    }
+    if (h < UI_DIRECT_MIN_H) {
+        s_direct_rej[1]++;
+        return false;
+    }
+    /* ここからロックを持つ。離すのは戻る直前。
+       (a) LVGL が render 中でないこと = ロック
+       (b) 飛行中の flush が着地していること = flushing を待つ
+       (a) だけだと最後のチャンクの fbcpy に負け、(b) だけだと render 中の
+       古いスナップショットが後から flush される。両方要る。 */
+    if (!lvgl_port_lock(0)) {
+        s_direct_rej[2]++;
+        return false;
+    }
+    int fy = y, fh = h;
+    if (!canvas_free_band(x, y, w, h, &fy, &fh) || fh < UI_DIRECT_MIN_H) {
+        s_direct_rej[3]++;
+        lvgl_port_unlock();
+        return false;   /* 隠れていない帯が無い / 小さすぎる */
+    }
+    y = fy; h = fh;     /* 出すのはこの帯だけ。残りは呼び出し側が LVGL へ */
+    /* 飛行中の flush を着地させる。**ここで flushing を 0 にしてはいけない**
+       —— fbcpy が生きているかもしれない。諦めたら従来経路へ落とす。 */
+    if (s_disp) {
+        int64_t t0 = esp_timer_get_time();
+        while (s_disp->flushing) {
+            int64_t dt = esp_timer_get_time() - t0;
+            if (dt > UI_FLUSH_MAX_US) {
+                s_direct_rej[4]++;
+                lvgl_port_unlock();
+                return false;
+            }
+            if (dt > UI_FLUSH_SPIN_US)
+                vTaskDelay(1);
+        }
+    }
+
+    /* RGB565 の SRM は幅・オフセットが偶数であることを要求する
+       (ppa_srm.c)。切り下げ / 切り上げで偶数に寄せる。 */
+    if (x & 1) { w += 1; x -= 1; }
+    if (w & 1) w += 1;
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > s_canvas_w) w = s_canvas_w - x;
+    if (y < 0) { h += y; y = 0; }
+    if (y + h > s_canvas_h) h = s_canvas_h - y;
+    if (w <= 0 || h <= 0) {
+        lvgl_port_unlock();   /* ここはロックの内側。返す前に必ず離す */
+        return false;
+    }
+
+    void *fb = NULL;
+    if (esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb) != ESP_OK || !fb) {
+        lvgl_port_unlock();
+        return false;
+    }
+    if (!s_ppa_srm_direct) {
+        ppa_client_config_t cfg = {};
+        cfg.oper_type = PPA_OPERATION_SRM;
+        cfg.max_pending_trans_num = 1;
+        if (ppa_register_client(&cfg, &s_ppa_srm_direct) != ESP_OK) {
+            lvgl_port_unlock();
+            return false;
+        }
+    }
+
+    /* 宛先は**キャンバスの実座標から**引く。
+
+       ここは以前 `ly = y + UI_STATUSBAR_H` と定数で書いていた。
+       lv_obj_set_pos(_canvas, 0, UI_STATUSBAR_H) の位置は**親のコンテンツ
+       box からの相対**で、画面自体が上に UI_STATUSBAR_H の padding を
+       持っている (ui_widgets.cpp)。つまり絶対 y は 2 倍になりうる。
+       同じ関数の中で、重なり判定 (canvas_free_band) は
+       lv_obj_get_content_coords の絶対座標を使っていたので、
+       **「どこを守るか」と「どこへ出すか」が別の座標系だった。**
+       ずれた分だけ、直接経路で出した絵だけが縦に動く —— LVGL 経路で
+       描き直した段との段差になって見える。
+
+       padding が付いた日に静かに壊れるのも同じ理由なので、定数はやめて
+       判定に使ったのと同じ実座標を引く。 */
+    lv_area_t cvp;
+    lv_obj_get_content_coords(s_js_canvas, &cvp);
+    int lx = cvp.x1 + x, ly = cvp.y1 + y;
+    {
+        static bool warned;
+        if (!warned && (cvp.x1 != 0 || cvp.y1 != UI_STATUSBAR_H)) {
+            warned = true;
+            ESP_LOGW(TAG, "canvas at (%d,%d), not (0,%d) — "
+                     "直接提示は実座標を使う", (int)cvp.x1, (int)cvp.y1,
+                     UI_STATUSBAR_H);
+        }
+    }
+    /* パネルは常に 720x1280 (縦) なので、横のときだけ 90 度回す。 */
+    int ox, oy, obw, obh;
+    ppa_srm_rotation_angle_t rot;
+    if (s_landscape) {
+        rot = PPA_SRM_ROTATION_ANGLE_90;
+        obw = h; obh = w;
+#if UI_DIRECT_ROT_CW
+        ox = UI_LCD_H_RES - ly - h;
+        oy = lx;
+#else
+        ox = ly;
+        oy = UI_LCD_V_RES - lx - w;
+#endif
+    } else {
+        rot = PPA_SRM_ROTATION_ANGLE_0;
+        obw = w; obh = h;
+        ox = lx; oy = ly;
+    }
+    if (ox < 0 || oy < 0 || ox + obw > UI_LCD_H_RES || oy + obh > UI_LCD_V_RES ||
+        (ox & 1)) {
+        s_direct_rej[5]++;
+        lvgl_port_unlock(); /* 幾何が合っていない。黙って壊すより従来経路へ */
+        return false;
+    }
+
+    ppa_srm_oper_config_t srm = {};
+    srm.in.buffer          = s_js_canvas_buf;
+    srm.in.pic_w           = (uint32_t)s_canvas_w;
+    srm.in.pic_h           = (uint32_t)s_canvas_h;
+    srm.in.block_w         = (uint32_t)w;
+    srm.in.block_h         = (uint32_t)h;
+    srm.in.block_offset_x  = (uint32_t)x;
+    srm.in.block_offset_y  = (uint32_t)y;
+    srm.in.srm_cm          = PPA_SRM_COLOR_MODE_RGB565;
+    srm.out.buffer         = fb;
+    srm.out.buffer_size    = (uint32_t)UI_LCD_H_RES * UI_LCD_V_RES * 2;
+    srm.out.pic_w          = UI_LCD_H_RES;
+    srm.out.pic_h          = UI_LCD_V_RES;
+    srm.out.block_offset_x = (uint32_t)ox;
+    srm.out.block_offset_y = (uint32_t)oy;
+    srm.out.srm_cm         = PPA_SRM_COLOR_MODE_RGB565;
+    srm.rotation_angle     = rot;
+    srm.scale_x = 1.0f;
+    srm.scale_y = 1.0f;
+    srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t r = ppa_do_scale_rotate_mirror(s_ppa_srm_direct, &srm);
+    if (r != ESP_OK) {
+        s_direct_rej[6]++;
+        lvgl_port_unlock();
+        return false;
+    }
+    s_direct_us += esp_timer_get_time() - t0;
+    s_direct_n++;
+    s_direct_total++;
+    *done_y = y;
+    *done_h = h;
+    lvgl_port_unlock();
+    return true;
+}
+#endif /* UI_DIRECT_PRESENT */
+
+extern "C" void ui_tab5_canvas_reset_sync(void)
+{
+    /* ui_up() は ui_widgets.cpp の static。ここでは同じ条件
+       (ディスプレイが立ってキャンバス寸法が入っている) を直接見る。 */
+    if (!s_disp || !s_canvas_w)
+        return;
+    lvgl_port_lock(0);
+    if (s_js_canvas_buf && s_canvas_w && s_canvas_h)
+        surf_fill_rect(s_js_canvas_buf, 0, 0, s_canvas_w, s_canvas_h,
+                       lv_color_to_u16(lv_color_hex(UI_COL_BG)), s_ppa_fill);
+    if (s_js_canvas)
+        lv_obj_add_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
+    kb_show(0);        /* a new app must not inherit the keyboard */
+    cbar_clear_mods(); /* ... nor an armed one-shot latch */
+    ovl_hide_all();    /* ... nor a dead app's float */
+    lvgl_port_unlock();
+}
+
+/* 描画バッチ全体を LVGL ロックの内側に入れる (宣言側に理由を書いた)。
+
+   **これが無いと、順序を直した直接経路でも取りこぼす。** 直接提示は
+   「自分が撃つ瞬間」だけを整えるが、キャンバスへ**書いている最中**に
+   LVGL が起きてロックを取り、描きかけの行を読んで flush してしまう窓は
+   閉じない —— SKK の確定で黄色い preedit の上端が残ったのはこれ。
+   その flush が最後に着弾すると、正しく提示し直した後でも古い画素が勝つ。
+
+   ロックは再帰 (esp_lvgl_port.c:77 xSemaphoreCreateRecursiveMutex) なので
+   ui_tab5_canvas_invalidate が内側でもう一度取っても問題ない。
+   **取れなくても描画は止めない**: 順序が緩むだけで、落とすよりましだから。 */
+extern "C" uint32_t ui_tab5_direct_count(void) { return s_direct_total; }
+
+extern "C" bool ui_tab5_canvas_batch_begin(void)
+{
+    return lvgl_port_lock(UI_BATCH_LOCK_MS);
+}
+
+extern "C" void ui_tab5_canvas_batch_end(void)
+{
+    lvgl_port_unlock();
+}
+
+extern "C" void ui_tab5_canvas_invalidate(int x, int y, int w, int h)
+{
+    if (!s_js_canvas || !s_canvas_w || !s_canvas_h)
+        return;
+#if UI_DIRECT_PRESENT
+    /* 大きい damage は LVGL を通さず直接 FB へ (実測 90.4 -> 32.5 ms)。
+       上に何か載っていたら**全部あきらめず**、隠れていない帯だけ出して
+       残りをこの下の LVGL 経路へ回す。断られるのは小さいとき・幾何が
+       合わないとき・帯が 1 本も取れないとき。 */
+    int dy = 0, dh = 0;
+    if (canvas_present_direct(x, y, w, h, &dy, &dh)) {
+        if (dy > y)
+            ui_tab5_canvas_invalidate(x, y, w, dy - y);
+        int tail = y + h - (dy + dh);
+        if (tail > 0)
+            ui_tab5_canvas_invalidate(x, dy + dh, w, tail);
+        return;
+    }
+#endif
+    /* clamp to the canvas before anything else: LVGL would clip an
+       out-of-range area anyway, but an inverted one (x2 < x1) is
+       undefined and the caller's row arithmetic is exactly where an
+       off-by-one shows up */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s_canvas_w)
+        w = s_canvas_w - x;
+    if (y + h > s_canvas_h)
+        h = s_canvas_h - y;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (!lvgl_port_lock(0))
+        return;
+    /* Everything below is O(1) and touches no pixels — this is the µs
+       the whole split exists to keep short. */
+    s_prof_canvas_mark = true; /* the next refresh is a canvas one */
+    /* The presenter drew: show the canvas. CanvasApp does the same at
+       the end of a JS drawing batch, and hides it again when the
+       foreground TASK changes — that hide is the ownership gate, and
+       leaving it in place is deliberate. */
+    lv_obj_remove_flag(s_js_canvas, LV_OBJ_FLAG_HIDDEN);
+    /* Absolute coords, and CONTENT coords rather than lv_obj_get_coords:
+       the day the canvas gets padding or a border, (0,0) shifts and the
+       bug is a silent AFTERIMAGE — invalidated rectangle next to the
+       rows that actually changed — not a crash. */
+    lv_area_t cv;
+    lv_obj_get_content_coords(s_js_canvas, &cv);
+    lv_area_t a;
+    a.x1 = (int32_t)(cv.x1 + x);
+    a.y1 = (int32_t)(cv.y1 + y);
+    a.x2 = (int32_t)(cv.x1 + x + w - 1);
+    a.y2 = (int32_t)(cv.y1 + y + h - 1);
+    lv_obj_invalidate_area(s_js_canvas, &a);
+    lvgl_port_unlock();
+}
+/* >>> host-testable native surface end <<< */
+
+/* ------------------------------------------------------------------ */
 /* Landscape rotation (keyboard dock). Callable from any task; takes   */
 /* the LVGL port lock. Content is PPA-rotated per flush by             */
 /* esp_lvgl_port (sw_rotate), touch is rotated by LVGL itself          */
@@ -3697,6 +5907,14 @@ extern "C" void ui_tab5_set_hw_keyboard(bool present)
     lvgl_port_lock(0);
     kb_show(s_app_kb_mode);
     lvgl_port_unlock();
+}
+
+/* Read side for components that raise their own software keyboard
+   (fs_picker). Plain flag read — no lock, any task; a race with a
+   (dis)dock costs at most one keyboard show/hide decision. */
+extern "C" bool ui_tab5_hw_keyboard(void)
+{
+    return s_hw_kb;
 }
 
 extern "C" void ui_tab5_set_landscape(bool on)
@@ -3789,6 +6007,19 @@ extern "C" void ui_tab5_set_landscape(bool on)
     /* tell the foreground app its ui.size() changed (same token channel
        as the control bar; apps that don't care just ignore it) */
     mqjs_post_key("\x00rotate", 7);
+
+#if UI_SRM_BENCH
+    /* 向きが変わるたびに測り直す。横 (rot=90) は 46 ns/px と取れたが、
+       **それが回転税なのか DMA の床なのかが決まっていない**。縦 (rot=0)
+       は転置が無いので書きが連続になる —— 縦が速ければ回転税、同じなら
+       床。ドックの着脱だけで両方の数字が出るようにする。
+       1.2 秒待つのは、回転直後の LVGL の作り直しと重ならないため。 */
+    {
+        lv_timer_t *t = lv_timer_create(srm_bench_timer, 1200, nullptr);
+        if (t)
+            lv_timer_set_repeat_count(t, 1);
+    }
+#endif
 }
 
 extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
@@ -3802,7 +6033,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
                                               MALLOC_CAP_SPIRAM);
     s_log_mtx = s_log ? xSemaphoreCreateMutex() : NULL;
     s_status_mtx = xSemaphoreCreateMutex();
-    s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
+    s_cmd_queue = xQueueCreateWithCaps(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t),
+                                       MALLOC_CAP_SPIRAM);
+    if (!s_cmd_queue) /* PSRAM が無い / 取れない板では内部で妥協する */
+        s_cmd_queue = xQueueCreate(UI_CMD_QUEUE_DEPTH, sizeof(ui_cmd_t));
     s_job_queue = xQueueCreate(UI_JOB_QUEUE_DEPTH, sizeof(ui_job_t));
 
     ui_panel_variant_t variant = panel_reset_and_detect();
@@ -3815,6 +6049,7 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     esp_lcd_panel_handle_t panel = NULL;
     if (display_init(variant, &io, &panel) != ESP_OK)
         return;
+    s_dpi_panel = panel;
 
     /* LVGL task on Core 1, low priority (js_task runs on Core 0) */
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
@@ -3861,6 +6096,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         return;
     }
     s_disp = disp; /* ui_tab5_set_landscape rotates this display */
+    prof_attach(disp); /* presentation breakdown, always on (spec §F #13) */
+    /* flush の完了待ちに上限を入れる。既定の while(disp->flushing); は
+       完了が来なければ core 1 を丸ごと殺す —— 実機で再現済み。 */
+    lv_display_set_flush_wait_cb(disp, ui_flush_wait);
 
     /* JS-visible canvas resolution (everything below the status bar);
        published before js_task starts, so ui.size() is always valid */
@@ -3878,6 +6117,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     mc.openApp(mc.installApp(std::make_unique<CanvasApp>()));
     lv_timer_create(
         [](lv_timer_t *) {
+#if UI_CORONER
+            s_ui_beat = s_ui_beat + 1;   /* 検死役が読む脈 */
+            s_ui_beat_ms = (uint32_t)(esp_timer_get_time() / 1000);
+#endif
             mooncake::GetMooncake().update();
             touch_observe();
             /* after the canvas consumed its commands, so a term's blit
@@ -3886,6 +6129,11 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         },
         16, nullptr);
     lvgl_port_unlock();
+#if UI_CORONER
+    /* core 0 に固定。core 1 が止まっても動き続けるのが要件。 */
+    xTaskCreatePinnedToCore(coroner_task, "coroner", 3072, nullptr, 3,
+                            nullptr, 0);
+#endif
 
     touch_init(variant, disp);
 
@@ -3896,6 +6144,16 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     {
         lv_timer_t *t = lv_timer_create(
             [](lv_timer_t *) { kb_bench(); }, 6000, nullptr);
+        lv_timer_set_repeat_count(t, 1);
+    }
+#endif
+
+#if UI_SRM_BENCH
+    /* キャンバスは CanvasApp::onCreate が上で publish 済み。10 秒待つのは
+       Wi-Fi/Tailscale が立ち上がって PSRAM 帯域が定常になってから測るため
+       —— 起動直後の静かな瞬間で測ると、実使用より良い数字が出る。 */
+    {
+        lv_timer_t *t = lv_timer_create(srm_bench_timer, 10000, nullptr);
         lv_timer_set_repeat_count(t, 1);
     }
 #endif
