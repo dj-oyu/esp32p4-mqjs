@@ -85,6 +85,13 @@ typedef void (*fs_pick_cb_t)(void *ctx, const fs_pick_result_t *r);
      - PSRAM が取れなかった / lv_timer を作れなかった */
 bool fs_pick_begin(const fs_pick_req_t *req, fs_pick_cb_t cb, void *ctx);
 
+/* モーダルが出ているか。**入力をどこへ配るかの判定に使う。**
+   出ている間、裏のアプリはタップもキーも受け取ってはいけない ——
+   ピッカーでファイルを選んだら裏の原稿のカーソルが動き、一覧を
+   ドラッグしたら裏の原稿がスクロールする、という形で実際に壊れていた
+   (2026-08-27)。スピンロックだけなので毎フレーム呼んでよい。 */
+bool fs_pick_active(void);
+
 /*
  * 出ているピッカーを畳む。いつ呼んでも安全 (出ていなければ何もしない)。
  * 畳むと cb が r->ok=false で**ちょうど 1 回**呼ばれる。

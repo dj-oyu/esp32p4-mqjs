@@ -83,6 +83,10 @@
 #include "mqjs_native.h"
 #include "ui_cell_width.h"
 #include "ui_tab5.h"
+#if CONFIG_MQJS_UI_GEOM_PROBE
+/* 診断専用の口。公開ヘッダには出さない (旗が無いビルドに影を落とさない)。 */
+void ui_tab5_geom_probe(void);
+#endif
 
 static const char *TAG = "edit_ui";
 
@@ -546,6 +550,12 @@ static void render_row(uint16_t row)
 static bool s_pick_saving;
 /* 書き換え不可で行き先を差し替えたか。無限に差し替えないための印。 */
 static bool s_redirected;
+/* SAVE モードは Ctrl+W から。以前ここで core 1 が固まったが、真因は
+   **モーダルの上のタップが裏のこのタスクにも配られていたこと**だった
+   (touch_observe が fs_picker のスクリムを見ておらず、カメラのだけ見て
+   いた)。裏で全画面再描画が走り、UI タスクの lv_refr_now と同じ PPA を
+   LVGL ロックの内側で奪い合う —— PPA の待ちには上限が無いので両方が
+   止まる。ui_tab5 側でタッチを止めたので、この経路を戻した。 */
 static void open_picker(bool for_save);
 
 static void sys_note(const char *msg)
@@ -573,8 +583,14 @@ static void pick_done(void *ctx, const fs_pick_result_t *r)
     edit_cmd_t c;
 
     (void)ctx;
-    if (!r->ok || !r->vpath[0])
-        return;                     /* 取り消しは何もしない */
+    if (!r->ok || !r->vpath[0]) {
+        /* 取り消し。**描き直しは要る** —— モーダルの間こちらは描くのを
+           やめており、スクリムが消えた跡は誰も塗らない。 */
+        memset(&c, 0, sizeof c);
+        c.kind = EDIT_CMD_REPAINT;
+        post(&c);
+        return;
+    }
     /* **切り詰めない。** ピッカーの器は 512 B、こちらは 128 B。詰めて入れると
        別のファイルを開き、そのまま Ctrl+S で**別のファイルを上書きする**。
        入らない道は断って、断ったと言う。 */
@@ -796,6 +812,17 @@ static void invalidate_pending(void)
      rect           実際に無効化した矩形 */
 static void paint_dirty(void)
 {
+    /* **モーダルが出ている間は描かない。**
+       スクリムで完全に隠れているので描く理由が無い。そして描くと実害が
+       ある —— PPA SRM / DMA2D の使い手が 2 人になり、ピッカーの
+       lv_refr_now と衝突して flush が完了しなくなる。
+       検死役の 1 行がそれを名指しした (2026-08-27):
+         CORONER: UI stalled 3s | lock owner=(none) depth=0 | flushing=1
+       ロックの奪い合いではなく、**飛行中の flush が着地しない**形。
+       モーダルが閉じたら pick_done が OPEN / REPAINT を投げるので、
+       そこで描き直される。 */
+    if (fs_pick_active())
+        return;
     bool held = ui_tab5_canvas_batch_begin();
 #if EDIT_TRACE_PAINT
     s_tp_rows = s_tp_nonempty = s_tp_neg = 0;
@@ -926,6 +953,14 @@ static void key_to_edit(const char *k, size_t len)
            M5 のコマンド設計で操作バーに出すのが本筋で、それまでの入口。 */
         if (c == 0x13) { save_now(); return; }               /* Ctrl+S */
         if (c == 0x0F) { open_picker(false); return; }        /* Ctrl+O */
+        /* Ctrl+W = 名前を付けて保存。Ctrl+Shift+S は使えない ——
+           ドックは Ctrl+S と同じ 0x13 を送るので区別が付かない。 */
+        if (c == 0x17) { open_picker(true); return; }         /* Ctrl+W */
+#if CONFIG_MQJS_UI_GEOM_PROBE
+        /* Ctrl+G = 幾何プローブ (E2、診断専用)。旗が無いビルドでは
+           下の `c < 0x20` で捨てられる = 挙動は変わらない。 */
+        if (c == 0x07) { ui_tab5_geom_probe(); return; }      /* Ctrl+G */
+#endif
         if (c < 0x20) return;   /* その他の制御バイトは本文に入れない */
     }
     edit_insert(s_ed, k, len);
@@ -1109,6 +1144,8 @@ static void repaint_all(void)
 {
     if (!s_fg || !s_ed || s_rows_text == 0)
         return;
+    if (fs_pick_active())
+        return;   /* paint_dirty と同じ理由。隠れている間は描かない */
     s_canvas_gone = false;
     bool held = ui_tab5_canvas_batch_begin();
     clear_canvas();
@@ -1280,14 +1317,23 @@ static void edit_task_fn(void *arg)
                    いるので、ここを上書きできると信用の前提が崩れる。
                    断るだけでは行き止まりなので、**既定の置き場へ名前を
                    保って写す**。
-                   **モーダルは出さない。** ピッカーを SAVE モードで
-                   edit_task から開くと、名前入力の鍵盤を出したところで
-                   core 1 が止まった (実機 2026-08-27。UI タスクと
-                   edit_task が両方沈黙し、core 0 は動き続ける)。
-                   ピッカーは JS から呼ばれ、**呼び出し側の JS ワーカーが
-                   返事待ちで止まる**前提で作られている —— エディタは
-                   止まらない。原因を掴むまで、この経路は使わない。
-                   行き先は毎回同じで、どこへ行ったかを画面に出す。 */
+                   **ここではモーダルを出さない。** 名前を選びたいなら
+                   Ctrl+W があり、こちらは「断られた原稿を失わせない」ための
+                   自動の逃げ道。行き先は毎回同じで、どこへ行ったかを出す。
+
+                   (2026-08-27: ピッカーを edit_task から開くと core 1 が
+                   止まることがある —— UI タスクと edit_task が沈黙し
+                   core 0 は動き続ける。**SAVE 特有ではなく OPEN でも起き、
+                   しかも間欠**。
+                   2026-08-31 に真因判明: DMA2D の RX が FIFO 満杯のまま
+                   idle で駐車し、PPA 回転の完了通知が永久に来ない。引き金は
+                   回転後の 1 行が 14 バイト (出力幅 7) になるチャンクで、
+                   これは端数チャンクとして構造的に出る。ui_tab5 側で
+                   塞いだ (有界回転 + dma2d_force_end 回収、および 1 文字行
+                   未満は PPA を使わない)。
+                   それでもここでモーダルを出さない理由は変わらない ——
+                   I/O の返事の途中で勝手に画面を奪うのが筋として悪い。
+                   名前を選びたいなら Ctrl+W がある。) */
                 const char *base = strrchr(s_vpath, '/');
                 char alt[EDIT_VPATH_MAX];
                 int n = snprintf(alt, sizeof alt, "%s/%s", EDIT_DEFAULT_DIR,

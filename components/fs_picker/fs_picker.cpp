@@ -148,6 +148,10 @@ static const char *TAG = "fs_pick";
    いつ呼んでもよい。呼ぶのは FS_PICK_STALL_PROBE の内側だけなので、
    そこを 0 にすればリンク上の依存も消える (spec §依存の向き:
    fs_picker は fs_core と ui_tab5 だけ、を保てる)。 */
+/* 検死役 (ui_tab5.cpp) が止まった瞬間に読む。0 = このフレームは
+   present() を通っていない。 */
+extern "C" volatile uint8_t g_ui_refr_now;
+
 extern "C" void flash_stall_meter_report(const char *why);
 extern "C" void flash_stall_meter_reset(void);
 
@@ -771,6 +775,13 @@ static lv_obj_t *mk_button(lv_obj_t *parent, const char *text, int work,
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_height(b, 56);
     lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PANEL), 0);
+    /* テーマは styles.btn を**オブジェクト本体に**張り、その中で
+       text_color を設定する (lv_theme_default.c:1011,290)。
+       オブジェクト自身のスタイルは親からの継承に勝つので、s_dlg に
+       当てた PK_COL_TEXT はここへ届かない。ライトテーマの既定色は
+       0x424242 で、背景の PK_COL_PANEL (0x1A222C) の上では見えない。
+       文字を持つ部品には必ず自分で色を当てること。 */
+    lv_obj_set_style_text_color(b, lv_color_hex(PK_COL_TEXT), 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(PK_COL_PRESS), LV_STATE_PRESSED);
     lv_obj_set_style_radius(b, 8, 0);
     lv_obj_t *l = lv_label_create(b);
@@ -809,6 +820,11 @@ static bool build_ui(void)
     lv_obj_add_flag(s_scrim, LV_OBJ_FLAG_HIDDEN);
 
     s_dlg = lv_obj_create(top);
+    /* 幅 92% は意図的に残す (2026-08-28)。LV_PCT(100) の A/B で停止は
+       出なくなったが、それは w%16 と h を同時に動かした交絡実験で、
+       しかも 1137 幅こそが実機で止まった経路そのもの。幾何は E2 の
+       プローブ (ui_tab5_geom_probe) が直接測るので、実経路は元のまま
+       置いておく —— 原因が割れた後に、根拠を書いて直すこと。 */
     lv_obj_set_size(s_dlg, LV_PCT(92), LV_PCT(86));
     lv_obj_center(s_dlg);
     lv_obj_set_style_radius(s_dlg, 12, 0);
@@ -868,6 +884,13 @@ static bool build_ui(void)
     lv_textarea_set_placeholder_text(s_name, "ファイル名");
     lv_obj_set_width(s_name, LV_PCT(100));
     lv_obj_set_style_bg_color(s_name, lv_color_hex(PK_COL_PANEL), 0);
+    /* mk_button と同じ理由 (テーマが styles.card を textarea 本体に
+       張って text_color を持っていく)。これが無いと 0x424242 の字を
+       0x1A222C の上に描くので、入力は効いているのに何も見えない。
+       プレースホルダも出ない —— :1554 の set_text で中身が空でなく
+       なるため。「打っても出ないが保存すると変な名前で保存される」の
+       正体はこれ。 */
+    lv_obj_set_style_text_color(s_name, lv_color_hex(PK_COL_TEXT), 0);
     lv_obj_set_style_border_color(s_name, lv_color_hex(PK_COL_ACCENT),
                                   LV_STATE_FOCUSED);
     lv_obj_add_event_cb(s_name, name_event, LV_EVENT_CLICKED, NULL);
@@ -1206,7 +1229,16 @@ static void present(Pick *p, const char *what)
        値は濁らない。 */
     memset(&s_prof, 0, sizeof s_prof);
 
+    /* 「タイマの中から lv_refr_now を呼ぶ再入が犯人」という仮説を
+       **実機で**殺すための旗。止まった瞬間に 0 なら、止まったフレームは
+       ここを通っていない = lvgl_port の通常のリフレッシュだった。
+       (コードの上では既に否定されている: lv_refr_now は
+       lv_display_refr_timer を直接呼ぶだけで入れ子を作らず、
+       単一バッファの LVGL は各チャンクの前に wait_for_flushing する。
+       だが今日は「症状に合う説明」で 8 回外している。) */
+    g_ui_refr_now = 1;   /* present() は再入しない (UI タスク上の 1 本) */
     lv_refr_now(NULL);
+    g_ui_refr_now = 0;
 
     /* chunks はこの作業 (行の使い回し) 全体の物差し。無効になった矩形の
        高さ ÷ 描画バッファの 50 段が、そのままここに出る。
@@ -1748,6 +1780,18 @@ static void do_row(Pick *p)
     default:
         break;
     }
+}
+
+/* モーダルが出ているか。**スピンロックだけ。LVGL には触らない。**
+   入力の行き先を決める側 (ui_tab5 の touch_observe / mqjs_post_key) が
+   毎フレーム呼ぶので、ここで重い物を掴んではいけない。 */
+bool fs_pick_active(void)
+{
+    bool busy;
+    taskENTER_CRITICAL(&s_mux);
+    busy = s_busy;
+    taskEXIT_CRITICAL(&s_mux);
+    return busy;
 }
 
 static void do_confirm(Pick *p)
