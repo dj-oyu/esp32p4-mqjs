@@ -60,6 +60,11 @@
 /* mqjs public API (extern decl instead of REQUIRES: mqjs already
    depends on this component for ui_tab5.h, same trick as wifi.c) */
 extern "C" void mqjs_post_touch(int x, int y, int kind);
+/* モーダル (fs_picker) が出ているか。**依存は張れない** —— fs_picker が
+   こちらを REQUIRES しているので逆向きは循環する。mqjs_post_touch と同じ
+   extern の手で、リンクされていない構成のために weak の既定を置く。 */
+extern "C" bool fs_pick_active(void);
+extern "C" __attribute__((weak)) bool fs_pick_active(void) { return false; }
 extern "C" void mqjs_post_key(const char *utf8, size_t len);
 extern "C" void mqjs_focus(int slot);
 extern "C" void mqjs_request_open(const char *name);
@@ -137,6 +142,21 @@ const lv_font_t *ui_tab5_jp_font(void)
  * line of CJK to the right. */
 #include "freertos/idf_additions.h"
 #include "driver/ppa.h"
+/* 検死役がハードウェアの生の状態を読むため。
+   PPA も DMA2D も止まった瞬間に「誰が何を待っているか」を
+   ドライバの内部構造を覗かずに答えられるのはレジスタだけ。 */
+#include "soc/dma2d_struct.h"
+#include "soc/ppa_struct.h"
+#include "soc/interrupts.h"   /* ETS_DMA2D_*_INTR_SOURCE */
+#include "esp_intr_alloc.h"
+/* E1 (2026-08-28): 検死役が「駐車している descriptor は誰のものか」と
+   「dma2d のソフト側は何を待っているか」を答えるため。どちらもドライバの
+   private ヘッダにしか無い (CMakeLists が src/ を include に足している)。
+   読むだけで書かない。esp_cache.h は descriptor / 番兵を CPU で読む前の
+   M2C のため。 */
+#include "esp_cache.h"
+#include "ppa_priv.h"
+#include "dma2d_priv.h"
 #include "ui_cell_width.h"
 
 #define UI_CELL_W 9
@@ -747,6 +767,299 @@ static inline int ui_cur_hres(void)
    asking for DMA|SPIRAM together is legal here. */
 extern "C" lvgl_port_ppa_handle_t
 __real_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg);
+/* 回転の handle。検死役 (E1) が SRM エンジンの descriptor アドレスと
+   スクラッチの場所をここから引く。書き手は起動時の 1 回だけ。 */
+static lvgl_port_ppa_handle_t s_rot_handle;
+static uint32_t               s_rot_buf_size;
+
+/* ------------------------------------------------------------------ */
+/* 回転の有界化 (E3): 待つのは UI_ROT_TIMEOUT_MS まで、死ぬのは禁止    */
+/* ------------------------------------------------------------------ */
+/* DMA2D RX が絵の途中で駐車する (descriptor owner=DMA のまま・RX L2
+ * FIFO full (cnt=12)・FSM idle・エラービット無し・PPA sr_eof=1・割り込み
+ * 永久沈黙 — 検死役の実測、24 分後も同じ) と、BLOCKING の回転は
+ * ppa_core.c:470 の xSemaphoreTake(trans_elm->sem, portMAX_DELAY) から
+ * 二度と戻らず UI タスク (core 1) が永久に固まる。watchdog はどれも
+ * 鳴らない: 「正当にブロックしたタスク」を見張る仕組みは無い。
+ *
+ * 単純なタイムアウト付き待ちでは足りない: エンジンのセマフォは ISR の
+ * 完了経路 (ppa_core.c:511) でしか返らないので、諦めて帰るだけでは次の
+ * 回転が :431 で永久に待つ —— 凍結が 1 回転ぶん後ろへずれるだけ。
+ * 対策は 3 段:
+ *   1. 回転を NON_BLOCKING で撃つ (rotate_cfg->ppa_mode は lcd_ppa.c が
+ *      そのまま SRM config へ写す) と、エンジンのセマフォ取得も 0 tick に
+ *      なり (ppa_core.c:430-431)、:431/:470 のどちらの永久待ちも消える。
+ *      完了は自前の on_trans_done (下の ui_rot_done_cb) + セマフォで
+ *      有界に待つ。PPA_LCD_ENABLE_CB=0 なので port 側の callback とは
+ *      衝突しない。
+ *   2. タイムアウトしたら dma2d_force_end() (ドライバ公式の強制終了 API、
+ *      JPEG エラー回復用に存在する) で駐車した RX チャネルを止めて解放し、
+ *      続けてドライバ自身の完了ルーチン ppa_transaction_done_cb() を呼ぶ。
+ *      これは来なかった ISR がやるはずだった仕事そのもの (エンジンの
+ *      キューから外す・エンジンのセマフォを返す・trans をリサイクル・
+ *      trans_cnt を戻す) で、偽の semaphore give ではない。チャネルの
+ *      ハードは次に選ばれたとき dma2d_connect() がリセットする
+ *      (dma2d.c:212) ので、満杯のまま残った FIFO もそこで消える。
+ *   3. 回復に失敗したら s_rot_dead を立て、以後 PPA には二度と触らず
+ *      CPU で回す。遅いが確実に生きる。
+ * どの経路でも、駐車したチャンクは CPU で回し直してから返すので、
+ * 呼び出し元 (flush) は常に完全な絵を受け取る。 */
+
+/* 健康な回転は 1〜3 ms。全画面 (720x1280) でも flush 全体で 67 ms
+ * (実測、rot 含む)。NON_BLOCKING では回転がカメラの SRM 処理の後ろに
+ * 並ぶことがあり、それでも数十 ms。1000 ms はその 10 倍超で正当な経路
+ * では切れず、検死役の 3 秒よりは十分手前 —— 「UI stalled 3s」の行は
+ * 回転以外の停止のために残る。 */
+#define UI_ROT_TIMEOUT_MS 1000
+
+/* 回転後の出力幅 (90/270 では = 入力チャンクの高さ h) がこれ未満なら
+ * PPA を使わず最初から CPU で回す。実機で駐車した 14/14 は全て出力幅 7
+ * (1 行 14 B、1280x7 含む —— w 系の仮説は全滅) で、幅 8 以上の駐車は
+ * 0 件。だが引き金の下限は不明なので、UI_CELL_H (24) =「文字 1 行の
+ * 断片は全部 CPU」に丸めた (ユーザ決定、16 のマクロブロック境界より
+ * こちら)。性能でも損はしない見込み: PPA 回転は固定費 ~790 us +
+ * ~0.0115 us/px (実測フィット) で、1137x7 は 890 us 中 92 us しか実仕事が
+ * 無い。実測は下の s_cpu_rot が集める —— 閾値の再調整はこの 1 行。
+ *
+ * **24 -> 16 (2026-08-31、実機実測で確定)**。CPU 回転の実測は
+ * **18〜21 Mpix/s** で、見積り 43 の 2.3 分の 1 だった。交差点を引き直すと
+ *   PPA 790 + 0.0115*N  ==  N/18.5   ->  N ~ 18,600 px
+ * = w1137 なら h~16、w1280 なら h~14。閾値 24 の最悪チャンク 1137x23
+ * (26,151 px) は CPU 1414 us / PPA 1091 us で **CPU が 320 us 遅い**。
+ * h=17〜23 の帯は損をしていた。
+ *
+ * 16 で足りる根拠: 観測された駐車 14 件は**全部 h=7** (1137x7 x11,
+ * 1138x7 x2, 1280x7 x1) なので 2 倍以上の余裕がある。しかも SRM の
+ * マクロブロックは 16x16 で、境界としても筋が通る。
+ *
+ * 下げるもう一つの理由: **CPU 回転はフラッシュのキャッシュ停止に弱い**。
+ * program/erase 中は命令フェッチが止まるので CPU ループは死ぬが、PPA の
+ * DMA は走り続ける。実測で fstall max=18ms のとき 1 回転が 31ms/58ms まで
+ * 伸びた (18.5 Mpix/s なら 29k px は 1.6ms のはず)。CPU に回す量は
+ * 必要最小限にする。 */
+#define UI_ROT_CPU_BYPASS_H 16
+
+/* CPU 回転の集計 (ui_prof の窓ごとに 1 行)。書き手は LVGL タスクだけ、
+ * 読み/リセットも prof_report (同じタスク) なのでロック不要。
+ * bypass = 閾値未満 (と s_rot_dead) で PPA を素通りした回転、
+ * redo   = タイムアウト回収/enqueue 失敗の後の回し直し、
+ * ppa    = PPA へ撃った回転。px/us は CPU で回した分だけ (msync 込み)。 */
+static struct {
+    uint32_t bypass_n, redo_n, ppa_n;
+    uint64_t px, us;
+    uint32_t max_us;
+} s_cpu_rot;
+
+#ifndef UI_CORONER
+#define UI_CORONER 1
+#endif
+#if UI_CORONER
+static void coroner_dump_dma(void);   /* 定義は検死役の節 (下) */
+#endif
+
+/* lcd_ppa.c:20-25 の private struct の写し。first field の buffer を公開
+   API (lvgl_port_ppa_get_output_buffer) と突き合わせて一致したときだけ
+   srm_handle を信じる。 */
+struct ui_lcd_ppa_mirror_t {
+    uint8_t             *buffer;
+    uint32_t             buffer_size;
+    ppa_client_handle_t  srm_handle;
+    ppa_srm_color_mode_t color_mode;
+};
+
+static ppa_srm_engine_t *coroner_srm_engine(void)
+{
+    if (!s_rot_handle)
+        return nullptr;
+    ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)s_rot_handle;
+    if (m->buffer != lvgl_port_ppa_get_output_buffer(s_rot_handle) ||
+        !m->srm_handle)
+        return nullptr;   /* 写しが実物と食い違う: 触らない */
+    ppa_engine_t *e = m->srm_handle->engine;
+    if (!e || e->type != PPA_ENGINE_TYPE_SRM)
+        return nullptr;
+    return (ppa_srm_engine_t *)e;   /* base は先頭メンバ */
+}
+
+/* NULL = 未武装 (写し不一致など)。そのときは従来どおり BLOCKING。 */
+static SemaphoreHandle_t s_rot_done_sem;
+/* 回復失敗で立つ。以後 PPA 回転は封印、CPU のみ。戻さない。 */
+static volatile bool     s_rot_dead;
+static uint32_t          s_rot_timeouts, s_rot_recovered;
+
+static bool ui_rot_done_cb(ppa_client_handle_t c, ppa_event_data_t *e,
+                           void *user)
+{
+    (void)c; (void)e; (void)user;
+    BaseType_t hp = pdFALSE;
+    if (s_rot_done_sem)
+        xSemaphoreGiveFromISR(s_rot_done_sem, &hp);
+    return hp == pdTRUE;
+}
+
+/* CPU の 90 度回転 (RGB565)。dst = PSRAM のスクラッチ、src = 内部 SRAM の
+   draw buffer。dst の行を順に書く (PSRAM へは線形バースト)、src は
+   ストライド読み。32x32 タイルで src のキャッシュ足跡を抑える。 */
+static void ui_cpu_rotate_rgb565(uint16_t *dst, const uint16_t *src,
+                                 int w, int h, ppa_srm_rotation_angle_t rot,
+                                 bool swap)
+{
+    const int T = 32;
+    switch (rot) {
+    case PPA_SRM_ROTATION_ANGLE_90:
+        /* CCW: dst[(w-1-x)*h + y] = src[y*w + x]、dst の行幅 = h */
+        for (int ty = 0; ty < h; ty += T) {
+            int ye = ty + T < h ? ty + T : h;
+            for (int tx = 0; tx < w; tx += T) {
+                int xe = tx + T < w ? tx + T : w;
+                for (int x = tx; x < xe; x++) {
+                    uint16_t *d = dst + (uint32_t)(w - 1 - x) * h + ty;
+                    const uint16_t *s = src + (uint32_t)ty * w + x;
+                    for (int y = ty; y < ye; y++) {
+                        uint16_t px = *s;
+                        *d++ = swap ? __builtin_bswap16(px) : px;
+                        s += w;
+                    }
+                }
+            }
+        }
+        break;
+    case PPA_SRM_ROTATION_ANGLE_270:
+        /* CW: dst[x*h + (h-1-y)] = src[y*w + x] */
+        for (int ty = 0; ty < h; ty += T) {
+            int ye = ty + T < h ? ty + T : h;
+            for (int tx = 0; tx < w; tx += T) {
+                int xe = tx + T < w ? tx + T : w;
+                for (int x = tx; x < xe; x++) {
+                    uint16_t *d = dst + (uint32_t)x * h + (h - 1 - ty);
+                    const uint16_t *s = src + (uint32_t)ty * w + x;
+                    for (int y = ty; y < ye; y++) {
+                        uint16_t px = *s;
+                        *d-- = swap ? __builtin_bswap16(px) : px;
+                        s += w;
+                    }
+                }
+            }
+        }
+        break;
+    case PPA_SRM_ROTATION_ANGLE_180:
+        for (int y = 0; y < h; y++) {
+            uint16_t *d = dst + (uint32_t)(h - 1 - y) * w + (w - 1);
+            const uint16_t *s = src + (uint32_t)y * w;
+            for (int x = 0; x < w; x++) {
+                uint16_t px = *s++;
+                *d-- = swap ? __builtin_bswap16(px) : px;
+            }
+        }
+        break;
+    default:   /* ANGLE_0: 来ないはずだが、来ても絵は正しく */
+        for (uint32_t i = 0; i < (uint32_t)w * h; i++)
+            dst[i] = swap ? __builtin_bswap16(src[i]) : src[i];
+        break;
+    }
+}
+
+/* 1 チャンクを CPU で回してスクラッチへ。スクラッチは CPU ではなく
+   fbcpy の DMA が読むので、書いた分を C2M で押し出す。 */
+static bool ui_cpu_rotate_chunk(const uint8_t *in_buff, int w, int h,
+                                ppa_srm_rotation_angle_t rot, bool swap)
+{
+    if (!s_rot_handle || !in_buff || w <= 0 || h <= 0)
+        return false;
+    uint8_t *dst = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+    uint32_t bytes = (uint32_t)w * (uint32_t)h * 2u;   /* RGB565 */
+    uint32_t len = (bytes + 63u) & ~63u;
+    if (!dst || len > s_rot_buf_size)
+        return false;
+    /* msync も CPU 経路の実費なので測る範囲に入れる */
+    int64_t rt0 = esp_timer_get_time();
+    ui_cpu_rotate_rgb565((uint16_t *)dst, (const uint16_t *)in_buff,
+                         w, h, rot, swap);
+    esp_cache_msync(dst, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    uint32_t dus = (uint32_t)(esp_timer_get_time() - rt0);
+    s_cpu_rot.px += (uint64_t)w * (uint64_t)h;
+    s_cpu_rot.us += dus;
+    if (dus > s_cpu_rot.max_us)
+        s_cpu_rot.max_us = dus;
+    return true;
+}
+
+/* lcd_ppa.c:131-161 が PPA を撃つ前にやる座標変換の複製。s_rot_dead で
+   __real を呼ばない経路でも、flush は rotate_cfg->area を読む。 */
+static void ui_rotate_area_like_ppa(lvgl_port_ppa_disp_rotate_t *rc)
+{
+    uint16_t x1 = rc->area.x1, x2 = rc->area.x2;
+    uint16_t y1 = rc->area.y1, y2 = rc->area.y2;
+    switch (rc->rotation) {
+    case PPA_SRM_ROTATION_ANGLE_90:
+        rc->area.x1 = y1;
+        rc->area.x2 = y2;
+        rc->area.y1 = (uint16_t)(rc->disp_size.hres - x2 - 1);
+        rc->area.y2 = (uint16_t)(rc->disp_size.hres - x1 - 1);
+        break;
+    case PPA_SRM_ROTATION_ANGLE_180:
+        rc->area.x1 = (uint16_t)(rc->disp_size.hres - x2 - 1);
+        rc->area.x2 = (uint16_t)(rc->disp_size.hres - x1 - 1);
+        rc->area.y1 = (uint16_t)(rc->disp_size.vres - y2 - 1);
+        rc->area.y2 = (uint16_t)(rc->disp_size.vres - y1 - 1);
+        break;
+    case PPA_SRM_ROTATION_ANGLE_270:
+        rc->area.x1 = (uint16_t)(rc->disp_size.vres - y2 - 1);
+        rc->area.x2 = (uint16_t)(rc->disp_size.vres - y1 - 1);
+        rc->area.y1 = x1;
+        rc->area.y2 = x2;
+        break;
+    default:
+        break;
+    }
+}
+
+/* タイムアウト後の回収。返り値:
+ *   0 = 実は完了していた (遅かっただけ)。出力は完全、CPU 回し直し不要。
+ *   1 = force_end + 手動完了で回収成功。出力は不完全 → CPU で回し直す。
+ *   2 = 回収失敗。s_rot_dead を立てる側で。出力不完全 → CPU。
+ * 前提: この client (rotate) の trans は常に 1 個までしか飛ばない
+ * (LVGL flush は直列で、毎回ここで完了を待つ) ので、エンジンのキューの
+ * 先頭がこの client のものなら、それが駐車した回転そのもの。 */
+static int ui_rot_recover(void)
+{
+    /* ログを書いている間に完了していた、を最初に拾う */
+    if (xSemaphoreTake(s_rot_done_sem, 0) == pdTRUE)
+        return 0;
+    ppa_srm_engine_t *eng = coroner_srm_engine();
+    ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)s_rot_handle;
+    ppa_trans_t *trans = nullptr;
+    if (eng && m) {
+        portENTER_CRITICAL(&eng->base.spinlock);
+        trans = STAILQ_FIRST(&eng->base.trans_stailq);
+        portEXIT_CRITICAL(&eng->base.spinlock);
+    }
+    if (trans && trans->client == m->srm_handle) {
+        dma2d_trans_t *dt = trans->dma_trans_placeholder;
+        /* rx_chan はリサイクルでクリアされないので、それだけでは飛行中の
+           証拠にならない。チャネルが「今この trans を運んでいる」ことまで
+           確かめてから撃つ —— でないと他人の転送を殺しうる。 */
+        if (dt && dt->rx_chan && dt->rx_chan->status.transaction == dt) {
+            bool need_yield = false;
+            if (dma2d_force_end(dt, &need_yield) == ESP_OK) {
+                /* 来なかった ISR の仕事を代行する (ppa_core.c:477-526 と
+                   同じ経路)。この中で ui_rot_done_cb も呼ばれセマフォが
+                   立つので、次の回転が誤読しないよう飲み干す。 */
+                ppa_transaction_done_cb(NULL, NULL, trans);
+                xSemaphoreTake(s_rot_done_sem, 0);
+                if (need_yield)
+                    portYIELD();
+                return 1;
+            }
+        }
+    }
+    /* 飛行中でない/force_end 拒否: タイムアウトと完了が競った可能性に
+       少しだけ猶予を与える */
+    if (xSemaphoreTake(s_rot_done_sem, pdMS_TO_TICKS(50)) == pdTRUE)
+        return 0;
+    return 2;
+}
+
 extern "C" lvgl_port_ppa_handle_t
 __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
 {
@@ -754,7 +1067,39 @@ __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
     in_psram.flags.buff_spiram = 1;
     ESP_LOGI(TAG, "PPA rotation scratch -> PSRAM (%u bytes)",
              (unsigned)in_psram.buffer_size);
-    return __real_lvgl_port_ppa_create(&in_psram);
+    lvgl_port_ppa_handle_t h = __real_lvgl_port_ppa_create(&in_psram);
+    if (h) {
+        s_rot_handle = h;
+        /* lcd_ppa.c は ALIGN_UP(size, cache line) している。写し (上の
+           ui_lcd_ppa_mirror_t) を信じる前に、ここで公開 API と同じ値を
+           持っておく。 */
+        s_rot_buf_size = (in_psram.buffer_size + 63u) & ~63u;
+        /* E3: 有界待ちの道具立て。写しが実物と一致するときだけ武装する。
+           一致しなければ従来どおり BLOCKING (freeze の危険は残るが、
+           検証できない構造体を信じるよりよい)。 */
+        ui_lcd_ppa_mirror_t *m = (ui_lcd_ppa_mirror_t *)h;
+        if (m->buffer == lvgl_port_ppa_get_output_buffer(h) &&
+            m->srm_handle) {
+            s_rot_done_sem = xSemaphoreCreateBinary();
+            ppa_event_callbacks_t cbs = {};
+            cbs.on_trans_done = ui_rot_done_cb;
+            if (!s_rot_done_sem ||
+                ppa_client_register_event_callbacks(m->srm_handle, &cbs)
+                    != ESP_OK) {
+                if (s_rot_done_sem) {
+                    vSemaphoreDelete(s_rot_done_sem);
+                    s_rot_done_sem = NULL;
+                }
+                ESP_LOGW(TAG, "bounded rotate UNARMED (cb registration)");
+            } else {
+                ESP_LOGI(TAG, "bounded rotate armed (timeout %d ms)",
+                         UI_ROT_TIMEOUT_MS);
+            }
+        } else {
+            ESP_LOGW(TAG, "bounded rotate UNARMED (lcd_ppa mirror mismatch)");
+        }
+    }
+    return h;
 }
 
 /* How much of a presentation is the ROTATION? (spec §F #13)
@@ -772,15 +1117,207 @@ __wrap_lvgl_port_ppa_create(const lvgl_port_ppa_cfg_t *cfg)
  * on that same task. */
 static int64_t s_ppa_rot_us;
 
+/* ------------------------------------------------------------------ */
+/* 回転の幾何のリング。検死役が最後の 8 枚を出す。                     */
+/* ------------------------------------------------------------------ */
+/* 単一書き手 (LVGL タスクの flush_cb だけ)。読むのは core 0 の検死役で、
+   欠けても壊れない値なのでロックは要らない。 */
+/* t_ms は回転を撃つ直前の時刻。irq ring の EOF 時刻と対にして
+   「どの回転がいつ始まり、いつ (fbcpy まで) 終わったか」を読めるように
+   (E1、2026-08-28)。 */
+struct ui_geom_t { uint16_t w, h; uint32_t t_ms; };
+static volatile ui_geom_t s_geom[8];
+/* 直近の回転が返ってきた時刻 (0 = まだ返っていない)。 */
+static volatile uint32_t  s_rot_end_ms;
+/* **32 ビット。** 8 ビットにしていたら 256 回転 (= 全面 10 枚) で
+   一周し、検死役の "k <= head" が 8 件未満しか出さない —— head が
+   たまたま 0 なら "(none)" になり、**「割り込みが来ていない」という
+   一番効く結論と見分けが付かなくなる**。計器が嘘をつく側に倒れる。 */
+static volatile uint32_t  s_geom_i;
+
+static inline void ui_geom_note(int w, int h)
+{
+    uint32_t i = s_geom_i;
+    s_geom[i & 7].w = (uint16_t)w;
+    s_geom[i & 7].h = (uint16_t)h;
+    s_geom[i & 7].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_geom_i = i + 1;
+}
+
+/* ---- 番兵 (E1) ------------------------------------------------------
+ * 駐車した RX descriptor は完了時にしか書き戻されないので、「何バイト
+ * 足りなかったか」は descriptor からは取れない。代わりに、h が小さい
+ * チャンクだけ、回転の出力領域 (out_w = h, out_h = w → w*h*2 バイト) を
+ * 撃つ前に 0xA5 で埋めて C2M しておく。ドライバは自分で M2C するので
+ * 順序は壊れない。止まったら検死役が同じ領域を M2C して数える。
+ *
+ * **これは h <= UI_SENTINEL_MAX_H の回転を ~30 us 遅らせる** (16 KB の
+ * memset + writeback)。fbcpy 完了から次の回転までの間隔がタイミング候補
+ * (C2) の変数そのものなので、E2 で 1137x7 が止まらなくなったら
+ * -DUI_CORONER_SENTINEL=0 で焼き直すこと。 */
+#ifndef UI_CORONER_SENTINEL
+#define UI_CORONER_SENTINEL 1
+#endif
+#define UI_SENTINEL_MAX_H 8
+#define UI_SENTINEL_WORD  0xA5A5u
+static volatile uint32_t s_sent_bytes;   /* 0 = 直近の回転に番兵は無い */
+static volatile uint16_t s_sent_w, s_sent_h;
+static volatile uint32_t s_sent_t_ms;
+
 extern "C" esp_err_t
 __real_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
                             lvgl_port_ppa_disp_rotate_t *rotate_cfg);
+/* UI タスクが flush のどこに居るか。検死役が読む。
+   0 なし / 1 PPA 回転中 / 2 回転終わり / 3 draw_bitmap 中 / 4 その後 */
+volatile uint8_t g_ui_phase;
+/* fs_picker の present() が lv_refr_now に入っている間だけ非 0。
+   「タイマ内リフレッシュの再入」仮説を実機で殺すための旗。 */
+extern "C" volatile uint8_t g_ui_refr_now;
+volatile uint8_t g_ui_refr_now;
+
 extern "C" esp_err_t
 __wrap_lvgl_port_ppa_rotate(lvgl_port_ppa_handle_t handle,
                             lvgl_port_ppa_disp_rotate_t *rotate_cfg)
 {
     int64_t t0 = esp_timer_get_time();
-    esp_err_t err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+    const int gw = rotate_cfg->area.x2 - rotate_cfg->area.x1 + 1;
+    const int gh = rotate_cfg->area.y2 - rotate_cfg->area.y1 + 1;
+
+    /* 文字 1 行に満たない断片 (実機で駐車した 14/14 は全て出力幅 7) と、
+       回復失敗後 (s_rot_dead: エンジンのセマフォが人質のままかもしれない)
+       は PPA に触らない。座標変換も自前でやって CPU で回す。enqueue も
+       待ちも回収も検死も無し —— Ctrl+G プローブの h=7/8 段が駐車しなく
+       なるのは、これの合格信号であって退行ではない。 */
+    if (s_rot_dead || gh < UI_ROT_CPU_BYPASS_H) {
+        ui_geom_note(gw, gh);
+        s_rot_end_ms = 0;
+        g_ui_phase = 1;
+        ui_rotate_area_like_ppa(rotate_cfg);
+        bool ok = ui_cpu_rotate_chunk(rotate_cfg->in_buff, gw, gh,
+                                      rotate_cfg->rotation,
+                                      rotate_cfg->swap_bytes);
+        s_cpu_rot.bypass_n++;
+        g_ui_phase = 2;
+        s_rot_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_ppa_rot_us += esp_timer_get_time() - t0;
+        return ok ? ESP_OK : ESP_FAIL;
+    }
+
+    /* PPA の EOF は誰も拾っていない (ppa_core.c は esp_intr_alloc を
+       呼ばない) ので、この生ビットは「SRM エンジンが自分の仕事を
+       終えたか」だけを表す自由な旗になる。撃つ前に落としておく。
+       止まった瞬間に立っていれば、止まっているのは SRM ではなく
+       その先 —— DMA2D の通知側。 */
+    /* bit1 = blend_eof も一緒に落とす (E1)。誰も PPA の割り込みを使って
+       いないので影響は無く、止まった瞬間に立っていれば「この回転が
+       始まってから BLEND エンジンが仕事を終えた」= 別タスクの fill/blend
+       が割り込んだ、と言える。 */
+    PPA.int_clr.val = (1u << 0) | (1u << 1);   /* sr_eof | blend_eof */
+    /* **ena に入っていないビットを落としておく。**
+       ドライバが有効にするのは SUC_EOF|ERR_EOF|DESC_ERROR だけ
+       (dma2d_priv.h:36) で、int_st はそれで刈られる。だから
+       DESC_EMPTY / FIFO ovf・udf / reorder / dscr_task_ovf は
+       **割り込みを上げないまま in_int_raw に立ちっぱなしになる**
+       (R/WTC/SS: 書いてしか消えない)。ドライバは int_st に出たビットしか
+       クリアしないので、ここで撃つ前に落としておけば、止まった瞬間に
+       立っている = この回転で起きた、と言い切れる。
+       bit 1-3 は触らない (ドライバの通知経路そのもの)。
+       他方のチャネルが飛行中でも安全: このビット群は誰も読まず、
+       誰にも割り込まない。 */
+    DMA2D.in_channel[0].in_int_clr.val = 0x3FF0;
+    DMA2D.in_channel[1].in_int_clr.val = 0x3FF0;
+    /* この回転の幾何を残す。回転先の 1 行は 2*h バイト (lcd_ppa.c:135
+       out_w = h、ppa_srm.c が out.pic_w を ha_length に写す)。幾何の
+       仮説はどれも実機ダンプで死んだ: 奇数 h / 4 バイト非整列は 1137x31
+       が完走して否定、「最終出力ブロック 16 B 未満」も w%16 も停止例と
+       完走例を分けない (2026-08-31 幾何プローブ)。生き残った軸は
+       **出力幅 7 (1 行 14 B) だけ**で、しかも同じ幾何が 2 回完走して
+       3 回目に止まる —— 間欠。受け手 (DMA2D RX) 側のハード停止で、
+       DIG-734 の 12x128bit FIFO が満杯のまま FSM が idle で駐車する。 */
+    ui_geom_note(gw, gh);
+#if UI_CORONER_SENTINEL
+    s_sent_bytes = 0;
+    if (s_rot_handle && gh > 0 && gh <= UI_SENTINEL_MAX_H && gw > 0) {
+        uint8_t *sb = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+        uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 2u;   /* RGB565 */
+        uint32_t len = (bytes + 63u) & ~63u;
+        if (sb && len <= s_rot_buf_size) {
+            memset(sb, 0xA5, len);
+            esp_cache_msync(sb, len, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            s_sent_w = (uint16_t)gw;
+            s_sent_h = (uint16_t)gh;
+            s_sent_t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            s_sent_bytes = bytes;
+        }
+    }
+#endif
+    /* __real は撃つ前に rotate_cfg->area を回転後の座標へ書き換える。
+       CPU で回し直すときに要る入力側の情報をここで確保しておく。 */
+    uint8_t *in_buff = rotate_cfg->in_buff;
+    ppa_srm_rotation_angle_t rot = rotate_cfg->rotation;
+    bool swap = rotate_cfg->swap_bytes;
+
+    s_rot_end_ms = 0;
+    g_ui_phase = 1;
+    esp_err_t err;
+    if (s_rot_done_sem && handle == s_rot_handle) {
+        xSemaphoreTake(s_rot_done_sem, 0);   /* 前回の残り火を消す */
+        rotate_cfg->ppa_mode = PPA_TRANS_MODE_NON_BLOCKING;
+        s_cpu_rot.ppa_n++;
+        err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+        if (err != ESP_OK) {
+            /* 撃てすらしなかった (例: 過去の回収失敗で trans elm が漏れて
+               いる)。area は既に書き換わっているので、足りないのは絵だけ。 */
+            ESP_LOGE(TAG, "ROT: enqueue failed (%s), CPU fallback %dx%d",
+                     esp_err_to_name(err), gw, gh);
+            if (ui_cpu_rotate_chunk(in_buff, gw, gh, rot, swap)) {
+                s_cpu_rot.redo_n++;
+                err = ESP_OK;
+            }
+        } else if (xSemaphoreTake(s_rot_done_sem,
+                                  pdMS_TO_TICKS(UI_ROT_TIMEOUT_MS))
+                       != pdTRUE) {
+            s_rot_timeouts++;
+            ESP_LOGE(TAG,
+                     "ROT-TIMEOUT #%lu: %dx%d no completion in %d ms "
+                     "(healthy is 1-3 ms) - DMA2D RX parked?",
+                     (unsigned long)s_rot_timeouts, gw, gh,
+                     UI_ROT_TIMEOUT_MS);
+#if UI_CORONER
+            /* 駐車したままの姿を先に検死する。回収すると消える。 */
+            coroner_dump_dma();
+#endif
+            int r = ui_rot_recover();
+            if (r == 0) {
+                ESP_LOGE(TAG, "ROT-LATE: completed during recovery, "
+                              "output kept");
+            } else {
+                if (r == 1) {
+                    s_rot_recovered++;
+                    ESP_LOGE(TAG,
+                             "ROT-RECOVERED (%lu/%lu): DMA2D force-ended, "
+                             "PPA engine released; redoing chunk on CPU",
+                             (unsigned long)s_rot_recovered,
+                             (unsigned long)s_rot_timeouts);
+                } else {
+                    s_rot_dead = true;
+                    ESP_LOGE(TAG,
+                             "ROT-DEAD: recovery failed, PPA rotate is "
+                             "OFF for good - CPU rotation from now on");
+                }
+                if (ui_cpu_rotate_chunk(in_buff, gw, gh, rot, swap))
+                    s_cpu_rot.redo_n++;
+                else
+                    err = ESP_FAIL;
+            }
+        }
+    } else {
+        /* 未武装 (写し不一致): 従来どおり BLOCKING。 */
+        s_cpu_rot.ppa_n++;
+        err = __real_lvgl_port_ppa_rotate(handle, rotate_cfg);
+    }
+    g_ui_phase = 2;
+    s_rot_end_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_ppa_rot_us += esp_timer_get_time() - t0;
     return err;
 }
@@ -1031,6 +1568,580 @@ static void touch_init(ui_panel_variant_t variant, lv_display_t *disp)
    events: the scrim owns the screen like a web modal backdrop */
 static volatile bool s_cam_modal;
 
+/* ------------------------------------------------------------------ */
+/* 検死役 (UI_CORONER)                                                 */
+/* ------------------------------------------------------------------ */
+/*
+ * **「両方 Blocked で watchdog が鳴らない」形は、プラットフォームが何も
+ * 教えてくれない。** 今日はその一つを 6 回の当て推量で外した (タッチの
+ * 二重配達・wake のロック無し呼び出し・SAVE モード特有・鍵盤・列挙・
+ * 閾値)。推測を足す代わりに、止まった瞬間の事実を 1 行で出す。
+ *
+ * core 0 に置く。core 1 が止まっても動き続けるのが要件。
+ * 出すのは「誰が LVGL ロックを持っていて、どこで取ったか」。
+ * PC は addr2line で解決できる —— **解決してから語ること**
+ * (今日、生の PC を思い込みで読んで誤った原因をメモにまで書いた)。
+ */
+#ifndef UI_CORONER
+#define UI_CORONER 1
+#endif
+
+#if UI_CORONER
+static volatile uint32_t s_ui_beat;      /* UI フレームが立てる脈 */
+static volatile uint32_t s_ui_beat_ms;   /* その最後の時刻 (E1) */
+extern volatile uint8_t  g_ui_phase;     /* flush のどこに居るか (上で定義) */
+extern "C" uint32_t      s_draw_errs_ref(void);
+extern "C" uint32_t      s_flush_tmo_ref(void);
+static TaskHandle_t      s_lock_owner;   /* LVGL ロックの持ち主 */
+static void             *s_lock_pc;      /* それを取った場所 */
+static volatile uint8_t  s_lock_depth;   /* 再帰の深さ */
+
+extern "C" bool __real_lvgl_port_lock(uint32_t timeout_ms);
+extern "C" void __real_lvgl_port_unlock(void);
+
+extern "C" bool __wrap_lvgl_port_lock(uint32_t timeout_ms)
+{
+    bool ok = __real_lvgl_port_lock(timeout_ms);
+    if (!ok)
+        return false;   /* 取れなかったものを数えると持ち主が狂う */
+    uint8_t d = s_lock_depth;
+    s_lock_depth = (uint8_t)(d + 1);
+    if (d == 0) {
+        s_lock_owner = xTaskGetCurrentTaskHandle();
+        s_lock_pc = __builtin_return_address(0);
+    }
+    return true;
+}
+
+extern "C" void __wrap_lvgl_port_unlock(void)
+{
+    uint8_t d = s_lock_depth;
+    if (d) {
+        d = (uint8_t)(d - 1);
+        s_lock_depth = d;
+    }
+    if (d == 0) {
+        s_lock_owner = nullptr;
+        s_lock_pc = nullptr;
+    }
+    __real_lvgl_port_unlock();
+}
+
+/* ------------------------------------------------------------------ */
+/* DMA2D の割り込みステータスを保存するシム                            */
+/* ------------------------------------------------------------------ */
+/*
+ * **なぜ要るか。** ドライバの ISR は自分が読んだ直後に
+ * `in_int_st` を全部クリアする (dma2d.c:283-284)。だから検死役が
+ * 3 秒後に読んでも、落ちた理由のビットはもう残っていない。
+ * 残っている sticky なレジスタは `in_suc_eof_des_addr` と
+ * `in_err_eof_des_addr` の 2 本だけで、**後者は JPEG 専用**
+ * (dma2d_ll.h:57 "Only JPEG") なので回転では永久に 0。
+ *
+ * dma2d.c は 5 本の ISR を `esp_intr_alloc_intrstatus` 経由で取る
+ * (:442-447 rx / :457-462 tx)。別の翻訳単位からの呼び出しなので
+ * --wrap が効く。ここで本物のハンドラの前に 1 枚だけ写しを取る。
+ *
+ * **絞り込み。** ドライバが有効にする RX の割り込みは
+ * `SUC_EOF | ERR_EOF | DESC_ERROR` だけ (dma2d_priv.h:36)。
+ * `in_int_st` は ena で刈られるので、`DESC_EMPTY` は最初から上がらない。
+ * ERR_EOF は JPEG 専用。**つまり「通知が落ちる」経路は実質
+ * DESC_ERROR 一本**で、それが立っていればここに残る。
+ * 何も残っていなければ、そもそも割り込みが来ていない = ハードが
+ * 走り続けているか、起動されていないか (検死役の FSM が分ける)。
+ *
+ * IRAM 安全ではない。ドライバの ISR 自身がそうでない
+ * (CONFIG_DMA2D_ISR_IRAM_SAFE=n) ので条件は同じ。
+ * 万一 IRAM フラグ付きで来たら素通しする。
+ */
+struct ui_d2d_shim_t {
+    intr_handler_t     real;
+    void              *arg;
+    volatile uint32_t *st;
+    uint8_t            src;   /* ETS_DMA2D_IN_CH0 からの相対番号 */
+};
+static ui_d2d_shim_t s_d2d_shim[5];
+static uint8_t       s_d2d_shim_n;
+
+struct ui_d2d_ev_t { uint32_t t_ms; uint16_t st; uint8_t src; };
+static volatile ui_d2d_ev_t s_d2d_ev[16];
+static volatile uint32_t    s_d2d_ev_i;   /* 8 ビットだと全面 1 枚で一周する */
+
+static void ui_d2d_shim_isr(void *arg)
+{
+    ui_d2d_shim_t *sh = (ui_d2d_shim_t *)arg;
+    uint32_t st = *sh->st;
+    uint32_t i = s_d2d_ev_i;
+    s_d2d_ev[i & 15].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_d2d_ev[i & 15].st = (uint16_t)st;
+    s_d2d_ev[i & 15].src = sh->src;
+    s_d2d_ev_i = i + 1;
+    sh->real(sh->arg);
+}
+
+extern "C" esp_err_t
+__real_esp_intr_alloc_intrstatus(int source, int flags, uint32_t reg,
+                                 uint32_t mask, intr_handler_t handler,
+                                 void *arg, intr_handle_t *ret_handle);
+
+extern "C" esp_err_t
+__wrap_esp_intr_alloc_intrstatus(int source, int flags, uint32_t reg,
+                                 uint32_t mask, intr_handler_t handler,
+                                 void *arg, intr_handle_t *ret_handle)
+{
+    /* DMA2D の 5 本だけ。ほかのドライバも同じ口を使うので素通しが既定。 */
+    if (source < ETS_DMA2D_IN_CH0_INTR_SOURCE ||
+        source > ETS_DMA2D_OUT_CH2_INTR_SOURCE ||
+        (flags & ESP_INTR_FLAG_IRAM) ||
+        s_d2d_shim_n >= (uint8_t)(sizeof s_d2d_shim / sizeof s_d2d_shim[0]))
+        return __real_esp_intr_alloc_intrstatus(source, flags, reg, mask,
+                                                handler, arg, ret_handle);
+
+    ui_d2d_shim_t *sh = &s_d2d_shim[s_d2d_shim_n++];
+    sh->real = handler;
+    sh->arg = arg;
+    sh->st = (volatile uint32_t *)reg;
+    sh->src = (uint8_t)(source - ETS_DMA2D_IN_CH0_INTR_SOURCE);
+    return __real_esp_intr_alloc_intrstatus(source, flags, reg, mask,
+                                            ui_d2d_shim_isr, sh, ret_handle);
+}
+
+/* 止まった瞬間のハードウェアを 1 行で出す。
+ *
+ * 読み方 (dma2d.c:283-326 / dma2d_priv.h:36 / ppa_core.c:412-462 が根拠):
+ *
+ *   シムの環に **DESC_ERROR (b3)** が最後に居る
+ *       → 通知は上がったが**捨てられた**。RX ISR は
+ *         ERR_EOF/DESC_ERROR/DESC_EMPTY でもチャネルを解放するのに、
+ *         on_recv_eof を呼ぶのは SUC_EOF のときだけ。PPA の完了
+ *         コールバックは on_recv_eof にしか登録できない
+ *         (dma2d_rx_event_callbacks_t にエラーの口が無い) ので
+ *         trans_elm->sem は永久に与えられない。
+ *   raw に **DESC_EMPTY / FIFO ovf・udf / reorder / dscr_task_ovf**
+ *   が立っていて FSM idle・最後の SUC_EOF 以降にシムの環が空
+ *       → **そもそも通知が上がっていない**。これらは ena に無いので
+ *         割り込みにならず、raw にだけ残る (だから撃つ前に落としてある)。
+ *   FSM が busy
+ *       → ハードウェアが本当に走り続けている。ソフトの問題ではない。
+ *   raw 何も無し・FSM idle・PPA sr_eof も立たず
+ *       → そもそも起動されていない (チャネル待ちで積まれたまま)。
+ *
+ * **err_eof_des_addr は読まない。** ERR_EOF は JPEG 専用
+ * (dma2d_ll.h:57 "Only JPEG") なので回転では永久に 0 で、
+ * 追いかけると時間を捨てる。
+ *
+ * ppa_eof は __wrap_lvgl_port_ppa_rotate が撃つ前に落としている。
+ * 立っていれば SRM エンジンは仕事を終えている。
+ *
+ * 読むだけ (int_st は RO、int_raw は R/WTC で書いてしか消えない)。
+ * DMA2D のクロックはプール取得から解放まで入りっぱなしで、ここでは
+ * 解放されないので、**どの phase で呼んでも安全**。
+ */
+/* ------------------------------------------------------------------ */
+/* E1: 駐車 descriptor の持ち主・dma2d のソフト側・番兵                */
+/* ------------------------------------------------------------------ */
+/* dma2d pool 0。検死役が起動後に 1 度だけ dma2d_acquire_pool で握る
+   (参照カウントが 1 増えるだけ。ISR は既に確保済みなので、ここで
+   確保が走って ISR の core が変わることは無い —— シムが armed になって
+   from 呼ぶのはそのため)。 */
+static dma2d_group_t *s_d2d_group;
+
+/* ui_lcd_ppa_mirror_t と coroner_srm_engine() は回転の有界化 (E3) も
+   使うので、__wrap_lvgl_port_ppa_create の手前 (上) へ移した。 */
+
+static ppa_blend_engine_t *coroner_blend_engine(void)
+{
+    ppa_client_handle_t c = s_ppa_blend ? s_ppa_blend : s_ppa_fill;
+    if (!c || !c->engine || c->engine->type != PPA_ENGINE_TYPE_BLEND)
+        return nullptr;
+    return (ppa_blend_engine_t *)c->engine;
+}
+
+static const char *coroner_buf_name(const void *p)
+{
+    if (!p)
+        return "null";
+    if (s_rot_handle && p == lvgl_port_ppa_get_output_buffer(s_rot_handle))
+        return "scratch";
+    void *fb0 = nullptr;
+    if (s_dpi_panel &&
+        esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0) == ESP_OK &&
+        p == fb0)
+        return "fb0";
+    if (p == (const void *)s_js_canvas_buf)
+        return "canvas";
+    return "?";
+}
+
+/* descriptor を 1 行で。内部 SRAM・64 B 整列・64 B 確保 (ppa_core.c:67-71)
+   なので 1 行ぶん M2C してから読む。駐車中なら DMA は何も書き戻して
+   いないので cache と memory は元々一致しているはずだが、念のため。 */
+static void coroner_dump_desc(const char *who, const dma2d_descriptor_t *d)
+{
+    uintptr_t base = (uintptr_t)d & ~(uintptr_t)63;
+    size_t len = (((uintptr_t)d - base) + sizeof *d + 63) & ~(size_t)63;
+    esp_cache_msync((void *)base, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    const uint32_t *w = (const uint32_t *)d;
+    ESP_LOGE(TAG,
+             "CORONER: desc %s @%p w0=%08lx w1=%08lx w2=%08lx buf=%p(%s) "
+             "next=%p | vb=%u hb=%u eof=%u en=%u owner=%s va=%u ha=%u "
+             "pbyte=%u x=%u y=%u mode=%u",
+             who, (const void *)d, (unsigned long)w[0], (unsigned long)w[1],
+             (unsigned long)w[2], d->buffer, coroner_buf_name(d->buffer),
+             (const void *)d->next, (unsigned)d->vb_size,
+             (unsigned)d->hb_length, (unsigned)d->suc_eof,
+             (unsigned)d->dma2d_en, d->owner ? "DMA" : "CPU",
+             (unsigned)d->va_size, (unsigned)d->ha_length,
+             (unsigned)d->pbyte, (unsigned)d->x, (unsigned)d->y,
+             (unsigned)d->mode);
+}
+
+struct ui_desc_known_t { const char *name; const dma2d_descriptor_t *p; };
+
+static int coroner_known_descs(ui_desc_known_t *out, int cap)
+{
+    int n = 0;
+    ppa_srm_engine_t *s = coroner_srm_engine();
+    ppa_blend_engine_t *b = coroner_blend_engine();
+    if (s && n + 2 <= cap) {
+        out[n++] = { "SRM.rx", s->dma_rx_desc };
+        out[n++] = { "SRM.tx", s->dma_tx_desc };
+    }
+    if (b && n + 3 <= cap) {
+        out[n++] = { "BLEND.rx", b->dma_rx_desc };
+        out[n++] = { "BLEND.tx_bg", b->dma_tx_bg_desc };
+        out[n++] = { "BLEND.tx_fg", b->dma_tx_fg_desc };
+    }
+    return n;
+}
+
+static const char *coroner_desc_name(const ui_desc_known_t *k, int n,
+                                     uint32_t low18)
+{
+    for (int i = 0; i < n; i++)
+        if (((uintptr_t)k[i].p & 0x3FFFFu) == low18)
+            return k[i].name;
+    return "?";
+}
+
+static const dma2d_descriptor_t *coroner_desc_ptr(const ui_desc_known_t *k,
+                                                  int n, uint32_t low18)
+{
+    for (int i = 0; i < n; i++)
+        if (((uintptr_t)k[i].p & 0x3FFFFu) == low18)
+            return k[i].p;
+    return nullptr;
+}
+
+static const char *coroner_picked_name(dma2d_trans_on_picked_callback_t f)
+{
+    if (f == ppa_srm_transaction_on_picked)   return "srm";
+    if (f == ppa_blend_transaction_on_picked) return "blend";
+    if (f == ppa_fill_transaction_on_picked)  return "fill";
+    return f ? "other(fbcpy?)" : "NULL";
+}
+
+/* dma2d のソフト側。止まった後にしか呼ばないので spinlock は取らない
+   (何も動いていない)。 */
+static void coroner_dump_d2d_sw(void)
+{
+    dma2d_group_t *g = s_d2d_group;
+    if (!g) {
+        ESP_LOGE(TAG, "CORONER: dma2d sw: pool not held (armed before?)");
+        return;
+    }
+    char line[160];
+    int n = 0, npend = 0;
+    dma2d_trans_t *t;
+    TAILQ_FOREACH(t, &g->pending_trans_tailq, entry) {
+        if (npend < 6 && n < (int)sizeof line - 24)
+            n += snprintf(line + n, sizeof line - n, " %s",
+                          t->desc ? coroner_picked_name(t->desc->on_job_picked)
+                                  : "?");
+        if (++npend > 64)
+            break;   /* 壊れたリストで永久に回らない */
+    }
+    ESP_LOGE(TAG, "CORONER: dma2d sw tx_free=0x%x rx_free=0x%x pending=%d%s",
+             (unsigned)g->tx_channel_free_mask,
+             (unsigned)g->rx_channel_free_mask, npend, n ? line : "");
+    for (int i = 0; i < 2; i++) {
+        dma2d_rx_channel_t *rc = g->rx_chans[i];
+        if (!rc)
+            continue;
+        const char *cb = rc->on_recv_eof == ppa_transaction_done_cb ? "ppa_done"
+                       : rc->on_recv_eof ? "other(fbcpy?)" : "NULL";
+        dma2d_trans_t *tr = rc->base.status.transaction;
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d sw rx%d on_recv_eof=%s user=%p trans=%p(%s) "
+                 "bundled_tx=0x%x periph_sel=%d",
+                 i, cb, rc->user_data, (void *)tr,
+                 tr && tr->desc ? coroner_picked_name(tr->desc->on_job_picked)
+                                : "-",
+                 (unsigned)rc->bundled_tx_channel_mask,
+                 (int)rc->base.status.periph_sel_id);
+    }
+}
+
+/* 番兵の残り = SRM が書けなかったバイト数。 */
+static void coroner_dump_sentinel(void)
+{
+#if UI_CORONER_SENTINEL
+    uint32_t bytes = s_sent_bytes;
+    if (!bytes || !s_rot_handle) {
+        ESP_LOGE(TAG, "CORONER: sentinel none (last rotate h > %d)",
+                 UI_SENTINEL_MAX_H);
+        return;
+    }
+    uint8_t *buf = lvgl_port_ppa_get_output_buffer(s_rot_handle);
+    uint32_t len = (bytes + 63u) & ~63u;
+    if (!buf || len > s_rot_buf_size)
+        return;
+    esp_cache_msync(buf, len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    const uint16_t *px = (const uint16_t *)buf;
+    uint32_t nw = bytes / 2, first = nw, last_written = 0, cnt = 0;
+    for (uint32_t i = 0; i < nw; i++) {
+        if (px[i] == UI_SENTINEL_WORD) {
+            cnt++;
+            if (first == nw)
+                first = i;
+        } else {
+            last_written = i;
+        }
+    }
+    unsigned ow = s_sent_h;   /* 回転後の 1 行 = h 画素 */
+    ESP_LOGE(TAG,
+             "CORONER: sentinel in %ux%u -> out %ux%u (%lu B, laid @%lu ms): "
+             "unwritten=%lu B (%lu/%lu words) first_unwritten=%lu B "
+             "(out row %lu of %u) last_written=%lu B (out row %lu)",
+             (unsigned)s_sent_w, (unsigned)s_sent_h, ow, (unsigned)s_sent_w,
+             (unsigned long)bytes, (unsigned long)s_sent_t_ms,
+             (unsigned long)(cnt * 2), (unsigned long)cnt, (unsigned long)nw,
+             (unsigned long)(first * 2),
+             (unsigned long)(ow ? (first * 2) / (ow * 2) : 0),
+             (unsigned)s_sent_w, (unsigned long)(last_written * 2),
+             (unsigned long)(ow ? (last_written * 2) / (ow * 2) : 0));
+#else
+    ESP_LOGE(TAG, "CORONER: sentinel off (UI_CORONER_SENTINEL=0)");
+#endif
+}
+
+static void coroner_dump_dma(void)
+{
+    uint32_t ppa_raw = PPA.int_raw.val;
+    ui_desc_known_t known[5];
+    int nknown = coroner_known_descs(known, 5);
+    {
+        char line[160];
+        int n = 0;
+        for (int i = 0; i < nknown; i++)
+            n += snprintf(line + n, sizeof line - n, " %s=%p", known[i].name,
+                          (const void *)known[i].p);
+        void *fb0 = nullptr;
+        if (s_dpi_panel)
+            esp_lcd_dpi_panel_get_frame_buffer(s_dpi_panel, 1, &fb0);
+        ESP_LOGE(TAG, "CORONER: desc table%s | scratch=%p(%lu) fb0=%p canvas=%p",
+                 nknown ? line : " (none: mirror mismatch?)",
+                 s_rot_handle ? (void *)lvgl_port_ppa_get_output_buffer(s_rot_handle)
+                              : nullptr,
+                 (unsigned long)s_rot_buf_size, fb0, (void *)s_js_canvas_buf);
+    }
+    for (int i = 0; i < 2; i++) {   /* RX チャネルは 2 本 */
+        uint32_t st = DMA2D.in_channel[i].in_state.val;
+        /* state は生も出す: 下位 18 ビットが**今どの descriptor に
+           居るか**で、suc_eof_des_addr と突き合わせると
+           「この回転の descriptor に張り付いたまま」かどうかが分かる。 */
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d rx%d state=0x%08lx fsm=%u dscr=%u "
+                 "suc_eof=0x%08lx",
+                 i, (unsigned long)st,
+                 (unsigned)((st >> 20) & 0x7), (unsigned)((st >> 18) & 0x3),
+                 (unsigned long)DMA2D.in_channel[i].in_suc_eof_des_addr.val);
+        ESP_LOGE(TAG,
+                 "CORONER: dma2d rx%d raw=0x%04lx ena=0x%04lx st=0x%04lx",
+                 i, (unsigned long)DMA2D.in_channel[i].in_int_raw.val,
+                 (unsigned long)DMA2D.in_channel[i].in_int_ena.val,
+                 (unsigned long)DMA2D.in_channel[i].in_int_st.val);
+        /* E1: 今の descriptor と最後に EOF した descriptor の持ち主、
+           FIFO の残り、start 時に書かれた link_addr。 */
+        {
+            uint32_t cur18 = st & 0x3FFFFu;
+            uint32_t eof = DMA2D.in_channel[i].in_suc_eof_des_addr.val;
+            uint32_t f = DMA2D.in_channel[i].infifo_status.val;
+            ESP_LOGE(TAG,
+                     "CORONER: dma2d rx%d cur=%s eof=%s | link_addr=0x%08lx "
+                     "dscr_bf0=0x%08lx | fifo raw=0x%08lx l2:empty=%u cnt=%u "
+                     "remain_under=0x%02x l1:cnt=%u l3:cnt=%u",
+                     i, coroner_desc_name(known, nknown, cur18),
+                     coroner_desc_name(known, nknown, eof & 0x3FFFFu),
+                     (unsigned long)DMA2D.in_channel[i].in_link_addr.val,
+                     (unsigned long)DMA2D.in_channel[i].in_dscr_bf0.val,
+                     (unsigned long)f, (unsigned)((f >> 1) & 1),
+                     (unsigned)((f >> 2) & 0xF), (unsigned)((f >> 7) & 0xFF),
+                     (unsigned)((f >> 17) & 0x1F), (unsigned)((f >> 24) & 0x1F));
+            const dma2d_descriptor_t *d = coroner_desc_ptr(known, nknown, cur18);
+            char who[16];
+            snprintf(who, sizeof who, "rx%d.cur", i);
+            if (d) {
+                coroner_dump_desc(who, d);
+            } else if (cur18) {
+                /* 持ち主不明 (fbcpy の descriptor など)。上位 14 bit は
+                   suc_eof のものを借りる —— L2MEM 768 KB の 1/3 なので
+                   外れうる。**推測** と明記して出す。 */
+                const dma2d_descriptor_t *g =
+                    (const dma2d_descriptor_t *)((eof & ~0x3FFFFu) | cur18);
+                snprintf(who, sizeof who, "rx%d.cur?", i);
+                coroner_dump_desc(who, g);
+            }
+        }
+    }
+    ESP_LOGE(TAG, "CORONER: dma2d tx fsm=%u/%u/%u raw=%04lx/%04lx/%04lx",
+             (unsigned)((DMA2D.out_channel[0].out_state.val >> 20) & 0xF),
+             (unsigned)((DMA2D.out_channel[1].out_state.val >> 20) & 0xF),
+             (unsigned)((DMA2D.out_channel[2].out_state.val >> 20) & 0xF),
+             (unsigned long)DMA2D.out_channel[0].out_int_raw.val,
+             (unsigned long)DMA2D.out_channel[1].out_int_raw.val,
+             (unsigned long)DMA2D.out_channel[2].out_int_raw.val);
+    /* blend_eof も回転の直前に落としている (wrap)。立っていれば、この
+       回転が始まってから BLEND エンジンが 1 枚仕上げた = 別タスクの
+       fill/blend が同時に居た。 */
+    ESP_LOGE(TAG,
+             "CORONER: ppa int_raw=0x%08lx (sr_eof=%u blend_eof=%u sr_cfg_err=%u)",
+             (unsigned long)ppa_raw, (unsigned)(ppa_raw & 1),
+             (unsigned)((ppa_raw >> 1) & 1), (unsigned)((ppa_raw >> 2) & 1));
+    /* cfg_err が立っていたら理由はこのレジスタに全部書いてある
+       (TRM: PPA_SR_PARAM_ERR_ST_REG)。立っていなければ 0。 */
+    if (ppa_raw & (1u << 2))
+        ESP_LOGE(TAG, "CORONER: ppa sr_param_err_st=0x%08lx",
+                 (unsigned long)PPA.sr_param_err_st.val);
+
+    /* ドライバがクリアする前に写した割り込み。新しい順に 8 件。
+       src 0,1 = RX ch0,ch1 / 2,3,4 = TX ch0..2。
+       st のビット (dma2d_ll.h:46-59):
+         b1 SUC_EOF  b2 ERR_EOF(JPEG 専用)  b3 DESC_ERROR
+       **b3 が最後に立っていたら、それが落ちた通知そのもの。**
+       最後の SUC_EOF より後に何も無ければ、割り込み自体が来ていない。 */
+    {
+        char line[192];
+        int n = 0;
+        uint32_t head = s_d2d_ev_i;
+        uint32_t have = head < 8 ? head : 8;
+        for (uint32_t k = 1; k <= have; k++) {
+            uint32_t i = (head - k) & 15;
+            n += snprintf(line + n, sizeof line - n, " %lu:s%u=%04x",
+                          (unsigned long)s_d2d_ev[i].t_ms,
+                          (unsigned)s_d2d_ev[i].src,
+                          (unsigned)s_d2d_ev[i].st);
+            if (n >= (int)sizeof line - 24)
+                break;
+        }
+        /* armed= はシムが実際に噛んでいる ISR の本数 (RX 2 + TX 3 = 5)。
+           DMA2D の ISR はプール取得時に確保されるので**起動直後は 0**
+           でありうる。ここで出しておけば "(none)" が
+           「割り込みが来ていない」なのか「計器が入っていない」なのかを
+           取り違えずに済む。 */
+        ESP_LOGE(TAG, "CORONER: d2d irq armed=%u total=%lu (newest first)%s",
+                 (unsigned)s_d2d_shim_n, (unsigned long)head,
+                 n ? line : " (none)");
+    }
+
+    /* 止まった回転の幾何。! = 奇数 h。bNN = 回転後の**最小出力ブロック**の
+       バイト数: SRM は 16x16 のマクロブロック (P4 rev1.x, ppa_ll.h:505) で
+       入力を刻むので、最後の列 (w%16) × 最後の行 (h%16) が最小 (1137x7 →
+       1x7 → 転置して 7x1 = 14 B)。@ は撃った時刻 ms。 */
+    {
+        char line[192];
+        int n = 0;
+        uint32_t head = s_geom_i;
+        uint32_t have = head < 8 ? head : 8;
+        for (uint32_t k = 1; k <= have; k++) {
+            uint32_t i = (head - k) & 7;
+            unsigned w = s_geom[i].w, h = s_geom[i].h;
+            unsigned wr = w % 16 ? w % 16 : 16, hr = h % 16 ? h % 16 : 16;
+            n += snprintf(line + n, sizeof line - n, " %ux%u%sb%u@%lu", w, h,
+                          (h & 1) ? "!" : "", wr * hr * 2,
+                          (unsigned long)s_geom[i].t_ms);
+            if (n >= (int)sizeof line - 24)
+                break;
+        }
+        ESP_LOGE(TAG, "CORONER: rot wxh (newest first, ! odd h, bN min out "
+                      "block B, @ms) last_end=%lu%s",
+                 (unsigned long)s_rot_end_ms, n ? line : " (none)");
+    }
+    coroner_dump_d2d_sw();
+    coroner_dump_sentinel();
+}
+
+static void coroner_task(void *arg)
+{
+    uint32_t last = 0;
+    int stale = 0;
+    bool armed_said = false;
+
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        /* **計器が生きていることを、停止を待たずに 1 度だけ言う。**
+           DMA2D の ISR はプール取得時に確保されるので起動直後は 0 本。
+           ここで n と件数が出れば、あとで環が空でも
+           「割り込みが来ていない」と読んでよい。 */
+        if (!armed_said && s_d2d_shim_n) {
+            armed_said = true;
+            ESP_LOGI(TAG, "CORONER: dma2d irq shim armed n=%u ev=%lu",
+                     (unsigned)s_d2d_shim_n, (unsigned long)s_d2d_ev_i);
+            /* E1: プールは既に在る (ISR が確保済み = シムが噛んでいる)
+               ので、ここで握っても新しい確保は走らない。参照が 1 増える
+               だけで、解放はしない (検死役は死なない)。 */
+            if (!s_d2d_group) {
+                dma2d_pool_config_t pc = {};
+                pc.pool_id = 0;
+                dma2d_pool_handle_t h = nullptr;
+                if (dma2d_acquire_pool(&pc, &h) == ESP_OK && h) {
+                    s_d2d_group = h;
+                    ESP_LOGI(TAG, "CORONER: dma2d pool held %p tx_free=0x%x "
+                                  "rx_free=0x%x",
+                             (void *)h, (unsigned)h->tx_channel_free_mask,
+                             (unsigned)h->rx_channel_free_mask);
+                } else {
+                    ESP_LOGW(TAG, "CORONER: dma2d_acquire_pool failed");
+                }
+            }
+        }
+        uint32_t b = s_ui_beat;
+        if (b != last) {
+            last = b;
+            stale = 0;
+            continue;
+        }
+        if (++stale != 3)      /* 3 秒動かなかったら 1 回だけ吐く */
+            continue;
+        TaskHandle_t o = s_lock_owner;
+        /* owner= は **UI タスク自身を見られない**。--wrap は同じ
+           翻訳単位の中の呼び出しを書き換えないので (ld manual:
+           "translation unit internal references ... are not resolved
+           to __wrap_symbol")、esp_lvgl_port.c の中でタスクループが
+           自分で呼ぶ lvgl_port_lock はここを通らない。
+           **"(none)" は「UI タスク以外の誰も持っていない」の意味**で、
+           「誰も持っていない」ではない。一日これを読み違えた。 */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        ESP_LOGE(TAG,
+                 "CORONER: UI stalled 3s | lock owner(non-UI)=%s depth=%u "
+                 "pc=%p | flushing=%d phase=%u refr_now=%u draw_err=%lu "
+                 "flush_tmo=%lu | last_beat=%lu ms (%lu ago)",
+                 o ? pcTaskGetName(o) : "(none)", (unsigned)s_lock_depth,
+                 s_lock_pc, s_disp ? (int)s_disp->flushing : -1,
+                 (unsigned)g_ui_phase, (unsigned)g_ui_refr_now,
+                 (unsigned long)s_draw_errs_ref(),
+                 (unsigned long)s_flush_tmo_ref(),
+                 (unsigned long)s_ui_beat_ms,
+                 (unsigned long)(now_ms - s_ui_beat_ms));
+        /* phase で絞らない。draw_bitmap 側で止まっていても
+           同じレジスタが同じだけ物を言う。1 回の停止につき数行、
+           それだけの価値がある。 */
+        coroner_dump_dma();
+    }
+}
+#endif /* UI_CORONER */
+
 static void touch_observe(void)
 {
     static bool was_pressed;
@@ -1038,7 +2149,16 @@ static void touch_observe(void)
 
     if (!s_touch_indev)
         return;
-    if (s_cam_modal) {
+    /* **モーダルが出ている間はアプリへ配らない。**
+       ここは以前カメラのスクリムしか見ておらず、fs_picker のスクリムは
+       素通りしていた —— キーは fs_pick が横取りするのにタッチはしない、
+       という非対称。結果、ピッカーの上のタップが裏のエディタにも届き、
+       ファイルを選ぶと裏の原稿のカーソルが動き、一覧をドラッグすると
+       裏の原稿がスクロールしていた (それ自体がバグ)。
+       さらに悪いのは負荷で、ドラッグ 1 サンプル (10 ms) ごとに裏で
+       全画面再描画が走り、UI タスクの lv_refr_now と同じ PPA を
+       ロックの内側で奪い合う —— 実機の core 1 フリーズはこの形。 */
+    if (s_cam_modal || fs_pick_active()) {
         /* close any in-flight gesture so ui.onTouch apps don't hang in
            "pressed" state, then go silent for the modal's lifetime */
         if (was_pressed)
@@ -3124,6 +4244,17 @@ void ui_tab5_kb_field(int mode)
    警告は出ない。エディタ (ui_tab5_canvas_invalidate) は定義より後ろに
    あるので動き、端末だけが直接経路に入れず、拒否理由の内訳まで全部 0
    だった (= 入口にすら来ていなかった)。 */
+/* **切り分け済み (2026-08-27 に 0、2026-08-31 に 1 へ復帰)**:
+   検死役が phase=1 を出した —— UI タスクが LVGL の flush が撃った PPA
+   回転から戻ってこない。PPA SRM を flush 以外から使う唯一のコードが
+   この経路で、DMA2D のチャネルは esp_async_fbcpy と共有。これを 0 に
+   して固まらなければ犯人が確定する、として落としていた。
+
+   **結果: この経路は犯人ではなかった。** 駐車は flush 側の回転そのもの
+   で起き (DMA2D の RX が FIFO 満杯のまま idle で停まる)、引き金は
+   出力幅 7 = 1 行 14 バイト。安全網 (有界回転 + dma2d_force_end 回収) と
+   バイパス (UI_ROT_CPU_BYPASS_H) で塞いだので、借りていた速度を返す。
+   横 90.4 -> 32.5 ms。 */
 #ifndef UI_DIRECT_PRESENT
 #define UI_DIRECT_PRESENT 1
 #endif
@@ -3265,6 +4396,23 @@ static void prof_report(int64_t now)
              (unsigned long)s_direct_rej[6],
              (unsigned long)s_flush_timeouts,
              (unsigned long)s_draw_errs);
+    /* CPU 回転の窓集計 (E3 Task 2)。回した実績がある窓だけ 1 行 ——
+       縦画面では黙る。px/us == Mpix/s なので割るだけでよい。 */
+    if (s_cpu_rot.bypass_n || s_cpu_rot.redo_n) {
+        uint32_t r100 = s_cpu_rot.us
+            ? (uint32_t)(s_cpu_rot.px * 100 / s_cpu_rot.us) : 0;
+        ESP_LOGW("ui_prof",
+                 "cpu_rot: bypass=%lu redo=%lu ppa=%lu | %llu px / %llu us "
+                 "= %lu.%02lu Mpix/s | max %lu us",
+                 (unsigned long)s_cpu_rot.bypass_n,
+                 (unsigned long)s_cpu_rot.redo_n,
+                 (unsigned long)s_cpu_rot.ppa_n,
+                 (unsigned long long)s_cpu_rot.px,
+                 (unsigned long long)s_cpu_rot.us,
+                 (unsigned long)(r100 / 100), (unsigned long)(r100 % 100),
+                 (unsigned long)s_cpu_rot.max_us);
+    }
+    memset(&s_cpu_rot, 0, sizeof s_cpu_rot);
     s_direct_n = 0;
     s_direct_us = 0;
     memset(s_direct_rej, 0, sizeof s_direct_rej);
@@ -3458,7 +4606,9 @@ extern "C" esp_err_t __wrap_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
                                                       int x1, int y1, int x2,
                                                       int y2, const void *data)
 {
+    g_ui_phase = 3;
     esp_err_t r = __real_esp_lcd_panel_draw_bitmap(p, x1, y1, x2, y2, data);
+    g_ui_phase = 4;
     if (r != ESP_OK && s_disp) {
         s_draw_errs++;
         /* 転送は始まっていない。LVGL に「終わった」と伝えないと永久に待つ。 */
@@ -3466,6 +4616,9 @@ extern "C" esp_err_t __wrap_esp_lcd_panel_draw_bitmap(esp_lcd_panel_handle_t p,
     }
     return r;
 }
+
+extern "C" uint32_t s_draw_errs_ref(void) { return s_draw_errs; }
+extern "C" uint32_t s_flush_tmo_ref(void) { return s_flush_timeouts; }
 
 static void ui_flush_wait(lv_display_t *d)
 {
@@ -3664,6 +4817,127 @@ static void kb_bench(void)
 #undef KB_BENCH_STEP
 }
 #endif
+
+/* ------------------------------------------------------------------ */
+/* E2: 幾何プローブ (CONFIG_MQJS_UI_GEOM_PROBE)                          */
+/* ------------------------------------------------------------------ */
+/*
+ * landscape の回転が「どの幾何で」止まるかを、人の操作から切り離して
+ * 決定論的に踏む。lv_layer_top に透明なオブジェクトを 1 個置き、寸法を
+ * W×H にして lv_refr_now する —— 描画バッファ 36000 px は H ≤ 31 の
+ * どの段も 1 チャンクに収まるので、1 ステップ = ちょうど W×H の回転 1 回。
+ *
+ * 順番は「生きるはず」から「死ぬはず」へ。止まった所が答え:
+ *   1280x28  sanity。普段のチャンクそのもの
+ *   1280x7   奇数・小 h だが w%16=0 → 最小ブロック 7x16 = 224 B。
+ *            ここで止まれば「奇数 h / 行整列」(D7 原型) が復活
+ *   1137x8   w%16=1 だが 1x8 → 16 B (境界)
+ *   1138x7   w%16=2 → 2x7 = 28 B
+ *   1137x7   1x7 = 14 B。実機で止まったのと同じ幾何
+ *   1137x31  同じ幅の完走例 (ring で完了が見えていたもの)
+ *
+ * 各ステップは 2 段: settle (前のオブジェクトを消して 1 回 refresh =
+ * 前の幾何の回転がもう 1 回走る) と probe (新しい寸法で refresh)。
+ * 消して作り直すのは、寸法変更だと旧領域と新領域の 2 つが 1 回の
+ * refresh に乗って幾何が濁るから。
+ *
+ * ログ: "GEOM_PROBE probe WxH begin" の後に "done" が出ない段が犯人。
+ * 検死役は 3 秒後に通常の CORONER 行を出す (rot ring の先頭が同じ WxH)。
+ * rotates= が 1 でなければ、その refresh に別の無効化 (時計など) が
+ * 相乗りしている —— rot ring で確かめること。
+ */
+#if CONFIG_MQJS_UI_GEOM_PROBE
+struct ui_geom_step_t { uint16_t w, h; };
+static const ui_geom_step_t s_gp_steps[] = {
+    { 1280, 28 }, { 1280, 7 }, { 1137, 8 }, { 1138, 7 }, { 1137, 7 },
+    { 1137, 31 },
+};
+#define UI_GP_N ((int)(sizeof s_gp_steps / sizeof s_gp_steps[0]))
+static lv_obj_t *s_gp_obj;
+static int       s_gp_i;
+static bool      s_gp_probe_phase;   /* false: settle / true: probe */
+static bool      s_gp_running;
+
+static void gp_refresh(const char *what, int w, int h)
+{
+    const int max_row = 36000 / (w > 0 ? w : 1);   /* 描画バッファ 72000 B */
+    uint32_t g0 = s_geom_i;
+    int64_t t0 = esp_timer_get_time();
+    ESP_LOGW(TAG, "GEOM_PROBE %s %dx%d begin (w%%16=%d h%%16=%d min_blk=%d B, "
+                  "chunk h=%d)",
+             what, w, h, w % 16, h % 16,
+             (w % 16 ? w % 16 : 16) * (h % 16 ? h % 16 : 16) * 2,
+             h <= max_row ? h : max_row);
+    memset(&s_prof, 0, sizeof s_prof);
+    lv_refr_now(s_disp);
+    ESP_LOGW(TAG, "GEOM_PROBE %s %dx%d done %lld us | chunks=%d rot=%lld us "
+                  "rotates=%lu",
+             what, w, h, (long long)(esp_timer_get_time() - t0),
+             s_prof.flushes, (long long)s_ppa_rot_us,
+             (unsigned long)(s_geom_i - g0));
+}
+
+static void gp_timer(lv_timer_t *t)
+{
+    if (!s_gp_probe_phase) {
+        if (s_gp_obj) {
+            int pw = (int)lv_obj_get_width(s_gp_obj);
+            int ph = (int)lv_obj_get_height(s_gp_obj);
+            lv_obj_delete(s_gp_obj);
+            s_gp_obj = nullptr;
+            gp_refresh("settle", pw, ph);
+        }
+        if (s_gp_i >= UI_GP_N) {
+            ESP_LOGW(TAG, "GEOM_PROBE end: all %d steps completed", UI_GP_N);
+            s_gp_running = false;
+            lv_timer_delete(t);
+            return;
+        }
+        s_gp_probe_phase = true;
+        return;
+    }
+    const ui_geom_step_t &st = s_gp_steps[s_gp_i];
+    s_gp_obj = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_gp_obj);
+    lv_obj_remove_flag(s_gp_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_gp_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_gp_obj, 0, UI_STATUSBAR_H + 40);
+    lv_obj_set_size(s_gp_obj, st.w, st.h);
+    lv_obj_set_style_bg_color(s_gp_obj, lv_color_hex(0xFF00FF), 0);
+    lv_obj_set_style_bg_opa(s_gp_obj, LV_OPA_50, 0);
+    ESP_LOGW(TAG, "GEOM_PROBE step %d/%d", s_gp_i + 1, UI_GP_N);
+    gp_refresh("probe", st.w, st.h);
+    s_gp_i++;
+    s_gp_probe_phase = false;
+}
+
+/* UI タスクの上 (ui_run_frame_work、ロックの内側) で呼ばれる。 */
+static void gp_job(void *)
+{
+    if (s_gp_running) {
+        ESP_LOGW(TAG, "GEOM_PROBE already running");
+        return;
+    }
+    if (!s_disp) {
+        ESP_LOGW(TAG, "GEOM_PROBE no display");
+        return;
+    }
+    s_gp_running = true;
+    s_gp_i = 0;
+    s_gp_probe_phase = true;
+    ESP_LOGW(TAG, "GEOM_PROBE start: %s hres=%d sentinel=%d (portrait = no "
+                  "rotate, the probe then measures nothing)",
+             s_landscape ? "landscape" : "portrait", ui_cur_hres(),
+             (int)UI_CORONER_SENTINEL);
+    lv_timer_create(gp_timer, 400, nullptr);
+}
+
+extern "C" void ui_tab5_geom_probe(void)
+{
+    if (!ui_tab5_post_job(gp_job, nullptr, 0))
+        ESP_LOGW(TAG, "GEOM_PROBE: job queue full / UI not up");
+}
+#endif /* CONFIG_MQJS_UI_GEOM_PROBE */
 
 #include "ui_tab5_surf.inc"
 
@@ -4835,6 +6109,10 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
     mc.openApp(mc.installApp(std::make_unique<CanvasApp>()));
     lv_timer_create(
         [](lv_timer_t *) {
+#if UI_CORONER
+            s_ui_beat = s_ui_beat + 1;   /* 検死役が読む脈 */
+            s_ui_beat_ms = (uint32_t)(esp_timer_get_time() / 1000);
+#endif
             mooncake::GetMooncake().update();
             touch_observe();
             /* after the canvas consumed its commands, so a term's blit
@@ -4843,6 +6121,11 @@ extern "C" void ui_tab5_start(ui_tab5_ready_cb_t ready_cb, void *arg)
         },
         16, nullptr);
     lvgl_port_unlock();
+#if UI_CORONER
+    /* core 0 に固定。core 1 が止まっても動き続けるのが要件。 */
+    xTaskCreatePinnedToCore(coroner_task, "coroner", 3072, nullptr, 3,
+                            nullptr, 0);
+#endif
 
     touch_init(variant, disp);
 

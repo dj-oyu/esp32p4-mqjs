@@ -10,4 +10,19 @@ menu "Tab5 on-device UI"
             bindings. Off by default so Stamp-P4 builds are unaffected;
             when disabled ui_tab5.h provides no-op inline stubs.
 
+    config MQJS_UI_GEOM_PROBE
+        bool "Geometry probe for the landscape PPA rotate hang (E2)"
+        default n
+        depends on MQJS_TAB5_UI
+        help
+            Diagnostic only. Adds ui_tab5_geom_probe(): on the UI task it
+            invalidates a transparent top-layer object of fixed sizes
+            (1280x28, 1280x7, 1137x8, 1138x7, 1137x7, 1137x31) one at a
+            time and forces a refresh, logging GEOM_PROBE lines. In
+            landscape each size becomes one PPA SRM rotate of exactly
+            that chunk geometry, so the step that never prints "done"
+            names the geometry that hangs. Triggered explicitly from the
+            native editor with Ctrl+G (dock). Nothing runs unless the key
+            is pressed.
+
 endmenu
